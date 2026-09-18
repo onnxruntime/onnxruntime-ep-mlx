@@ -499,3 +499,34 @@ mod float64_primitive_tests {
         }
     }
 }
+
+unsafe extern "C" fn log_mlx_error(
+    msg: *const std::os::raw::c_char,
+    _data: *mut std::os::raw::c_void,
+) {
+    let msg = unsafe { std::ffi::CStr::from_ptr(msg) }.to_string_lossy();
+    log::error!("MLX error: {msg}");
+}
+
+pub fn install_error_handler() {
+    unsafe { mlx::mlx_set_error_handler(Some(log_mlx_error), std::ptr::null_mut(), None) };
+}
+
+#[cfg(test)]
+mod error_handler_tests {
+    use super::*;
+    use crate::sys::mlx as sys;
+
+    #[test]
+    fn op_failure_returns_error_code_instead_of_exiting() {
+        install_error_handler();
+        let (a_data, b_data) = ([0f32; 2], [0f32; 3]);
+        let a = Array::from_data(a_data.as_ptr().cast(), &[2], sys::mlx_dtype__MLX_FLOAT32);
+        let b = Array::from_data(b_data.as_ptr().cast(), &[3], sys::mlx_dtype__MLX_FLOAT32);
+        let stream = Stream::new_default_cpu();
+        let mut raw = unsafe { sys::mlx_array_new() };
+        let rc = unsafe { sys::mlx_add(&mut raw, a.as_raw(), b.as_raw(), stream.as_raw()) };
+        drop(Array::from_raw(raw));
+        assert_ne!(rc, 0, "broadcasting [2] with [3] must fail");
+    }
+}

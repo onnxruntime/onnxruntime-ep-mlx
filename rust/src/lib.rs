@@ -179,6 +179,7 @@ unsafe fn CreateEpFactories_impl(
             );
         }
 
+        mlx::install_error_handler();
         let factory = MlxEpFactory::new(registration_name, ort_api, ep_api);
         *factories.add(0) = factory.as_ptr();
         *num_factories = 1;
