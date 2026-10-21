@@ -1,10 +1,10 @@
-# onnxruntime-mlx
+# onnxruntime-ep-mlx
 
 [![PyPI Version](https://img.shields.io/pypi/v/onnxruntime-ep-mlx)](https://pypi.org/project/onnxruntime-ep-mlx/)
 [![Crates.io Version](https://img.shields.io/crates/v/onnxruntime-ep-mlx)](https://crates.io/crates/onnxruntime-ep-mlx)
 [![Rust](https://shields.io/badge/-Rust-3776AB?style=flat&logo=rust)](https://rustup.rs/)
 
-> **PyPI package: [`onnxruntime-ep-mlx`](https://pypi.org/project/onnxruntime-ep-mlx/)** — `pip install onnxruntime-ep-mlx`, `import onnxruntime_ep_mlx`. (Formerly published as `onnxruntime-mlx`, now renamed.)
+> **PyPI package: [`onnxruntime-ep-mlx`](https://pypi.org/project/onnxruntime-ep-mlx/)** — `pip install onnxruntime-ep-mlx`, `import onnxruntime_ep_mlx`.
 
 An **MLX-native execution provider** for ONNX Runtime on Apple Silicon, built as an out-of-tree
 **plugin EP** (ORT plugin-EP C ABI, ORT 1.29 / `ORT_API_VERSION 29`). It ships as a standalone

@@ -27,8 +27,8 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/justinchuby/onnxruntime-mlx"
-Repository = "https://github.com/justinchuby/onnxruntime-mlx"
+Homepage = "https://github.com/onnxruntime/onnxruntime-ep-mlx"
+Repository = "https://github.com/onnxruntime/onnxruntime-ep-mlx"
 
 # --- Hatchling wheel build ----------------------------------------------------
 # The execution provider is a Rust `cdylib` (../rust). It is NOT a Python

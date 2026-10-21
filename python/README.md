@@ -11,7 +11,7 @@ prefill, and token-at-a-time decode workloads, including quantized matmul,
 attention, normalization, convolution, shape operations, and compiled
 shape-specialized `If`, `Loop`, and `Scan` control flow.
 
-See the [complete README](https://github.com/justinchuby/onnxruntime-mlx#readme)
+See the [complete README](https://github.com/onnxruntime/onnxruntime-ep-mlx#readme)
 for operator coverage, performance results, diagnostics, build instructions,
 and C/C++ integration.
 
