@@ -10,7 +10,7 @@ no ONNX Runtime fork is required. Unsupported operators stay on ORT's CPU provid
 
 ## Install and use
 
-Requires **macOS on Apple Silicon**, Python 3.10+, and **ONNX Runtime 1.31 or newer**.
+Requires **macOS 14+ on Apple Silicon**, Python 3.11+, and **ONNX Runtime 1.31 or newer**.
 The wheel bundles the MLX runtime; source-build tools are not needed.
 
 ```sh

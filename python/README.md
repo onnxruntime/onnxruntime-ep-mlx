@@ -33,5 +33,5 @@ session = ort.InferenceSession(
 outputs = session.run(None, feeds)
 ```
 
-The package requires macOS on Apple Silicon and ONNX Runtime 1.31 or newer.
+The package requires macOS 14+ on Apple Silicon, Python 3.11+, and ONNX Runtime 1.31 or newer.
 The `0.31.x` package series targets ABI 31 and is built with ONNX Runtime 1.31 headers.

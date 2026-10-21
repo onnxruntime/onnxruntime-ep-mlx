@@ -157,7 +157,7 @@ class CustomBuildHook(BuildHookInterface):
 
         # 4) This is a platform wheel with no Python-ABI extension: force a
         #    py3-none-macosx_*_arm64 tag so ONE wheel serves every interpreter
-        #    (CPython 3.10+, free-threaded 3.13t/3.14t, ...).
+        #    (CPython 3.11+, free-threaded 3.13t/3.14t, ...).
         plat = sysconfig.get_platform().replace("-", "_").replace(".", "_")
         if plat.startswith("macosx_"):
             # setup-python may provide a universal2 interpreter even though MLX and the EP dylib
