@@ -29,14 +29,17 @@ and to catch an op silently dropping out of the claimed set.
 python bench/compare.py --base base.json --pr pr.json --threshold 10 > comment.md
 ```
 
-Emits a Markdown table (regressions 🔴, improvements 🟢, new CPU fallbacks ⛔) keyed
-on a hidden marker so CI can upsert it as a single sticky PR comment.
+Emits a Markdown table (regressions 🔴, improvements 🟢, new CPU fallbacks ⛔).
+Timing flags are threshold-based observations, not proof of a performance change.
 
 ## CI
 
-`.github/workflows/bench.yml` runs on PRs that touch `rust/src/**`, `bench/**`, or
-the shared model builders. It builds the PR and base (`main`) EP dylibs on the same
-Apple-silicon runner, benchmarks both with the PR's harness (apples-to-apples), and
-posts/updates the perf comment. It is **informational only** — shared-runner timings
-are noisy, so it never fails the build; treat a flagged regression as a prompt to
-re-check locally, not a gate. To gate, add `--fail-on-regression` to `compare.py`.
+`.github/workflows/bench.yml` is **manual-only**. In Actions, select the **Bench**
+workflow, choose the branch to measure, and use **Run workflow**. It builds that ref
+and `main` on the same Apple-silicon runner, then benchmarks them sequentially with
+the selected ref's harness. Results appear in the Actions job summary; the workflow
+does not run automatically on PRs or post PR comments.
+
+Shared-runner timings are too noisy for reliable regression detection, even when
+both builds use the same runner. Reproduce timing changes locally on an idle machine
+before drawing conclusions. Correctness tests remain automatic and separate.
