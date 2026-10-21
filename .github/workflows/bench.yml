@@ -1,25 +1,12 @@
 name: Bench
 
-# Perf-regression guard for op changes: builds the PR and the base (main) EP dylibs
-# on the SAME Apple-silicon runner, benchmarks both with the PR's harness, and posts a
-# sticky PR comment with the per-op median-time delta. Informational (never gates) —
-# shared-runner timings are noisy, so it flags direction, not absolutes.
+# Manual comparison of the selected ref and main. Shared-runner timings are too
+# noisy for automatic regression signals; results stay in the Actions summary.
 on:
-  pull_request:
-    paths:
-      # Anything that can change what/how an op is claimed or translated.
-      - "rust/src/**"
-      - "rust/build.rs"
-      - "rust/Cargo.toml"
-      - "rust/Cargo.lock"
-      - "bench/**"
-      - "tests/ops/_models.py"
-      - ".github/workflows/bench.yml"
   workflow_dispatch:
 
 permissions:
   contents: read
-  pull-requests: write
 
 # ONNX Runtime telemetry is deliberately NOT disabled here. It stays off on developer
 # machines (rootdir conftest.py) and on in CI, so ORT's maintainers still see the runtime
@@ -38,14 +25,12 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: 0 # need the base commit to build the comparison dylib
+          fetch-depth: 0 # need main to build the comparison dylib
 
       - name: Check base runtime ABI compatibility
         id: base-abi
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
-          base_sha="${BASE_SHA:-origin/main}"
+          base_sha="origin/main"
           echo "sha=$base_sha" >> "$GITHUB_OUTPUT"
           if git show "$base_sha:rust/src/engine.rs" | grep -q "mlx_cumsum_axis"; then
             echo "compatible=true" >> "$GITHUB_OUTPUT"
@@ -79,7 +64,7 @@ jobs:
       - name: Python deps
         run: python -m pip install --upgrade "onnxruntime==${ORT_VERSION}" numpy onnx onnx_ir
 
-      - name: Build PR EP dylib
+      - name: Build selected ref EP dylib
         run: |
           set -euo pipefail
           ( cd rust && ORT_INCLUDE_DIR="$ORT_HOME/include" cargo build --release )
@@ -94,16 +79,15 @@ jobs:
           ( cd "$RUNNER_TEMP/base/rust" && ORT_INCLUDE_DIR="$ORT_HOME/include" cargo build --release )
           cp "$RUNNER_TEMP/base/rust/target/release/libonnxruntime_mlx_ep.dylib" "$RUNNER_TEMP/base.dylib"
 
-      - name: Run benchmark (PR harness against both dylibs)
+      - name: Run benchmark (selected ref harness against both dylibs)
         run: |
           set -euo pipefail
           export DYLD_LIBRARY_PATH="$ORT_HOME/lib"
           if [ "${{ steps.base-abi.outputs.compatible }}" = "true" ]; then
-            # Same harness + same cases for both builds → the delta is apples-to-apples even if the
-            # PR changed the case set.
+            # Use the same harness and cases even if the selected ref changed the case set.
             ONNXRUNTIME_MLX_EP_LIB="$RUNNER_TEMP/base.dylib" python bench/bench.py --out base.json --label "base (main)"
           fi
-          ONNXRUNTIME_MLX_EP_LIB="$RUNNER_TEMP/pr.dylib" python bench/bench.py --out pr.json --label "PR"
+          ONNXRUNTIME_MLX_EP_LIB="$RUNNER_TEMP/pr.dylib" python bench/bench.py --out pr.json --label "selected ref"
 
       - name: Build comparison report
         run: |
@@ -111,31 +95,9 @@ jobs:
             python bench/compare.py --base base.json --pr pr.json --threshold 10 > comment.md
           else
             {
-              echo "<!-- mlx-ep-bench -->"
               echo "## MLX EP op benchmark"
               echo
-              echo "The PR benchmark completed, but the base comparison was skipped because this PR updates the mlx-c ABI."
-              echo "Normal base-vs-PR comparisons resume after the dependency bump reaches main."
+              echo "The selected ref benchmark completed, but the base comparison was skipped because the base does not satisfy the ABI compatibility checks."
             } > comment.md
           fi
           cat comment.md >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Upsert PR comment
-        if: github.event_name == 'pull_request'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
-          PR: ${{ github.event.pull_request.number }}
-        run: |
-          set -euo pipefail
-          # Find our previous sticky comment (keyed on the hidden marker) and edit it in place,
-          # else create a fresh one — keeps the PR to a single, always-current perf comment.
-          CID="$(gh api "repos/$REPO/issues/$PR/comments" --paginate \
-                   --jq '.[] | select(.body | contains("<!-- mlx-ep-bench -->")) | .id' | head -n1 || true)"
-          if [ -n "$CID" ]; then
-            gh api -X PATCH "repos/$REPO/issues/comments/$CID" -F body=@comment.md >/dev/null
-            echo "updated comment $CID"
-          else
-            gh pr comment "$PR" --body-file comment.md
-            echo "created new comment"
-          fi

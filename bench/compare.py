@@ -2,8 +2,8 @@
 
 Emits a PR-comment-ready table flagging per-case regressions/improvements beyond a
 threshold, plus any claim-status changes (an op that newly falls back to CPU is the
-loudest kind of perf regression). Prints the Markdown to stdout; CI upserts it as a
-sticky PR comment keyed on the hidden marker below.
+loudest kind of perf regression). Prints the Markdown to stdout; the manual CI
+workflow includes it in the Actions job summary.
 
 Usage:
     python bench/compare.py --base base.json --pr pr.json [--threshold 10] > comment.md
