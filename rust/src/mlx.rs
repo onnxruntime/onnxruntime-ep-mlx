@@ -504,12 +504,17 @@ unsafe extern "C" fn log_mlx_error(
     msg: *const std::os::raw::c_char,
     _data: *mut std::os::raw::c_void,
 ) {
-    let msg = unsafe { std::ffi::CStr::from_ptr(msg) }.to_string_lossy();
-    log::error!("MLX error: {msg}");
+    let _ = std::panic::catch_unwind(|| {
+        let msg = unsafe { std::ffi::CStr::from_ptr(msg) }.to_string_lossy();
+        log::error!("MLX error: {msg}");
+    });
 }
 
 pub fn install_error_handler() {
-    unsafe { mlx::mlx_set_error_handler(Some(log_mlx_error), std::ptr::null_mut(), None) };
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| unsafe {
+        mlx::mlx_set_error_handler(Some(log_mlx_error), std::ptr::null_mut(), None)
+    });
 }
 
 #[cfg(test)]
