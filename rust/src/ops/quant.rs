@@ -1233,7 +1233,17 @@ fn gather_block_quantized_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Resu
         bs *= d;
     }
     let idx_r = ctx.reshape(idx_in, &[bs])?;
-    let idx = ctx.astype(idx_r, mlx::mlx_dtype__MLX_INT32)?;
+    // Mask before narrowing so large int64 indices cannot wrap into valid rows.
+    let idx64 = ctx.astype(idx_r, mlx::mlx_dtype__MLX_INT64)?;
+    let rows = ctx.dim(data, 0) as i64;
+    let lower = ctx.scalar_i64(-rows);
+    let upper = ctx.scalar_i64(rows);
+    let above_lower = ctx.binary(mlx::mlx_greater_equal, idx64, lower)?;
+    let below_upper = ctx.binary(mlx::mlx_less, idx64, upper)?;
+    let valid = ctx.binary(mlx::mlx_logical_and, above_lower, below_upper)?;
+    let zero_index = ctx.scalar_i64(0);
+    let safe_idx = ctx.where_(valid, idx64, zero_index)?;
+    let idx = ctx.astype(safe_idx, mlx::mlx_dtype__MLX_INT32)?;
 
     let g = gather_rows(ctx, data, idx)?; // [BS, D/2] uint8
     let sg = gather_rows(ctx, scales, idx)?; // [BS, nblocks]
@@ -1280,6 +1290,9 @@ fn gather_block_quantized_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Resu
 
     let sc_full = broadcast_blocks(ctx, sg, bs, nblocks, block)?;
     let w = mul(ctx, centered, sc_full)?;
+    let valid = ctx.reshape(valid, &[bs, 1])?;
+    let zero = ctx.scalar_f32(0.0);
+    let w = ctx.where_(valid, w, zero)?;
 
     let mut oshape: Vec<i32> = ish.clone();
     oshape.push(d);
@@ -2012,6 +2025,10 @@ fn gather_block_quantized_claim(node: &NodeView) -> ClaimResult {
         (Some(d), Some(i), Some(s)) => (d, i, s),
         _ => deny!("missing tensor type/shape info on an input"),
     };
+    require!(
+        data.shape.len() == 2 && data.shape[0] > 0,
+        "only rank-2 data with a positive row count is supported"
+    );
     if !is_uint8(data.dtype)
         || !is_int_index(idx.dtype)
         || scales.dtype != out.dtype

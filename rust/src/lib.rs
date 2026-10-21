@@ -1,6 +1,6 @@
 //! **onnxruntime-mlx** — an MLX-native ONNX Runtime plugin execution provider for Apple Silicon.
 //!
-//! Loaded as a standalone `libonnxruntime_mlx_ep.dylib` by a stock ORT ≥ 1.29 via
+//! Loaded as a standalone `libonnxruntime_mlx_ep.dylib` by a stock ORT ≥ 1.31 via
 //! `RegisterExecutionProviderLibrary` (no ONNX Runtime fork). It translates fused ONNX subgraphs
 //! into MLX graphs and lets MLX compile/schedule the Metal work — one implementation covers prefill
 //! and decode with no hand-written `.metal` kernels.
@@ -211,7 +211,7 @@ unsafe fn CreateEpFactories_impl(
             let legacy = get_api(1);
             return ((*legacy).CreateStatus.unwrap())(
                 ort::OrtErrorCode_ORT_INVALID_ARGUMENT,
-                c"MLXExecutionProvider requires ONNX Runtime 1.29 or newer (ORT_API_VERSION >= 29)"
+                c"MLXExecutionProvider requires ONNX Runtime 1.31 or newer (ORT_API_VERSION >= 31)"
                     .as_ptr(),
             );
         }

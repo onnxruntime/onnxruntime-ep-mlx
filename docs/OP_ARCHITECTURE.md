@@ -253,7 +253,7 @@ The backend writes present K/V to the same ORT context outputs in `[B, kv_heads,
 
 ### 3.4 Quantized embedding gather
 
-`GatherBlockQuantized` is claimed for both the symmetric int4 embedding form (three inputs, `zp=8`, `w=(q-8)·scale`) and the asymmetric four-input form with explicit `zero_points` (`w=(q-zp)·scale`). The backend performs gather plus int4 dequant, uses the schema's default block size of 128, and retains the scale tensor's output dtype.
+`GatherBlockQuantized` is claimed for both the symmetric int4 embedding form (three inputs, `zp=8`, `w=(q-8)·scale`) and the asymmetric four-input form with explicit `zero_points` (`w=(q-zp)·scale`). The backend performs gather plus int4 dequant, uses the schema's default block size of 128, and returns zero slices for out-of-range indices as required by ORT 1.31. Bounds are checked before narrowing int64 indices, and the result retains the scale tensor's dtype.
 
 `GatedRMSNorm` supports the ORT 1.31 `activation` attribute: `silu` (default), its `swish` alias, and `sigmoid`. Unknown activations are not claimed.
 

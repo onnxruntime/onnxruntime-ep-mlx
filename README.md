@@ -10,7 +10,7 @@ no ONNX Runtime fork is required. Unsupported operators stay on ORT's CPU provid
 
 ## Install and use
 
-Requires **macOS on Apple Silicon**, Python 3.10+, and **ONNX Runtime 1.29 or newer**.
+Requires **macOS on Apple Silicon**, Python 3.10+, and **ONNX Runtime 1.31 or newer**.
 The wheel bundles the MLX runtime; source-build tools are not needed.
 
 ```sh
@@ -40,12 +40,13 @@ target C ABI, not the ONNX model opset.
 
 | Package series | Minimum ONNX Runtime | Target `ORT_API_VERSION` |
 |---|---|---|
-| `0.29.x` | 1.29 | 29 |
+| `0.31.x` | 1.31 | 31 |
+| `0.29.x` (earlier releases) | 1.29 | 29 |
 
-Version `0.29.7` retains ABI 29: it does not need the optional APIs added in
+Version `0.31.0` targets the C ABI from
 [ONNX Runtime 1.31.0](https://github.com/microsoft/onnxruntime/releases/tag/v1.31.0).
-CI builds with 1.29 headers and exercises both 1.29 and 1.31 runtimes.
-Registration rejects runtimes that cannot provide API 29.
+CI and release builds use 1.31 headers and runtime.
+Registration rejects runtimes that cannot provide API 31.
 
 ## How it works
 
@@ -64,19 +65,19 @@ fragmentation.
 ## Build from source
 
 Source builds require a Rust toolchain, CMake 3.25+, a C++20 compiler, `curl`, `unzip`, and the
-ONNX Runtime 1.29 headers. The setup script pins MLX 0.32.2 (`1f8e74e3`) and mlx-c (`c74db530`);
+ONNX Runtime 1.31 headers. The setup script pins MLX 0.32.2 (`1f8e74e3`) and mlx-c (`c74db530`);
 both are required build dependencies.
 
 ```sh
 rust/scripts/setup_mlx.sh "$PWD/.deps/mlx-0.32.2"
 export MLX_PREFIX="$PWD/.deps/mlx-0.32.2"
 export MLXC_PREFIX="$MLX_PREFIX"
-export ORT_HOME=/path/to/onnxruntime-osx-arm64-1.29.0
+export ORT_HOME=/path/to/onnxruntime-osx-arm64-1.31.0
 cargo build --manifest-path rust/Cargo.toml --release
 # Output: rust/target/release/libonnxruntime_mlx_ep.dylib
 ```
 
-Alternatively, set `ORT_INCLUDE_DIR` directly to the 1.29 include directory. Each MLX prefix must
+Alternatively, set `ORT_INCLUDE_DIR` directly to the 1.31 include directory. Each MLX prefix must
 contain `include/` and `lib/`; wheel builds also bundle `mlx.metallib` and an optional `libjaccl.dylib`
 from `MLX_PREFIX/lib`.
 

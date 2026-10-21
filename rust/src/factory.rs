@@ -10,11 +10,11 @@ use std::ptr;
 use crate::ep::MlxEp;
 use crate::sys::ort;
 
-pub const ORT_API_VERSION: u32 = 29;
+pub const ORT_API_VERSION: u32 = 31;
 
 const _: () = assert!(
     ORT_API_VERSION == ort::ORT_API_VERSION,
-    "Build onnxruntime-ep-mlx with ONNX Runtime 1.29 headers"
+    "Build onnxruntime-ep-mlx with ONNX Runtime 1.31 headers"
 );
 
 #[repr(C)]
@@ -63,7 +63,7 @@ impl MlxEpFactory {
             vendor: c"onnxruntime-mlx".to_owned(),
             // Single-sourced from [package].version so the EP reports its real version to ORT
             // (GetVersion). Our version scheme encodes ORT compat: 0.<ORT_API_VERSION>.<patch>,
-            // so 0.29.x requires ORT 1.29 or newer (ORT_API_VERSION 29).
+            // so 0.31.x requires ORT 1.31 or newer (ORT_API_VERSION 31).
             version: CString::new(env!("CARGO_PKG_VERSION"))
                 .expect("CARGO_PKG_VERSION contains an interior nul"),
         })

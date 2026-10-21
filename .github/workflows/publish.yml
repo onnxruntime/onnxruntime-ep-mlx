@@ -25,7 +25,7 @@ jobs:
     name: Build distributions (macOS arm64)
     runs-on: macos-15
     env:
-      ORT_VERSION: "1.29.0"
+      ORT_VERSION: "1.31.0"
       MLX_VERSION: "0.32.2"
       MLX_COMMIT: "1f8e74e3f12f31365464a6867c6579f0e9b29d85"
       MLXC_COMMIT: "c74db5307cc8ce122f48d97ef951b30578674e7f"
@@ -134,7 +134,7 @@ jobs:
     permissions:
       id-token: write # required for the OIDC token exchange with crates.io
     env:
-      ORT_VERSION: "1.29.0"
+      ORT_VERSION: "1.31.0"
       MLX_VERSION: "0.32.2"
       MLX_COMMIT: "1f8e74e3f12f31365464a6867c6579f0e9b29d85"
       MLXC_COMMIT: "c74db5307cc8ce122f48d97ef951b30578674e7f"

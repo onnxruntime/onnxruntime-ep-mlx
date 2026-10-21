@@ -1,7 +1,8 @@
 """Correctness tests for the MLX EP state-space / KV-cache / quantized-embedding coverage.
 
 Covers the ops added in this work:
-  * ``GatherBlockQuantized`` asymmetric 4-input form, default block size, and output dtype.
+  * ``GatherBlockQuantized`` asymmetric 4-input form, default block size, output dtype,
+    and ORT 1.31 zero-fill semantics for out-of-range indices.
   * ``GatedRMSNorm`` grouped normalization with SiLU, Swish, and Sigmoid gate activations.
   * ``TensorScatter`` (ai.onnx opset 24) — static-KV-cache scatter, prefill (offset 0), decode
     (per-batch write index, batch_size 1), and circular-wrap forms.
@@ -167,6 +168,28 @@ def test_gather_block_quantized_default_block_size(dtype, np_dtype):
     m.assert_matches_ref(model, feeds, [expected], rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("asymmetric", [False, True])
+@pytest.mark.parametrize(
+    "indices",
+    [
+        [-3, 2],
+        [np.iinfo(np.int64).min, np.iinfo(np.int64).max],
+        [1 << 32, (1 << 32) + 1],
+    ],
+    ids=["outside-boundaries", "int64-extremes", "int32-wraparound"],
+)
+def test_gather_block_quantized_out_of_range_zero_fill(asymmetric, indices):
+    model, feeds = (
+        _gbq_asym_model() if asymmetric else m.gather_block_quantized_model()
+    )
+    feeds["indices"] = np.array(indices, dtype=np.int64)
+    m.assert_mlx_claims(model, feeds)
+    m.assert_matches_cpu(model, feeds, rtol=0, atol=0)
+    m.assert_matches_ref(
+        model, feeds, [np.zeros((2, 32), dtype=np.float32)], rtol=0, atol=0
+    )
+
+
 def test_matmul_block_quantized_fp4_weight():
     n, k, block = 3, 24, 16
     a = np.arange(2 * k, dtype=np.float16).reshape(2, k) / np.float16(16)
@@ -300,8 +323,6 @@ def test_linear_attention_gate(with_beta: bool):
 
 @pytest.mark.parametrize("activation", [None, "silu", "swish", "sigmoid"])
 def test_gated_rms_norm_grouped(activation):
-    if activation is not None and tuple(map(int, ort.__version__.split(".")[:2])) < (1, 31):
-        pytest.skip("GatedRMSNorm activation attribute requires ONNX Runtime 1.31")
     rng = np.random.default_rng(1294)
     x = rng.standard_normal((2, 3, 12)).astype(np.float16)
     gate = rng.standard_normal((2, 3, 12)).astype(np.float16)
@@ -334,8 +355,7 @@ def test_gated_rms_norm_grouped(activation):
     )
     feeds = {"x": x, "scale": scale, "gate": gate}
     m.assert_mlx_claims(model, feeds)
-    if tuple(map(int, ort.__version__.split(".")[:2])) >= (1, 31):
-        m.assert_matches_cpu(model, feeds, rtol=3e-3, atol=3e-3)
+    m.assert_matches_cpu(model, feeds, rtol=3e-3, atol=3e-3)
     m.assert_matches_ref(model, feeds, [expected], rtol=3e-3, atol=3e-3)
 
 
