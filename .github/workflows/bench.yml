@@ -31,7 +31,8 @@ jobs:
     name: Op benchmark (macOS arm64)
     runs-on: macos-15
     env:
-      ORT_VERSION: "1.29.0"
+      ORT_VERSION: "1.31.0"
+      ORT_BUILD_VERSION: "1.29.0"
       MLX_VERSION: "0.32.2"
       MLX_COMMIT: "1f8e74e3f12f31365464a6867c6579f0e9b29d85"
       MLXC_COMMIT: "c74db5307cc8ce122f48d97ef951b30578674e7f"
@@ -47,7 +48,10 @@ jobs:
         run: |
           base_sha="${BASE_SHA:-origin/main}"
           echo "sha=$base_sha" >> "$GITHUB_OUTPUT"
-          if git show "$base_sha:rust/src/engine.rs" | grep -q "mlx_cumsum_axis"; then
+          base_api="$(git show "$base_sha:rust/src/factory.rs" | sed -n 's/^pub const ORT_API_VERSION: u32 = \([0-9]*\);/\1/p')"
+          pr_api="$(sed -n 's/^pub const ORT_API_VERSION: u32 = \([0-9]*\);/\1/p' rust/src/factory.rs)"
+          if [ -n "$pr_api" ] && [ "$base_api" = "$pr_api" ] && \
+             git show "$base_sha:rust/src/engine.rs" | grep -q "mlx_cumsum_axis"; then
             echo "compatible=true" >> "$GITHUB_OUTPUT"
           else
             echo "compatible=false" >> "$GITHUB_OUTPUT"
@@ -67,10 +71,15 @@ jobs:
       - name: Provision ONNX Runtime ${{ env.ORT_VERSION }}
         run: |
           set -euo pipefail
-          curl -fsSL \
-            "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-osx-arm64-${ORT_VERSION}.tgz" \
-            | tar xz
+          for version in "$ORT_BUILD_VERSION" "$ORT_VERSION"; do
+            if [ ! -d "onnxruntime-osx-arm64-$version" ]; then
+              curl -fsSL \
+                "https://github.com/microsoft/onnxruntime/releases/download/v${version}/onnxruntime-osx-arm64-${version}.tgz" \
+                | tar xz
+            fi
+          done
           echo "ORT_HOME=$PWD/onnxruntime-osx-arm64-${ORT_VERSION}" >> "$GITHUB_ENV"
+          echo "ORT_BUILD_HOME=$PWD/onnxruntime-osx-arm64-${ORT_BUILD_VERSION}" >> "$GITHUB_ENV"
 
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
@@ -82,7 +91,7 @@ jobs:
       - name: Build PR EP dylib
         run: |
           set -euo pipefail
-          ( cd rust && ORT_INCLUDE_DIR="$ORT_HOME/include" cargo build --release )
+          ( cd rust && ORT_INCLUDE_DIR="$ORT_BUILD_HOME/include" cargo build --release )
           cp rust/target/release/libonnxruntime_mlx_ep.dylib "$RUNNER_TEMP/pr.dylib"
 
       - name: Build base (main) EP dylib in a worktree
@@ -91,7 +100,7 @@ jobs:
           set -euo pipefail
           BASE_SHA="${{ steps.base-abi.outputs.sha }}"
           git worktree add "$RUNNER_TEMP/base" "$BASE_SHA"
-          ( cd "$RUNNER_TEMP/base/rust" && ORT_INCLUDE_DIR="$ORT_HOME/include" cargo build --release )
+          ( cd "$RUNNER_TEMP/base/rust" && ORT_INCLUDE_DIR="$ORT_BUILD_HOME/include" cargo build --release )
           cp "$RUNNER_TEMP/base/rust/target/release/libonnxruntime_mlx_ep.dylib" "$RUNNER_TEMP/base.dylib"
 
       - name: Run benchmark (PR harness against both dylibs)

@@ -129,7 +129,7 @@ jobs:
     # The crate is a cdylib that only builds on Apple Silicon (mlx-c + Metal), so
     # `cargo publish`'s verify build must run on macos-15. Auth is via crates.io
     # Trusted Publishing (OIDC) — no long-lived token; the `crates` environment is
-    # the configured trusted publisher (repo justinchuby/onnxruntime-mlx, this workflow).
+    # the configured trusted publisher (repo onnxruntime/onnxruntime-ep-mlx, this workflow).
     environment: crates
     permissions:
       id-token: write # required for the OIDC token exchange with crates.io

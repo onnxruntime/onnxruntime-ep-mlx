@@ -1,7 +1,8 @@
 """Correctness tests for the MLX EP state-space / KV-cache / quantized-embedding coverage.
 
 Covers the ops added in this work:
-  * ``GatherBlockQuantized`` asymmetric 4-input form (explicit packed int4 ``zero_points``).
+  * ``GatherBlockQuantized`` asymmetric 4-input form, default block size, and output dtype.
+  * ``GatedRMSNorm`` grouped normalization with SiLU, Swish, and Sigmoid gate activations.
   * ``TensorScatter`` (ai.onnx opset 24) — static-KV-cache scatter, prefill (offset 0), decode
     (per-batch write index, batch_size 1), and circular-wrap forms.
   * ``CausalConvWithState`` (com.microsoft) — stateful causal depthwise conv1d, with/without carry
@@ -130,6 +131,40 @@ def test_gather_block_quantized_asymmetric():
     if not _cpu_supports(model, feeds):
         pytest.skip("ORT CPU lacks com.microsoft.GatherBlockQuantized (4-input) in this build")
     m.assert_matches_cpu(model, feeds, rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.parametrize(
+    "dtype,np_dtype", [(DT.FLOAT, np.float32), (DT.FLOAT16, np.float16)]
+)
+def test_gather_block_quantized_default_block_size(dtype, np_dtype):
+    model = build(
+        "GatherBlockQuantized",
+        [
+            m.tensor("data", DT.UINT8, [2, 128]),
+            m.tensor("indices", DT.INT64, [2]),
+            m.tensor("scales", dtype, [2, 2]),
+        ],
+        [m.tensor("out", dtype, [2, 256])],
+        domain="com.microsoft",
+        attrs=[
+            ir.AttrInt64("bits", 4),
+            ir.AttrInt64("gather_axis", 0),
+            ir.AttrInt64("quantize_axis", 1),
+        ],
+    )
+    scales = np.array([[0.5, 1.0], [2.0, 4.0]], dtype=np_dtype)
+    feeds = {
+        "data": np.full((2, 128), 0x98, dtype=np.uint8),
+        "indices": np.array([-2, 1], dtype=np.int64),
+        "scales": scales,
+    }
+    expected = (
+        np.tile(np.array([0.0, 1.0], dtype=np_dtype), 128)
+        * np.repeat(scales, 128, axis=1)
+    )
+    m.assert_mlx_claims(model, feeds)
+    m.assert_matches_cpu(model, feeds, rtol=0, atol=0)
+    m.assert_matches_ref(model, feeds, [expected], rtol=0, atol=0)
 
 
 def test_matmul_block_quantized_fp4_weight():
@@ -263,7 +298,10 @@ def test_linear_attention_gate(with_beta: bool):
     m.assert_matches_ref(model, feeds, expected, rtol=2e-3, atol=2e-3)
 
 
-def test_gated_rms_norm_grouped():
+@pytest.mark.parametrize("activation", [None, "silu", "swish", "sigmoid"])
+def test_gated_rms_norm_grouped(activation):
+    if activation is not None and tuple(map(int, ort.__version__.split(".")[:2])) < (1, 31):
+        pytest.skip("GatedRMSNorm activation attribute requires ONNX Runtime 1.31")
     rng = np.random.default_rng(1294)
     x = rng.standard_normal((2, 3, 12)).astype(np.float16)
     gate = rng.standard_normal((2, 3, 12)).astype(np.float16)
@@ -271,11 +309,14 @@ def test_gated_rms_norm_grouped():
     eps = 1e-5
     xg = x.astype(np.float32).reshape(-1, 4)
     gg = gate.astype(np.float32).reshape(-1, 4)
+    gate_activation = 1 / (1 + np.exp(-gg))
+    if activation != "sigmoid":
+        gate_activation = gg * gate_activation
     expected = (
         xg
         / np.sqrt(np.mean(xg * xg, axis=-1, keepdims=True) + eps)
         * scale.astype(np.float32)
-        * (gg / (1 + np.exp(-gg)))
+        * gate_activation
     ).reshape(x.shape).astype(np.float16)
     model = build(
         "GatedRMSNorm",
@@ -286,10 +327,15 @@ def test_gated_rms_norm_grouped():
         ],
         [m.tensor("out", DT.FLOAT16, [2, 3, 12])],
         domain="com.microsoft",
-        attrs=[ir.AttrFloat32("epsilon", eps)],
+        attrs=[
+            ir.AttrFloat32("epsilon", eps),
+            *([ir.AttrString("activation", activation)] if activation else []),
+        ],
     )
     feeds = {"x": x, "scale": scale, "gate": gate}
     m.assert_mlx_claims(model, feeds)
+    if tuple(map(int, ort.__version__.split(".")[:2])) >= (1, 31):
+        m.assert_matches_cpu(model, feeds, rtol=3e-3, atol=3e-3)
     m.assert_matches_ref(model, feeds, [expected], rtol=3e-3, atol=3e-3)
 
 

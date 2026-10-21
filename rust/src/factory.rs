@@ -12,6 +12,11 @@ use crate::sys::ort;
 
 pub const ORT_API_VERSION: u32 = 29;
 
+const _: () = assert!(
+    ORT_API_VERSION == ort::ORT_API_VERSION,
+    "Build onnxruntime-ep-mlx with ONNX Runtime 1.29 headers"
+);
+
 #[repr(C)]
 pub struct MlxEpFactory {
     base: ort::OrtEpFactory,
@@ -58,7 +63,7 @@ impl MlxEpFactory {
             vendor: c"onnxruntime-mlx".to_owned(),
             // Single-sourced from [package].version so the EP reports its real version to ORT
             // (GetVersion). Our version scheme encodes ORT compat: 0.<ORT_API_VERSION>.<patch>,
-            // so 0.29.x pairs with ORT 1.29.x (ORT_API_VERSION 29).
+            // so 0.29.x requires ORT 1.29 or newer (ORT_API_VERSION 29).
             version: CString::new(env!("CARGO_PKG_VERSION"))
                 .expect("CARGO_PKG_VERSION contains an interior nul"),
         })

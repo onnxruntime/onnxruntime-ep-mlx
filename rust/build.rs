@@ -63,6 +63,7 @@ fn main() {
         .allowlist_type("Ort.*")
         .allowlist_type("ONNX.*")
         .allowlist_function("Ort.*")
+        .allowlist_var("ORT_API_VERSION")
         .wrap_unsafe_ops(true)
         .generate()
         .expect("ORT bindgen failed")

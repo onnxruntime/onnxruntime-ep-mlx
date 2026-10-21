@@ -1313,8 +1313,16 @@ fn gated_rms_norm_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), M
     let gate32 = ctx.astype(gate, mlx::mlx_dtype__MLX_FLOAT32)?;
     let gate2 = ctx.reshape(gate32, &[rows, c])?;
     let sigmoid = ctx.unary(mlx::mlx_sigmoid, gate2)?;
-    let silu = ctx.mul(gate2, sigmoid)?;
-    let out32 = ctx.mul(normalized, silu)?;
+    let activation = match str_attr(n, "activation", "silu").as_str() {
+        "silu" | "swish" => ctx.mul(gate2, sigmoid)?,
+        "sigmoid" => sigmoid,
+        activation => {
+            return Err(format!(
+                "GatedRMSNorm: unsupported activation {activation:?}"
+            ));
+        }
+    };
+    let out32 = ctx.mul(normalized, activation)?;
     let out = ctx.astype(out32, out_dt)?;
     let out = ctx.reshape(out, &x_shape)?;
     ctx.bind(&n.outputs[0], out);
@@ -1325,6 +1333,11 @@ fn gated_rms_norm_claim(node: &NodeView) -> ClaimResult {
     require!(
         node.num_inputs() == 3 && node.num_outputs() == 1,
         "GatedRMSNorm expects 3 inputs and 1 output"
+    );
+    let activation = node.string_attr("activation", "silu");
+    require!(
+        matches!(activation.as_str(), "silu" | "swish" | "sigmoid"),
+        "GatedRMSNorm activation must be silu, swish, or sigmoid"
     );
     let (x, scale, gate, out) = match (
         node.input_info(0),

@@ -1222,7 +1222,7 @@ fn matmulnbits_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxE
 // ---- GatherBlockQuantized -----------------------------------------------------------------------
 
 fn gather_block_quantized_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
-    let block = n.ints.get("block_size").copied().unwrap_or(32) as i32;
+    let block = n.ints.get("block_size").copied().unwrap_or(128) as i32;
     let idx_in = ctx.resolve(&n.inputs[1])?;
     let data = ctx.resolve(&n.inputs[0])?; // uint8 [V, D/2]
     let scales = ctx.resolve(&n.inputs[2])?; // f32 [V, nblocks]
@@ -1284,6 +1284,8 @@ fn gather_block_quantized_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Resu
     let mut oshape: Vec<i32> = ish.clone();
     oshape.push(d);
     let out = ctx.reshape(w, &oshape)?;
+    let out_dtype = ctx.dtype_of(scales);
+    let out = ctx.astype(out, out_dtype)?;
     ctx.bind(&n.outputs[0], out);
     Ok(())
 }

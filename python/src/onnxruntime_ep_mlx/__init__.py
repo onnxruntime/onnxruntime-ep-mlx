@@ -12,8 +12,9 @@ provider and a thin registration helper. Typical usage::
         providers=["MLXExecutionProvider", "CPUExecutionProvider"],
     )
 
-The plugin targets the ONNX Runtime plugin-EP C ABI (ORT_API_VERSION >= 29,
-i.e. onnxruntime >= 1.29). ``onnxruntime`` must expose
+The plugin targets the ONNX Runtime plugin-EP C ABI (ORT_API_VERSION 29,
+i.e. onnxruntime >= 1.29), including newer runtimes that support API 29.
+``onnxruntime`` must expose
 ``register_execution_provider_library``.
 """
 

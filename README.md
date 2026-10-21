@@ -4,15 +4,48 @@
 [![Crates.io Version](https://img.shields.io/crates/v/onnxruntime-ep-mlx)](https://crates.io/crates/onnxruntime-ep-mlx)
 [![Rust](https://shields.io/badge/-Rust-3776AB?style=flat&logo=rust)](https://rustup.rs/)
 
-> **PyPI package: [`onnxruntime-ep-mlx`](https://pypi.org/project/onnxruntime-ep-mlx/)** — `pip install onnxruntime-ep-mlx`, `import onnxruntime_ep_mlx`.
+An [MLX](https://github.com/ml-explore/mlx)-native execution provider for **ONNX Runtime on Apple
+Silicon**. It accelerates encoders, LLM prefill, and token-at-a-time decode as an out-of-tree plugin:
+no ONNX Runtime fork is required. Unsupported operators stay on ORT's CPU provider.
 
-An **MLX-native execution provider** for ONNX Runtime on Apple Silicon, built as an out-of-tree
-**plugin EP** (ORT plugin-EP C ABI, ORT 1.29 / `ORT_API_VERSION 29`). It ships as a standalone
-`libonnxruntime_mlx_ep.dylib` loaded by a stock prebuilt `libonnxruntime.dylib` via
-`RegisterExecutionProviderLibrary` — **no ONNX Runtime fork required**.
+## Install and use
 
-The EP translates fused ONNX subgraphs into [MLX](https://github.com/ml-explore/mlx) graphs for
-encoders, LLM prefill, and token-at-a-time decode.
+Requires **macOS on Apple Silicon**, Python 3.10+, and **ONNX Runtime 1.29 or newer**.
+The wheel bundles the MLX runtime; source-build tools are not needed.
+
+```sh
+pip install -U onnxruntime-ep-mlx
+```
+
+```python
+import onnxruntime as ort
+import onnxruntime_ep_mlx
+
+onnxruntime_ep_mlx.register_execution_provider_library()
+session = ort.InferenceSession(
+    "model.onnx",
+    providers=["MLXExecutionProvider", "CPUExecutionProvider"],
+)
+outputs = session.run(None, feeds)
+```
+
+The Python package also exposes `library_path()`, `ep_name()`, `version()`, and
+`append_to_session_options(so)`. Other language bindings can load the same
+`libonnxruntime_mlx_ep.dylib` through ORT's plugin-EP API.
+
+## ONNX Runtime compatibility
+
+Package versions follow `0.<ORT_API_VERSION>.<patch>`. The minor version identifies the
+target C ABI, not the ONNX model opset.
+
+| Package series | Minimum ONNX Runtime | Target `ORT_API_VERSION` |
+|---|---|---|
+| `0.29.x` | 1.29 | 29 |
+
+Version `0.29.7` retains ABI 29: it does not need the optional APIs added in
+[ONNX Runtime 1.31.0](https://github.com/microsoft/onnxruntime/releases/tag/v1.31.0).
+CI builds with 1.29 headers and exercises both 1.29 and 1.31 runtimes.
+Registration rejects runtimes that cannot provide API 29.
 
 ## How it works
 
@@ -28,90 +61,34 @@ decode uses a shapeless path so growing KV length does not retrace. Use
 `ONNXRUNTIME_EP_MLX_VERBOSE=1` or `ONNXRUNTIME_EP_MLX_CLAIM_DEBUG=1` to diagnose fallback and
 fragmentation.
 
-## Requirements
+## Build from source
 
-- macOS on Apple Silicon, ORT 1.29 prebuilt (`ORT_API_VERSION >= 29`)
-- CMake 3.25+, a C++20 compiler, `curl`, and `unzip` to build the pinned MLX runtime
-- **`mlx-c` (and `mlx`) — a HARD build dependency**: run the setup block below and export both
-  `MLX_PREFIX` and `MLXC_PREFIX` to its prefix. This pins MLX 0.32.2 commit
-  `1f8e74e3` and mlx-c commit `c74db530`; wheels bundle these runtime libraries.
-- A **Rust toolchain** (`rustup`) to build the EP from source
-
-## Versioning (ORT compatibility)
-
-A plugin EP targets one ORT C-ABI version. Package versions use
-`0.<ORT_API_VERSION>.<patch>`:
-
-| onnxruntime-ep-mlx | ONNX Runtime | `ORT_API_VERSION` |
-|---|---|---|
-| `0.29.x` | 1.29.x | 29 |
-
-For example, ORT 1.28 moves the EP to `0.28.x`.
-
-## Build
-
-The EP is a Rust `cdylib` crate under [`rust/`](rust/). Point it at an ONNX Runtime C-API
-include directory and `cargo build`:
+Source builds require a Rust toolchain, CMake 3.25+, a C++20 compiler, `curl`, `unzip`, and the
+ONNX Runtime 1.29 headers. The setup script pins MLX 0.32.2 (`1f8e74e3`) and mlx-c (`c74db530`);
+both are required build dependencies.
 
 ```sh
-setup_mlx=rust/scripts/setup_mlx.sh                     # repository checkout
-test -x "$setup_mlx" || setup_mlx=scripts/setup_mlx.sh  # published Rust crate
-"$setup_mlx" "$PWD/.deps/mlx-0.32.2"                   # HARD dependency (mlx-c + mlx)
+rust/scripts/setup_mlx.sh "$PWD/.deps/mlx-0.32.2"
 export MLX_PREFIX="$PWD/.deps/mlx-0.32.2"
 export MLXC_PREFIX="$MLX_PREFIX"
-cd rust
-# Either point ORT_INCLUDE_DIR at the ORT headers directly, or set ORT_HOME to an
-# ONNX Runtime release root (build.rs will look in $ORT_HOME/include):
-export ORT_INCLUDE_DIR=/path/to/onnxruntime/include   # or: export ORT_HOME=/path/to/onnxruntime-osx-arm64-1.29.0
-cargo build --release
-# => rust/target/release/libonnxruntime_mlx_ep.dylib  (registers the EP as "MLXExecutionProvider")
+export ORT_HOME=/path/to/onnxruntime-osx-arm64-1.29.0
+cargo build --manifest-path rust/Cargo.toml --release
+# Output: rust/target/release/libonnxruntime_mlx_ep.dylib
 ```
 
-Set `MLX_PREFIX` and `MLXC_PREFIX` to link and bundle a custom MLX runtime
-instead of the Homebrew installation. Each prefix must contain `include/` and
-`lib/`; the wheel builder also bundles `mlx.metallib` and an optional
-`libjaccl.dylib` from `MLX_PREFIX/lib`.
+Alternatively, set `ORT_INCLUDE_DIR` directly to the 1.29 include directory. Each MLX prefix must
+contain `include/` and `lib/`; wheel builds also bundle `mlx.metallib` and an optional `libjaccl.dylib`
+from `MLX_PREFIX/lib`.
 
 The crate binds the ORT plugin-EP C ABI and `mlx-c` directly via `bindgen`; it does **not** link
 `libonnxruntime` (ORT is reached through the `OrtApi` function-pointer table passed to
 `CreateEpFactories`).
 
-## Install & use
+### C / C++
 
-### Python (recommended)
-
-```sh
-pip install -U onnxruntime-ep-mlx        # macOS/Apple-Silicon wheel; bundles the mlx runtime
-```
-
-```python
-import onnxruntime as ort
-import onnxruntime_ep_mlx
-
-# Register the plugin EP once, then select it (with CPU fallback) like any provider.
-onnxruntime_ep_mlx.register_execution_provider_library()          # name: "MLXExecutionProvider"
-sess = ort.InferenceSession(
-    "model.onnx",
-    providers=["MLXExecutionProvider", "CPUExecutionProvider"],
-)
-out = sess.run(None, feeds)
-```
-
-`onnxruntime_ep_mlx` also exposes `library_path()`, `ep_name()`, `version()`, and
-`append_to_session_options(so)`.
-
-### C / C++ (or any onnxruntime binding)
-
-Point onnxruntime at the built dylib and select the provider by name:
-
-```c
-// 1. Register the plugin library with the environment (once).
-RegisterExecutionProviderLibrary(env, "MLXExecutionProvider",
-                                 "/abs/path/libonnxruntime_mlx_ep.dylib");
-// 2. Append it to a session's options (falls back to CPU for unclaimed ops).
-const char* ep = "MLXExecutionProvider";
-SessionOptionsAppendExecutionProvider_V2(options, env, &ep, /*count*/ 1, ...);
-```
+Register the dylib with `OrtApi::RegisterExecutionProviderLibrary`, find its `OrtEpDevice` in
+`OrtApi::GetEpDevices`, and pass that device to `OrtApi::SessionOptionsAppendExecutionProvider_V2`.
+The device's `EpDevice_EpName` is `MLXExecutionProvider`; the V2 API takes devices, not provider-name strings.
 
 From Rust via **onnx-genai**: `ONNX_GENAI_EP=metal` +
 `ONNX_GENAI_METAL_EP_LIB=/abs/path/libonnxruntime_mlx_ep.dylib`.
@@ -139,6 +116,8 @@ group size of 4-8 layers, targeting about seven partitions. Override it with
 `ONNXRUNTIME_EP_MLX_LAYER_PARTITIONS=<layers>`; use `0` or `off` to disable partitioning.
 
 ## Performance (M1 Max, warm)
+
+These are previously measured results, not new ONNX Runtime 1.31 benchmarks.
 
 Real end-to-end models, median of 10 runs, MLX EP vs the ORT **CPU** EP on the same machine — top-1
 identical and max abs diff ≤ 6e-5 in every case:
@@ -254,7 +233,9 @@ Build the EP (above), then run the pytest op-correctness suite (MLX vs ORT CPU r
 ```sh
 export ONNXRUNTIME_MLX_EP_LIB=$PWD/rust/target/release/libonnxruntime_mlx_ep.dylib
 export DYLD_LIBRARY_PATH=<ort-prebuilt/lib>
+cargo test --manifest-path rust/Cargo.toml --release --lib
 python -m pytest tests/ops -q
+python -m pytest tests/backend -q
 ```
 
 - `tests/ops` — each translated decoder op via MLX vs. ORT CPU reference (tolerance-gated, pytest)

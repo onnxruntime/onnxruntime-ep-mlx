@@ -31,10 +31,17 @@ jobs:
         run: cargo fmt --manifest-path rust/Cargo.toml --all -- --check
 
   build-test:
-    name: Build + op tests (macOS arm64)
+    name: Build + op tests (macOS arm64, ORT ${{ matrix.ort-version }})
     runs-on: macos-15
+    strategy:
+      fail-fast: false
+      matrix:
+        ort-version: ["1.29.0", "1.31.0"]
     env:
-      ORT_VERSION: "1.29.0"
+      ORT_VERSION: ${{ matrix.ort-version }}
+      ORT_BUILD_VERSION: "1.29.0"
+      # Both runtime releases use ONNX 1.22; newer fixtures can require unsupported schemas.
+      ONNX_VERSION: "1.22.0"
       MLX_VERSION: "0.32.2"
       MLX_COMMIT: "1f8e74e3f12f31365464a6867c6579f0e9b29d85"
       MLXC_COMMIT: "c74db5307cc8ce122f48d97ef951b30578674e7f"
@@ -58,30 +65,35 @@ jobs:
       - name: Provision ONNX Runtime ${{ env.ORT_VERSION }}
         run: |
           set -euo pipefail
-          curl -fsSL \
-            "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-osx-arm64-${ORT_VERSION}.tgz" \
-            | tar xz
+          for version in "$ORT_BUILD_VERSION" "$ORT_VERSION"; do
+            if [ ! -d "onnxruntime-osx-arm64-$version" ]; then
+              curl -fsSL \
+                "https://github.com/microsoft/onnxruntime/releases/download/v${version}/onnxruntime-osx-arm64-${version}.tgz" \
+                | tar xz
+            fi
+          done
           echo "ORT_HOME=$PWD/onnxruntime-osx-arm64-${ORT_VERSION}" >> "$GITHUB_ENV"
+          echo "ORT_BUILD_HOME=$PWD/onnxruntime-osx-arm64-${ORT_BUILD_VERSION}" >> "$GITHUB_ENV"
 
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
 
       - name: Python test deps
-        run: python -m pip install --upgrade "onnxruntime==${ORT_VERSION}" numpy onnx onnx_ir pytest
+        run: python -m pip install --upgrade "onnxruntime==${ORT_VERSION}" "onnx==${ONNX_VERSION}" numpy onnx_ir pytest
 
       - name: Build the Rust EP (cargo)
         run: |
           cd rust
           # -D warnings: the tree is warning-clean; fail CI on any new dead-code / unused drift.
-          ORT_INCLUDE_DIR="$ORT_HOME/include" RUSTFLAGS="-D warnings" cargo build --release
+          ORT_INCLUDE_DIR="$ORT_BUILD_HOME/include" RUSTFLAGS="-D warnings" cargo build --release
           test -f target/release/libonnxruntime_mlx_ep.dylib
 
       - name: Rust library unit tests
         run: |
           cd rust
           export DYLD_LIBRARY_PATH="$ORT_HOME/lib"
-          ORT_INCLUDE_DIR="$ORT_HOME/include" RUSTFLAGS="-D warnings" cargo test --release --lib
+          ORT_INCLUDE_DIR="$ORT_BUILD_HOME/include" RUSTFLAGS="-D warnings" cargo test --release --lib
 
       - name: Op-correctness tests (pytest, MLX vs ORT CPU)
         run: |
@@ -109,26 +121,28 @@ jobs:
       - name: ONNX backend node tests (MLX EP vs ONNX reference — gating)
         # Runs ONNX's own curated per-node tests through the MLX EP. Run IN-PROCESS (no
         # pytest-forked): fork() does not preserve a live Metal/MLX device context, so forking the
-        # test process yields spurious, non-deterministic failures (and is ~50× slower). In-process
-        # the suite is clean and deterministic (~5s). This GATES the build — any op the EP
-        # incorrectly claims surfaces here as a real reference mismatch. The harness excludes a set
-        # of ORT/ONNX-inherent cases (see `_EXCLUDE`); everything else must match ONNX's reference.
+        # test process yields spurious, non-deterministic failures. Propagate pytest's exit status
+        # through tee so a reference mismatch or native process exit fails the build.
         run: |
+          set -euo pipefail
           export ONNXRUNTIME_MLX_EP_LIB="$PWD/rust/target/release/libonnxruntime_mlx_ep.dylib"
           export DYLD_LIBRARY_PATH="$ORT_HOME/lib"
-          python -m pytest tests/backend -q -p no:cacheprovider | tee /tmp/backend.out
+          status=0
+          python -m pytest tests/backend -q -p no:cacheprovider | tee /tmp/backend.out || status=$?
           {
             echo "### ONNX backend node tests (MLX EP)"
             echo '```'
             tail -n 3 /tmp/backend.out
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
 
   python-wheel:
     name: Python package smoke (macOS arm64)
     runs-on: macos-15
     env:
-      ORT_VERSION: "1.29.0"
+      ORT_VERSION: "1.31.0"
+      ORT_BUILD_VERSION: "1.29.0"
       MLX_VERSION: "0.32.2"
       MLX_COMMIT: "1f8e74e3f12f31365464a6867c6579f0e9b29d85"
       MLXC_COMMIT: "c74db5307cc8ce122f48d97ef951b30578674e7f"
@@ -150,10 +164,15 @@ jobs:
       - name: Provision ONNX Runtime ${{ env.ORT_VERSION }}
         run: |
           set -euo pipefail
-          curl -fsSL \
-            "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-osx-arm64-${ORT_VERSION}.tgz" \
-            | tar xz
+          for version in "$ORT_BUILD_VERSION" "$ORT_VERSION"; do
+            if [ ! -d "onnxruntime-osx-arm64-$version" ]; then
+              curl -fsSL \
+                "https://github.com/microsoft/onnxruntime/releases/download/v${version}/onnxruntime-osx-arm64-${version}.tgz" \
+                | tar xz
+            fi
+          done
           echo "ORT_HOME=$PWD/onnxruntime-osx-arm64-${ORT_VERSION}" >> "$GITHUB_ENV"
+          echo "ORT_BUILD_HOME=$PWD/onnxruntime-osx-arm64-${ORT_BUILD_VERSION}" >> "$GITHUB_ENV"
 
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
@@ -164,7 +183,7 @@ jobs:
           python -m pip install --upgrade pip build
           # The build hook runs `cargo build --release` (honouring ORT_INCLUDE_DIR),
           # bundles the cargo dylib + mlx runtime, and forces a py3-none platform tag.
-          ORT_INCLUDE_DIR="$ORT_HOME/include" MACOSX_DEPLOYMENT_TARGET=14.0 \
+          ORT_INCLUDE_DIR="$ORT_BUILD_HOME/include" MACOSX_DEPLOYMENT_TARGET=14.0 \
             python -m build --wheel ./python -o dist
           ls -la dist
           # One pure-Python platform wheel (no CPython ABI) serves 3.12/3.13/free-threaded.

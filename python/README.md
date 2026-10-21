@@ -4,7 +4,7 @@
 [![Rust crate](https://img.shields.io/crates/v/onnxruntime-ep-mlx)](https://crates.io/crates/onnxruntime-ep-mlx)
 
 MLX-native ONNX Runtime execution provider for Apple Silicon. It is an
-out-of-tree plugin EP for ONNX Runtime 1.29 and requires no ONNX Runtime fork.
+out-of-tree plugin EP for ONNX Runtime 1.29 or newer and requires no ONNX Runtime fork.
 
 The wheel bundles MLX 0.32.2 commit `1f8e74e3` and mlx-c commit `c74db530`. It supports encoder, LLM
 prefill, and token-at-a-time decode workloads, including quantized matmul,
@@ -33,4 +33,5 @@ session = ort.InferenceSession(
 outputs = session.run(None, feeds)
 ```
 
-The package requires macOS on Apple Silicon and an ONNX Runtime 1.29 build.
+The package requires macOS on Apple Silicon and ONNX Runtime 1.29 or newer.
+It targets ABI 29 to remain compatible with both ONNX Runtime 1.29 and 1.31.
