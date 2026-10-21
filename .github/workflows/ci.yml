@@ -111,20 +111,23 @@ jobs:
       - name: ONNX backend node tests (MLX EP vs ONNX reference — gating)
         # Runs ONNX's own curated per-node tests through the MLX EP. Run IN-PROCESS (no
         # pytest-forked): fork() does not preserve a live Metal/MLX device context, so forking the
-        # test process yields spurious, non-deterministic failures (and is ~50× slower). In-process
-        # the suite is clean and deterministic (~5s). This GATES the build — any op the EP
+        # test process yields spurious, non-deterministic failures (and is ~50× slower).
+        # This GATES the build — any op the EP
         # incorrectly claims surfaces here as a real reference mismatch. The harness excludes a set
         # of ORT/ONNX-inherent cases (see `_EXCLUDE`); everything else must match ONNX's reference.
         run: |
+          set -euo pipefail
           export ONNXRUNTIME_MLX_EP_LIB="$PWD/rust/target/release/libonnxruntime_mlx_ep.dylib"
           export DYLD_LIBRARY_PATH="$ORT_HOME/lib"
-          python -m pytest tests/backend -q -p no:cacheprovider | tee /tmp/backend.out
+          status=0
+          python -m pytest tests/backend -q -p no:cacheprovider | tee /tmp/backend.out || status=$?
           {
             echo "### ONNX backend node tests (MLX EP)"
             echo '```'
             tail -n 3 /tmp/backend.out
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
 
   python-wheel:
     name: Python package smoke (macOS arm64)
