@@ -293,12 +293,12 @@ fn standard_norm_op(
 }
 
 /// SkipLayerNormalization (com.microsoft): residual = input + skip (+ bias);
-/// Y = layer_norm(residual, gamma, beta, eps). out[0]=Y; optional out[3]=residual sum.
+/// Y = layer_norm(residual, gamma, beta, eps); optional mean, inverse and residual outputs.
 fn skip_layer_norm_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
     skip_norm_op(ctx, n, true)
 }
 
-/// SkipSimplifiedLayerNormalization: input + skip (+ bias), normalized Y and optional slot3 residual.
+/// SkipSimplifiedLayerNormalization: residual, normalized Y and optional inverse statistic.
 fn skip_rms_norm_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
     skip_norm_op(ctx, n, false)
 }
@@ -364,7 +364,40 @@ fn skip_norm_op(
     if let Some(bias) = bias {
         residual = add(ctx, residual, bias)?;
     }
-    let output = if ctx.size_of(residual) == 0 {
+    let has_mean = centered && n.outputs.get(1).is_some_and(|o| !o.name.is_empty());
+    let has_inverse = n.outputs.get(2).is_some_and(|o| !o.name.is_empty());
+    let output = if has_mean || has_inverse {
+        let axes = [(shape.len() - 1) as i32];
+        let mean = if centered {
+            Some(norm_mean_axes(ctx, residual, &axes, compute_dtype)?)
+        } else {
+            None
+        };
+        let values = match mean {
+            Some(mean) => sub(ctx, residual, mean)?,
+            None => residual,
+        };
+        let squared = mul(ctx, values, values)?;
+        let variance = norm_mean_axes(ctx, squared, &axes, compute_dtype)?;
+        let eps = scalar_like(ctx, epsilon(n, 1e-12), compute_dtype)?;
+        let denominator = add(ctx, variance, eps)?;
+        let stddev = sqrt(ctx, denominator)?;
+        let inverse = ctx.unary(mlx::mlx_reciprocal, stddev)?;
+        let normalized = mul(ctx, values, inverse)?;
+        let scaled = mul(ctx, normalized, gamma)?;
+        let output = match beta {
+            Some(beta) => add(ctx, scaled, beta)?,
+            None => scaled,
+        };
+        if has_mean && let Some(mean) = mean {
+            ctx.bind(&n.outputs[1], mean);
+        }
+        if has_inverse {
+            ctx.bind(&n.outputs[2], inverse);
+        }
+        ctx.mark_composed("skip normalization with float32 saved statistics");
+        output
+    } else if ctx.size_of(residual) == 0 {
         ctx.mark_composed("empty skip normalization");
         residual
     } else if centered {
@@ -815,7 +848,17 @@ fn skip_norm_claim(node: &NodeView, centered: bool) -> ClaimResult {
     }
     for i in 1..=2 {
         let used = node.output_is_used(i).map_err(std::borrow::Cow::Owned)?;
-        require!(!used, "training diagnostic output {i} is not implemented");
+        require!(
+            centered || i != 1 || !used,
+            "SkipSimplifiedLayerNormalization: the live mean output has no defined RMS statistic contract"
+        );
+        if node.output_present(i) {
+            require!(
+                node.output_info(i).is_some_and(|o| o.dtype
+                    == ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT),
+                "saved statistic output {i} must be float32"
+            );
+        }
     }
     if node.output_present(3) {
         require!(
@@ -831,14 +874,17 @@ fn skip_norm_claim(node: &NodeView, centered: bool) -> ClaimResult {
 }
 
 fn skip_norm_compile_shape_safety(node: &NodeView) -> CompileShapeSafety {
-    if node
-        .input_info(0)
-        .is_some_and(|x| x.shape.iter().all(|&d| d > 0))
+    let statistics = node.output_present(2)
+        || (node.op_type() == "SkipLayerNormalization" && node.output_present(1));
+    if !statistics
+        && node
+            .input_info(0)
+            .is_some_and(|x| x.shape.iter().all(|&d| d > 0))
     {
         CompileShapeSafety::Shapeless
     } else {
         CompileShapeSafety::ShapeKeyedOnly {
-            reason: "conservatively shape-keyed: empty versus fused skip normalization depends on concrete extents",
+            reason: "conservatively shape-keyed: saved statistics and empty versus fused skip normalization depend on concrete extents",
         }
     }
 }
