@@ -193,6 +193,25 @@ extent remain unclaimed rather than capturing an incorrect shape. Runtime
 bounds and float64 `Range` remain open coverage partitions, not proven backend
 limitations.
 
+`Pad` handles version-1 `paddings` and version-2 size/value attributes, modern
+int64 `pads`, and optional int32/int64 axes. Constant and live boundary
+parameters use the existing bounded full-value general-cache keys; interior
+data-dependent pads/axes stay eager. The fill value remains live graph data,
+not a host specialization parameter. Signed pads crop before edge, wrap and
+reflection padding. Constant mode preserves original-coordinate overlap,
+including removal beyond an edge compensated by padding at the other edge.
+Empty/scalar outputs, exact numeric/Boolean payloads, and float64 CPU movement
+retain their types and bits. Reflection composes repeated folds and singleton
+broadcasts where native padding kernels reject wider pads. Dimensions,
+products, vector/scalar ranks and normalized unique axes are checked before
+native allocation; nonconstant modes cannot extend an empty cropped axis.
+Wrap requires schema 19 or newer. String, complex and encoded element formats
+remain outside this tensor materialization path, not proven impossible
+backend operations.
+ORT 1.31's shape inference rejects constant int32 axes before provider
+selection; int64 initializers and int32 graph values avoid that frontend
+limitation.
+
 Metal has no float64 kernels; supported float64 forms run through MLX CPU, while
 other forms fall back to ORT CPU. Empty/dynamic support is per-handler, not a
 blanket guarantee. Claimed control-flow nodes translate supported tensor bodies;
