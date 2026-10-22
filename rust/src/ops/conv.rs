@@ -8,8 +8,8 @@
 //! conv weights are repacked from ONNX `[O, I/g, k...]` to MLX `[O, k..., I/g]`. Conv and
 //! ConvTranspose support 1-3 spatial dimensions (MLX restricts groups to 1D/2D). Transpose
 //! convolution uses an uncropped convolution followed by output cropping, supporting asymmetric
-//! pads without slicing the undilated input. Window pooling remains 2D/floor-mode; unsupported
-//! forms are left to ORT CPU.
+//! pads without slicing the undilated input. Window pooling uses dilated strided views for
+//! 1-3 spatial dimensions, including ceil-mode tails and original-coordinate MaxPool indices.
 
 use std::os::raw::{c_char, c_void};
 
@@ -589,9 +589,101 @@ fn conv_transpose_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), M
     Ok(())
 }
 
-// ---- shared pooling primitives (2D, channels-last) ----------------------------------------------
+// ---- shared pooling primitives (channels-last) -------------------------------------------------
 
-/// Pad the H/W (axes 1,2) of a channels-last [N,H,W,C] array with `value`. `pads` is [t,l,b,r].
+#[derive(Debug)]
+struct PoolGeometry {
+    kernel: Vec<i64>,
+    strides: Vec<i64>,
+    dilations: Vec<i64>,
+    pads: Vec<i64>,
+    tail: Vec<i64>,
+    output: Vec<i32>,
+}
+
+impl PoolGeometry {
+    fn new(
+        spatial: &[i64],
+        kernel: Vec<i64>,
+        strides: Vec<i64>,
+        dilations: Vec<i64>,
+        mut pads: Vec<i64>,
+        auto_pad: &str,
+        ceil: bool,
+    ) -> Result<Self, MlxError> {
+        let r = spatial.len();
+        if !(1..=3).contains(&r)
+            || kernel.len() != r
+            || strides.len() != r
+            || dilations.len() != r
+            || pads.len() != 2 * r
+            || spatial.iter().any(|&v| v <= 0 || v > i32::MAX as i64)
+            || kernel
+                .iter()
+                .chain(&strides)
+                .chain(&dilations)
+                .any(|&v| v <= 0 || v > i32::MAX as i64)
+            || pads.iter().any(|&v| v < 0 || v > i32::MAX as i64)
+        {
+            return Err("Pool: invalid spatial dimensions or window attributes".into());
+        }
+        if auto_pad != "NOTSET" {
+            pads = auto_pad_pads(auto_pad, spatial, &kernel, &strides, &dilations)
+                .ok_or_else(|| format!("Pool: unsupported auto_pad {auto_pad:?}"))?;
+        }
+        let mut output = Vec::with_capacity(r);
+        let mut tail = Vec::with_capacity(r);
+        for i in 0..r {
+            // Attribute components fit i32; their products and sums fit i64.
+            let effective = dilations[i] * (kernel[i] - 1) + 1;
+            let padded = spatial[i] + pads[i] + pads[i + r];
+            let delta = padded - effective;
+            let mut count = if matches!(auto_pad, "SAME_UPPER" | "SAME_LOWER") {
+                (spatial[i] + strides[i] - 1) / strides[i]
+            } else {
+                delta.div_euclid(strides[i])
+                    + i64::from(ceil && delta.rem_euclid(strides[i]) != 0)
+                    + 1
+            };
+            if ceil && count > 0 && (count - 1) * strides[i] >= spatial[i] + pads[i] {
+                count -= 1;
+            }
+            let extra = if count > 0 {
+                ((count - 1) * strides[i] + effective - padded).max(0)
+            } else {
+                0
+            };
+            if count < 0 || count > i32::MAX as i64 || padded + extra > i32::MAX as i64 {
+                return Err("Pool: output or padded extent is not representable by MLX".into());
+            }
+            output.push(count as i32);
+            tail.push(extra);
+        }
+        Ok(Self {
+            kernel,
+            strides,
+            dilations,
+            pads,
+            tail,
+            output,
+        })
+    }
+
+    fn materialized_pads(&self) -> Vec<i64> {
+        let mut pads = self.pads.clone();
+        let r = self.output.len();
+        for i in 0..r {
+            pads[r + i] += self.tail[i];
+        }
+        pads
+    }
+
+    fn axes(&self) -> Vec<i32> {
+        let r = self.output.len() as i32;
+        (r + 1..2 * r + 1).collect()
+    }
+}
+
 fn pad_spatial(
     ctx: &mut TranslationContext,
     x: mlx::mlx_array,
@@ -601,20 +693,21 @@ fn pad_spatial(
     if pads.iter().all(|&p| p == 0) {
         return Ok(x);
     }
-    let axes = [1i32, 2];
-    let low = [pads[0] as i32, pads[1] as i32];
-    let high = [pads[2] as i32, pads[3] as i32];
+    let r = pads.len() / 2;
+    let axes: Vec<i32> = (1..=r as i32).collect();
+    let low: Vec<i32> = pads[..r].iter().map(|&v| v as i32).collect();
+    let high: Vec<i32> = pads[r..].iter().map(|&v| v as i32).collect();
     let mode = b"constant\0";
     let out = ctx.emit(|res, s| unsafe {
         mlx::mlx_pad(
             res,
             x,
             axes.as_ptr(),
-            2,
+            r,
             low.as_ptr(),
-            2,
+            r,
             high.as_ptr(),
-            2,
+            r,
             value,
             mode.as_ptr() as *const c_char,
             s,
@@ -623,28 +716,45 @@ fn pad_spatial(
     ctx.contiguous(out)
 }
 
-/// Build a [N, out_h, out_w, kH, kW, C] strided window view over channels-last [N,H,W,C].
-fn sliding_windows_2d(
+/// Build [N, out..., kernel..., C] over a contiguous, fully materialized padded input.
+fn sliding_windows(
     ctx: &mut TranslationContext,
     x: mlx::mlx_array,
-    kernel: &[i64],
-    strides: &[i64],
+    geometry: &PoolGeometry,
 ) -> Result<mlx::mlx_array, MlxError> {
     let shape = ctx.shape_of(x);
-    let (n, h, w, c) = (shape[0], shape[1], shape[2], shape[3]);
-    let out_h = (h - kernel[0] as i32) / strides[0] as i32 + 1;
-    let out_w = (w - kernel[1] as i32) / strides[1] as i32 + 1;
-    let window_shape: [i32; 6] = [n, out_h, out_w, kernel[0] as i32, kernel[1] as i32, c];
-    let row_stride = w as i64 * c as i64;
-    let window_strides: [i64; 6] = [
-        h as i64 * row_stride,
-        strides[0] * row_stride,
-        strides[1] * c as i64,
-        row_stride,
-        c as i64,
-        1,
-    ];
-    ctx.emit(|res, s| unsafe {
+    let r = geometry.output.len();
+    let mut contiguous = vec![1i64; r + 2];
+    for i in (0..r + 1).rev() {
+        contiguous[i] = contiguous[i + 1]
+            .checked_mul(i64::from(shape[i + 1]))
+            .ok_or("Pool: padded strides overflow int64")?;
+    }
+    let mut window_shape = vec![shape[0]];
+    window_shape.extend(&geometry.output);
+    window_shape.extend(geometry.kernel.iter().map(|&v| v as i32));
+    window_shape.push(shape[r + 1]);
+    window_shape.iter().try_fold(1i64, |size, &dim| {
+        size.checked_mul(i64::from(dim))
+            .ok_or("Pool: window element count overflows int64")
+    })?;
+    let mut window_strides = vec![contiguous[0]];
+    for i in 0..r {
+        window_strides.push(
+            contiguous[i + 1]
+                .checked_mul(geometry.strides[i])
+                .ok_or("Pool: window strides overflow int64")?,
+        );
+    }
+    for i in 0..r {
+        window_strides.push(
+            contiguous[i + 1]
+                .checked_mul(geometry.dilations[i])
+                .ok_or("Pool: dilated strides overflow int64")?,
+        );
+    }
+    window_strides.push(1);
+    let windows = ctx.emit(|res, s| unsafe {
         mlx::mlx_as_strided(
             res,
             x,
@@ -655,90 +765,309 @@ fn sliding_windows_2d(
             0,
             s,
         )
-    })
-}
-
-fn reduce_pool_windows(
-    ctx: &mut TranslationContext,
-    windows: mlx::mlx_array,
-    average: bool,
-) -> Result<mlx::mlx_array, MlxError> {
-    let axes = [3i32, 4];
-    if average {
-        ctx.emit(|res, s| unsafe { mlx::mlx_mean_axes(res, windows, axes.as_ptr(), 2, false, s) })
+    })?;
+    // MLX 0.32.4's strided reduction misreads overlapping dilated views
+    // (e.g. [N,3,3,C] with spatial strides [C,2*C]). Materialize new
+    // dilated forms; keep the existing undilated reduction fast path.
+    if geometry.dilations.iter().any(|&d| d != 1) {
+        ctx.contiguous(windows)
     } else {
-        ctx.emit(|res, s| unsafe { mlx::mlx_max_axes(res, windows, axes.as_ptr(), 2, false, s) })
+        Ok(windows)
     }
 }
 
-fn sum_axes34(
+fn pool_sum(
     ctx: &mut TranslationContext,
     a: mlx::mlx_array,
-    keepdims: bool,
+    axes: &[i32],
 ) -> Result<mlx::mlx_array, MlxError> {
-    let axes = [3i32, 4];
-    ctx.emit(|res, s| unsafe { mlx::mlx_sum_axes(res, a, axes.as_ptr(), 2, keepdims, s) })
+    ctx.emit(|res, s| unsafe { mlx::mlx_sum_axes(res, a, axes.as_ptr(), axes.len(), false, s) })
+}
+
+fn pool_mask_windows(
+    ctx: &mut TranslationContext,
+    spatial: &[i64],
+    geometry: &PoolGeometry,
+    include_pad: bool,
+) -> Result<mlx::mlx_array, MlxError> {
+    let r = spatial.len();
+    let mut shape = vec![1];
+    for (i, &dim) in spatial.iter().enumerate() {
+        let padding = if include_pad {
+            geometry.pads[i] + geometry.pads[r + i]
+        } else {
+            0
+        };
+        shape.push((dim + padding) as i32);
+    }
+    shape.push(1);
+    let mask = ctx.emit(|res, s| unsafe {
+        mlx::mlx_ones(
+            res,
+            shape.as_ptr(),
+            shape.len(),
+            mlx::mlx_dtype__MLX_FLOAT32,
+            s,
+        )
+    })?;
+    let zero = ctx.scalar_f32(0.0);
+    // Ceil-only extension is not declared ONNX padding, even when count_include_pad=1.
+    let pads = if include_pad {
+        let mut pads = vec![0; 2 * r];
+        pads[r..].copy_from_slice(&geometry.tail);
+        pads
+    } else {
+        geometry.materialized_pads()
+    };
+    let mask = pad_spatial(ctx, mask, &pads, zero)?;
+    sliding_windows(ctx, mask, geometry)
+}
+
+fn pool_counts(
+    ctx: &mut TranslationContext,
+    spatial: &[i64],
+    geometry: &PoolGeometry,
+    include_pad: bool,
+) -> Result<mlx::mlx_array, MlxError> {
+    let windows = pool_mask_windows(ctx, spatial, geometry, include_pad)?;
+    pool_sum(ctx, windows, &geometry.axes())
+}
+
+fn pool_indices(
+    ctx: &mut TranslationContext,
+    n: &NodeDesc,
+    shape: &[i32],
+    windows: mlx::mlx_array,
+    maxima: mlx::mlx_array,
+    geometry: &PoolGeometry,
+) -> Result<(), MlxError> {
+    let rank = shape.len();
+    let r = rank - 2;
+    let mut indices = ctx.scalar_i64(0);
+    let mut stride = 1i64;
+    for axis in (0..rank).rev() {
+        let coord = ctx.arange(0.0, f64::from(shape[axis]), 1.0, mlx::mlx_dtype__MLX_INT64)?;
+        let mut broadcast = vec![1; rank];
+        broadcast[axis] = shape[axis];
+        let coord = ctx.reshape(coord, &broadcast)?;
+        let scale = ctx.scalar_i64(stride);
+        let coord = ctx.binary(mlx::mlx_multiply, coord, scale)?;
+        indices = ctx.binary(mlx::mlx_add, indices, coord)?;
+        stride = stride
+            .checked_mul(i64::from(shape[axis]))
+            .ok_or("MaxPool: original flattened indices overflow int64")?;
+    }
+    let indices = to_channels_last(ctx, indices, r as i32)?;
+    let sentinel = ctx.scalar_i64(i64::MAX);
+    let indices = pad_spatial(ctx, indices, &geometry.materialized_pads(), sentinel)?;
+    let indices = sliding_windows(ctx, indices, geometry)?;
+    let mut expanded = ctx.shape_of(maxima);
+    for _ in 0..r {
+        expanded.insert(r + 1, 1);
+    }
+    let maxima = ctx.reshape(maxima, &expanded)?;
+    let equal = ctx.binary(mlx::mlx_equal, windows, maxima)?;
+    let candidates = ctx.where_(equal, indices, sentinel)?;
+    let axes = geometry.axes();
+    // Min ORIGINAL row-major index implements the first valid window element on ties,
+    // independently of the requested output index encoding and padded sentinel values.
+    let selected = ctx.emit(|res, s| unsafe {
+        mlx::mlx_min_axes(res, candidates, axes.as_ptr(), axes.len(), false, s)
+    })?;
+    let selected = from_channels_last(ctx, selected, r as i32)?;
+    let valid = ctx.binary(mlx::mlx_not_equal, selected, sentinel)?;
+    let zero = ctx.scalar_i64(0);
+    let selected = ctx.where_(valid, selected, zero)?;
+    let encoded = if n.ints.get("storage_order").copied().unwrap_or(0) == 1 {
+        let spatial_size = shape[2..].iter().try_fold(1i64, |size, &v| {
+            size.checked_mul(i64::from(v))
+                .ok_or("MaxPool: spatial size overflows int64")
+        })?;
+        let size = ctx.scalar_i64(spatial_size);
+        let batch_channel = ctx.binary(mlx::mlx_floor_divide, selected, size)?;
+        let mut encoded = ctx.binary(mlx::mlx_multiply, batch_channel, size)?;
+        let mut trailing = spatial_size;
+        let mut leading = 1i64;
+        for &dim in &shape[2..] {
+            trailing /= i64::from(dim);
+            let divisor = ctx.scalar_i64(trailing);
+            let coord = ctx.binary(mlx::mlx_floor_divide, selected, divisor)?;
+            let dimension = ctx.scalar_i64(i64::from(dim));
+            let coord = ctx.binary(mlx::mlx_remainder, coord, dimension)?;
+            let scale = ctx.scalar_i64(leading);
+            let coord = ctx.binary(mlx::mlx_multiply, coord, scale)?;
+            encoded = ctx.binary(mlx::mlx_add, encoded, coord)?;
+            leading *= i64::from(dim);
+        }
+        encoded
+    } else {
+        selected
+    };
+    // ORT encodes the no-sample sentinel as spatial coordinates (-1,...,-1),
+    // plus the original batch/channel offset, rather than a global -1.
+    let column_major = n.ints.get("storage_order").copied().unwrap_or(0) == 1;
+    let mut spatial_size = 1i64;
+    let mut sentinel_offset = 0i64;
+    let dimensions: Vec<i32> = if column_major {
+        shape[2..].to_vec()
+    } else {
+        shape[2..].iter().copied().rev().collect()
+    };
+    for dim in dimensions {
+        sentinel_offset = sentinel_offset
+            .checked_sub(spatial_size)
+            .ok_or("MaxPool: missing index offset overflows int64")?;
+        spatial_size = spatial_size
+            .checked_mul(i64::from(dim))
+            .ok_or("MaxPool: spatial size overflows int64")?;
+    }
+    let mut missing = ctx.scalar_i64(sentinel_offset);
+    let mut scale = spatial_size;
+    for axis in (0..2).rev() {
+        let coord = ctx.arange(0.0, f64::from(shape[axis]), 1.0, mlx::mlx_dtype__MLX_INT64)?;
+        let mut broadcast = vec![1; rank];
+        broadcast[axis] = shape[axis];
+        let coord = ctx.reshape(coord, &broadcast)?;
+        let factor = ctx.scalar_i64(scale);
+        let coord = ctx.binary(mlx::mlx_multiply, coord, factor)?;
+        missing = ctx.binary(mlx::mlx_add, missing, coord)?;
+        scale = scale
+            .checked_mul(i64::from(shape[axis]))
+            .ok_or("MaxPool: original size overflows int64")?;
+    }
+    let encoded = ctx.where_(valid, encoded, missing)?;
+    ctx.bind(&n.outputs[1], encoded);
+    Ok(())
 }
 
 fn pool_op(ctx: &mut TranslationContext, n: &NodeDesc, average: bool) -> Result<(), MlxError> {
-    let kernel = n
-        .int_arrays
-        .get("kernel_shape")
-        .cloned()
-        .unwrap_or_default();
-    let strides = attr_or(n, "strides", 2, 1);
-    let count_include_pad = average && n.ints.get("count_include_pad").copied().unwrap_or(0) != 0;
-
     let x0 = ctx.resolve(&n.inputs[0])?;
-    // Guard against a genuinely-unresolvable (<=0) spatial dim at trace time (see `conv_op`).
-    {
-        let xs = ctx.shape_of(x0);
-        if xs.len() != 4 || xs[2] <= 0 || xs[3] <= 0 {
-            return Err(format!(
-                "Pool: non-positive spatial dim at trace time: {xs:?}"
-            ));
-        }
+    let shape = ctx.shape_of(x0);
+    if !(3..=5).contains(&shape.len()) {
+        return Err("Pool: input must have 1-3 spatial dimensions".into());
     }
-    // `auto_pad` (SAME_UPPER/SAME_LOWER/VALID) → explicit pads from the static input spatial shape
-    // (dilations are 1 for the claimed pool forms); NOTSET reads the `pads` attribute.
-    let auto_pad = n
-        .strings
-        .get("auto_pad")
-        .map(String::as_str)
-        .unwrap_or("NOTSET");
-    let pads: Vec<i64> = if auto_pad == "NOTSET" {
-        attr_or(n, "pads", 4, 0)
+    if shape[0] != 0 && shape[1] == 0 {
+        return Err("Pool: only the batch dimension may be zero".into());
+    }
+    let r = shape.len() - 2;
+    let spatial: Vec<i64> = shape[2..].iter().map(|&v| i64::from(v)).collect();
+    let geometry = PoolGeometry::new(
+        &spatial,
+        n.int_arrays
+            .get("kernel_shape")
+            .cloned()
+            .unwrap_or_default(),
+        attr_or(n, "strides", r, 1),
+        attr_or(n, "dilations", r, 1),
+        attr_or(n, "pads", 2 * r, 0),
+        n.strings
+            .get("auto_pad")
+            .map(String::as_str)
+            .unwrap_or("NOTSET"),
+        n.ints.get("ceil_mode").copied().unwrap_or(0) == 1,
+    )?;
+    let axes = geometry.axes();
+    let lp = n.op_type == "LpPool";
+    let original_dt = ctx.dtype_of(x0);
+    if shape[0] == 0 || shape[1] == 0 || geometry.output.contains(&0) {
+        let mut output_shape = shape[..2].to_vec();
+        output_shape.extend(&geometry.output);
+        for (i, output) in n
+            .outputs
+            .iter()
+            .enumerate()
+            .filter(|(_, o)| !o.name.is_empty())
+        {
+            let dtype = if i == 0 {
+                original_dt
+            } else {
+                mlx::mlx_dtype__MLX_INT64
+            };
+            let empty = ctx.emit(|res, s| unsafe {
+                mlx::mlx_zeros(res, output_shape.as_ptr(), output_shape.len(), dtype, s)
+            })?;
+            ctx.bind(output, empty);
+        }
+        return Ok(());
+    }
+    let x = to_channels_last(ctx, x0, r as i32)?;
+    let x = if average || lp {
+        ctx.astype(x, mlx::mlx_dtype__MLX_FLOAT32)?
     } else {
-        let xs = ctx.shape_of(x0);
-        let in_sp = [xs[2] as i64, xs[3] as i64];
-        auto_pad_pads(auto_pad, &in_sp, &kernel, &strides, &[1, 1])
-            .ok_or_else(|| format!("Pool: unsupported auto_pad '{auto_pad}'"))?
+        x
     };
-    let x = to_channels_last(ctx, x0, 2)?;
     let dt = ctx.dtype_of(x);
-    let pad_value = if average { 0.0f32 } else { f32::NEG_INFINITY };
-    let pv = scalar_for_dtype(ctx, pad_value, dt)?;
-    let padded = pad_spatial(ctx, x, &pads, pv)?;
-    let windows = sliding_windows_2d(ctx, padded, &kernel, &strides)?;
-
-    let has_padding = pads.iter().any(|&p| p != 0);
-    let out = if !average || count_include_pad || !has_padding {
-        reduce_pool_windows(ctx, windows, average)?
+    let pad_value = if average || lp {
+        0.0
     } else {
-        // count_include_pad == 0 average pooling with padding: divide the window sums by the count
-        // of genuine (non-pad) elements per window (a padded ones-mask, same strided reduction).
-        let sums = sum_axes34(ctx, windows, false)?;
-        let x_shape = ctx.shape_of(x);
-        let mask_shape = [x_shape[0], x_shape[1], x_shape[2], 1];
-        let mask =
-            ctx.emit(|res, s| unsafe { mlx::mlx_ones(res, mask_shape.as_ptr(), 4, dt, s) })?;
-        let zero = scalar_for_dtype(ctx, 0.0, dt)?;
-        let padded_mask = pad_spatial(ctx, mask, &pads, zero)?;
-        let mask_windows = sliding_windows_2d(ctx, padded_mask, &kernel, &strides)?;
-        let counts = sum_axes34(ctx, mask_windows, false)?;
-        ctx.binary(mlx::mlx_divide, sums, counts)?
+        match dt {
+            mlx::mlx_dtype__MLX_INT8 => -128.0,
+            mlx::mlx_dtype__MLX_UINT8 => 0.0,
+            _ => f32::NEG_INFINITY,
+        }
     };
-    let y = from_channels_last(ctx, out, 2)?;
+    let pv = scalar_for_dtype(ctx, pad_value, dt)?;
+    let padded = pad_spatial(ctx, x, &geometry.materialized_pads(), pv)?;
+    let windows = sliding_windows(ctx, padded, &geometry)?;
+    let out = if lp {
+        let p = if n.since_version == 1 {
+            n.floats.get("p").copied().unwrap_or(2.0)
+        } else {
+            n.ints.get("p").copied().unwrap_or(2) as f32
+        };
+        let a = abs_(ctx, windows)?;
+        let ps = ctx.scalar_f32(p);
+        let mut powered = power(ctx, a, ps)?;
+        if p <= 0.0 && geometry.materialized_pads().iter().any(|&v| v != 0) {
+            let mask = pool_mask_windows(ctx, &spatial, &geometry, false)?;
+            let zero = ctx.scalar_f32(0.0);
+            let valid = ctx.binary(mlx::mlx_greater, mask, zero)?;
+            powered = ctx.where_(valid, powered, zero)?;
+        }
+        let summed = pool_sum(ctx, powered, &axes)?;
+        let inv = ctx.scalar_f32(1.0 / p);
+        power(ctx, summed, inv)?
+    } else if average {
+        let include_pad = n.ints.get("count_include_pad").copied().unwrap_or(0) != 0;
+        let has_padding = geometry.materialized_pads().iter().any(|&p| p != 0);
+        if !has_padding {
+            let out = ctx.emit(|res, s| unsafe {
+                mlx::mlx_mean_axes(res, windows, axes.as_ptr(), axes.len(), false, s)
+            })?;
+            let out = ctx.astype(out, original_dt)?;
+            let y = from_channels_last(ctx, out, r as i32)?;
+            ctx.bind(&n.outputs[0], y);
+            return Ok(());
+        }
+        let sums = pool_sum(ctx, windows, &axes)?;
+        let counts = pool_counts(ctx, &spatial, &geometry, include_pad)?;
+        ctx.binary(mlx::mlx_divide, sums, counts)?
+    } else {
+        let mut out = ctx.emit(|res, s| unsafe {
+            mlx::mlx_max_axes(res, windows, axes.as_ptr(), axes.len(), false, s)
+        })?;
+        if geometry.materialized_pads().iter().any(|&v| v != 0) {
+            let counts = pool_counts(ctx, &spatial, &geometry, false)?;
+            let zero = ctx.scalar_f32(0.0);
+            let nonempty = ctx.binary(mlx::mlx_greater, counts, zero)?;
+            let lowest = match original_dt {
+                mlx::mlx_dtype__MLX_INT8 => -128.0,
+                mlx::mlx_dtype__MLX_UINT8 => 0.0,
+                _ => f32::MIN,
+            };
+            let lowest = scalar_for_dtype(ctx, lowest, original_dt)?;
+            out = ctx.where_(nonempty, out, lowest)?;
+        }
+        if n.outputs
+            .get(1)
+            .is_some_and(|output| !output.name.is_empty())
+        {
+            pool_indices(ctx, n, &shape, windows, out, &geometry)?;
+        }
+        out
+    };
+    let out = ctx.astype(out, original_dt)?;
+    let y = from_channels_last(ctx, out, r as i32)?;
     ctx.bind(&n.outputs[0], y);
     Ok(())
 }
@@ -783,30 +1112,7 @@ fn global_max_pool_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), 
 // ---- LpPool / GlobalLpPool (from normpool.cc) ---------------------------------------------------
 
 fn lp_pool_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
-    let kernel = n
-        .int_arrays
-        .get("kernel_shape")
-        .cloned()
-        .unwrap_or_default();
-    let strides = attr_or(n, "strides", 2, 1);
-    let pads = attr_or(n, "pads", 4, 0);
-    let p = n.ints.get("p").copied().unwrap_or(2) as f32;
-
-    let x0 = ctx.resolve(&n.inputs[0])?;
-    let x = to_channels_last(ctx, x0, 2)?;
-    let dt = ctx.dtype_of(x);
-    let zero = scalar_for_dtype(ctx, 0.0, dt)?;
-    let padded = pad_spatial(ctx, x, &pads, zero)?;
-    let a = abs_(ctx, padded)?;
-    let ps = scalar_for_dtype(ctx, p, dt)?;
-    let powered = power(ctx, a, ps)?;
-    let windows = sliding_windows_2d(ctx, powered, &kernel, &strides)?;
-    let summed = sum_axes34(ctx, windows, false)?;
-    let inv = scalar_for_dtype(ctx, 1.0 / p, dt)?;
-    let out = power(ctx, summed, inv)?;
-    let y = from_channels_last(ctx, out, 2)?;
-    ctx.bind(&n.outputs[0], y);
-    Ok(())
+    pool_op(ctx, n, false)
 }
 
 fn global_lp_pool_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
@@ -900,25 +1206,6 @@ fn auto_pad_pads(
 
 fn static_positive_shape(shape: &[i64], rank: usize) -> bool {
     shape.len() == rank && shape.iter().all(|&d| d > 0 && d <= i32::MAX as i64)
-}
-
-/// Like `static_positive_shape`, but permits a dynamic (symbolic / non-positive) leading batch dim.
-/// ORT reports a symbolic dim as `-1` at GetCapability time; the batch dim is only carried through
-/// (never used to size a kernel), so requiring it to be static needlessly rejects the whole conv/pool
-/// backbone of any dynamic-batch model. All non-batch dims (channels + spatial) must still be
-/// statically known and positive so the MLX conv/pool shapes are well-defined.
-fn static_positive_shape_dyn_batch(shape: &[i64], rank: usize) -> bool {
-    rank >= 1 && shape.len() == rank && shape[1..].iter().all(|&d| d > 0)
-}
-
-/// Conv/pool input-shape validity that additionally permits dynamic (symbolic / non-positive)
-/// SPATIAL dims (H/W), on top of the dynamic batch dim already allowed by
-/// `static_positive_shape_dyn_batch`. Only the channel dim (index 1) must be statically known and
-/// positive — it drives group / channel-divisibility and kernel checks. Batch (index 0) and every
-/// spatial dim (index 2..) may be `-1`: the general compiled path is shape-keyed, so at TRACE time
-/// `ctx.shape_of` resolves the concrete spatial extent and the handler computes any auto_pad from it.
-fn channels_static_dyn_batch_spatial(shape: &[i64], rank: usize) -> bool {
-    rank >= 2 && shape.len() == rank && shape[1] > 0
 }
 
 /// Compare an actual (ONNX-declared) shape against an expected shape, treating any negative
@@ -1424,9 +1711,10 @@ fn conv_transpose_claim(node: &NodeView) -> ClaimResult {
 }
 
 fn pool_claim(node: &NodeView, average: bool) -> ClaimResult {
+    let max = node.op_type() == "MaxPool";
     require!(
-        node.num_inputs() == 1 && node.num_outputs() == 1,
-        "expects 1 input and 1 output, got {}in/{}out",
+        node.num_inputs() == 1 && (node.num_outputs() == 1 || (max && node.num_outputs() == 2)),
+        "expects 1 input and 1 output (plus optional MaxPool indices), got {}in/{}out",
         node.num_inputs(),
         node.num_outputs()
     );
@@ -1435,70 +1723,75 @@ fn pool_claim(node: &NodeView, average: bool) -> ClaimResult {
         _ => deny!("missing tensor type/shape info on input or output"),
     };
     require!(
-        is_mlx_float(x.dtype) && out.dtype == x.dtype,
-        "input/output must share one float dtype (fp32/fp16/bf16), got {} -> {}",
+        (is_mlx_float(x.dtype) || (max && matches!(x.dtype, 2 | 3))) && out.dtype == x.dtype,
+        "input/output must share a supported float dtype (or int8/uint8 for MaxPool), got {} -> {}",
         crate::registry::ort_dtype_name(x.dtype),
         crate::registry::ort_dtype_name(out.dtype)
     );
     require!(
-        x.shape.len() == 4,
-        "only rank-4 Pool2D is supported (got input rank {}); dynamic batch/spatial dims are supported",
+        (x.dtype != 16 || node.since_version() >= 22)
+            && (!matches!(x.dtype, 2 | 3) || node.since_version() >= 12),
+        "input dtype is unavailable in this Pool schema version"
+    );
+    require!(
+        (3..=5).contains(&x.shape.len()),
+        "Pool requires 1-3 spatial dimensions (got input rank {})",
         x.shape.len()
     );
     require!(
-        channels_static_dyn_batch_spatial(&x.shape, 4),
-        "input channel dim must be statically known and positive (shape {:?}); dynamic batch/spatial dims are supported",
+        x.shape.iter().all(|&d| d <= i32::MAX as i64) && x.shape[2..].iter().all(|&d| d != 0),
+        "Pool spatial dimensions must be nonzero and dimensions must fit MLX (shape {:?}); symbolic dimensions are supported",
         x.shape
     );
     require!(
-        out.shape.len() == 4,
-        "Pool2D output must have rank 4 (got rank {})",
+        x.shape[0] == 0 || x.shape[1] != 0,
+        "Pool: only the batch dimension may be zero"
+    );
+    require!(
+        out.shape.len() == x.shape.len(),
+        "Pool output rank must match input (got rank {})",
         out.shape.len()
     );
     require!(
-        node.int_attr("ceil_mode", 0) == 0,
-        "ceil_mode=1 is unsupported"
+        matches!(node.int_attr("ceil_mode", 0), 0 | 1),
+        "ceil_mode must be 0 or 1"
     );
-    let spatial_dynamic = x.shape[2] <= 0 || x.shape[3] <= 0;
+    let r = x.shape.len() - 2;
+    let spatial_dynamic = x.shape[2..].iter().any(|&d| d < 0);
     let (kernel_present, kernel) = node.ints_attr("kernel_shape");
     require!(
-        kernel_present && kernel.len() == 2 && kernel[0] > 0 && kernel[1] > 0,
-        "kernel_shape must contain 2 positive values (got {:?})",
+        kernel_present
+            && kernel.len() == r
+            && kernel.iter().all(|&v| v > 0 && v <= i32::MAX as i64),
+        "kernel_shape must contain {r} positive MLX-representable values (got {:?})",
         kernel
     );
-    let strides = match read_spatial_attribute(node, "strides", 2, 1) {
+    let strides = match read_spatial_attribute(node, "strides", r, 1) {
         Some(v) => v,
-        None => deny!("strides must contain 2 positive spatial values"),
+        None => deny!("strides must contain {r} positive MLX-representable values"),
     };
-    let dilations = match read_spatial_attribute(node, "dilations", 2, 1) {
+    let dilations = match read_spatial_attribute(node, "dilations", r, 1) {
         Some(v) => v,
-        None => deny!("dilations must contain 2 positive spatial values"),
+        None => deny!("dilations must contain {r} positive MLX-representable values"),
     };
-    require!(
-        dilations == [1, 1],
-        "dilated pooling is unsupported (dilations must be [1, 1], got {:?})",
-        dilations
-    );
-    // `auto_pad` (SAME_UPPER/SAME_LOWER/VALID) resolves to explicit pads from the static input
-    // spatial shape (kernel_shape is the window); NOTSET reads the `pads` attribute.
     let auto_pad = node.string_attr("auto_pad", "NOTSET");
-    let pads: Option<Vec<i64>> = if auto_pad == "NOTSET" {
-        match read_pads(node, 2) {
-            Some(v) => Some(v),
-            None => deny!("pads must contain 4 non-negative values"),
-        }
-    } else if node.ints_attr("pads").0 {
-        deny!("auto_pad and explicit pads cannot both be specified");
-    } else if spatial_dynamic {
-        // auto_pad + dynamic spatial: pads depend on the runtime spatial extent; `pool_op` resolves
-        // them at trace time from the concrete `ctx.shape_of`.
-        None
-    } else {
-        let in_sp = [x.shape[2], x.shape[3]];
-        match auto_pad_pads(&auto_pad, &in_sp, &kernel, &strides, &dilations) {
-            Some(v) => Some(v),
-            None => deny!("unsupported auto_pad value {auto_pad:?}"),
-        }
+    require!(
+        matches!(
+            auto_pad.as_str(),
+            "NOTSET" | "VALID" | "SAME_UPPER" | "SAME_LOWER"
+        ),
+        "unsupported auto_pad value {auto_pad:?}"
+    );
+    require!(
+        auto_pad == "NOTSET" || !node.ints_attr("pads").0,
+        "auto_pad and explicit pads cannot both be specified"
+    );
+    let pads = match read_pads(node, r) {
+        Some(v) => v,
+        None => deny!(
+            "pads must contain {} non-negative MLX-representable values",
+            2 * r
+        ),
     };
     if average {
         let cip = node.int_attr("count_include_pad", 0);
@@ -1506,33 +1799,53 @@ fn pool_claim(node: &NodeView, average: bool) -> ClaimResult {
             cip == 0 || cip == 1,
             "count_include_pad must be 0 or 1 (got {cip})"
         );
-    } else {
+    } else if max {
         require!(
-            node.int_attr("storage_order", 0) == 0,
-            "storage_order=1 is unsupported"
+            matches!(node.int_attr("storage_order", 0), 0 | 1),
+            "storage_order must be 0 or 1"
         );
-    }
-    let expected = match &pads {
-        // Static spatial with resolved pads → validate the derived output extent.
-        Some(pads) if !spatial_dynamic => {
-            let padded_h = x.shape[2] + pads[0] + pads[2];
-            let padded_w = x.shape[3] + pads[1] + pads[3];
+        if node.output_present(1) {
+            let indices = match node.output_info(1) {
+                Some(info) => info,
+                None => deny!("missing MaxPool indices type/shape info"),
+            };
             require!(
-                padded_h >= kernel[0] && padded_w >= kernel[1],
-                "padded spatial shape [{padded_h}, {padded_w}] is smaller than kernel {:?}",
-                kernel
+                indices.dtype == 7 && same_known_shape(&indices.shape, &out.shape),
+                "MaxPool indices must be int64 with the same shape as Y"
             );
-            vec![
-                x.shape[0],
-                x.shape[1],
-                (padded_h - kernel[0]) / strides[0] + 1,
-                (padded_w - kernel[1]) / strides[1] + 1,
-            ]
+            require!(
+                x.shape
+                    .iter()
+                    .filter(|&&d| d >= 0)
+                    .try_fold(1i64, |p, &d| p.checked_mul(d))
+                    .is_some(),
+                "MaxPool flattened indices exceed int64"
+            );
         }
-        // Dynamic spatial → output spatial dims are dynamic; wildcard them. `pool_op` resolves the
-        // concrete window math at trace time.
-        _ => vec![x.shape[0], x.shape[1], -1, -1],
-    };
+    } else {
+        if node.since_version() == 1 {
+            let p = node.float_attr("p", 2.0);
+            require!(p.is_finite(), "LpPool p must be finite");
+        }
+    }
+    let mut expected = x.shape[..2].to_vec();
+    if spatial_dynamic {
+        expected.extend(vec![-1; r]);
+    } else {
+        let geometry = match PoolGeometry::new(
+            &x.shape[2..],
+            kernel,
+            strides,
+            dilations,
+            pads,
+            &auto_pad,
+            node.int_attr("ceil_mode", 0) == 1,
+        ) {
+            Ok(geometry) => geometry,
+            Err(reason) => deny!("{reason}"),
+        };
+        expected.extend(geometry.output.iter().map(|&v| i64::from(v)));
+    }
     require!(
         same_known_shape(&out.shape, &expected),
         "output shape {:?} does not match expected {:?} (dynamic batch/spatial dims are wildcards)",
@@ -1547,13 +1860,6 @@ fn average_pool_claim(node: &NodeView) -> ClaimResult {
 }
 
 fn max_pool_claim(node: &NodeView) -> ClaimResult {
-    // MaxPool's optional 2nd output (indices) has no MLX argmax-window primitive here; only the
-    // single-output form is claimed (mirrors the C++ single-output PoolClaim path).
-    require!(
-        node.num_outputs() == 1,
-        "MaxPool indices output is unsupported (expects 1 output, got {})",
-        node.num_outputs()
-    );
     pool_claim(node, false)
 }
 
@@ -1591,88 +1897,7 @@ fn global_pool_claim(node: &NodeView) -> ClaimResult {
 }
 
 fn lp_pool_claim(node: &NodeView) -> ClaimResult {
-    require!(
-        node.num_inputs() == 1 && node.num_outputs() == 1,
-        "expects 1 input and 1 output, got {}in/{}out",
-        node.num_inputs(),
-        node.num_outputs()
-    );
-    let (x, out) = match (node.input_info(0), node.output_info(0)) {
-        (Some(x), Some(o)) => (x, o),
-        _ => deny!("missing tensor type/shape info on input or output"),
-    };
-    require!(
-        is_mlx_float(x.dtype) && out.dtype == x.dtype,
-        "input/output must share one float dtype (fp32/fp16/bf16), got {} -> {}",
-        crate::registry::ort_dtype_name(x.dtype),
-        crate::registry::ort_dtype_name(out.dtype)
-    );
-    require!(
-        static_positive_shape_dyn_batch(&x.shape, 4),
-        "LpPool requires rank-4 input with static positive channel/spatial dims (shape {:?}); dynamic batch is supported",
-        x.shape
-    );
-    require!(
-        out.shape.len() == 4,
-        "LpPool output must have rank 4 (got rank {})",
-        out.shape.len()
-    );
-    require!(
-        node.string_attr("auto_pad", "NOTSET") == "NOTSET",
-        "LpPool supports only auto_pad=NOTSET"
-    );
-    require!(
-        node.int_attr("ceil_mode", 0) == 0,
-        "ceil_mode=1 is unsupported"
-    );
-    require!(
-        node.int_attr("p", 2) > 0,
-        "p must be positive (got {})",
-        node.int_attr("p", 2)
-    );
-    let (kernel_present, kernel) = node.ints_attr("kernel_shape");
-    require!(
-        kernel_present && kernel.len() == 2 && kernel[0] > 0 && kernel[1] > 0,
-        "kernel_shape must contain 2 positive values (got {:?})",
-        kernel
-    );
-    let strides = match read_spatial_attribute(node, "strides", 2, 1) {
-        Some(v) => v,
-        None => deny!("strides must contain 2 positive spatial values"),
-    };
-    let pads = match read_pads(node, 2) {
-        Some(v) => v,
-        None => deny!("pads must contain 4 non-negative values"),
-    };
-    let dilations = match read_spatial_attribute(node, "dilations", 2, 1) {
-        Some(v) => v,
-        None => deny!("dilations must contain 2 positive spatial values"),
-    };
-    require!(
-        dilations == [1, 1],
-        "dilated LpPool is unsupported (dilations must be [1, 1], got {:?})",
-        dilations
-    );
-    let padded_h = x.shape[2] + pads[0] + pads[2];
-    let padded_w = x.shape[3] + pads[1] + pads[3];
-    require!(
-        padded_h >= kernel[0] && padded_w >= kernel[1],
-        "padded spatial shape [{padded_h}, {padded_w}] is smaller than kernel {:?}",
-        kernel
-    );
-    let expected = vec![
-        x.shape[0],
-        x.shape[1],
-        (padded_h - kernel[0]) / strides[0] + 1,
-        (padded_w - kernel[1]) / strides[1] + 1,
-    ];
-    require!(
-        same_known_shape(&out.shape, &expected),
-        "output shape {:?} does not match expected {:?}",
-        out.shape,
-        expected
-    );
-    Ok(())
+    pool_claim(node, false)
 }
 
 fn global_lp_pool_claim(node: &NodeView) -> ClaimResult {
@@ -1810,4 +2035,67 @@ pub fn register_conv(registry: &mut OpRegistry) {
         global_lp_pool_op,
         global_lp_pool_claim,
     );
+}
+
+#[cfg(test)]
+mod pooling_tests {
+    use super::PoolGeometry;
+
+    #[test]
+    fn ceil_tail_and_last_window_correction() {
+        let g =
+            PoolGeometry::new(&[4], vec![3], vec![2], vec![1], vec![0, 0], "NOTSET", true).unwrap();
+        assert_eq!(g.output, [2]);
+        assert_eq!(g.tail, [1]);
+        assert_eq!(g.materialized_pads(), [0, 1]);
+        let g =
+            PoolGeometry::new(&[4], vec![2], vec![2], vec![1], vec![0, 1], "NOTSET", true).unwrap();
+        assert_eq!(g.output, [2]);
+        assert_eq!(g.tail, [0]);
+    }
+
+    #[test]
+    fn same_padding_uses_dilated_extent() {
+        for (auto_pad, expected) in [("SAME_UPPER", [1, 2]), ("SAME_LOWER", [2, 1])] {
+            let g = PoolGeometry::new(&[6], vec![3], vec![2], vec![2], vec![0, 0], auto_pad, false)
+                .unwrap();
+            assert_eq!(g.output, [3]);
+            assert_eq!(g.pads, expected);
+        }
+    }
+
+    #[test]
+    fn empty_output_is_not_negative_output() {
+        let g = PoolGeometry::new(&[2], vec![3], vec![1], vec![1], vec![0, 0], "NOTSET", false)
+            .unwrap();
+        assert_eq!(g.output, [0]);
+        assert!(
+            PoolGeometry::new(&[1], vec![5], vec![1], vec![2], vec![0, 0], "NOTSET", false)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn invalid_or_unrepresentable_geometry_is_rejected() {
+        for (spatial, kernel, stride, dilation, pads) in [
+            (vec![0], vec![2], vec![1], vec![1], vec![0, 0]),
+            (vec![4], vec![2], vec![0], vec![1], vec![0, 0]),
+            (vec![4], vec![2], vec![1], vec![0], vec![0, 0]),
+            (vec![4], vec![2], vec![1], vec![1], vec![-1, 0]),
+            (vec![4], vec![2, 2], vec![1], vec![1], vec![0, 0]),
+            (vec![i32::MAX as i64], vec![2], vec![1], vec![1], vec![1, 1]),
+            (
+                vec![1],
+                vec![i32::MAX as i64],
+                vec![1],
+                vec![i32::MAX as i64],
+                vec![0, 0],
+            ),
+        ] {
+            assert!(
+                PoolGeometry::new(&spatial, kernel, stride, dilation, pads, "NOTSET", false)
+                    .is_err()
+            );
+        }
+    }
 }
