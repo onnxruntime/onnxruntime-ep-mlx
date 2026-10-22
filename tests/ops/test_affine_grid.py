@@ -63,7 +63,8 @@ def _session(model, *, strict=True):
     options.log_severity_level = 3
     if strict:
         options.add_session_config_entry("session.disable_cpu_ep_fallback", "1")
-    session = ort.InferenceSession(model, options, providers=m.EP_PROVIDERS)
+    session = ort.InferenceSession(
+        model, options, providers=["MLXExecutionProvider"] if strict else m.EP_PROVIDERS)
     session.disable_fallback()
     return session
 

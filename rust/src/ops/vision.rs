@@ -1731,7 +1731,7 @@ pub fn register_vision(registry: &mut OpRegistry) {
             handler: affine_grid_op,
             claim: affine_grid_claim,
         },
-        "host-generated homogeneous grid depends on size values",
+        "conservatively specialize host-generated homogeneous grid to size values",
     );
     shape_keyed(
         registry,
