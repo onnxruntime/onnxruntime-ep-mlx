@@ -87,6 +87,9 @@ sliding/local windows or attention bias, retain the slice-free shapeless decode 
 no-past, local/bidirectional, sliding-window and attention-bias forms remain claimed but `EagerOnly`:
 their per-batch cache writes, rotary positions and masks use live sequence lengths on every call.
 Supplied rotary caches are never replaced by frequencies inferred from a sample row.
+The growing/fixed-capacity cache contract is also checked on every apply: equal-shaped rollback
+lengths that change that contract use eager lowering, while returning to the traced contract reuses
+the existing closure.
 
 Standalone rotary positions are range-checked before narrowing to MLX indices, including before
 every compiled replay. Boundary-provided positions retain compilation; graph-produced positions

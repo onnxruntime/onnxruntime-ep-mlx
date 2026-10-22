@@ -546,6 +546,9 @@ fn detect_shared_kv(
         } else {
             continue;
         };
+        if s <= 0 || total < s || total - s > cap {
+            return None;
+        }
         return Some((cap > total - s, mask_ctx_index, total_seq_ctx_index));
     }
     None
@@ -725,6 +728,16 @@ pub fn try_compiled(
     }
     if !slot.get(unsafe { &*plan_ptr }).valid {
         return Ok(false);
+    }
+    if cfg.kv_alias {
+        let Some((shared, _, _)) = detect_shared_kv(unsafe { &*plan_ptr }, api, kctx) else {
+            return Ok(false);
+        };
+        if shared != slot.get(unsafe { &*plan_ptr }).shared_kv {
+            // Equal-shaped live lengths may switch growing versus fixed-capacity cache semantics.
+            // Reuse the closure only for the cache contract it traced.
+            return Ok(false);
+        }
     }
 
     // Shape-keyed guard: skip (=> eager) when any dynamic input is an empty tensor (a zero-size dim).

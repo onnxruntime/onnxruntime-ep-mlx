@@ -118,6 +118,34 @@ def test_gqa_default_rotary_ignores_optional_caches(packed, supplied_rotary, cau
     np.testing.assert_allclose(m.run_mlx(model, feeds)[0], expected, rtol=3e-3, atol=3e-3)
 
 
+def test_gqa_live_lengths_switch_cache_contract():
+    q = np.zeros((1, 1, 8), np.float32)
+    pk = np.zeros((1, 1, 4, 8), np.float32)
+    pv = np.broadcast_to(np.arange(4, dtype=np.float32)[None, None, :, None], pk.shape).copy()
+    model = build_model(
+        "GroupQueryAttention",
+        [_t("q", list(q.shape)), _t("k", list(q.shape)), _t("v", list(q.shape)),
+         _t("pk", list(pk.shape)), _t("pv", list(pv.shape)),
+         _t("lengths", [1], DT.INT32), _t("total", [1], DT.INT32)],
+        [_t("y", list(q.shape)), _t("outk", [1, 1, "capacity", 8]),
+         _t("outv", [1, 1, "capacity", 8])],
+        domain="com.microsoft", attributes={"num_heads": 1, "kv_num_heads": 1},
+    )
+    session = ort.InferenceSession(model, providers=m.EP_PROVIDERS)
+    for step, total in enumerate([5, 3, 5]):
+        value = np.full_like(q, 6 + step)
+        feeds = dict(q=q, k=q, v=value, pk=pk, pv=pv,
+                     lengths=np.array([total - 1], np.int32), total=np.array([total], np.int32))
+        if total == 5:
+            expected = np.concatenate([pv, value.reshape(1, 1, 1, 8)], axis=2)
+        else:
+            expected = pv.copy()
+            expected[:, :, total - 1:total] = value.reshape(1, 1, 1, 8)
+        actual, _, actual_pv = session.run(None, feeds)
+        np.testing.assert_array_equal(actual_pv, expected)
+        np.testing.assert_allclose(actual, expected[:, :, :total].mean(axis=2), rtol=1e-6, atol=1e-7)
+
+
 @pytest.mark.parametrize("dtype", [np.float16, np.float32])
 @pytest.mark.parametrize("batch,sliding", [(1, False), (2, False), (1, True), (2, True)])
 @pytest.mark.parametrize("interleaved", [False, True])
@@ -196,6 +224,7 @@ def test_gqa_exact_rotary_and_ragged_positions(dtype, batch, sliding, interleave
 @pytest.mark.parametrize("target", [
     "test_gqa_live_lengths_defaults_and_causality[True-1-1--1-False]",
     "test_gqa_exact_rotary_and_ragged_positions[True-False-1-False-float32]",
+    "test_gqa_live_lengths_switch_cache_contract",
 ])
 def test_gqa_decode_trace_proves_replay(tmp_path, target):
     import json
