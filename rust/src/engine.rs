@@ -1109,6 +1109,96 @@ impl<'a> TranslationContext<'a> {
         }
     }
 
+    fn sequence_input(&self, r: &TensorRef) -> Result<*const ort::OrtValue, MlxError> {
+        if r.source != Src::CtxInput {
+            return Err("MLX: sequence input must cross the ORT kernel boundary".into());
+        }
+        unsafe {
+            let api = &*self.ort_api;
+            let mut value = std::ptr::null();
+            ort_status(
+                api,
+                (api.KernelContext_GetInput.unwrap())(self.kctx, r.ctx_index, &mut value),
+                "KernelContext_GetInput(sequence)",
+            )?;
+            if value.is_null() {
+                return Err("MLX: sequence input is absent".into());
+            }
+            let mut kind = 0;
+            ort_status(
+                api,
+                (api.GetValueType.unwrap())(value, &mut kind),
+                "GetValueType(sequence)",
+            )?;
+            if kind != ort::ONNXType_ONNX_TYPE_SEQUENCE {
+                return Err("MLX: expected an ORT sequence input".into());
+            }
+            Ok(value)
+        }
+    }
+
+    pub fn sequence_len(&self, r: &TensorRef) -> Result<usize, MlxError> {
+        let value = self.sequence_input(r)?;
+        unsafe {
+            let api = &*self.ort_api;
+            let mut count = 0;
+            ort_status(
+                api,
+                (api.GetValueCount.unwrap())(value, &mut count),
+                "GetValueCount(sequence)",
+            )?;
+            Ok(count)
+        }
+    }
+
+    pub fn sequence_element(
+        &mut self,
+        r: &TensorRef,
+        index: usize,
+        expected_dtype: ort::ONNXTensorElementDataType,
+    ) -> Result<mlxsys::mlx_array, MlxError> {
+        let value = self.sequence_input(r)?;
+        let index = i32::try_from(index)
+            .map_err(|_| "MLX: sequence index exceeds the ORT GetValue range".to_string())?;
+        unsafe {
+            let api = &*self.ort_api;
+            let mut allocator = std::ptr::null_mut();
+            ort_status(
+                api,
+                (api.GetAllocatorWithDefaultOptions.unwrap())(&mut allocator),
+                "GetAllocatorWithDefaultOptions",
+            )?;
+            if allocator.is_null() {
+                return Err("MLX: ORT returned a null sequence allocator".into());
+            }
+            let mut element = std::ptr::null_mut();
+            let result = ort_status(
+                api,
+                (api.GetValue.unwrap())(value, index, allocator, &mut element),
+                "GetValue(sequence)",
+            )
+            .and_then(|()| {
+                if element.is_null() {
+                    return Err("MLX: ORT returned a null sequence element".into());
+                }
+                let (data, shape, dtype) = read_ort_tensor_raw(api, element)?;
+                if dtype != expected_dtype {
+                    return Err("MLX: sequence element dtype differs from the output dtype".into());
+                }
+                let shape = shape
+                    .into_iter()
+                    .map(dim_i32)
+                    .collect::<Result<Vec<_>, _>>()?;
+                // GetValue owns a temporary OrtValue: copy before releasing it, never borrow.
+                Ok(Array::from_data(data, &shape, mlx_dtype_from_onnx(dtype)))
+            });
+            if !element.is_null() {
+                (api.ReleaseValue.unwrap())(element);
+            }
+            result.map(|array| self.keep(array))
+        }
+    }
+
     /// Read a constant int64 parameter input (shape/axes/starts/ends/steps/pads/repeats/split) as a
     /// host `Vec<i64>` at translate time. The claim predicate verified it is a tensor(int64) input.
     pub fn read_ints(&self, r: &TensorRef) -> Result<Vec<i64>, MlxError> {
@@ -1124,29 +1214,7 @@ impl<'a> TranslationContext<'a> {
         &self,
         index: usize,
     ) -> Result<(*const c_void, Vec<i64>, ort::ONNXTensorElementDataType), MlxError> {
-        unsafe {
-            let api = &*self.ort_api;
-            let mut val: *const ort::OrtValue = std::ptr::null();
-            let st = (api.KernelContext_GetInput.unwrap())(self.kctx, index, &mut val);
-            if !st.is_null() || val.is_null() {
-                return Err(format!("MLX: KernelContext_GetInput({index}) failed"));
-            }
-            let mut info: *mut ort::OrtTensorTypeAndShapeInfo = std::ptr::null_mut();
-            (api.GetTensorTypeAndShape.unwrap())(val, &mut info);
-            let mut nd: usize = 0;
-            (api.GetDimensionsCount.unwrap())(info, &mut nd);
-            let mut dims = vec![0i64; nd];
-            if nd > 0 {
-                (api.GetDimensions.unwrap())(info, dims.as_mut_ptr(), nd);
-            }
-            let mut etype: ort::ONNXTensorElementDataType = 0;
-            (api.GetTensorElementType.unwrap())(info, &mut etype);
-            (api.ReleaseTensorTypeAndShapeInfo.unwrap())(info);
-
-            let mut data: *const c_void = std::ptr::null();
-            (api.GetTensorData.unwrap())(val, &mut data);
-            Ok((data, dims, etype))
-        }
+        read_ctx_input_raw(self.ort_api, self.kctx, index)
     }
 
     // ---- MLX op helpers (each keeps and returns the raw result) --------------------------------
@@ -2126,6 +2194,74 @@ impl<'a> TranslationContext<'a> {
 
 /// Read a ctx input's `(data ptr, shape, dtype)` directly from the kernel context (no
 /// `TranslationContext` needed — used by the compiled-decode path).
+fn ort_status(
+    api: &ort::OrtApi,
+    status: *mut ort::OrtStatus,
+    operation: &str,
+) -> Result<(), MlxError> {
+    if status.is_null() {
+        return Ok(());
+    }
+    unsafe {
+        let detail = std::ffi::CStr::from_ptr((api.GetErrorMessage.unwrap())(status))
+            .to_string_lossy()
+            .into_owned();
+        (api.ReleaseStatus.unwrap())(status);
+        Err(format!("MLX: {operation} failed: {detail}"))
+    }
+}
+
+fn read_ort_tensor_raw(
+    api: &ort::OrtApi,
+    value: *const ort::OrtValue,
+) -> Result<(*const c_void, Vec<i64>, ort::ONNXTensorElementDataType), MlxError> {
+    unsafe {
+        let mut info = std::ptr::null_mut();
+        let result = ort_status(
+            api,
+            (api.GetTensorTypeAndShape.unwrap())(value, &mut info),
+            "GetTensorTypeAndShape",
+        )
+        .and_then(|()| {
+            if info.is_null() {
+                return Err("MLX: ORT returned null tensor metadata".into());
+            }
+            let mut rank = 0;
+            ort_status(
+                api,
+                (api.GetDimensionsCount.unwrap())(info, &mut rank),
+                "GetDimensionsCount",
+            )?;
+            let mut shape = vec![0; rank];
+            ort_status(
+                api,
+                (api.GetDimensions.unwrap())(info, shape.as_mut_ptr(), rank),
+                "GetDimensions",
+            )?;
+            let mut dtype = 0;
+            ort_status(
+                api,
+                (api.GetTensorElementType.unwrap())(info, &mut dtype),
+                "GetTensorElementType",
+            )?;
+            let mut data = std::ptr::null();
+            ort_status(
+                api,
+                (api.GetTensorData.unwrap())(value, &mut data),
+                "GetTensorData",
+            )?;
+            if !shape.contains(&0) && data.is_null() {
+                return Err("MLX: ORT returned null data for a nonempty tensor".into());
+            }
+            Ok((data, shape, dtype))
+        });
+        if !info.is_null() {
+            (api.ReleaseTensorTypeAndShapeInfo.unwrap())(info);
+        }
+        result
+    }
+}
+
 pub(crate) fn read_ctx_input_raw(
     ort_api: *const ort::OrtApi,
     kctx: *mut ort::OrtKernelContext,
@@ -2134,24 +2270,17 @@ pub(crate) fn read_ctx_input_raw(
     unsafe {
         let api = &*ort_api;
         let mut val: *const ort::OrtValue = std::ptr::null();
-        let st = (api.KernelContext_GetInput.unwrap())(kctx, index, &mut val);
-        if !st.is_null() || val.is_null() {
-            return Err(format!("MLX: KernelContext_GetInput({index}) failed"));
+        ort_status(
+            api,
+            (api.KernelContext_GetInput.unwrap())(kctx, index, &mut val),
+            "KernelContext_GetInput",
+        )?;
+        if val.is_null() {
+            return Err(format!(
+                "MLX: KernelContext_GetInput({index}) returned no value"
+            ));
         }
-        let mut info: *mut ort::OrtTensorTypeAndShapeInfo = std::ptr::null_mut();
-        (api.GetTensorTypeAndShape.unwrap())(val, &mut info);
-        let mut nd: usize = 0;
-        (api.GetDimensionsCount.unwrap())(info, &mut nd);
-        let mut dims = vec![0i64; nd];
-        if nd > 0 {
-            (api.GetDimensions.unwrap())(info, dims.as_mut_ptr(), nd);
-        }
-        let mut etype: ort::ONNXTensorElementDataType = 0;
-        (api.GetTensorElementType.unwrap())(info, &mut etype);
-        (api.ReleaseTensorTypeAndShapeInfo.unwrap())(info);
-        let mut data: *const c_void = std::ptr::null();
-        (api.GetTensorData.unwrap())(val, &mut data);
-        Ok((data, dims, etype))
+        read_ort_tensor_raw(api, val)
     }
 }
 
