@@ -1546,7 +1546,7 @@ pub fn is_mlx_cpu_float(t: ort::ONNXTensorElementDataType) -> bool {
     is_mlx_float(t) || is_float64(t)
 }
 
-/// True when any tensor slot of `node` (input or output) is float64.
+/// True when a tensor slot or explicitly selected normalization statistics use float64.
 ///
 /// Drives two things: the cluster-boundary rule in GetCapability (an fp64 node never merges with a
 /// non-fp64 node) and the CPU-stream selection for the resulting plan.
@@ -1561,7 +1561,10 @@ pub fn node_uses_float64(node: &NodeView) -> bool {
 
 pub(crate) fn uses_float64_statistics(domain: &str, op_type: &str, stash_type: i64) -> bool {
     domain.is_empty()
-        && matches!(op_type, "RMSNormalization" | "LayerNormalization")
+        && matches!(
+            op_type,
+            "RMSNormalization" | "LayerNormalization" | "GroupNormalization"
+        )
         && stash_type == 11
 }
 

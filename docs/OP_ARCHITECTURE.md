@@ -288,6 +288,14 @@ precision; float64 statistics stay on an isolated MLX CPU stream even when all
 boundary tensors are float32. LayerNormalization also produces optional mean and
 inverse-standard-deviation outputs, including omitted output slots.
 
+`GroupNormalization` supports opset 18's per-group affine parameters and opset
+21+'s per-channel affine parameters and stash precision. Batch, channel, and
+spatial extents may change between calls; channels must be divisible by the
+positive group count, and both affine vectors are validated. Empty extents are
+supported. Floating-point payloads include float64 on the MLX CPU stream;
+float64 stash statistics also select that stream independently of payload dtype.
+Concrete group reshapes use shape-keyed compilation.
+
 `SkipSimplifiedLayerNormalization` is translated as skip-add followed by `mlx_fast_rms_norm` for `fp32`/`fp16`/`bf16` input/skip/gamma.
 
 ### 3.4 Quantized embedding gather
