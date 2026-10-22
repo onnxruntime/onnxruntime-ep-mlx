@@ -84,10 +84,13 @@ The MLX 0.32.2 audit found these missing-`output_shapes` primitives in current l
 `GroupQueryAttention` is classified per node. Single-batch causal forms with past caches, without
 sliding/local windows or attention bias, retain the slice-free shapeless decode configuration
 (exact data-fed RoPE cache rows plus shape-preserving cache updates). Ragged/dynamic batches,
-no-past, local/bidirectional, sliding-window, attention-bias, softcap, QK diagnostic and
+no-past, local/bidirectional, sliding-window, attention-bias, custom rotary position IDs,
+empty-new-KV read-only cache reuse, softcap, QK diagnostic and
 smooth-softmax/head-sink forms remain claimed but `EagerOnly`:
 their per-batch cache writes, rotary positions and masks use live sequence lengths on every call.
 Supplied rotary caches are never replaced by frequencies inferred from a sample row.
+Symbolic boundary K/V inputs are checked on every compiled call: an empty new-KV sequence
+uses eager read-only reuse, never the decoder trace's append offset or delta writeback.
 The growing/fixed-capacity cache contract is also checked on every apply: equal-shaped rollback
 lengths that change that contract use eager lowering, while returning to the traced contract reuses
 the existing closure.
@@ -413,3 +416,25 @@ Baseline/fixed provider SHA256:
 `82909220e0375a62d25254be74432c7dea6cfc13ecd1a74e5f79b71a934c2069` /
 `6788fc690b2fb279d199cec9f39fd9f1c02bbed16b40a900469c756cae4a0cd1`.
 The ORT dylib SHA256 is the same `83973572...62e31` recorded in §7.
+
+### Later declared opsets and resolved Attention schemas
+
+The cache-free general-capture eligibility rule is not hardcoded to opset 23. Regression coverage
+uses unchanged standard Attention forms declared at **23, 24, 25 and 26**, checking the same general
+path, cache miss/hit/retrace sequence and live Q/K/V, boolean/additive masks, causal mode and Slice
+bounds. These models retain their declared opset; no schema conversion or experimental-opset
+override is used.
+
+Declared model opset and resolved operator schema are different. The pinned ONNX 1.23.2 package
+defines Attention schemas 23, 24 and 25, but ORT 1.31.0 registers only Attention-23/24. Its default
+domain-level model limit is opset **26**: unchanged Attention forms declared at 25/26 resolve to the
+runtime's Attention-24 schema. The provider consumes ORT's `Node_GetSinceVersion`, not the model's
+opset number. This demonstrates compatibility for those unchanged forms, not full Attention-25
+schema support. Valid ONNX-25 window attributes (`left_window_size` / `right_window_size`) are
+rejected by ORT 1.31 before EP claiming, even in models declared at 26; models declared at 27 or
+later hit its default released-opset fence. Negative regressions exercise both CPU and MLX provider
+lists and are explicitly scoped to the pinned ORT 1.31 runtime.
+
+If a future runtime exposes an actual Attention-25 node, its existing composed-path / `EagerOnly`
+safety classification remains intact. This change makes no compiled-execution promise for that
+schema or for model versions beyond the current runtime's supported range.

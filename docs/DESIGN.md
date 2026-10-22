@@ -185,6 +185,24 @@ output contract is distinct from resident-cache geometry. `smooth_softmax=1` sup
 zero sink logit unless an explicit per-head `head_sink` overrides it, including when the
 flag is zero. Sinks never contribute values.
 
+GQA custom rotary IDs follow the pinned ORT 1.31 CPU contract: when query length equals
+`total_sequence_length`, only the first ID supplies a contiguous offset; later calls use
+the first `B*S` flattened IDs. Used positions are bounds-checked on every call before
+narrowing. Empty new K/V are supported only with paired, non-sliding past caches: Q can
+still rotate, but existing K/V are neither rotated nor appended, and the full cache
+(including unused capacity) is preserved. Arbitrary unequal positive Q/KV lengths are
+not a GQA cross-attention contract.
+
+Sliding-cache bias retains its absolute `total_sequence_length` final axis. Resident or
+staged attention gathers columns starting at the resident absolute origin, not column
+zero. Multi-token staging, capacity slack and ragged members use their own origins.
+Each sliding member's live total must cover the query step; ordinary first-prompt
+right-padding is not a valid sliding-cache input.
+As in ORT, a rollback crossing a compaction boundary requires caller-rematerialized cache
+rows; the operator cannot recover evicted history. These forms are claimed eager without
+changing the ordinary compiled decoder guards. Sliding QK diagnostics, quantized KV
+transport and additional paged LATENT contracts remain separate limitations.
+
 `PagedAttention` supports SEPARATE packed QKV as contiguous Q, K and V sections in input 0
 with inputs 1/2 absent. LATENT retains its separate key contract. Its `softcap` precedes
 masking and sinks, using FP32 accumulation and activation-dtype output/cache storage.
