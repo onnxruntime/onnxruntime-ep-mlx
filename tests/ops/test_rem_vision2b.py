@@ -10,10 +10,10 @@ against ORT's CPU EP, tolerance-gated:
     ROI coordinates are integer-valued (after scaling) so the round() quantization is unambiguous.
   * MaxUnpool  — X[N,C,H,W] scattered back to a larger tensor by its flattened max indices;
     parametrized over kernel/stride/pad. Indices are drawn as a distinct set so scatter == assign.
-    The 3-input (explicit output_shape) form and integer payloads are left to CPU.
+    Explicit output_shape, repeated indices, and empty/dynamic forms have dedicated regressions in
+    test_spatial_semantics.py. Integer payloads are left to CPU.
 
-DeformConv and NonMaxSuppression are intentionally left to ORT CPU (see vision2b.cc header) and are
-not registered by the EP, so they are not exercised here.
+DeformConv and NonMaxSuppression have separate focused test modules.
 """
 
 from __future__ import annotations

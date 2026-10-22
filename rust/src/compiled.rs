@@ -110,6 +110,7 @@ fn host_parameter_indices(n: &NodeDesc) -> &'static [usize] {
         "STFT" => &[1, 3],
         "HannWindow" | "HammingWindow" | "BlackmanWindow" => &[0],
         "MelWeightMatrix" => &[0, 1, 2, 3, 4],
+        "MaxUnpool" => &[1, 2],
         "CumSum" | "CumProd" => &[1],
         "RNN" | "GRU" | "LSTM" => &[4],
         "TopK" => &[1],
@@ -1506,6 +1507,32 @@ mod shape_inference_tests {
         assert!(reads_unguarded_parameter(&node, true));
         node.inputs[0].shape_const = true;
         assert!(!reads_unguarded_parameter(&node, true));
+    }
+
+    #[test]
+    fn max_unpool_host_reads_require_constant_indices_and_output_shape() {
+        let mut node = NodeDesc::new(
+            "MaxUnpool".to_string(),
+            String::new(),
+            22,
+            CompileShapeSafety::ShapeKeyedOnly {
+                reason: "host-validated indices and output shape",
+            },
+        );
+        node.inputs = vec![
+            input("x", Src::CtxInput),
+            input("indices", Src::Initializer),
+            input("shape", Src::Initializer),
+        ];
+        assert!(!reads_unguarded_parameter(&node, true));
+        for index in [1, 2] {
+            for source in [Src::CtxInput, Src::Intermediate] {
+                node.inputs[index].source = source;
+                assert!(reads_unguarded_parameter(&node, true));
+                assert!(reads_data_dependent_parameter(&node));
+            }
+            node.inputs[index].source = Src::Initializer;
+        }
     }
 
     #[test]

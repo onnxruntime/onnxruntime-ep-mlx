@@ -5,10 +5,11 @@
 //! ONNX conv/pool tensors are NCHW (channels-first); MLX's `mlx_conv*` and the strided-window pooling
 //! path expect NHWC (channels-last). Every handler therefore transposes the input to channels-last
 //! (`to_channels_last`), runs the MLX op, and transposes the result back (`from_channels_last`);
-//! conv weights are repacked from ONNX `[O, I/g, kH, kW]` to MLX `[O, kH, kW, I/g]`. Only the exact
-//! attribute/shape forms the C++ claim accepts are claimed (NOTSET auto_pad, per-dim asymmetric pads
-//! via `mlx_conv_general`, unit dilations where MLX cannot express them, no ceil_mode); everything
-//! else is left to ORT CPU.
+//! conv weights are repacked from ONNX `[O, I/g, k...]` to MLX `[O, k..., I/g]`. Conv and
+//! ConvTranspose support 1-3 spatial dimensions (MLX restricts groups to 1D/2D). Transpose
+//! convolution uses an uncropped convolution followed by output cropping, supporting asymmetric
+//! pads without slicing the undilated input. Window pooling remains 2D/floor-mode; unsupported
+//! forms are left to ORT CPU.
 
 use std::os::raw::{c_char, c_void};
 
@@ -55,11 +56,9 @@ fn to_channels_last(
     x: mlx::mlx_array,
     spatial_rank: i32,
 ) -> Result<mlx::mlx_array, MlxError> {
-    let axes: Vec<i32> = if spatial_rank == 1 {
-        vec![0, 2, 1]
-    } else {
-        vec![0, 2, 3, 1]
-    };
+    let mut axes = vec![0];
+    axes.extend(2..spatial_rank + 2);
+    axes.push(1);
     let t = ctx.transpose(x, &axes)?;
     ctx.contiguous(t)
 }
@@ -70,11 +69,8 @@ fn from_channels_last(
     x: mlx::mlx_array,
     spatial_rank: i32,
 ) -> Result<mlx::mlx_array, MlxError> {
-    let axes: Vec<i32> = if spatial_rank == 1 {
-        vec![0, 2, 1]
-    } else {
-        vec![0, 3, 1, 2]
-    };
+    let mut axes = vec![0, spatial_rank + 1];
+    axes.extend(1..spatial_rank + 1);
     let t = ctx.transpose(x, &axes)?;
     ctx.contiguous(t)
 }
@@ -85,13 +81,7 @@ fn conv_weight_to_mlx(
     w: mlx::mlx_array,
     spatial_rank: i32,
 ) -> Result<mlx::mlx_array, MlxError> {
-    let axes: Vec<i32> = if spatial_rank == 1 {
-        vec![0, 2, 1]
-    } else {
-        vec![0, 2, 3, 1]
-    };
-    let t = ctx.transpose(w, &axes)?;
-    ctx.contiguous(t)
+    to_channels_last(ctx, w, spatial_rank)
 }
 
 /// `int_arrays[name]` or a default vector of `value` repeated `size` times.
@@ -314,8 +304,13 @@ fn deform_bilinear_sample(
 
 fn deform_conv_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
     let x = ctx.resolve(&n.inputs[0])?;
+    let output_dtype = ctx.dtype_of(x);
+    // Coordinates must not lose integer or fractional bits in fp16/bf16 before gathering.
+    let x = ctx.astype(x, mlx::mlx_dtype__MLX_FLOAT32)?;
     let weight = ctx.resolve(&n.inputs[1])?;
+    let weight = ctx.astype(weight, mlx::mlx_dtype__MLX_FLOAT32)?;
     let offset = ctx.resolve(&n.inputs[2])?;
+    let offset = ctx.astype(offset, mlx::mlx_dtype__MLX_FLOAT32)?;
     let x_shape = ctx.shape_of(x);
     let w_shape = ctx.shape_of(weight);
     let offset_shape = ctx.shape_of(offset);
@@ -387,6 +382,7 @@ fn deform_conv_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxE
                 )?;
                 if present(n, 4) {
                     let mask = ctx.resolve(&n.inputs[4])?;
+                    let mask = ctx.astype(mask, mlx::mlx_dtype__MLX_FLOAT32)?;
                     let mask_channel = og * kernel_size + kernel_index;
                     let mask = ctx.slice(
                         mask,
@@ -452,40 +448,143 @@ fn deform_conv_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxE
     }
     if present(n, 3) {
         let bias = ctx.resolve(&n.inputs[3])?;
+        let bias = ctx.astype(bias, mlx::mlx_dtype__MLX_FLOAT32)?;
         let bias = ctx.reshape(bias, &[1, out_channels, 1, 1])?;
         output = ctx.add(output, bias)?;
     }
+    output = ctx.astype(output, output_dtype)?;
     output = ctx.contiguous(output)?;
     ctx.bind(&n.outputs[0], output);
     Ok(())
 }
 
-// ---- ConvTranspose (2D) -------------------------------------------------------------------------
+// ---- ConvTranspose ------------------------------------------------------------------------------
+
+fn transpose_pads(
+    auto_pad: &str,
+    input: &[i64],
+    kernel: &[i64],
+    strides: &[i64],
+    dilations: &[i64],
+    output_padding: &[i64],
+    output_shape: Option<&[i64]>,
+    explicit_pads: &[i64],
+) -> Result<Vec<i64>, MlxError> {
+    let rank = input.len();
+    if output_shape.is_none() && matches!(auto_pad, "NOTSET" | "VALID") {
+        return Ok(if auto_pad == "VALID" {
+            vec![0; rank * 2]
+        } else {
+            explicit_pads.to_vec()
+        });
+    }
+    let mut pads = vec![0; rank * 2];
+    for i in 0..rank {
+        let desired = output_shape.map_or(input[i] * strides[i], |shape| shape[i]);
+        let total =
+            strides[i] * (input[i] - 1) + output_padding[i] + dilations[i] * (kernel[i] - 1) + 1
+                - desired;
+        if total < 0 {
+            return Err("ConvTranspose: requested output requires negative total padding".into());
+        }
+        pads[i] = if auto_pad == "SAME_UPPER" {
+            total / 2
+        } else {
+            total - total / 2
+        };
+        pads[i + rank] = total - pads[i];
+    }
+    Ok(pads)
+}
 
 fn conv_transpose_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
-    let strides = attr_or(n, "strides", 2, 1);
-    let pads = attr_or(n, "pads", 4, 0);
-    let output_padding = attr_or(n, "output_padding", 2, 0);
-
     let x0 = ctx.resolve(&n.inputs[0])?;
-    let x = to_channels_last(ctx, x0, 2)?;
-    // ONNX ConvTranspose weight is [I, O, kH, kW]; MLX conv_transpose2d wants [O, kH, kW, I].
+    let xs = ctx.shape_of(x0);
+    let rank = xs.len() - 2;
+    if xs[1..].iter().any(|&dim| dim <= 0) {
+        return Err("ConvTranspose: channel and spatial dimensions must be positive".into());
+    }
+    let strides = attr_or(n, "strides", rank, 1);
+    let dilations = attr_or(n, "dilations", rank, 1);
+    let output_padding = attr_or(n, "output_padding", rank, 0);
+    let group = n.ints.get("group").copied().unwrap_or(1) as i32;
+    let x = to_channels_last(ctx, x0, rank as i32)?;
     let w0 = ctx.resolve(&n.inputs[1])?;
-    let wt = ctx.transpose(w0, &[1, 2, 3, 0])?;
-    let weight = ctx.contiguous(wt)?;
+    let ws = ctx.shape_of(w0);
+    if xs[1] != ws[0] {
+        return Err("ConvTranspose: W input channels must match X".into());
+    }
+    let pads = transpose_pads(
+        n.strings.get("auto_pad").map_or("NOTSET", String::as_str),
+        &xs[2..].iter().map(|&v| i64::from(v)).collect::<Vec<_>>(),
+        &ws[2..].iter().map(|&v| i64::from(v)).collect::<Vec<_>>(),
+        &strides,
+        &dilations,
+        &output_padding,
+        n.int_arrays.get("output_shape").map(Vec::as_slice),
+        &attr_or(n, "pads", 2 * rank, 0),
+    )?;
+    let mut grouped_shape = vec![group, ws[0] / group, ws[1]];
+    grouped_shape.extend_from_slice(&ws[2..]);
+    let w = ctx.reshape(w0, &grouped_shape)?;
+    let mut axes = vec![0, 2];
+    axes.extend(3..rank as i32 + 3);
+    axes.push(1);
+    let w = ctx.transpose(w, &axes)?;
+    let mut weight_shape = vec![ws[1] * group];
+    weight_shape.extend_from_slice(&ws[2..]);
+    weight_shape.push(ws[0] / group);
+    let w = ctx.contiguous(w)?;
+    let weight = ctx.reshape(w, &weight_shape)?;
 
-    let (s0, s1) = (strides[0] as i32, strides[1] as i32);
-    let (p0, p1) = (pads[0] as i32, pads[1] as i32);
-    let (op0, op1) = (output_padding[0] as i32, output_padding[1] as i32);
+    // Compute the uncropped transpose, then crop output rather than using negative conv padding
+    // (which would slice the undilated input and lose stride-aligned samples).
+    let low: Vec<i32> = (0..rank)
+        .map(|i| (dilations[i] * (i64::from(ws[i + 2]) - 1)) as i32)
+        .collect();
+    let high: Vec<i32> = (0..rank)
+        .map(|i| low[i] + output_padding[i] as i32)
+        .collect();
+    let kernel_dilation: Vec<i32> = dilations.iter().map(|&v| v as i32).collect();
+    let input_dilation: Vec<i32> = strides.iter().map(|&v| v as i32).collect();
+    let unit = vec![1; rank];
     let mut out = ctx.emit(|res, s| unsafe {
-        mlx::mlx_conv_transpose2d(res, x, weight, s0, s1, p0, p1, 1, 1, op0, op1, 1, s)
+        mlx::mlx_conv_general(
+            res,
+            x,
+            weight,
+            unit.as_ptr(),
+            rank,
+            low.as_ptr(),
+            rank,
+            high.as_ptr(),
+            rank,
+            kernel_dilation.as_ptr(),
+            rank,
+            input_dilation.as_ptr(),
+            rank,
+            group,
+            true,
+            s,
+        )
     })?;
+    let mut start = vec![0; rank + 2];
+    let mut stop = ctx.shape_of(out);
+    for i in 0..rank {
+        start[i + 1] = i32::try_from(pads[i]).map_err(|_| "ConvTranspose: pad exceeds int32")?;
+        stop[i + 1] -=
+            i32::try_from(pads[i + rank]).map_err(|_| "ConvTranspose: pad exceeds int32")?;
+        if stop[i + 1] <= start[i + 1] {
+            return Err("ConvTranspose: output spatial dimensions must be positive".into());
+        }
+    }
+    out = ctx.slice(out, &start, &stop)?;
 
     if present(n, 2) {
         let bias = ctx.resolve(&n.inputs[2])?;
         out = add(ctx, out, bias)?;
     }
-    let y = from_channels_last(ctx, out, 2)?;
+    let y = from_channels_last(ctx, out, rank as i32)?;
     ctx.bind(&n.outputs[0], y);
     Ok(())
 }
@@ -658,11 +757,16 @@ fn global_pool_op(
     average: bool,
 ) -> Result<(), MlxError> {
     let x = ctx.resolve(&n.inputs[0])?;
-    let axes = [2i32, 3];
+    if ctx.shape_of(x)[2..].iter().any(|&d| d <= 0) {
+        return Err("global Pool: spatial dimensions must be positive".into());
+    }
+    let axes: Vec<i32> = (2..ctx.ndim(x) as i32).collect();
     let out = if average {
-        ctx.emit(|res, s| unsafe { mlx::mlx_mean_axes(res, x, axes.as_ptr(), 2, true, s) })?
+        ctx.emit(|res, s| unsafe {
+            mlx::mlx_mean_axes(res, x, axes.as_ptr(), axes.len(), true, s)
+        })?
     } else {
-        ctx.emit(|res, s| unsafe { mlx::mlx_max_axes(res, x, axes.as_ptr(), 2, true, s) })?
+        ctx.emit(|res, s| unsafe { mlx::mlx_max_axes(res, x, axes.as_ptr(), axes.len(), true, s) })?
     };
     ctx.bind(&n.outputs[0], out);
     Ok(())
@@ -707,6 +811,9 @@ fn lp_pool_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError
 
 fn global_lp_pool_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
     let x = ctx.resolve(&n.inputs[0])?;
+    if ctx.shape_of(x)[2..].iter().any(|&d| d <= 0) {
+        return Err("GlobalLpPool: spatial dimensions must be positive".into());
+    }
     let rank = ctx.ndim(x) as i32;
     let p = n.ints.get("p").copied().unwrap_or(2) as f32;
     let dt = ctx.dtype_of(x);
@@ -736,7 +843,7 @@ fn read_spatial_attribute(
     if !present {
         values = vec![default; spatial_rank];
     }
-    if values.len() != spatial_rank || !values.iter().all(|&v| v > 0) {
+    if values.len() != spatial_rank || !values.iter().all(|&v| v > 0 && v <= i32::MAX as i64) {
         return None;
     }
     Some(values)
@@ -747,7 +854,7 @@ fn read_pads(node: &NodeView, spatial_rank: usize) -> Option<Vec<i64>> {
     if !present {
         pads = vec![0; 2 * spatial_rank];
     }
-    if pads.len() != 2 * spatial_rank || !pads.iter().all(|&v| v >= 0) {
+    if pads.len() != 2 * spatial_rank || !pads.iter().all(|&v| v >= 0 && v <= i32::MAX as i64) {
         return None;
     }
     Some(pads)
@@ -792,7 +899,7 @@ fn auto_pad_pads(
 }
 
 fn static_positive_shape(shape: &[i64], rank: usize) -> bool {
-    shape.len() == rank && shape.iter().all(|&d| d > 0)
+    shape.len() == rank && shape.iter().all(|&d| d > 0 && d <= i32::MAX as i64)
 }
 
 /// Like `static_positive_shape`, but permits a dynamic (symbolic / non-positive) leading batch dim.
@@ -814,7 +921,7 @@ fn channels_static_dyn_batch_spatial(shape: &[i64], rank: usize) -> bool {
     rank >= 2 && shape.len() == rank && shape[1] > 0
 }
 
-/// Compare an actual (ONNX-declared) shape against an expected shape, treating any non-positive
+/// Compare an actual (ONNX-declared) shape against an expected shape, treating any negative
 /// (dynamic / symbolic) dim on EITHER side as a wildcard. Dynamic spatial convs declare `-1` output
 /// dims and we cannot precompute the expected spatial extent (pads may depend on the runtime shape),
 /// so both sides carry wildcards that must be skipped.
@@ -825,7 +932,7 @@ fn same_known_shape(actual: &[i64], expected: &[i64]) -> bool {
     actual
         .iter()
         .zip(expected)
-        .all(|(&a, &e)| a <= 0 || e <= 0 || a == e)
+        .all(|(&a, &e)| a < 0 || e < 0 || a == e)
 }
 
 fn optional_bias_is_valid(
@@ -864,8 +971,8 @@ fn conv_claim(node: &NodeView) -> ClaimResult {
         crate::registry::ort_dtype_name(out.dtype)
     );
     require!(
-        x.shape.len() == 3 || x.shape.len() == 4,
-        "only rank-3 Conv1D and rank-4 Conv2D are supported (got X rank {}); dynamic batch/spatial dims are supported",
+        (3..=5).contains(&x.shape.len()),
+        "only Conv1D/2D/3D are supported (got X rank {}); dynamic batch/spatial dims are supported",
         x.shape.len()
     );
     let spatial_rank = x.shape.len() - 2;
@@ -947,6 +1054,10 @@ fn conv_claim(node: &NodeView) -> ClaimResult {
     require!(
         group > 0 && group <= i32::MAX as i64,
         "group must be positive and fit int32 (got {group})"
+    );
+    require!(
+        spatial_rank != 3 || group == 1,
+        "MLX Conv3D does not support groups"
     );
     let Some(channels) = w.shape[1].checked_mul(group) else {
         deny!("W channels times group overflows int64");
@@ -1162,100 +1273,147 @@ fn conv_transpose_claim(node: &NodeView) -> ClaimResult {
         crate::registry::ort_dtype_name(out.dtype)
     );
     require!(
-        static_positive_shape_dyn_batch(&x.shape, 4),
-        "ConvTranspose requires rank-4 X with static positive channel/spatial dims (shape {:?}); dynamic batch is supported",
+        (3..=5).contains(&x.shape.len()) && x.shape[1..].iter().all(|&d| d != 0),
+        "ConvTranspose requires rank 3-5 X with nonzero channel/spatial dims (shape {:?}); symbolic dims are supported",
         x.shape
     );
+    let rank = x.shape.len() - 2;
     require!(
-        static_positive_shape(&w.shape, 4),
-        "ConvTranspose requires rank-4 W with all dims statically known and positive (shape {:?})",
+        static_positive_shape(&w.shape, rank + 2),
+        "ConvTranspose requires matching-rank W with static positive dims (shape {:?})",
         w.shape
     );
     require!(
-        out.shape.len() == 4,
-        "ConvTranspose output must have rank 4 (got rank {})",
+        out.shape.len() == rank + 2,
+        "ConvTranspose output must match X rank (got rank {})",
         out.shape.len()
     );
+    let auto_pad = node.string_attr("auto_pad", "NOTSET");
     require!(
-        node.string_attr("auto_pad", "NOTSET") == "NOTSET",
-        "ConvTranspose supports only auto_pad=NOTSET"
+        matches!(
+            auto_pad.as_str(),
+            "NOTSET" | "VALID" | "SAME_UPPER" | "SAME_LOWER"
+        ),
+        "unsupported auto_pad {auto_pad:?}"
+    );
+    let group = node.int_attr("group", 1);
+    require!(
+        group > 0
+            && group <= i32::MAX as i64
+            && w.shape[0] % group == 0
+            && (rank != 3 || group == 1),
+        "group must divide W input channels; MLX ConvTranspose3D requires group=1"
     );
     require!(
-        node.int_attr("group", 1) == 1,
-        "grouped ConvTranspose is unsupported (group must be 1)"
-    );
-    require!(
-        w.shape[0] == x.shape[1],
+        x.shape[1] < 0 || w.shape[0] == x.shape[1],
         "W input-channel dim {} must match X channels {}",
         w.shape[0],
         x.shape[1]
     );
-    let strides = match read_spatial_attribute(node, "strides", 2, 1) {
+    let strides = match read_spatial_attribute(node, "strides", rank, 1) {
         Some(v) => v,
-        None => deny!("strides must contain 2 positive spatial values"),
+        None => deny!("strides must contain {rank} positive spatial values"),
     };
-    let dilations = match read_spatial_attribute(node, "dilations", 2, 1) {
+    let dilations = match read_spatial_attribute(node, "dilations", rank, 1) {
         Some(v) => v,
-        None => deny!("dilations must contain 2 positive spatial values"),
+        None => deny!("dilations must contain {rank} positive spatial values"),
     };
-    require!(
-        dilations == [1, 1],
-        "dilated ConvTranspose is unsupported (dilations must be [1, 1], got {:?})",
-        dilations
-    );
-    let pads = match read_pads(node, 2) {
+    let explicit_pads = match read_pads(node, rank) {
         Some(v) => v,
-        None => deny!("pads must contain 4 non-negative values"),
+        None => deny!("pads must contain {} non-negative values", rank * 2),
     };
-    require!(
-        pads[0] == pads[2] && pads[1] == pads[3],
-        "ConvTranspose requires symmetric pads (got {:?})",
-        pads
-    );
     let (op_present, mut output_padding) = node.ints_attr("output_padding");
     if !op_present {
-        output_padding = vec![0, 0];
+        output_padding = vec![0; rank];
     }
     require!(
-        output_padding.len() == 2
-            && output_padding[0] >= 0
-            && output_padding[1] >= 0
-            && output_padding[0] < strides[0]
-            && output_padding[1] < strides[1],
-        "output_padding must contain 2 non-negative values smaller than strides {:?} (got {:?})",
+        output_padding.len() == rank
+            && output_padding
+                .iter()
+                .enumerate()
+                .all(|(i, &v)| v >= 0 && v < strides[i].max(dilations[i])),
+        "output_padding must contain {rank} non-negative values smaller than stride or dilation {:?} (got {:?})",
         strides,
         output_padding
     );
-    let (output_shape_present, _) = node.ints_attr("output_shape");
+    let (output_shape_present, output_shape) = node.ints_attr("output_shape");
     require!(
-        !output_shape_present,
-        "the output_shape attribute is unsupported"
+        !output_shape_present
+            || (output_shape.len() == rank
+                && output_shape.iter().all(|&v| v > 0 && v <= i32::MAX as i64)),
+        "output_shape must contain {rank} positive int32 values"
     );
     let (kernel_present, kernel_shape) = node.ints_attr("kernel_shape");
     require!(
-        !kernel_present || kernel_shape == vec![w.shape[2], w.shape[3]],
+        !kernel_present || kernel_shape == w.shape[2..],
         "kernel_shape {:?} must match W spatial shape {:?}",
         kernel_shape,
         &w.shape[2..]
     );
-    let out_channels = w.shape[1];
+    let Some(out_channels) = w.shape[1]
+        .checked_mul(group)
+        .filter(|&v| v <= i32::MAX as i64)
+    else {
+        deny!("output channels exceed int32");
+    };
     require!(
         optional_bias_is_valid(node, x.dtype, out_channels),
         "optional bias must have dtype {} and shape [{}]",
         crate::registry::ort_dtype_name(x.dtype),
         out_channels
     );
-    let expected = vec![
-        x.shape[0],
-        out_channels,
-        strides[0] * (x.shape[2] - 1) + output_padding[0] + w.shape[2] - pads[0] - pads[2],
-        strides[1] * (x.shape[3] - 1) + output_padding[1] + w.shape[3] - pads[1] - pads[3],
-    ];
     require!(
-        expected[2] > 0 && expected[3] > 0,
-        "derived output spatial shape must be positive (got {:?})",
-        &expected[2..]
+        (0..rank).all(|i| dilations[i]
+            .checked_mul(w.shape[i + 2] - 1)
+            .and_then(|v| v.checked_add(output_padding[i]))
+            .is_some_and(|v| v < i32::MAX as i64)),
+        "dilated kernel and output padding must fit int32"
     );
+    require!(
+        !matches!(auto_pad.as_str(), "SAME_UPPER" | "SAME_LOWER")
+            || output_shape_present
+            || (0..rank)
+                .all(|i| dilations[i] * (w.shape[i + 2] - 1) + 1 + output_padding[i] >= strides[i]),
+        "SAME padding requiring output extension is unsupported"
+    );
+    let mut expected = vec![x.shape[0], out_channels];
+    if x.shape[2..].iter().all(|&d| d > 0) {
+        let pads = match transpose_pads(
+            &auto_pad,
+            &x.shape[2..],
+            &w.shape[2..],
+            &strides,
+            &dilations,
+            &output_padding,
+            output_shape_present.then_some(output_shape.as_slice()),
+            &explicit_pads,
+        ) {
+            Ok(pads) => pads,
+            Err(reason) => deny!("{reason}"),
+        };
+        for i in 0..rank {
+            let uncropped = strides[i] * (x.shape[i + 2] - 1)
+                + output_padding[i]
+                + dilations[i] * (w.shape[i + 2] - 1)
+                + 1;
+            require!(
+                uncropped <= i32::MAX as i64,
+                "uncropped output extent must fit int32"
+            );
+            let extent = uncropped - pads[i] - pads[i + rank];
+            require!(
+                extent > 0 && extent <= i32::MAX as i64,
+                "derived output extent must be positive int32"
+            );
+            expected.push(extent);
+        }
+    } else {
+        expected.extend(if output_shape_present {
+            output_shape
+        } else {
+            vec![-1; rank]
+        });
+    }
     require!(
         same_known_shape(&out.shape, &expected),
         "output shape {:?} does not match expected {:?}",
@@ -1417,11 +1575,12 @@ fn global_pool_claim(node: &NodeView) -> ClaimResult {
         crate::registry::ort_dtype_name(out.dtype)
     );
     require!(
-        static_positive_shape_dyn_batch(&x.shape, 4),
-        "global Pool requires rank-4 input with static positive channel/spatial dims (shape {:?}); dynamic batch is supported",
+        x.shape.len() >= 3 && x.shape[2..].iter().all(|&d| d != 0),
+        "global Pool requires rank >=3 with nonzero spatial dims (shape {:?}); symbolic dims are supported",
         x.shape
     );
-    let expected = [x.shape[0], x.shape[1], 1, 1];
+    let mut expected = x.shape.clone();
+    expected[2..].fill(1);
     require!(
         same_known_shape(&out.shape, &expected),
         "output shape {:?} does not match expected {:?}",
@@ -1534,8 +1693,8 @@ fn global_lp_pool_claim(node: &NodeView) -> ClaimResult {
         crate::registry::ort_dtype_name(out.dtype)
     );
     require!(
-        static_positive_shape_dyn_batch(&x.shape, 4),
-        "GlobalLpPool requires rank-4 input with static positive channel/spatial dims (shape {:?}); dynamic batch is supported",
+        x.shape.len() >= 3 && x.shape[2..].iter().all(|&d| d != 0),
+        "GlobalLpPool requires rank >=3 with nonzero spatial dims (shape {:?}); symbolic dims are supported",
         x.shape
     );
     require!(
@@ -1543,7 +1702,8 @@ fn global_lp_pool_claim(node: &NodeView) -> ClaimResult {
         "p must be positive (got {})",
         node.int_attr("p", 2)
     );
-    let expected = [x.shape[0], x.shape[1], 1, 1];
+    let mut expected = x.shape.clone();
+    expected[2..].fill(1);
     require!(
         same_known_shape(&out.shape, &expected),
         "output shape {:?} does not match expected {:?}",
@@ -1597,18 +1757,19 @@ pub fn register_conv(registry: &mut OpRegistry) {
         OpRegistration {
             domain: "",
             op_type: "DeformConv",
-            min_opset: 22,
+            min_opset: 19,
             max_opset: K_ANY_OPSET,
             handler: deform_conv_op,
             claim: deform_conv_claim,
         },
         crate::registry::MLX_SLICE_SHAPE_REASON,
     );
-    shapeless(
+    shape_keyed(
         registry,
         "ConvTranspose",
         conv_transpose_op,
         conv_transpose_claim,
+        crate::registry::MLX_SLICE_SHAPE_REASON,
     );
     shape_keyed(
         registry,
