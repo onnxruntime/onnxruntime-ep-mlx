@@ -415,6 +415,16 @@ def test_paged_composed_live_cache(packed, causal, window, softcap, sink, extras
         feeds["qw"] = np.linspace(0.5, 1.5, head).astype(np.float16)
         feeds["kw"] = np.linspace(1.5, 0.5, head).astype(np.float16)
         feeds["metadata"] = np.array([1000, 1000, 0], np.int32)
+    # Cache bytes must match the ordinary, separate-QKV lowering exactly, including
+    # the existing fast RMSNorm kernel's rounding (not a NumPy RMSNorm approximation).
+    baseline = onnx.ModelProto()
+    baseline.CopyFrom(model)
+    for attr in baseline.graph.node[0].attribute:
+        if attr.name == "softcap":
+            attr.f = 0.0
+        elif attr.name == "local_window_size":
+            attr.i = -1
+    baseline = baseline.SerializeToString()
     q, k, v = (feeds[n] for n in ("query", "key", "value"))
     if packed:
         node.input[1:3] = ["", ""]
@@ -426,6 +436,7 @@ def test_paged_composed_live_cache(packed, causal, window, softcap, sink, extras
     model = model.SerializeToString()
     assert_mlx_claims(model, {n: a.copy() for n, a in feeds.items()})
     session = _strict_session(model)
+    baseline_session = _strict_session(baseline)
     for step in range(2):
         v += np.float16(step * 0.25)
         feeds["cos_cache"] += np.float16(step * 0.125)
@@ -444,8 +455,13 @@ def test_paged_composed_live_cache(packed, causal, window, softcap, sink, extras
         )
         live = {n: a.copy() for n, a in feeds.items()}
         actual = session.run(None, live)[0]
+        baseline_feeds = {n: a.copy() for n, a in feeds.items() if n != "query"}
+        baseline_feeds.update(query=q.copy(), key=k.copy(), value=v.copy())
+        baseline_session.run(None, baseline_feeds)
         np.testing.assert_allclose(actual, expected, rtol=3e-3, atol=3e-3)
-        np.testing.assert_array_equal(live["key_cache"], kc.astype(np.float16))
+        np.testing.assert_array_equal(live["key_cache"], baseline_feeds["key_cache"])
+        if not extras:
+            np.testing.assert_array_equal(live["key_cache"], kc.astype(np.float16))
         np.testing.assert_array_equal(live["value_cache"], vc.astype(np.float16))
 
 
@@ -460,8 +476,13 @@ def _bf16_boundary(model):
             before.append(onnx.helper.make_node("Cast", [value.name], [name], to=onnx.TensorProto.BFLOAT16))
             node.input[:] = [name if i == value.name else i for i in node.input]
     for value in model.graph.output:
-        value.type.tensor_type.elem_type = onnx.TensorProto.FLOAT
         name = value.name + "_bf16"
+        intermediate = onnx.ValueInfoProto()
+        intermediate.CopyFrom(value)
+        intermediate.name = name
+        intermediate.type.tensor_type.elem_type = onnx.TensorProto.BFLOAT16
+        model.graph.value_info.append(intermediate)
+        value.type.tensor_type.elem_type = onnx.TensorProto.FLOAT
         node.output[:] = [name if o == value.name else o for o in node.output]
         after.append(onnx.helper.make_node("Cast", [name], [value.name], to=onnx.TensorProto.FLOAT))
     nodes = before + [node] + after
