@@ -1775,6 +1775,7 @@ mod tests {
             ("", "ScatterElements", 24),
             ("", "CenterCropPad", 24),
             ("", "ScatterND", 24),
+            ("", "GatherND", 13),
             ("", "Slice", 24),
             ("", "Split", 24),
             ("", "Pad", 24),

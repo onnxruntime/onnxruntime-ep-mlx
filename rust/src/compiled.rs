@@ -106,6 +106,8 @@ fn host_parameter_indices(n: &NodeDesc) -> &'static [usize] {
         "Slice" => &[1, 2, 3, 4],
         "Range" => &[0, 1, 2],
         "CumSum" | "CumProd" => &[1],
+        "ReduceSum" | "ReduceMean" | "ReduceMax" | "ReduceMin" | "ReduceProd"
+        | "ReduceSumSquare" | "ReduceL1" | "ReduceL2" | "ReduceLogSum" | "ReduceLogSumExp" => &[1],
         _ => &[],
     }
 }
@@ -1430,6 +1432,42 @@ mod shape_inference_tests {
             false
         ));
         assert!(!compile_shape_mode_supported(&[eager_only_gqa], true));
+    }
+
+    #[test]
+    fn reduction_axes_are_guarded_for_all_compile_routes() {
+        for op in [
+            "ReduceSum",
+            "ReduceMean",
+            "ReduceMax",
+            "ReduceMin",
+            "ReduceProd",
+            "ReduceSumSquare",
+            "ReduceL1",
+            "ReduceL2",
+            "ReduceLogSum",
+            "ReduceLogSumExp",
+        ] {
+            for source in [Src::CtxInput, Src::Intermediate] {
+                let mut node = cumulative(op, source, "runtime reduction axes");
+                assert!(reads_data_dependent_parameter(&node));
+                assert!(reads_unguarded_parameter(&node, true));
+                assert!(!compile_shape_mode_supported(
+                    std::slice::from_ref(&node),
+                    true
+                ));
+                assert!(compile_shape_mode_supported(
+                    std::slice::from_ref(&node),
+                    false
+                ));
+                if source == Src::Intermediate {
+                    node.inputs[1].shape_const = true;
+                    assert!(!reads_unguarded_parameter(&node, true));
+                }
+            }
+            let node = cumulative(op, Src::Initializer, "runtime reduction axes");
+            assert!(!reads_data_dependent_parameter(&node));
+        }
     }
 
     #[test]

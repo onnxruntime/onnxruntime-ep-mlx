@@ -67,6 +67,7 @@ The following table is the current support contract. Do not broaden claims witho
 | **GatherBlockQuantized** | `com.microsoft` | int4 embedding, symmetric (3-input, `zp=8`) **and** asymmetric (4-input `zero_points`) | gather + int4 dequant | Symmetric: `w=(q-8)·scale`. Asymmetric: `w=(q-zp)·scale`. |
 | **Softmax** | `ai.onnx` | any valid axis; `fp32`/`fp16`/`bf16` | `mlx_softmax_axis` / `mlx_softmax_axes` | Opset <13 normalizes the complete suffix starting at `axis` (default 1); opset >=13 normalizes one axis (default -1). Legacy multi-axis suffixes use shape-keyed compilation because MLX selects the lowering using singleton extents; single-axis forms retain shapeless compilation. |
 | **MatMul** | `ai.onnx` | rank >=1 floating operands, including vector-vector, vector-matrix and batched vector forms | `mlx_matmul` | ONNX vector promotion/squeezing and batch broadcasting are native MLX semantics. Empty contraction dimensions, empty batches and symbolic extents are supported. Float64 uses the isolated MLX CPU stream; integer MatMul stays on ORT CPU. |
+| **GatherND** | `ai.onnx` | numeric/bool data; any valid `batch_dims`; statically known positive index-tuple width | flattened gather plus per-batch offsets | Preserves scalar slices, zero-size index grids/tails/batches, and live negative indices. Symbolic extents use shape-keyed compilation because flattening strides depend on concrete shapes. Float64 data uses the isolated MLX CPU stream. |
 | **Add** | `ai.onnx` | `fp32`/`fp16`/`bf16` | MLX elementwise add | Floating forms only (fp32 via the residual-add predicate, fp16/bf16 via the elementwise predicate). |
 | **Mul** | `ai.onnx` | `fp32`/`fp16`/`bf16` | MLX elementwise multiply | Floating forms only. |
 | **Sub** | `ai.onnx` | `fp32`/`fp16`/`bf16`, `int64` | MLX elementwise subtract | Covers supported numeric/bookkeeping forms only. |
@@ -152,10 +153,13 @@ The **core Rust modules** register:
 | `misc.rs` / `image.rs` | Constants, losses, NonZero/Unique/Det, numeric TF-IDF, and image decoding |
 | `random.rs` / `signal.rs` / `recurrent.rs` / `vision.rs` / `controlflow.rs` | Random, signal/FFT/window, RNN/GRU/LSTM, vision/detection, and recursive control-flow translations |
 
-`ReduceMax` also claims Boolean tensors from opset 20 onward, including scalars.
-Boolean max lowers to MLX logical OR; empty reductions produce `False` with the
-same axes/`keepdims` output shape rules as numeric reductions. Other reduction
-operators retain their existing numeric/float-only dtype restrictions.
+Reductions accept scalar inputs. `ReduceMax` and `ReduceMin` also claim Boolean
+tensors from opset 20 onward, using logical OR and AND respectively. Empty
+extrema reductions use exact dtype identities: Boolean `False`/`True`, integer
+minimum/maximum, or floating-point negative/positive infinity. Live axes are
+read on each invocation, not frozen into a compiled closure; initializer axes
+remain compilable, and proven shape-derived axes use shape-keyed compilation.
+Other reduction operators retain their numeric/float-only dtype restrictions.
 
 Every claim is **conservative**: a handler claims only the ONNX forms it can translate correctly
 (dtype/shape/attr/opset checked in its `ClaimPredicate`); every other form falls back to ORT CPU.

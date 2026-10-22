@@ -9,8 +9,8 @@
 
 use crate::engine::{MlxError, NodeDesc, Src, TranslationContext};
 use crate::registry::{
-    ClaimResult, K_ANY_OPSET, NodeView, OpRegistration, OpRegistry, is_float64, is_mlx_cpu_float,
-    is_mlx_float, is_mlx_numeric, is_signed_integer,
+    ClaimResult, CompileShapeSafety, K_ANY_OPSET, NodeView, OpRegistration, OpRegistry, is_float64,
+    is_mlx_cpu_float, is_mlx_float, is_mlx_numeric, is_signed_integer,
 };
 use crate::sys::mlx;
 use crate::sys::ort;
@@ -51,9 +51,9 @@ fn has_axes_input(n: &NodeDesc) -> bool {
     n.inputs.len() >= 2 && n.inputs[1].source != Src::Absent
 }
 
-fn read_axes(ctx: &TranslationContext, n: &NodeDesc) -> Result<Vec<i64>, MlxError> {
+fn read_axes(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<Vec<i64>, MlxError> {
     if has_axes_input(n) {
-        return ctx.read_ints(&n.inputs[1]);
+        return ctx.read_ints_eval(&n.inputs[1]);
     }
     Ok(n.int_arrays.get("axes").cloned().unwrap_or_default())
 }
@@ -82,7 +82,7 @@ fn empty_reduce(
     axes: &[i32],
     reduce_all: bool,
     keepdims: bool,
-    identity_float: f32,
+    kind: Kind,
 ) -> Result<mlx::mlx_array, MlxError> {
     let in_shape = ctx.shape_of(x);
     let rank = in_shape.len();
@@ -107,14 +107,41 @@ fn empty_reduce(
         }
     }
     let dt = ctx.dtype_of(x);
-    let is_float = dt == mlx::mlx_dtype__MLX_FLOAT32
-        || dt == mlx::mlx_dtype__MLX_FLOAT16
-        || dt == mlx::mlx_dtype__MLX_BFLOAT16;
-    let ident = if is_float { identity_float } else { 0.0 };
-    let mut scalar = ctx.scalar_f32(ident);
-    if dt != mlx::mlx_dtype__MLX_FLOAT32 {
-        scalar = ctx.astype(scalar, dt)?;
-    }
+    let minimum = kind == Kind::Min;
+    let float_identity = if minimum {
+        f64::INFINITY
+    } else {
+        f64::NEG_INFINITY
+    };
+    let scalar = match dt {
+        mlx::mlx_dtype__MLX_FLOAT64 => ctx.scalar_f64(float_identity),
+        mlx::mlx_dtype__MLX_FLOAT32
+        | mlx::mlx_dtype__MLX_FLOAT16
+        | mlx::mlx_dtype__MLX_BFLOAT16 => ctx.scalar_f32(float_identity as f32),
+        mlx::mlx_dtype__MLX_BOOL => ctx.scalar_bool(minimum),
+        mlx::mlx_dtype__MLX_INT8 => ctx.scalar_i64(if minimum {
+            i8::MAX as i64
+        } else {
+            i8::MIN as i64
+        }),
+        mlx::mlx_dtype__MLX_INT16 => ctx.scalar_i64(if minimum {
+            i16::MAX as i64
+        } else {
+            i16::MIN as i64
+        }),
+        mlx::mlx_dtype__MLX_INT32 => ctx.scalar_i64(if minimum {
+            i32::MAX as i64
+        } else {
+            i32::MIN as i64
+        }),
+        mlx::mlx_dtype__MLX_INT64 => ctx.scalar_i64(if minimum { i64::MAX } else { i64::MIN }),
+        mlx::mlx_dtype__MLX_UINT8
+        | mlx::mlx_dtype__MLX_UINT16
+        | mlx::mlx_dtype__MLX_UINT32
+        | mlx::mlx_dtype__MLX_UINT64 => ctx.scalar_i64(if minimum { -1 } else { 0 }),
+        _ => return Err("MLX empty reduction has an unsupported dtype".to_string()),
+    };
+    let scalar = ctx.astype(scalar, dt)?;
     ctx.emit(|res, s| unsafe {
         mlx::mlx_full(res, out_shape.as_ptr(), out_shape.len(), scalar, dt, s)
     })
@@ -129,13 +156,7 @@ fn apply_reduction(
     kind: Kind,
 ) -> Result<mlx::mlx_array, MlxError> {
     if matches!(kind, Kind::Max | Kind::Min | Kind::LogSumExp) && ctx.size_of(x) == 0 {
-        let ident = f32::NEG_INFINITY; // Max/LogSumExp identity; Min uses +inf below
-        let ident = if kind == Kind::Min {
-            f32::INFINITY
-        } else {
-            ident
-        };
-        return empty_reduce(ctx, x, axes, reduce_all, keepdims, ident);
+        return empty_reduce(ctx, x, axes, reduce_all, keepdims, kind);
     }
     // Boolean max is logical OR (False < True), not a numeric max kernel.
     if kind == Kind::Max && ctx.dtype_of(x) == mlx::mlx_dtype__MLX_BOOL {
@@ -144,6 +165,15 @@ fn apply_reduction(
         } else {
             ctx.emit(|res, s| unsafe {
                 mlx::mlx_any_axes(res, x, axes.as_ptr(), axes.len(), keepdims, s)
+            })
+        };
+    }
+    if kind == Kind::Min && ctx.dtype_of(x) == mlx::mlx_dtype__MLX_BOOL {
+        return if reduce_all {
+            ctx.emit(|res, s| unsafe { mlx::mlx_all(res, x, keepdims, s) })
+        } else {
+            ctx.emit(|res, s| unsafe {
+                mlx::mlx_all_axes(res, x, axes.as_ptr(), axes.len(), keepdims, s)
             })
         };
     }
@@ -489,13 +519,9 @@ fn reduction_claim(node: &NodeView, float_only: bool) -> ClaimResult {
         (Some(x), Some(o)) => (x, o),
         _ => deny!("missing tensor type/shape info on input or output"),
     };
-    let bool_max = node.op_type() == "ReduceMax"
+    let bool_extrema = matches!(node.op_type().as_str(), "ReduceMax" | "ReduceMin")
         && node.since_version() >= 20
         && x.dtype == ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL;
-    require!(
-        bool_max || !x.shape.is_empty(),
-        "input must have rank >= 1 (got a scalar)"
-    );
     require!(
         x.dtype == out.dtype,
         "input/output dtypes must match, got {} -> {}",
@@ -518,8 +544,8 @@ fn reduction_claim(node: &NodeView, float_only: bool) -> ClaimResult {
         );
     } else {
         require!(
-            is_mlx_numeric(x.dtype) || is_float64(x.dtype) || bool_max,
-            "dtype must be an MLX-supported numeric type (or bool for ReduceMax opset >= 20), got {}",
+            is_mlx_numeric(x.dtype) || is_float64(x.dtype) || bool_extrema,
+            "dtype must be an MLX-supported numeric type (or bool for ReduceMax/ReduceMin opset >= 20), got {}",
             crate::registry::ort_dtype_name(x.dtype)
         );
     }
@@ -565,6 +591,16 @@ fn reduce_numeric_claim(node: &NodeView) -> ClaimResult {
 
 fn reduce_float_claim(node: &NodeView) -> ClaimResult {
     reduction_claim(node, true)
+}
+
+fn reduction_compile_shape_safety(node: &NodeView) -> CompileShapeSafety {
+    if node.input_present(1) && !node.is_constant_initializer(1) {
+        CompileShapeSafety::ShapeKeyedOnly {
+            reason: "runtime reduction axes require shape/value guards, not shapeless replay",
+        }
+    } else {
+        CompileShapeSafety::Shapeless
+    }
 }
 
 fn argminmax_claim(node: &NodeView) -> ClaimResult {
@@ -945,74 +981,48 @@ fn shape_keyed(
     );
 }
 
+fn register_reduction(
+    registry: &mut OpRegistry,
+    op_type: &'static str,
+    handler: crate::registry::OpHandler,
+    claim: crate::registry::ClaimPredicate,
+) {
+    registry.register_shape_classified(
+        OpRegistration {
+            domain: "",
+            op_type,
+            min_opset: K_ANY_OPSET,
+            max_opset: K_ANY_OPSET,
+            handler,
+            claim,
+        },
+        reduction_compile_shape_safety,
+    );
+}
+
 pub fn register(registry: &mut OpRegistry) {
-    shapeless(
-        registry,
-        "ReduceSum",
-        K_ANY_OPSET,
-        reduce_sum_op,
-        reduce_numeric_claim,
-    );
-    shapeless(
-        registry,
-        "ReduceMax",
-        K_ANY_OPSET,
-        reduce_max_op,
-        reduce_numeric_claim,
-    );
-    shapeless(
-        registry,
-        "ReduceMean",
-        K_ANY_OPSET,
-        reduce_mean_op,
-        reduce_float_claim,
-    );
-    shapeless(
-        registry,
-        "ReduceMin",
-        K_ANY_OPSET,
-        reduce_min_op,
-        reduce_numeric_claim,
-    );
-    shapeless(
-        registry,
-        "ReduceProd",
-        K_ANY_OPSET,
-        reduce_prod_op,
-        reduce_numeric_claim,
-    );
-    shapeless(
+    register_reduction(registry, "ReduceSum", reduce_sum_op, reduce_numeric_claim);
+    register_reduction(registry, "ReduceMax", reduce_max_op, reduce_numeric_claim);
+    register_reduction(registry, "ReduceMean", reduce_mean_op, reduce_float_claim);
+    register_reduction(registry, "ReduceMin", reduce_min_op, reduce_numeric_claim);
+    register_reduction(registry, "ReduceProd", reduce_prod_op, reduce_numeric_claim);
+    register_reduction(
         registry,
         "ReduceSumSquare",
-        K_ANY_OPSET,
         reduce_sumsquare_op,
         reduce_numeric_claim,
     );
-    shapeless(
-        registry,
-        "ReduceL1",
-        K_ANY_OPSET,
-        reduce_l1_op,
-        reduce_numeric_claim,
-    );
-    shapeless(
-        registry,
-        "ReduceL2",
-        K_ANY_OPSET,
-        reduce_l2_op,
-        reduce_float_claim,
-    );
-    shapeless(
+    register_reduction(registry, "ReduceL1", reduce_l1_op, reduce_numeric_claim);
+    register_reduction(registry, "ReduceL2", reduce_l2_op, reduce_float_claim);
+    register_reduction(
         registry,
         "ReduceLogSum",
-        K_ANY_OPSET,
         reduce_logsum_op,
         reduce_float_claim,
     );
-    shapeless(
+    register_reduction(
         registry,
         "ReduceLogSumExp",
-        K_ANY_OPSET,
         reduce_logsumexp_op,
         reduce_float_claim,
     );
