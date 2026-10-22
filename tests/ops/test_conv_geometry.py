@@ -81,7 +81,7 @@ def test_grouped_conv3d(op, group, dtype, geometry, execution_mode):
         return m.run_cpu(ref, feeds)[0]
 
     session = _claimed_session(model)
-    for shape in [[1, 4, 4, 4, 4], [2, 4, 5, 3, 5], [1, 4, 4, 4, 4]]:
+    for shape in [[1, 4, 4, 4, 4], [2, 4, 5, 3, 5], [0, 4, 4, 4, 4], [1, 4, 4, 4, 4]]:
         feeds["x"] = (rng.standard_normal(shape) * .2).astype(np_dtype)
         feeds["w"] *= -.5
         feeds["b"] *= -.5
@@ -245,6 +245,27 @@ def test_col2im_exact_payloads(rank, np_dtype, execution_mode):
     m.assert_mlx_claims(model, feeds)
 
 
+@pytest.mark.parametrize("rank", [1, 2, 3])
+@pytest.mark.parametrize("np_dtype", [np.int64, np.uint64, np.bool_, np.float64])
+def test_col2im_exact_constant_payloads(rank, np_dtype, execution_mode):
+    dtype = ir.DataType.from_numpy(np.dtype(np_dtype))
+    model = _col2im_model(rank, dtype, "constant")
+    session = _claimed_session(model)
+    shape = [1, 2 * 2**rank, 3**rank]
+    data = (np.arange(int(np.prod(shape))).reshape(shape) % 7).astype(np_dtype)
+    if np.issubdtype(np_dtype, np.integer):
+        data += np_dtype(2**55)
+    elif np_dtype == np.float64:
+        data += 2.0**-40
+    for _ in range(3):
+        expected = _col2im_ref(data, [4] * rank, [2] * rank,
+                               [1] * rank, [1] * rank, [0] * (2 * rank))
+        feeds = {"data": data}
+        np.testing.assert_array_equal(ReferenceEvaluator(model).run(None, feeds)[0], expected)
+        np.testing.assert_array_equal(session.run(None, feeds)[0], expected)
+        data = np.flip(data, axis=-1).copy()
+
+
 @pytest.mark.parametrize("bad_image,bad_block,shape,error", [
     ([0], [2], [1, 2, 3], "invalid dimensions"),
     ([4], [0], [1, 2, 3], "invalid dimensions"),
@@ -381,6 +402,7 @@ def test_geometry_compile_routes(tmp_path):
         "test_col2im_runtime_geometry[compiled-FLOAT-float32-constant-1]",
         "test_col2im_runtime_geometry[compiled-FLOAT-float32-live-1]",
         "test_col2im_runtime_geometry[compiled-FLOAT-float32-intermediate-1]",
+        "test_col2im_exact_constant_payloads[compiled-int64-2]",
     ]
     subprocess.run(
         [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
