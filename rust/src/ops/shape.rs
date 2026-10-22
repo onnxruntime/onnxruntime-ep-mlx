@@ -814,53 +814,108 @@ fn slice_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> 
     Ok(())
 }
 
+fn checked_split_sizes(
+    extent: Option<i64>,
+    count: usize,
+    sizes: Option<&[i64]>,
+    num_outputs: Option<i64>,
+) -> Result<Option<Vec<i64>>, MlxError> {
+    if count == 0 || count > i32::MAX as usize {
+        return Err("MLX Split: output count must be positive and fit int32".to_string());
+    }
+    if let Some(num_outputs) = num_outputs
+        && (num_outputs <= 0 || num_outputs != count as i64 || sizes.is_some())
+    {
+        return Err(
+            "MLX Split: num_outputs must match the output count and cannot accompany split sizes"
+                .to_string(),
+        );
+    }
+    if let Some(sizes) = sizes {
+        if sizes.len() != count {
+            return Err("MLX Split: split count must equal the output count".to_string());
+        }
+        let mut total = 0i64;
+        for &size in sizes {
+            if size < 0 {
+                return Err("MLX Split: split sizes must be non-negative".to_string());
+            }
+            total = total
+                .checked_add(size)
+                .ok_or("MLX Split: split sizes sum overflows int64")?;
+        }
+        if extent.is_some_and(|extent| total != extent) {
+            return Err("MLX Split: split sizes sum must equal the axis extent".to_string());
+        }
+        return Ok(Some(sizes.to_vec()));
+    }
+    let Some(extent) = extent else {
+        return Ok(None);
+    };
+    let count = count as i64;
+    let chunk = if num_outputs.is_some() {
+        extent / count + i64::from(extent % count != 0)
+    } else {
+        if extent % count != 0 {
+            return Err("MLX Split: equal split requires an evenly divisible axis".to_string());
+        }
+        extent / count
+    };
+    let last = extent - chunk * (count - 1);
+    if last < 0 {
+        return Err("MLX Split: num_outputs produces a negative final chunk".to_string());
+    }
+    let mut sizes = vec![chunk; count as usize];
+    sizes[count as usize - 1] = last;
+    Ok(Some(sizes))
+}
+
 fn split_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
     let data = ctx.resolve(&n.inputs[0])?;
-    let rank = ctx.ndim(data) as i32;
-    let axis = norm_axis(int_attr(n, "axis", 0), rank);
-    let num_out = n.outputs.len();
-
-    let sizes: Vec<i64> = if present(n, 1) {
-        read_ints(ctx, n, 1)?
-    } else {
-        n.int_arrays.get("split").cloned().unwrap_or_default()
+    let shape = ctx.shape_of(data);
+    let rank = shape.len() as i64;
+    let axis = int_attr(n, "axis", 0);
+    if axis < -rank || axis >= rank {
+        return Err(format!(
+            "MLX Split: axis {axis} is out of range for rank {rank}"
+        ));
+    }
+    let axis = norm_axis(axis, rank as i32);
+    if present(n, 1) && ctx.tensor_shape(&n.inputs[1])?.len() != 1 {
+        return Err("MLX Split: split sizes must have rank one".to_string());
+    }
+    let (have_sizes, sizes) = read_list_input_or_attr(ctx, n, 1, "split")?;
+    let sizes = checked_split_sizes(
+        Some(i64::from(shape[axis as usize])),
+        n.outputs.len(),
+        have_sizes.then_some(sizes.as_slice()),
+        n.ints.get("num_outputs").copied(),
+    )?
+    .ok_or("MLX Split: unresolved split sizes")?;
+    let mut indices = Vec::with_capacity(sizes.len() - 1);
+    let mut acc = 0i32;
+    for &size in &sizes[..sizes.len() - 1] {
+        acc += size as i32;
+        indices.push(acc);
+    }
+    let mut parts = VectorArray::new();
+    let rc = unsafe {
+        mlx::mlx_split_sections(
+            parts.as_mut_ptr(),
+            data,
+            indices.as_ptr(),
+            indices.len(),
+            axis,
+            ctx.stream(),
+        )
     };
-
-    let parts = if !sizes.is_empty() {
-        // Cumulative boundary indices (exclusive of the final section) for mlx_split_sections.
-        let mut indices: Vec<i32> = Vec::new();
-        let mut acc = 0i32;
-        for &sz in &sizes[..sizes.len().saturating_sub(1)] {
-            acc += sz as i32;
-            indices.push(acc);
-        }
-        let mut pv = VectorArray::new();
-        let rc = unsafe {
-            mlx::mlx_split_sections(
-                pv.as_mut_ptr(),
-                data,
-                indices.as_ptr(),
-                indices.len(),
-                axis,
-                ctx.stream(),
-            )
-        };
-        if rc != 0 {
-            return Err("mlx_split_sections failed".to_string());
-        }
-        pv
-    } else {
-        let mut pv = VectorArray::new();
-        let rc =
-            unsafe { mlx::mlx_split(pv.as_mut_ptr(), data, num_out as i32, axis, ctx.stream()) };
-        if rc != 0 {
-            return Err("mlx_split failed".to_string());
-        }
-        pv
-    };
-
-    let count = parts.size();
-    for i in 0..count.min(num_out) {
+    if rc != 0 {
+        return Err("MLX Split: mlx_split_sections failed".to_string());
+    }
+    if parts.size() != n.outputs.len() {
+        return Err("MLX Split: backend returned an unexpected output count".to_string());
+    }
+    for i in 0..n.outputs.len() {
         let part = ctx.keep(parts.get(i));
         // Split parts are zero-copy strided views; contiguous is deferred to the output boundary.
         ctx.bind(&n.outputs[i], part);
@@ -2106,7 +2161,12 @@ fn split_claim(node: &NodeView) -> ClaimResult {
         node.num_outputs()
     );
     let data = match node.input_info(0) {
-        Some(d) if is_movable(d.dtype) && !d.shape.is_empty() => d,
+        Some(d)
+            if is_movable(d.dtype)
+                && (node.input_rank_known(0) != Some(true) || !d.shape.is_empty()) =>
+        {
+            d
+        }
         Some(d) => deny!(
             "Split: data dtype {} must be a movable GPU dtype and data must be non-scalar (shape {:?})",
             crate::registry::ort_dtype_name(d.dtype),
@@ -2114,6 +2174,10 @@ fn split_claim(node: &NodeView) -> ClaimResult {
         ),
         None => deny!("missing data tensor type/shape info"),
     };
+    require!(
+        data.shape.iter().all(|&dim| dim <= i32::MAX as i64),
+        "Split: data dimensions must fit MLX int32 geometry"
+    );
     for i in 0..node.num_outputs() {
         match node.output_info(i) {
             Some(o) if o.dtype == data.dtype => {}
@@ -2125,53 +2189,58 @@ fn split_claim(node: &NodeView) -> ClaimResult {
             None => deny!("Split: output[{i}] has no tensor type/shape info"),
         }
     }
-    let rank = data.shape.len() as i64;
     let axis = node.int_attr("axis", 0);
-    require!(
-        axis >= -rank && axis < rank,
-        "axis {axis} is out of range for rank {rank}"
-    );
-    let axis_size = data.shape[norm_axis(axis, rank as i32) as usize];
+    let axis_size = if node.input_rank_known(0) == Some(true) {
+        let rank = data.shape.len() as i64;
+        require!(
+            axis >= -rank && axis < rank,
+            "axis {axis} is out of range for rank {rank}"
+        );
+        let extent = data.shape[norm_axis(axis, rank as i32) as usize];
+        (extent >= 0).then_some(extent)
+    } else {
+        None
+    };
 
     // Explicit per-section sizes: opset-13 `split` input or opset<13 `split` INTS attribute.
     let (have_sizes, sizes) = if nin == 2 && node.input_present(1) {
-        match node.read_const_int64(1) {
-            Some(s) => (true, s),
-            None => deny!(
-                "Split: dynamic `split` sizes are unsupported; only a constant int64 `split` initializer is claimed — stays on CPU"
-            ),
-        }
+        require!(
+            node.since_version() >= 13,
+            "Split: legacy optional floating split input has no supported length contract"
+        );
+        let info = node.input_info(1).ok_or("Split: missing split metadata")?;
+        require!(
+            info.dtype == ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64,
+            "Split: split sizes must be int64"
+        );
+        require!(
+            node.input_rank_known(1) != Some(true) || info.shape.len() == 1,
+            "Split: split sizes must have rank one"
+        );
+        (true, node.read_const_int64(1))
     } else {
         let (present, s) = node.ints_attr("split");
-        (present, s)
+        (present, present.then_some(s))
     };
-    if have_sizes {
-        let mut total = 0i64;
-        for &s in &sizes {
-            require!(
-                s >= 0,
-                "Split: `split` sizes must be non-negative (got {s})"
-            );
-            total += s;
-        }
+    let num_outputs = node
+        .has_attr("num_outputs")
+        .then(|| node.int_attr("num_outputs", 0));
+    if have_sizes && num_outputs.is_some() {
+        deny!("Split: split sizes and num_outputs are mutually exclusive");
+    }
+    if !have_sizes || sizes.is_some() {
+        checked_split_sizes(axis_size, node.num_outputs(), sizes.as_deref(), num_outputs)?;
+    } else if let Some(info) = node.input_info(1)
+        && info.shape.len() == 1
+        && info.shape[0] >= 0
+    {
         require!(
-            sizes.len() == node.num_outputs(),
+            info.shape[0] as usize == node.num_outputs(),
             "Split: `split` count {} must equal the number of outputs {}",
-            sizes.len(),
+            info.shape[0],
             node.num_outputs()
         );
-        require!(
-            total == axis_size,
-            "Split: `split` sizes sum {total} must equal axis extent {axis_size}"
-        );
-        return Ok(());
     }
-    // Equal split: MLX requires the axis to divide evenly by the output count.
-    require!(
-        axis_size % node.num_outputs() as i64 == 0,
-        "Split: equal split requires axis extent {axis_size} to divide evenly by output count {}",
-        node.num_outputs()
-    );
     Ok(())
 }
 
@@ -2978,4 +3047,47 @@ pub fn register(registry: &mut OpRegistry) {
         handler: resize_op,
         claim: upsample_claim,
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::checked_split_sizes;
+
+    #[test]
+    fn split_sizes_validate_without_known_axis_geometry() {
+        assert_eq!(
+            checked_split_sizes(None, 3, Some(&[2, 0, 4]), None).unwrap(),
+            Some(vec![2, 0, 4])
+        );
+        assert_eq!(checked_split_sizes(None, 2, None, None).unwrap(), None);
+        assert!(checked_split_sizes(None, 2, Some(&[i64::MAX, i64::MAX]), None).is_err());
+        assert!(checked_split_sizes(None, 2, Some(&[-1, 7]), None).is_err());
+        assert!(checked_split_sizes(None, 2, Some(&[]), None).is_err());
+        assert!(checked_split_sizes(None, 2, Some(&[2, 4]), Some(2)).is_err());
+        for num_outputs in [i64::MIN, -1, 0, 1, 3, i64::MAX] {
+            assert!(checked_split_sizes(None, 2, None, Some(num_outputs)).is_err());
+        }
+    }
+
+    #[test]
+    fn split_sizes_preserve_empty_and_smaller_final_sections() {
+        for (extent, count, num_outputs, expected) in [
+            (0, 2, None, vec![0, 0]),
+            (0, 2, Some(2), vec![0, 0]),
+            (1, 2, Some(2), vec![1, 0]),
+            (6, 2, None, vec![3, 3]),
+            (5, 2, Some(2), vec![3, 2]),
+            (4, 3, Some(3), vec![2, 2, 0]),
+            (7, 4, Some(4), vec![2, 2, 2, 1]),
+        ] {
+            assert_eq!(
+                checked_split_sizes(Some(extent), count, None, num_outputs).unwrap(),
+                Some(expected)
+            );
+        }
+        assert!(checked_split_sizes(Some(5), 2, None, None).is_err());
+        assert!(checked_split_sizes(Some(5), 4, None, Some(4)).is_err());
+        assert!(checked_split_sizes(Some(1), 3, None, Some(3)).is_err());
+        assert!(checked_split_sizes(Some(6), 2, Some(&[2, 3]), None).is_err());
+    }
 }
