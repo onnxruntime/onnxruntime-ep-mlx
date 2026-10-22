@@ -109,9 +109,29 @@ fn conv_general(
     group: i32,
     flip: bool,
 ) -> Result<mlx::mlx_array, MlxError> {
+    let xs = ctx.shape_of(x);
+    let ws = ctx.shape_of(weight);
+    if xs[0] == 0 {
+        let mut shape = vec![0];
+        for i in 0..strides.len() {
+            let input = (i64::from(xs[i + 1]) - 1) * i64::from(input_dilation[i]) + 1;
+            let kernel = (i64::from(ws[i + 1]) - 1) * i64::from(kernel_dilation[i]) + 1;
+            let extent = (input + i64::from(low[i]) + i64::from(high[i]) - kernel)
+                .div_euclid(i64::from(strides[i]))
+                + 1;
+            shape.push(
+                i32::try_from(extent)
+                    .ok()
+                    .filter(|&v| v >= 0)
+                    .ok_or("Conv: derived empty-batch output extent must be nonnegative int32")?,
+            );
+        }
+        shape.push(ws[0]);
+        let dtype = ctx.dtype_of(x);
+        return ctx
+            .emit(|res, s| unsafe { mlx::mlx_zeros(res, shape.as_ptr(), shape.len(), dtype, s) });
+    }
     if strides.len() == 3 && group > 1 {
-        let xs = ctx.shape_of(x);
-        let ws = ctx.shape_of(weight);
         let mut output = None;
         for g in 0..group {
             let mut begin = vec![0; xs.len()];
