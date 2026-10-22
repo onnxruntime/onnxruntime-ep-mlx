@@ -93,8 +93,9 @@ set is small and repeating (prefill prompt lengths, CNN batch sizes), pathologic
 
 ### Value-guarded boundary shape parameters
 
-The general route can also specialize direct ORT boundary parameters of `Reshape`, `Expand`, and
-`Slice`. Before **every** apply it reads their integer values from the current kernel context,
+The general route can also specialize direct ORT boundary parameters of `Reshape`, `Expand`,
+`Slice`, `DFT` (length/axis), `STFT` (step/frame length), and the three cosine-sum windows (size).
+Before **every** apply it reads their integer values from the current kernel context,
 including dtype and tensor shape in an explicit host key. An unused synthetic input with a unique
 shape selects the corresponding MLX trace, using the same mechanism as static control-flow
 specialization. Changing parameter values with otherwise identical input shapes therefore retraces;
@@ -109,6 +110,26 @@ shape-constant provenance; the compiler never evaluates a data-dependent tracer.
 
 Claim rules are unchanged: runtime `Range`/`Tile` remain on CPU, and dynamic Slice axes/steps are
 not newly claimed. The shapeless decode and specialized attention configurations are unchanged.
+
+Signal controls must be rank-zero host-readable int32/int64 tensors (DFT axis is int64).
+Lengths and steps are checked in the positive int32 range before narrowing. FFT signal shapes and
+STFT window shapes may vary between calls; windows must match an explicit frame length. If both
+STFT optional inputs are absent, the frame spans the signal, matching the ONNX reference.
+DFT supports full forward/inverse transforms, real forward onesided output, and complex inverse
+onesided output (IRFFT, with trailing component dimension 1). The omitted IRFFT length is
+`2 * (input_axis_length - 1)`. Complex STFT requires `onesided=0`. FFTs use float32/complex64
+internally and explicitly cast back to fp32/fp16/bf16; double FFTs remain unclaimed rather than
+silently losing precision.
+
+Window and MelWeightMatrix outputs support all ONNX numeric dtypes, with an explicit cast before
+any fused consumer. Double windows use host double-precision cosine because MLX's CPU cosine
+is only float32-accurate; double Mel matrices retain host double-precision weights.
+Integer generator outputs truncate host double values before any float32 rounding.
+Mel scalar frequency bounds support fp16/bf16/fp32/fp64. Runtime Mel parameters use eager
+translation because their float-valued controls do not participate in the bounded integer cache;
+constant Mel parameters can be compiled. Negative/zero sizes, invalid frequency ranges, and
+unrepresentable allocations are rejected. Symmetric singleton floating windows preserve the
+reference's NaN; integer outputs for that undefined conversion produce an explicit error.
 
 ### Two distinct senses of "dynamic"
 
