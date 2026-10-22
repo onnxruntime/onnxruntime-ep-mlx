@@ -240,5 +240,15 @@ python -m pytest tests/backend -q
 ```
 
 - `tests/ops` — each translated decoder op via MLX vs. ORT CPU reference (tolerance-gated, pytest)
+- `tests/backend` — official ONNX node, simple, and PyTorch operator/converted cases.
+  CI pins ONNX 1.23.2. Its public `BackendTest` runner obtains node models and
+  input/expected datasets in memory via `load_model_tests(kind="node")`; packaged
+  node fixture directories and the generate-data CLI are not needed. Collection
+  fails if any intended category is empty. Models run unchanged with their
+  original datasets and tolerances; only explicit runtime IR/domain-opset limit
+  rejections become version-reasoned skips. Kernel errors and output mismatches
+  still fail, with CPU fallback available for ops MLX does not claim.
+  The loader/adapter regressions can run without Metal:
+  `python -m pytest tests/backend/test_backend_adapter.py -q`.
 - `tests/conformance` — opt-in fuzz-conformance of the MLX EP against the ONNX standard
   (`cbourjau/onnx-tests`); see [`tests/conformance/README.md`](tests/conformance/README.md)
