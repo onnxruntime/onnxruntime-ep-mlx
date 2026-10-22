@@ -46,9 +46,12 @@ if not (_LIB and Path(_LIB).is_file()):
     )
 
 from _backend import MlxBackend, backend_test_cases  # noqa: E402
+from _attention_precision import ATTENTION_FP16_TEST_KWARGS  # noqa: E402
 
 
-_backend_test = onnx.backend.test.BackendTest(MlxBackend, __name__)
+_backend_test = onnx.backend.test.BackendTest(
+    MlxBackend, __name__, test_kwargs=ATTENTION_FP16_TEST_KWARGS
+)
 
 # Cases the EP fundamentally cannot serve even via CPU fallback, or that are
 # environment/model-zoo heavy. Extend as needed.

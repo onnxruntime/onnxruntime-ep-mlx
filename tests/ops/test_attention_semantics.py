@@ -111,3 +111,38 @@ def test_attention_fp16_external_cache_softmax_accuracy():
     expected = _attention_reference(q, k, v, allowed)
     assert_mlx_claims(model, feeds)
     np.testing.assert_allclose(m.run_mlx(model, feeds)[0], expected, rtol=0.001, atol=1e-7)
+
+
+@pytest.mark.parametrize("dtype", [np.float16, np.float32])
+def test_attention_3d_cached_fully_masked_rows(dtype):
+    rng = np.random.default_rng(17)
+    q = rng.random((1, 4, 2, 8)).astype(dtype)
+    k = rng.random((1, 2, 2, 8)).astype(dtype)
+    v = rng.random((1, 2, 2, 8)).astype(dtype)
+    pk = rng.random(k.shape).astype(dtype)
+    pv = rng.random(v.shape).astype(dtype)
+    mask = np.array([[False, False, False, False], [True, True, False, True]])
+    dt = DT.FLOAT16 if dtype == np.float16 else DT.FLOAT
+    q3 = q.transpose(0, 2, 1, 3).reshape(1, 2, 32)
+    k3 = k.transpose(0, 2, 1, 3).reshape(1, 2, 16)
+    v3 = v.transpose(0, 2, 1, 3).reshape(1, 2, 16)
+    model = build_model(
+        "Attention",
+        [_t("Q", list(q3.shape), dt), _t("K", list(k3.shape), dt),
+         _t("V", list(v3.shape), dt), _t("M", list(mask.shape), DT.BOOL),
+         _t("PK", list(pk.shape), dt), _t("PV", list(pv.shape), dt)],
+        [_t("Y", list(q3.shape), dt), _t("present_K", [1, 2, 4, 8], dt),
+         _t("present_V", [1, 2, 4, 8], dt)],
+        attributes={"q_num_heads": 4, "kv_num_heads": 2, "is_causal": 1},
+    )
+    feeds = {"Q": q3, "K": k3, "V": v3, "M": mask, "PK": pk, "PV": pv}
+    present_k = np.concatenate((pk, k), axis=2)
+    present_v = np.concatenate((pv, v), axis=2)
+    expected = _attention_reference(q, present_k, present_v, mask)
+    expected = expected.transpose(0, 2, 1, 3).reshape(q3.shape)
+    assert_mlx_claims(model, feeds)
+    actual, actual_k, actual_v = m.run_mlx(model, feeds)
+    np.testing.assert_allclose(actual, expected, rtol=0.001, atol=1e-7)
+    np.testing.assert_array_equal(actual[:, 0], 0)
+    np.testing.assert_array_equal(actual_k, present_k)
+    np.testing.assert_array_equal(actual_v, present_v)
