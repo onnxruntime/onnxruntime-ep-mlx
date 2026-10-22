@@ -348,17 +348,18 @@ pub struct CompiledSubgraph {
     pub attempted: bool,
     /// Is `closure` usable?
     pub valid: bool,
-    /// Host control-flow decisions baked into the current general trace. `If` branches and static
-    /// `Loop` trip counts are specialized explicitly because MLX's shape-keyed compile cache does
-    /// not retrace when scalar input data changes.
-    pub control_flow_key: Option<String>,
+    /// Host decisions baked into the current general trace: control flow and boundary shape values.
+    /// MLX's native shape-keyed cache does not observe changes to their data.
+    pub host_specialization_key: Option<String>,
     /// Whether this general plan contains static control flow and therefore needs a host-decision
     /// specialization key. False for ordinary graphs, avoiding a full node walk on every call.
     pub control_flow_specialization_enabled: bool,
-    /// Stable synthetic shape token per control-flow specialization. The token is appended as an
+    /// Boundary parameters read by Reshape/Expand/Slice, checked on EVERY general apply.
+    pub boundary_shape_inputs: Vec<usize>,
+    /// Stable synthetic shape token per host-value specialization. The token is appended as an
     /// unused closure input so MLX's native shape-keyed cache retains every visited branch/trip
     /// combination and can replay it when execution returns to that decision.
-    pub control_flow_specializations: HashMap<String, i32>,
+    pub host_specializations: HashMap<String, i32>,
     /// The compiled closure.
     pub closure: Option<crate::mlx::Closure>,
     /// Ordered, de-duplicated dynamic ctx inputs = closure inputs `[0..n)`.
@@ -400,9 +401,10 @@ impl CompiledSubgraph {
             enabled: false,
             attempted: false,
             valid: false,
-            control_flow_key: None,
+            host_specialization_key: None,
             control_flow_specialization_enabled: false,
-            control_flow_specializations: HashMap::new(),
+            boundary_shape_inputs: Vec::new(),
+            host_specializations: HashMap::new(),
             closure: None,
             dyn_inputs: Vec::new(),
             ext_outputs: Vec::new(),

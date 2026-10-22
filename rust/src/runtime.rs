@@ -276,11 +276,11 @@ unsafe fn compute_impl(
                     let key = if tr.active() {
                         let mut key =
                             compute_shape_key(info.ort_api, kctx, &plan.general.dyn_inputs);
-                        if let Some(control) = &plan.general.control_flow_key
-                            && !control.is_empty()
+                        if let Some(specialization) = &plan.general.host_specialization_key
+                            && !specialization.is_empty()
                         {
                             key.push('|');
-                            key.push_str(control);
+                            key.push_str(specialization);
                         }
                         key
                     } else {

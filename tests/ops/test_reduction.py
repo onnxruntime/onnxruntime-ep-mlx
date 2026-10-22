@@ -776,10 +776,12 @@ def test_cumsum_failures_do_not_abort_host() -> None:
         ]
         assert cumsum_compute_events == slice_compute_events
         assert len(cumsum_compute_events) == 2
+        assert [event["args"].get("cache") for event in cumsum_compute_events] == [
+            "MISS", "RETRACE",
+        ]
         assert all(
-            event.get("name") == "mlx.compute[eager]"
-            and event["args"].get("path") == "eager"
-            and event["args"].get("cache") == "n/a"
+            event.get("name") == "mlx.compute[general]"
+            and event["args"].get("path") == "general"
             and set(partition_names(event))
             == {
                 "decoder_shape_safety_cumsum",
@@ -789,7 +791,7 @@ def test_cumsum_failures_do_not_abort_host() -> None:
             for event in cumsum_compute_events
         ), (
             "CumSum and its adjacent runtime-parameter Slice must share one correctly coloured "
-            f"eager MLX partition on both T=4 and T=7: {cumsum_compute_events}"
+            f"value-guarded shape-keyed partition on both T=4 and T=7: {cumsum_compute_events}"
         )
 
         qmoe_events = [

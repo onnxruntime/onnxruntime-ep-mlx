@@ -100,18 +100,82 @@ fn is_general_compile_unsafe(n: &NodeDesc) -> bool {
             .any(|sg| sg.nodes.iter().any(is_general_compile_unsafe))
 }
 
-/// Decide whether the general compiled fast path is allowed for this plan. Shares the compile
-/// kill-switch (`ONNXRUNTIME_EP_MLX_NO_COMPILE`), and is additionally disabled for any subgraph
-/// containing an op that is unsafe to trace (see [`is_general_compile_unsafe`]). An
-/// extra kill-switch `ONNXRUNTIME_EP_MLX_NO_GENERAL_COMPILE` forces eager for A/B numerical validation without
-/// touching the decode path.
-/// A node that would read a DATA-DEPENDENT runtime shape/scalar while translating the graph.
-///
-/// Shape-keyed MLX caches observe tensor shapes/dtypes, not tensor values. A direct runtime
-/// Reshape/Expand/Slice/Range parameter or cumulative axis would otherwise be read from the live
-/// `OrtKernelContext` during the first trace and silently baked into every later call with the same
-/// input shapes. Initializers and shape-const intermediates (derived from `Shape`/`Size`) are safe:
-/// their value is fixed, or changes exactly when the shape key changes.
+fn host_parameter_indices(n: &NodeDesc) -> &'static [usize] {
+    match n.op_type.as_str() {
+        "Reshape" | "Expand" => &[1],
+        "Slice" => &[1, 2, 3, 4],
+        "Range" => &[0, 1, 2],
+        "CumSum" | "CumProd" => &[1],
+        _ => &[],
+    }
+}
+
+fn guarded_boundary_parameter(n: &NodeDesc, r: &crate::engine::TensorRef) -> bool {
+    matches!(n.op_type.as_str(), "Reshape" | "Expand" | "Slice") && r.source == Src::CtxInput
+}
+
+pub fn boundary_shape_inputs(nodes: &[NodeDesc]) -> Vec<usize> {
+    let mut inputs = Vec::new();
+    for node in nodes {
+        for &i in host_parameter_indices(node) {
+            if let Some(r) = node.inputs.get(i)
+                && !r.constant
+                && !r.shape_const
+                && guarded_boundary_parameter(node, r)
+                && !inputs.contains(&r.ctx_index)
+            {
+                inputs.push(r.ctx_index);
+            }
+        }
+        for subgraph in &node.subgraphs {
+            for index in boundary_shape_inputs(&subgraph.nodes) {
+                if !inputs.contains(&index) {
+                    inputs.push(index);
+                }
+            }
+        }
+    }
+    inputs
+}
+
+fn boundary_shape_specialization_key(
+    indices: &[usize],
+    api: *const ort::OrtApi,
+    kctx: *mut ort::OrtKernelContext,
+) -> Result<String, MlxError> {
+    let mut key = String::new();
+    for &index in indices {
+        let (data, shape, dtype) = read_ctx_input_raw(api, kctx, index)?;
+        let count = shape.iter().try_fold(1usize, |count, &dim| {
+            usize::try_from(dim)
+                .ok()
+                .and_then(|dim| count.checked_mul(dim))
+        });
+        let count = count
+            .filter(|&count| count > 0 && count <= 64)
+            .ok_or_else(|| "boundary shape specialization requires 1..=64 integers".to_string())?;
+        if data.is_null() {
+            return Err("boundary shape specialization input has null data".to_string());
+        }
+        let values: Vec<i64> = match dtype {
+            ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64 => unsafe {
+                std::slice::from_raw_parts(data as *const i64, count).to_vec()
+            },
+            ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32 => unsafe {
+                std::slice::from_raw_parts(data as *const i32, count)
+                    .iter()
+                    .map(|&v| i64::from(v))
+                    .collect()
+            },
+            _ => return Err("boundary shape specialization requires int32/int64".to_string()),
+        };
+        key.push_str(&format!("P{index}:{dtype}:{shape:?}={values:?};"));
+    }
+    Ok(key)
+}
+
+/// Shape-keyed MLX caches do not observe input values. Only initializers, proven shape-constant
+/// intermediates, or explicitly value-guarded Reshape/Expand/Slice boundary parameters are safe.
 fn reads_data_dependent_parameter(n: &NodeDesc) -> bool {
     if n.subgraphs
         .iter()
@@ -119,20 +183,17 @@ fn reads_data_dependent_parameter(n: &NodeDesc) -> bool {
     {
         return true;
     }
-    let idx: &[usize] = match n.op_type.as_str() {
-        "Reshape" | "Expand" => &[1],
-        "Slice" => &[1, 2, 3, 4],
-        "Range" => &[0, 1, 2],
-        "CumSum" | "CumProd" => &[1],
-        _ => return false,
-    };
-    idx.iter().any(|&i| {
+    host_parameter_indices(n).iter().any(|&i| {
         n.inputs.get(i).is_some_and(|tr| {
-            !matches!(tr.source, Src::Initializer | Src::Absent) && !tr.constant && !tr.shape_const
+            !matches!(tr.source, Src::Initializer | Src::Absent)
+                && !tr.constant
+                && !tr.shape_const
+                && !guarded_boundary_parameter(n, tr)
         })
     })
 }
 
+/// General capture shares NO_COMPILE and also honors NO_GENERAL_COMPILE for eager A/B validation.
 pub fn general_enabled(has_control_flow: bool, nodes: &[NodeDesc]) -> bool {
     if !compile_enabled(has_control_flow) {
         return false;
@@ -538,30 +599,40 @@ pub fn try_compiled(
     if !slot.get(unsafe { &*plan_ptr }).enabled {
         return Ok(false);
     }
-    let control_flow_token = if slot == Slot::General
-        && slot
-            .get(unsafe { &*plan_ptr })
-            .control_flow_specialization_enabled
+    let general = &unsafe { &*plan_ptr }.general;
+    let host_specialization_token = if slot == Slot::General
+        && (general.control_flow_specialization_enabled
+            || !general.boundary_shape_inputs.is_empty())
     {
-        let key = match control_flow_specialization_key(&unsafe { &*plan_ptr }.nodes, api, kctx) {
-            Ok(key) => key,
-            Err(_) => return Ok(false),
+        let mut key = if general.control_flow_specialization_enabled {
+            match control_flow_specialization_key(&unsafe { &*plan_ptr }.nodes, api, kctx) {
+                Ok(key) => key,
+                Err(_) => return Ok(false),
+            }
+        } else {
+            String::new()
         };
+        match boundary_shape_specialization_key(&general.boundary_shape_inputs, api, kctx) {
+            Ok(parameters) => key.push_str(&parameters),
+            Err(error) => {
+                log::debug!("boundary shape specialization declined ({error}); using eager");
+                return Ok(false);
+            }
+        }
         if key.is_empty() {
             None
         } else {
             let general = slot.get_mut(unsafe { &mut *plan_ptr });
-            if let Some(&token) = general.control_flow_specializations.get(&key) {
-                general.control_flow_key = Some(key);
+            if let Some(&token) = general.host_specializations.get(&key) {
+                general.host_specialization_key = Some(key);
                 Some(token)
-            } else if general.control_flow_specializations.len() >= 16 {
+            } else if general.host_specializations.len() >= 16 {
+                log::debug!("host-value specialization limit reached; using eager for new values");
                 return Ok(false);
             } else {
-                let token = general.control_flow_specializations.len() as i32 + 1;
-                general
-                    .control_flow_specializations
-                    .insert(key.clone(), token);
-                general.control_flow_key = Some(key);
+                let token = general.host_specializations.len() as i32 + 1;
+                general.host_specializations.insert(key.clone(), token);
+                general.host_specialization_key = Some(key);
                 Some(token)
             }
         }
@@ -676,7 +747,7 @@ pub fn try_compiled(
             input.append(arr.as_raw());
             arena.push(arr);
         }
-        if let Some(token) = control_flow_token {
+        if let Some(token) = host_specialization_token {
             let zeros = vec![0u8; token as usize];
             let arr = Array::from_data(
                 zeros.as_ptr() as *const std::os::raw::c_void,
@@ -1389,7 +1460,7 @@ mod shape_inference_tests {
     }
 
     #[test]
-    fn direct_runtime_shape_parameter_is_data_dependent() {
+    fn direct_runtime_shape_parameter_is_value_guarded() {
         let mut reshape = NodeDesc::new(
             "Reshape".to_string(),
             String::new(),
@@ -1397,9 +1468,14 @@ mod shape_inference_tests {
             CompileShapeSafety::Shapeless,
         );
         reshape.inputs = vec![input("data", Src::CtxInput), input("shape", Src::CtxInput)];
-        assert!(reads_data_dependent_parameter(&reshape));
+        assert!(!reads_data_dependent_parameter(&reshape));
+        assert_eq!(
+            boundary_shape_inputs(std::slice::from_ref(&reshape)),
+            vec![0]
+        );
 
         reshape.inputs[1].source = Src::Intermediate;
+        assert!(reads_data_dependent_parameter(&reshape));
         reshape.inputs[1].shape_const = true;
         assert!(
             !reads_data_dependent_parameter(&reshape),

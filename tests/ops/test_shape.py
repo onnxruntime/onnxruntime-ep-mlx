@@ -803,3 +803,99 @@ def test_reshape_dynamic_shape_from_input_shape(tmp_path) -> None:
         "the shape-const Reshape was declined; its target is derivable at trace time, and each "
         f"declined node is a partition boundary. Declined: {sorted(declined)}"
     )
+
+
+@pytest.mark.skipif(
+    os.environ.get("ONNXRUNTIME_EP_MLX_BOUNDARY_SHAPE_CHILD") != "1",
+    reason="run by test_boundary_shapes_use_value_guarded_compile",
+)
+def test_boundary_shape_compile_child() -> None:
+    options = ort.SessionOptions()
+    options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+
+    def check(model, feeds):
+        mlx = ort.InferenceSession(model, options, providers=m.EP_PROVIDERS)
+        cpu = ort.InferenceSession(model, options, providers=["CPUExecutionProvider"])
+        for feed in feeds:
+            actual = mlx.run(None, feed)
+            expected = cpu.run(None, feed)
+            for a, e in zip(actual, expected, strict=True):
+                np.testing.assert_array_equal(a, e)
+
+    for op, data, targets in [
+        ("Reshape", np.arange(12, dtype=np.float32), [[3, 4], [3, 4], [2, 6], [2, 6], [3, 4]]),
+        ("Expand", np.arange(3, dtype=np.float32).reshape(1, 3),
+         [[2, 3], [2, 3], [4, 3], [4, 3], [2, 3]]),
+    ]:
+        model = build(
+            op,
+            [m.tensor("x", DT.FLOAT, data.shape), m.tensor("shape", DT.INT64, [2])],
+            [m.tensor("y", DT.FLOAT, ["a", "b"])],
+        )
+        check(model, [
+            {"x": data + iteration, "shape": np.array(target, np.int64)}
+            for iteration, target in enumerate(targets)
+        ])
+
+    model = build(
+        "Slice",
+        [m.tensor("x", DT.FLOAT, [32]), m.tensor("start", DT.INT64, [1]),
+         m.tensor("end", DT.INT64, [1])],
+        [m.tensor("y", DT.FLOAT, ["n"])],
+    )
+    check(model, [
+        {"x": np.arange(32, dtype=np.float32) + iteration,
+         "start": np.array([start], np.int64), "end": np.array([end], np.int64)}
+        for iteration, (start, end) in enumerate([(0, 8), (0, 8), (2, 10), (2, 10), (0, 8)])
+    ])
+    # The 17th distinct value must use eager; an earlier cached value must still be reusable.
+    check(model, [
+        {"x": np.arange(32, dtype=np.float32) + iteration,
+         "start": np.array([0], np.int64), "end": np.array([end], np.int64)}
+        for iteration, end in enumerate([1, 1, *range(2, 18), 1])
+    ])
+
+
+@pytest.mark.skipif(
+    os.environ.get("ONNXRUNTIME_EP_MLX_BOUNDARY_SHAPE_CHILD") == "1",
+    reason="child process executes the traced workload",
+)
+def test_boundary_shapes_use_value_guarded_compile(tmp_path: Path) -> None:
+    trace = tmp_path / "boundary_shapes.json"
+    subprocess.run(
+        [sys.executable, "-m", "pytest",
+         f"{Path(__file__).name}::test_boundary_shape_compile_child", "-q", "-p", "no:cacheprovider"],
+        check=True,
+        cwd=str(Path(__file__).parent),
+        env={
+            **os.environ,
+            "ONNXRUNTIME_EP_MLX_TRACE": str(trace),
+            "ONNXRUNTIME_EP_MLX_NO_COMPILE": "0",
+            "ONNXRUNTIME_EP_MLX_NO_GENERAL_COMPILE": "0",
+            "ONNXRUNTIME_EP_MLX_BOUNDARY_SHAPE_CHILD": "1",
+        },
+        timeout=300,
+    )
+    events = json.loads(trace.read_text())
+    paths = [event for event in events if event.get("cat") == "ep.path"]
+    general = [event["args"]["cache"] for event in paths
+               if event["name"] == "mlx.compute[general]"]
+    assert general[:15] == ["MISS", "HIT", "RETRACE", "HIT", "HIT"] * 3
+    assert general[15:] == ["MISS", "HIT", *(["RETRACE"] * 15), "HIT"]
+    eager = [event for event in paths if event["name"] == "mlx.compute[eager]"]
+    assert len(eager) == 1, "only the uncached 17th value specialization should use eager"
+
+
+def test_boundary_reshape_invalid_target_then_recovery() -> None:
+    model = build(
+        "Reshape",
+        [m.tensor("x", DT.FLOAT, [12]), m.tensor("shape", DT.INT64, [2])],
+        [m.tensor("y", DT.FLOAT, ["a", "b"])],
+    )
+    session = ort.InferenceSession(model, providers=m.EP_PROVIDERS)
+    x = np.arange(12, dtype=np.float32)
+    session.run(None, {"x": x, "shape": np.array([3, 4], np.int64)})
+    with pytest.raises(Exception, match="Reshape|reshape"):
+        session.run(None, {"x": x, "shape": np.array([5, 5], np.int64)})
+    actual = session.run(None, {"x": x + 1, "shape": np.array([2, 6], np.int64)})[0]
+    np.testing.assert_array_equal(actual, (x + 1).reshape(2, 6))

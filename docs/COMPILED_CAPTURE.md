@@ -91,6 +91,25 @@ colours. Stricter nodes remain claimed by MLX without disabling a more capable n
 partition. ShapeKeyed pays one recompile per distinct `(shape, dtype)` tuple — cheap when the shape
 set is small and repeating (prefill prompt lengths, CNN batch sizes), pathological if unbounded.
 
+### Value-guarded boundary shape parameters
+
+The general route can also specialize direct ORT boundary parameters of `Reshape`, `Expand`, and
+`Slice`. Before **every** apply it reads their integer values from the current kernel context,
+including dtype and tensor shape in an explicit host key. An unused synthetic input with a unique
+shape selects the corresponding MLX trace, using the same mechanism as static control-flow
+specialization. Changing parameter values with otherwise identical input shapes therefore retraces;
+returning to an earlier value reuses its trace. Ordinary activation/cache inputs remain live data.
+
+This does not infer or restore `shape_const` provenance. It is safe even when the boundary values
+really are data-dependent. Each parameter must contain 1–64 int32/int64 elements, and the general
+plan retains at most 16 host-value specializations (shared with control-flow decisions). New values
+after that limit use eager translation; previously cached values remain reusable. Empty/unsupported
+parameters also use eager translation. Runtime-valued **intermediates** still require proven
+shape-constant provenance; the compiler never evaluates a data-dependent tracer.
+
+Claim rules are unchanged: runtime `Range`/`Tile` remain on CPU, and dynamic Slice axes/steps are
+not newly claimed. The shapeless decode and specialized attention configurations are unchanged.
+
 ### Two distinct senses of "dynamic"
 
 - **Symbolic-dynamic at claim time** (a `-1`/symbolic dim in the graph): always fine **as long as the
@@ -123,7 +142,8 @@ violates one falls back to eager (or, for attention, to the growing-concat route
 2. **No data-dependent translation parameters.** `Reshape` / `Expand` target (input 1), `Slice`
    starts/ends/axes/steps (1–4), `Range` bounds (0–2), and the `CumSum`/`CumProd` axis (1) must be **constant or
    shape-const** (derived from `Shape`/`Size`), never plain runtime data
-   (`reads_data_dependent_parameter`). Shape-const is OK because it changes with the shape-keyed cache
+   (`reads_data_dependent_parameter`). The general route additionally permits the explicitly
+   value-guarded boundary parameters described above. Shape-const is OK because it changes with the shape-keyed cache
    key; an ordinary runtime tensor value does not participate in that key and would otherwise be
    silently baked into later calls. (This is exactly why runtime-bounded `Range` is deferred — see
    `OP_ARCHITECTURE`/README Range note.)
@@ -190,3 +210,62 @@ The shapeless growing-KV decode capture is currently hardwired to `com.microsoft
 ai.onnx `Attention` is a larger change because that op has a different KV/mask contract (additive mask +
 `is_causal`, no `seqlens_k`), so it does not yet get the shapeless decode fast path. Static-shape
 `Attention` subgraphs are still eligible for the **general** `ShapeKeyed` capture.
+
+---
+
+## 7. Nemotron streaming attribution (issue #10)
+
+The supplied English fp32 Nemotron Speech Streaming 0.6B export and `parakeet-rs` streaming engine
+were measured on an M1 Max, 32 GiB, macOS 27.0.1, AC power, ORT 1.31.0, MLX 0.32.2. Model revision:
+`altunenes/parakeet-rs@4d2a8bc71f5c896ec40faa59732e6716295edaf2` on Hugging Face, directory
+`nemotron-speech-streaming-en-0.6b`. Rust engine revision:
+`altunenes/parakeet-rs@6ad1501898842fda76f86f7bcad6b361daf5df9e`.
+
+This is **not** a reproduction of the historical CPU 10.5s / MLX 10.3s result: the reporter's
+original audio/runtime/timer are unknown. The authorized alternate audio fixture repeats/truncates
+Whisper's public `tests/jfk.flac` to 40 seconds after mono 16 kHz PCM16 conversion. Fixture SHA256:
+`d20746b9aae79111ce0775605dc02960454df04f4827f34450aa648c64044f67`.
+
+The measurement adapter retains the supplied engine's preprocessing, cache updates, greedy decoder,
+8960-sample chunks, final-chunk padding, and three zero flush chunks. It times in-memory processing,
+excluding loading/audio I/O/printing; resets all streaming state before every utterance; and records
+token IDs/logprobs plus encoder/decoder wrapper wall times. Each fresh, sequential provider process
+reuses its sessions for three full warmups followed by ten timed utterances. Session settings:
+Level3 graph optimization, four intra-op threads, one inter-op thread. The MLX process explicitly
+registers its canonical provider library path; the separate CPU process registers no MLX library.
+Final timings have tracing, ORT profiling, verbose/claim logs, captures, and compile kill switches off.
+
+| Provider/source | Median seconds | p95 seconds | Median encoder / decoder seconds |
+|---|---:|---:|---:|
+| ORT CPU | 8.204 | 8.658 | 7.884 / 0.292 |
+| MLX main `57a0d2e` | 7.312 | 7.786 | 6.029 / 1.257 |
+| MLX coverage fixes `605f11e` | 5.862 | 5.932 | 5.435 / 0.399 |
+| MLX coverage fixes + current main, `5a52393` | 5.849 | 5.996 | 5.421 / 0.400 |
+| MLX plus value-guarded boundary specialization | 2.912 | 3.178 | 2.414 / 0.464 |
+
+Run order was CPU, main, coverage fixes, specialization; a later confirmation ran updated coverage
+fixes, specialization, CPU and measured medians 5.849s, 2.809s, 8.062s respectively. Confirmation
+p95s were 5.996s, 3.552s, 8.222s. These are sequential local observations, not confidence intervals.
+The machine already had about 4.76 GiB swap in use; free-memory percentage was 54–56%, with no
+recorded thermal/performance warnings. Existing swap and other host activity limit precision.
+
+All warmup/timed utterances produced the same 131 token IDs and transcript as CPU, with 75 encoder
+and 656 decoder calls. Maximum emitted-token logprob difference was `1.15e-5` for coverage fixes
+and `7.63e-6` with specialization. Model weights, audio, transcripts, and raw profiles remain local.
+
+Attribution used separate diagnostic runs, never their timings as final performance results:
+
+- Coverage fixes reduced 22 partitions to nine, claiming 2739/2746 optimized nodes. The remaining
+  CPU `Range` x6 and `Tile` x1 took about 4ms combined in the profiled utterance; their direct compute
+  cost is not the main bottleneck. Main's tiny decoder partitions also imposed substantial overhead.
+- Six encoder partitions, including the 2293-node block, still reconstructed eagerly: 450 eager
+  executions per utterance. Translation spans totaled about 3.72s, dominated by Reshape/Slice.
+  These spans can include synchronization, not just CPU graph construction.
+- Original-graph diagnostic outputs at calls 0/37/74 showed Slice ends `[77]` and the first-layer
+  reshape target `[1,-1,1024]`, while live cache valid length changed from 0 to 70. The fix does
+  **not** assume those observed values stay constant: it guards boundary parameter values every call.
+- Specialization produced 1837 general executions, nine first-use misses and no eager executions
+  or retraces in the fixed-chunk diagnostic utterance. Full output copies remained about 1849 MiB;
+  copy volume was not eliminated. Evaluation remains GPU-inclusive wall time, including lazy JIT
+  work on first use, not a measurement of pure GPU kernel duration. Warmup excludes that first-use
+  work from the steady-state table above; closure-build counters alone do not quantify it.

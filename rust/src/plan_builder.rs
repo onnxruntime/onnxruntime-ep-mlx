@@ -68,6 +68,7 @@ pub(crate) unsafe fn build_plan(
         crate::compiled::prefill_enabled(has_control_flow || has_compile_barrier, &plan.nodes);
     plan.general.enabled = crate::compiled::general_enabled(has_compile_barrier, &plan.nodes);
     plan.general.control_flow_specialization_enabled = has_control_flow;
+    plan.general.boundary_shape_inputs = crate::compiled::boundary_shape_inputs(&plan.nodes);
     if plan.requires_cpu_stream {
         plan.compiled.enabled = false;
         plan.prefill.enabled = false;
