@@ -1769,6 +1769,7 @@ mod tests {
             ("com.microsoft", "MRotaryEmbedding", 1),
             ("", "Scan", 24),
             ("", "DeformConv", 22),
+            ("", "ConvTranspose", 22),
             ("", "AveragePool", 24),
             ("", "MaxPool", 24),
             ("", "LpPool", 24),
@@ -1899,7 +1900,12 @@ mod tests {
     #[test]
     fn standard_opset_introductions_are_version_gated() {
         let registry = registry();
-        for (op, before, first) in [("Celu", 11, 12), ("Swish", 23, 24), ("SwiGLU", 27, 28)] {
+        for (op, before, first) in [
+            ("Celu", 11, 12),
+            ("Swish", 23, 24),
+            ("SwiGLU", 27, 28),
+            ("DeformConv", 18, 19),
+        ] {
             assert!(
                 registry.find_entry("", op, before).is_none(),
                 "{op} must not be registered before opset {first}"

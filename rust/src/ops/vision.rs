@@ -3,9 +3,10 @@
 //!
 //! Every op reduces to the same primitives the shape handlers already use — host-computed
 //! gather/scatter index maps + `take`/`take_along_axis`/`scatter_add` + on-device coordinate
-//! arithmetic — so they translate exactly to MLX with no bespoke kernel. Only the static, float
-//! forms the C++ claim accepts are claimed; exotic forms (cubic GridSample, 5-D volumetric,
-//! adaptive RoiAlign `sampling_ratio==0`, the 3-input MaxUnpool, non-float payloads) are left to CPU.
+//! arithmetic — so they translate exactly to MLX with no bespoke kernel. ROI pooling and MaxUnpool
+//! accept symbolic extents; host-read MaxUnpool controls stay eager unless constant. Unsupported
+//! forms (cubic GridSample, 5-D volumetric, adaptive RoiAlign `sampling_ratio==0`, non-float
+//! payloads) are left to CPU.
 //! NonMaxSuppression is host-computed because MLX has no data-dependent compacting primitive.
 
 use std::cmp::Ordering;
@@ -798,6 +799,11 @@ fn roi_align_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxErr
     let rois = astype(ctx, r0, mlx::mlx_dtype__MLX_FLOAT32)?; // [R,4]
     let rr = ctx.shape_of(rois)[0];
     let b0 = ctx.resolve(&n.inputs[2])?;
+    if hh <= 0 || ww <= 0 || ctx.shape_of(b0) != [rr] {
+        return Err(
+            "RoiAlign: positive spatial dimensions and one batch index per ROI are required".into(),
+        );
+    }
     let batch_idx = astype(ctx, b0, mlx::mlx_dtype__MLX_INT32)?; // [R]
 
     let mode = n.strings.get("mode").map(String::as_str).unwrap_or("avg");
@@ -805,7 +811,11 @@ fn roi_align_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxErr
         .strings
         .get("coordinate_transformation_mode")
         .map(String::as_str)
-        .unwrap_or("half_pixel");
+        .unwrap_or(if n.since_version < 16 {
+            "output_half_pixel"
+        } else {
+            "half_pixel"
+        });
     let half_pixel = ctm == "half_pixel";
     let is_max = mode == "max";
     let oh = n.ints.get("output_height").copied().unwrap_or(1) as i32;
@@ -982,18 +992,18 @@ fn roi_align_claim(node: &NodeView) -> ClaimResult {
         crate::registry::ort_dtype_name(out.dtype)
     );
     require!(
-        x.shape.len() == 4 && x.shape.iter().all(|&d| d >= 0),
-        "input must have static rank-4 shape, got {:?}",
+        x.shape.len() == 4,
+        "input must have rank-4 shape, got {:?}",
         x.shape
     );
     require!(
-        r.shape.len() == 2 && r.shape[1] == 4 && r.shape.iter().all(|&d| d >= 0),
-        "rois must have static shape [R,4], got {:?}",
+        r.shape.len() == 2 && r.shape[1] == 4,
+        "rois must have shape [R,4], got {:?}",
         r.shape
     );
     require!(
-        b.shape.len() == 1 && b.shape.iter().all(|&d| d >= 0),
-        "batch_indices must have static rank-1 shape, got {:?}",
+        b.shape.len() == 1,
+        "batch_indices must have rank-1 shape, got {:?}",
         b.shape
     );
     let sampling_ratio = node.int_attr("sampling_ratio", 0);
@@ -1006,7 +1016,36 @@ fn roi_align_claim(node: &NodeView) -> ClaimResult {
         mode == "avg" || mode == "max",
         "mode must be \"avg\" or \"max\", got {mode:?}"
     );
-    let ctm = node.string_attr("coordinate_transformation_mode", "half_pixel");
+    require!(
+        x.shape[2] != 0
+            && x.shape[3] != 0
+            && (b.shape[0] < 0 || r.shape[0] < 0 || b.shape[0] == r.shape[0]),
+        "spatial dimensions must be positive and batch_indices must match the ROI count"
+    );
+    require!(
+        node.int_attr("output_height", 1) > 0 && node.int_attr("output_width", 1) > 0,
+        "output_height and output_width must be positive"
+    );
+    require!(
+        [
+            node.int_attr("output_height", 1),
+            node.int_attr("output_width", 1),
+            sampling_ratio,
+            sampling_ratio,
+        ]
+        .iter()
+        .try_fold(1i64, |size, &dim| size.checked_mul(dim))
+        .is_some_and(|size| size <= i32::MAX as i64),
+        "output grid and sampling ratio product must fit int32"
+    );
+    let ctm = node.string_attr(
+        "coordinate_transformation_mode",
+        if node.since_version() < 16 {
+            "output_half_pixel"
+        } else {
+            "half_pixel"
+        },
+    );
     require!(
         ctm == "half_pixel" || ctm == "output_half_pixel",
         "coordinate_transformation_mode must be \"half_pixel\" or \"output_half_pixel\", got {ctm:?}"
@@ -1024,6 +1063,9 @@ fn max_roi_pool_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), Mlx
     let xin = astype(ctx, xc, mlx::mlx_dtype__MLX_FLOAT32)?;
     let xs = ctx.shape_of(xin);
     let (cc, hh, ww) = (xs[1], xs[2], xs[3]);
+    if hh <= 0 || ww <= 0 {
+        return Err("MaxRoiPool: spatial dimensions must be positive".into());
+    }
 
     let r0 = ctx.resolve(&n.inputs[1])?;
     let rois = astype(ctx, r0, mlx::mlx_dtype__MLX_FLOAT32)?; // [R,5]
@@ -1107,7 +1149,7 @@ fn max_roi_pool_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), Mlx
     let lt_w = ctx.binary(mlx::mlx_less, w_idx, wend3)?;
     let mask_w = ctx.binary(mlx::mlx_logical_and, ge_w, lt_w)?; // [R,PW,W]
 
-    let neg = scalar_f(ctx, -3.0e38);
+    let neg = scalar_f(ctx, f32::MIN);
     let xb = take_axis(ctx, xin, batch_idx, 0)?; // [R,C,H,W]
 
     // Masked max over H: [R,PH,C,H,W] -> [R,PH,C,W].
@@ -1158,14 +1200,18 @@ fn max_roi_pool_claim(node: &NodeView) -> ClaimResult {
         crate::registry::ort_dtype_name(out.dtype)
     );
     require!(
-        x.shape.len() == 4 && x.shape.iter().all(|&d| d >= 0),
-        "input must have static rank-4 shape, got {:?}",
+        x.shape.len() == 4,
+        "input must have rank-4 shape, got {:?}",
         x.shape
     );
     require!(
-        r.shape.len() == 2 && r.shape[1] == 5 && r.shape.iter().all(|&d| d >= 0),
-        "rois must have static shape [R,5], got {:?}",
+        r.shape.len() == 2 && r.shape[1] == 5,
+        "rois must have shape [R,5], got {:?}",
         r.shape
+    );
+    require!(
+        x.shape[2] != 0 && x.shape[3] != 0,
+        "spatial dimensions must be positive"
     );
     let (present, pooled) = node.ints_attr("pooled_shape");
     require!(
@@ -1174,21 +1220,20 @@ fn max_roi_pool_claim(node: &NodeView) -> ClaimResult {
         pooled
     );
     require!(
-        pooled[0] >= 1 && pooled[1] >= 1,
-        "pooled_shape dimensions must be positive, got {:?}",
+        pooled.iter().all(|&v| v >= 1 && v <= i32::MAX as i64),
+        "pooled_shape dimensions must be positive int32 values, got {:?}",
         pooled
     );
     Ok(())
 }
 
 // =================================================================================================
-// MaxUnpool (2-input form)
+// MaxUnpool
 // =================================================================================================
 
 fn max_unpool_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
     let x0 = ctx.resolve(&n.inputs[0])?;
-    let xc = contiguous(ctx, x0)?;
-    let xin = astype(ctx, xc, mlx::mlx_dtype__MLX_FLOAT32)?;
+    let xin = contiguous(ctx, x0)?;
     let xs = ctx.shape_of(xin);
     let nn = xs[0];
     let cc = xs[1];
@@ -1210,25 +1255,66 @@ fn max_unpool_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxEr
         .cloned()
         .unwrap_or_else(|| vec![0; 2 * r]);
 
-    let mut total: i64 = nn as i64 * cc as i64;
-    let mut s_out: i64 = 1;
     let mut out_shape = vec![nn, cc];
     for d in 0..r {
-        total *= xs[2 + d] as i64;
         let od = (xs[2 + d] as i64 - 1) * strides[d] - (pads[d] + pads[r + d]) + kernel[d];
-        out_shape.push(od as i32);
-        s_out *= od;
+        out_shape.push(i32::try_from(od).map_err(|_| "MaxUnpool: output extent exceeds int32")?);
     }
-
-    let total_out = nn * cc * s_out as i32;
+    if input_present(n, 2) {
+        let shape = ctx.resolve(&n.inputs[2])?;
+        let shape = ctx.contiguous_eval(shape)?;
+        if ctx.shape_of(shape) != [xs.len() as i32] {
+            return Err(
+                "MaxUnpool: output_shape must be a vector with one entry per input axis".into(),
+            );
+        }
+        let values =
+            unsafe { std::slice::from_raw_parts(mlx::mlx_array_data_int64(shape), xs.len()) };
+        out_shape = values
+            .iter()
+            .map(|&v| {
+                i32::try_from(v).map_err(|_| "MaxUnpool: output_shape extent exceeds int32".into())
+            })
+            .collect::<Result<Vec<_>, MlxError>>()?;
+        if out_shape[..2] != xs[..2] {
+            return Err("MaxUnpool: output_shape batch and channel dimensions must match X".into());
+        }
+    }
+    if out_shape[2..].iter().any(|&d| d <= 0) {
+        return Err("MaxUnpool: output spatial dimensions must be positive".into());
+    }
+    let total =
+        i32::try_from(ctx.size_of(xin)).map_err(|_| "MaxUnpool: input size exceeds int32")?;
+    let total_out = out_shape
+        .iter()
+        .try_fold(1i32, |size, &dim| size.checked_mul(dim))
+        .ok_or("MaxUnpool: output size exceeds int32")?;
     let out_acc = zeros_1d(ctx, total_out)?;
+    let out_acc = astype(ctx, out_acc, ctx.dtype_of(xin))?;
 
     let idx0 = ctx.resolve(&n.inputs[1])?;
+    if ctx.shape_of(idx0) != xs {
+        return Err("MaxUnpool: indices shape must match X".into());
+    }
+    if total == 0 {
+        let output = reshape(ctx, out_acc, &out_shape)?;
+        ctx.bind(&n.outputs[0], output);
+        return Ok(());
+    }
+    let idx0 = ctx.contiguous_eval(idx0)?;
+    let indices =
+        unsafe { std::slice::from_raw_parts(mlx::mlx_array_data_int64(idx0), total as usize) };
+    if indices.iter().any(|&i| i < 0 || i >= i64::from(total_out)) {
+        return Err("MaxUnpool: indices must be within the flattened output".into());
+    }
     let idx_i = astype(ctx, idx0, mlx::mlx_dtype__MLX_INT32)?;
-    let idx = reshape(ctx, idx_i, &[total as i32])?;
-    let updates = reshape(ctx, xin, &[total as i32, 1])?;
-
-    let scattered = scatter_add(ctx, out_acc, idx, updates)?;
+    let idx = reshape(ctx, idx_i, &[total])?;
+    let updates = reshape(ctx, xin, &[total, 1])?;
+    let mut indices = VectorArray::new();
+    indices.append(idx);
+    let scattered = ctx.emit(|res, s| unsafe {
+        mlx::mlx_scatter(res, out_acc, indices.as_raw(), updates, [0].as_ptr(), 1, s)
+    })?;
     let out = reshape(ctx, scattered, &out_shape)?;
     let out = astype(ctx, out, out_dtype(n))?;
     let y = contiguous(ctx, out)?;
@@ -1237,10 +1323,9 @@ fn max_unpool_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxEr
 }
 
 fn max_unpool_claim(node: &NodeView) -> ClaimResult {
-    // 2-input form only: an explicit output_shape (input 2) may crop/pad -> leave to CPU.
     require!(
-        node.num_inputs() == 2 && !node.input_present(2) && node.num_outputs() == 1,
-        "only the 2-input form with 1 output is supported, got {}in/{}out",
+        (2..=3).contains(&node.num_inputs()) && node.num_outputs() == 1,
+        "expects 2 or 3 inputs and 1 output, got {}in/{}out",
         node.num_inputs(),
         node.num_outputs()
     );
@@ -1249,19 +1334,25 @@ fn max_unpool_claim(node: &NodeView) -> ClaimResult {
         _ => deny!("missing tensor type/shape info on an input or the output"),
     };
     require!(
-        is_mlx_float(x.dtype) && out.dtype == x.dtype && is_int_index(i.dtype),
-        "input/output must share one float dtype and indices must be int32/int64, got {} / {} -> {}",
+        is_mlx_float(x.dtype)
+            && out.dtype == x.dtype
+            && i.dtype == ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64,
+        "input/output must share one float dtype and indices must be int64, got {} / {} -> {}",
         crate::registry::ort_dtype_name(x.dtype),
         crate::registry::ort_dtype_name(i.dtype),
         crate::registry::ort_dtype_name(out.dtype)
     );
     require!(
-        x.shape.len() >= 3 && x.shape.len() <= 5 && x.shape.iter().all(|&d| d >= 0),
-        "input must have static rank 3-5 shape, got {:?}",
+        x.shape.len() >= 3 && x.shape.len() <= 5,
+        "input must have rank 3-5 shape, got {:?}",
         x.shape
     );
     require!(
-        i.shape == x.shape,
+        i.shape.len() == x.shape.len()
+            && i.shape
+                .iter()
+                .zip(&x.shape)
+                .all(|(&i, &x)| i < 0 || x < 0 || i == x),
         "indices shape must match input shape, got {:?} vs {:?}",
         i.shape,
         x.shape
@@ -1286,6 +1377,23 @@ fn max_unpool_claim(node: &NodeView) -> ClaimResult {
         2 * r,
         pads
     );
+    require!(
+        kernel.iter().all(|&v| v > 0 && v <= i32::MAX as i64)
+            && strides.iter().all(|&v| v > 0 && v <= i32::MAX as i64)
+            && pads.iter().all(|&v| v >= 0 && v <= i32::MAX as i64),
+        "kernel and strides must be positive int32 values and pads non-negative int32 values"
+    );
+    if node.input_present(2) {
+        let shape = match node.input_info(2) {
+            Some(shape) => shape,
+            None => deny!("missing output_shape tensor info"),
+        };
+        require!(
+            shape.dtype == ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64
+                && shape.shape == [x.shape.len() as i64],
+            "output_shape must be an int64 vector with one entry per input axis"
+        );
+    }
     Ok(())
 }
 
