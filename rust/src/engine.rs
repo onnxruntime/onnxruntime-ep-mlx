@@ -22,6 +22,7 @@ pub enum Src {
 /// control-flow BODY initializer the bytes are COPIED into `owned` (the subgraph handle is released
 /// after the compile-time walk), and `data` points into that owned buffer; for an ordinary
 /// session-owned initializer `owned` is `None` and `data` points at ORT's storage.
+/// String metadata has no raw payload; array resolution must not interpret it as numeric bytes.
 #[derive(Clone)]
 pub struct InitData {
     pub data: *const c_void,
@@ -983,6 +984,11 @@ impl<'a> TranslationContext<'a> {
                     return Ok(*a);
                 }
                 let (data, shape, dtype) = self.read_ctx_input(r.ctx_index)?;
+                if !crate::registry::is_movable(dtype) {
+                    return Err(format!(
+                        "MLX: tensor payload dtype {dtype} has no MLX representation"
+                    ));
+                }
                 let ishape: Vec<i32> = shape
                     .iter()
                     .map(|&d| dim_i32(d))
@@ -1011,6 +1017,12 @@ impl<'a> TranslationContext<'a> {
                     .init
                     .as_ref()
                     .ok_or_else(|| format!("MLX: initializer {} has no data", r.name))?;
+                if !crate::registry::is_movable(init.dtype) {
+                    return Err(format!(
+                        "MLX: initializer payload dtype {} has no MLX representation",
+                        init.dtype,
+                    ));
+                }
                 // Body-local initializers may legally shadow an outer/other-branch name. Qualify
                 // copied body constants by their stable owned allocation so branch specialization
                 // cannot reuse a same-named constant from another scope.
@@ -1071,6 +1083,35 @@ impl<'a> TranslationContext<'a> {
         }
     }
 
+    pub fn tensor_shape(&mut self, r: &TensorRef) -> Result<Vec<i64>, MlxError> {
+        match r.source {
+            Src::CtxInput => {
+                if let Some(&array) = self.env.get(&r.name) {
+                    return Ok(self.shape_of(array).into_iter().map(i64::from).collect());
+                }
+                if self.in_general_trace || self.in_compiled_trace {
+                    return Err(format!(
+                        "MLX: missing traced tensor metadata input {}",
+                        r.name
+                    ));
+                }
+                let value = read_ctx_input_value(self.ort_api, self.kctx, r.ctx_index)?;
+                let (shape, _) = read_ort_tensor_metadata(unsafe { &*self.ort_api }, value)?;
+                Ok(shape)
+            }
+            Src::Initializer => r
+                .init
+                .as_ref()
+                .map(|init| init.shape.clone())
+                .ok_or_else(|| format!("MLX: initializer {} has no metadata", r.name)),
+            Src::Intermediate => {
+                let array = self.resolve(r)?;
+                Ok(self.shape_of(array).into_iter().map(i64::from).collect())
+            }
+            Src::Absent => Err("MLX: absent tensor metadata input".into()),
+        }
+    }
+
     /// Whether an optional tensor reaches this fused node's input boundary.
     ///
     /// ORT 1.29 may return a non-null placeholder for an empty optional, so pointer-nullness alone
@@ -1106,15 +1147,7 @@ impl<'a> TranslationContext<'a> {
         }
         unsafe {
             let api = &*self.ort_api;
-            let mut value = std::ptr::null();
-            ort_status(
-                api,
-                (api.KernelContext_GetInput.unwrap())(self.kctx, r.ctx_index, &mut value),
-                "KernelContext_GetInput(sequence)",
-            )?;
-            if value.is_null() {
-                return Err("MLX: sequence input is absent".into());
-            }
+            let value = read_ctx_input_value(self.ort_api, self.kctx, r.ctx_index)?;
             let mut kind = 0;
             ort_status(
                 api,
@@ -2202,10 +2235,10 @@ fn ort_status(
     }
 }
 
-fn read_ort_tensor_raw(
+fn read_ort_tensor_metadata(
     api: &ort::OrtApi,
     value: *const ort::OrtValue,
-) -> Result<(*const c_void, Vec<i64>, ort::ONNXTensorElementDataType), MlxError> {
+) -> Result<(Vec<i64>, ort::ONNXTensorElementDataType), MlxError> {
     unsafe {
         let mut info = std::ptr::null_mut();
         let result = ort_status(
@@ -2235,16 +2268,7 @@ fn read_ort_tensor_raw(
                 (api.GetTensorElementType.unwrap())(info, &mut dtype),
                 "GetTensorElementType",
             )?;
-            let mut data = std::ptr::null();
-            ort_status(
-                api,
-                (api.GetTensorData.unwrap())(value, &mut data),
-                "GetTensorData",
-            )?;
-            if !shape.contains(&0) && data.is_null() {
-                return Err("MLX: ORT returned null data for a nonempty tensor".into());
-            }
-            Ok((data, shape, dtype))
+            Ok((shape, dtype))
         });
         if !info.is_null() {
             (api.ReleaseTensorTypeAndShapeInfo.unwrap())(info);
@@ -2253,11 +2277,28 @@ fn read_ort_tensor_raw(
     }
 }
 
-pub(crate) fn read_ctx_input_raw(
+fn read_ort_tensor_raw(
+    api: &ort::OrtApi,
+    value: *const ort::OrtValue,
+) -> Result<(*const c_void, Vec<i64>, ort::ONNXTensorElementDataType), MlxError> {
+    let (shape, dtype) = read_ort_tensor_metadata(api, value)?;
+    let mut data = std::ptr::null();
+    ort_status(
+        api,
+        unsafe { (api.GetTensorData.unwrap())(value, &mut data) },
+        "GetTensorData",
+    )?;
+    if !shape.contains(&0) && data.is_null() {
+        return Err("MLX: ORT returned null data for a nonempty tensor".into());
+    }
+    Ok((data, shape, dtype))
+}
+
+fn read_ctx_input_value(
     ort_api: *const ort::OrtApi,
     kctx: *mut ort::OrtKernelContext,
     index: usize,
-) -> Result<(*const c_void, Vec<i64>, ort::ONNXTensorElementDataType), MlxError> {
+) -> Result<*const ort::OrtValue, MlxError> {
     unsafe {
         let api = &*ort_api;
         let mut val: *const ort::OrtValue = std::ptr::null();
@@ -2271,8 +2312,17 @@ pub(crate) fn read_ctx_input_raw(
                 "MLX: KernelContext_GetInput({index}) returned no value"
             ));
         }
-        read_ort_tensor_raw(api, val)
+        Ok(val)
     }
+}
+
+pub(crate) fn read_ctx_input_raw(
+    ort_api: *const ort::OrtApi,
+    kctx: *mut ort::OrtKernelContext,
+    index: usize,
+) -> Result<(*const c_void, Vec<i64>, ort::ONNXTensorElementDataType), MlxError> {
+    let value = read_ctx_input_value(ort_api, kctx, index)?;
+    read_ort_tensor_raw(unsafe { &*ort_api }, value)
 }
 
 /// Create the ORT output tensor with the MLX result shape and memcpy on unified memory; when

@@ -145,7 +145,7 @@ impl GraphSidecars {
                 }
             }
         }
-        let raw_initializers = unsafe { collect_initializer_bytes(api, graph)? };
+        let raw_initializers = unsafe { collect_initializer_bytes(api, graph, snapshot)? };
         let mut initializers = HashMap::new();
         for &value in snapshot.initializers.keys() {
             let name = &snapshot.values[&value].name;
@@ -528,6 +528,7 @@ fn snapshot_initializer_data(
 unsafe fn collect_initializer_bytes(
     api: &ort::OrtApi,
     graph: *const ort::OrtGraph,
+    snapshot: &OrtGraphSnapshot,
 ) -> Result<HashMap<String, *const c_void>, String> {
     let mut count = 0;
     check(
@@ -546,6 +547,20 @@ unsafe fn collect_initializer_bytes(
     let mut result = HashMap::new();
     for info in infos {
         let name = unsafe { value_name(api, info)? };
+        let string_metadata = snapshot
+            .value_by_name
+            .get(&name)
+            .and_then(|id| snapshot.initializers.get(id))
+            .and_then(|metadata| metadata.dtype)
+            .is_some_and(|dtype| {
+                dtype.to_onnx() as u32
+                    == ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_STRING
+            });
+        if string_metadata {
+            // String payloads have no raw tensor buffer; type-only consumers need only metadata.
+            result.insert(name, ptr::null());
+            continue;
+        }
         let mut value = ptr::null();
         let status = unsafe { (api.ValueInfo_GetInitializerValue.unwrap())(info, &mut value) };
         if !status.is_null() {
@@ -604,11 +619,13 @@ unsafe fn initializer_data(
             "reading initializer count",
         )?;
         let mut data = ptr::null();
-        check(
-            api,
-            (api.GetTensorData.unwrap())(value, &mut data),
-            "reading initializer data",
-        )?;
+        if dtype != ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_STRING {
+            check(
+                api,
+                (api.GetTensorData.unwrap())(value, &mut data),
+                "reading initializer data",
+            )?;
+        }
         Ok(InitData {
             data,
             shape,

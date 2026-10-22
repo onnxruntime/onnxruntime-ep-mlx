@@ -629,6 +629,29 @@ impl NodeView {
             .and_then(|kind| kind.tensor().cloned())
     }
 
+    pub fn input_rank_known(&self, i: usize) -> Option<bool> {
+        let values = self.inputs_raw();
+        let &value = values.get(i)?;
+        if value.is_null() {
+            return None;
+        }
+        unsafe {
+            let mut info = std::ptr::null();
+            let status = (self.api().GetValueInfoTypeInfo.unwrap())(value, &mut info);
+            if !status.is_null() || info.is_null() {
+                self.release_status(status);
+                return None;
+            }
+            let mut tensor = std::ptr::null();
+            let status = (self.api().CastTypeInfoToTensorInfo.unwrap())(info, &mut tensor);
+            if !status.is_null() || tensor.is_null() {
+                self.release_status(status);
+                return None;
+            }
+            Some((self.api().TensorTypeAndShape_HasShape.unwrap())(tensor))
+        }
+    }
+
     /// Element type + shape of output `i` (None if omitted / non-tensor).
     pub fn output_info(&self, i: usize) -> Option<SlotInfo> {
         let outs = self.outputs_raw();
