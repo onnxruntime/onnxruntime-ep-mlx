@@ -122,6 +122,7 @@ fn host_parameter_indices(n: &NodeDesc) -> &'static [usize] {
         "HannWindow" | "HammingWindow" | "BlackmanWindow" => &[0],
         "MelWeightMatrix" => &[0, 1, 2, 3, 4],
         "MaxUnpool" => &[1, 2],
+        "TensorScatter" => &[2],
         "CumSum" | "CumProd" => &[1],
         "RNN" | "GRU" | "LSTM" => &[4],
         "ReduceSum" | "ReduceMean" | "ReduceMax" | "ReduceMin" | "ReduceProd"
@@ -1590,8 +1591,36 @@ mod shape_inference_tests {
                 assert!(reads_unguarded_parameter(&node, true));
                 assert!(reads_data_dependent_parameter(&node));
             }
+
             node.inputs[index].source = Src::Initializer;
         }
+    }
+
+    #[test]
+    fn tensor_scatter_never_captures_live_write_indices() {
+        let mut node = NodeDesc::new(
+            "TensorScatter".to_string(),
+            String::new(),
+            24,
+            CompileShapeSafety::ShapeKeyedOnly {
+                reason: crate::registry::MLX_SLICE_SHAPE_REASON,
+            },
+        );
+        node.inputs = vec![
+            input("past", Src::CtxInput),
+            input("update", Src::CtxInput),
+            input("indices", Src::Initializer),
+        ];
+        assert!(!reads_data_dependent_parameter(&node));
+        for source in [Src::CtxInput, Src::Intermediate] {
+            node.inputs[2].source = source;
+            assert!(reads_data_dependent_parameter(&node));
+            assert!(reads_unguarded_parameter(&node, true));
+            assert!(boundary_shape_inputs(std::slice::from_ref(&node)).is_empty());
+            assert!(!general_enabled(false, std::slice::from_ref(&node)));
+        }
+        node.inputs[2].source = Src::Absent;
+        assert!(!reads_data_dependent_parameter(&node));
     }
 
     #[test]
