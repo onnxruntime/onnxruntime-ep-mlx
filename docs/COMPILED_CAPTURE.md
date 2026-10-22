@@ -81,10 +81,20 @@ The MLX 0.32.2 audit found these missing-`output_shapes` primitives in current l
 | `FFT` | DFT/STFT |
 | `CustomKernel` | the fused selective-scan branch inside ONNX Scan |
 
-`GroupQueryAttention` is classified per node. Claimable non-sliding forms without attention bias use
-the slice-free shapeless decode configuration (data-fed RoPE rows plus shape-preserving cache
-updates). Sliding-window and attention-bias forms emit `Slice` and remain `EagerOnly`; unsupported
-forms are also denied compilation conservatively.
+`GroupQueryAttention` is classified per node. Single-batch causal forms with past caches, without
+sliding/local windows or attention bias, retain the slice-free shapeless decode configuration
+(exact data-fed RoPE cache rows plus shape-preserving cache updates). Ragged/dynamic batches,
+no-past, local/bidirectional, sliding-window and attention-bias forms remain claimed but `EagerOnly`:
+their per-batch cache writes, rotary positions and masks use live sequence lengths on every call.
+Supplied rotary caches are never replaced by frequencies inferred from a sample row.
+The growing/fixed-capacity cache contract is also checked on every apply: equal-shaped rollback
+lengths that change that contract use eager lowering, while returning to the traced contract reuses
+the existing closure.
+
+Standalone rotary positions are range-checked before narrowing to MLX indices, including before
+every compiled replay. Boundary-provided positions retain compilation; graph-produced positions
+(or offset spans whose input shape is internal) require eager validation instead of capturing a
+first-call bounds check.
 
 In decoder graphs, shapeless, shape-keyed-only, and eager-only nodes receive distinct partition
 colours. Stricter nodes remain claimed by MLX without disabling a more capable neighbouring

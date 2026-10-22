@@ -149,7 +149,7 @@ The EP claims only the following ONNX op forms. All other ops remain on CPU.
 | ONNX op | Domain | Claimed form | MLX target(s) | Notes |
 |---|---|---|---|---|
 | **MatMulNBits** | `com.microsoft` | int4 block quantized weights, `bits=4`, `block_size=32` | `mlx_quantized_matmul` | Packed uint8 int4 weights are repacked once to MLX affine-quant format and cached persistently on the plan. |
-| **GroupQueryAttention** | `com.microsoft` | 9-input separate-QKV form; matching `fp32`/`fp16`/`bf16` Q/K/V/past_k/past_v/cos/sin; `int32` `seqlens_k`/`total_seq`; RoPE applied in-op | `mlx_fast_scaled_dot_product_attention` + `mlx_fast_rope` | Writes present K/V to the same ORT ctx outputs in `[B, kv_heads, total_seq, head]` native-float layout. |
+| **GroupQueryAttention** | `com.microsoft` | Separate/packed QKV; optional paired past caches, rotary caches, bias and Q/K norm; matching `fp32`/`fp16`/`bf16`; live `int32` sequence lengths; causal/bidirectional and local/sliding forms | `mlx_fast_scaled_dot_product_attention` + exact cache-based RoPE | Ragged entries use their own cache-write offsets and rotary positions. Single-batch causal decoder forms retain compiled replay; other supported geometry is eager. |
 | **RMSNormalization** | `ai.onnx` | `axis=-1`, `fp32`/`fp16`/`bf16` | `mlx_fast_rms_norm` | Gamma is cached from live context data on first run. |
 | **SkipSimplifiedLayerNormalization** | `com.microsoft` | supported floating input/skip/gamma | skip-add + `mlx_fast_rms_norm` | Preserves the residual+RMS behavior expected by decoder graphs. |
 | **GatherBlockQuantized** | `com.microsoft` | SYMMETRIC int4 embedding only, 3-input form, `zp=8` | gather + int4 dequant | The asymmetric 4-input `zero_points` form is intentionally not claimed and falls back to CPU. MLX `zero_points` support is a follow-up. |
@@ -168,12 +168,13 @@ The hand-kernel era claimed or planned several ops that the current MLX translat
 - `SiLU`
 - `Swish`
 - `Gelu`
-- standalone `RotaryEmbedding`
 - `Reshape`
 - `Transpose`
 - `Concat`
 
-The important distinction is that RoPE inside `GroupQueryAttention` is still translated through `mlx_fast_rope`; the standalone ONNX `RotaryEmbedding` op is not.
+Both in-op and standalone `RotaryEmbedding` consume the supplied cos/sin values exactly, including
+scaled/nonlinear caches and one-row caches. Offset, explicit-position and per-position-cache forms
+use the same rotation semantics; no cache-frequency reconstruction is assumed.
 
 ### 3.2 Constant and initializer caching
 

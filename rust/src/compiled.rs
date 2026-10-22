@@ -546,6 +546,9 @@ fn detect_shared_kv(
         } else {
             continue;
         };
+        if s <= 0 || total < s || total - s > cap {
+            return None;
+        }
         return Some((cap > total - s, mask_ctx_index, total_seq_ctx_index));
     }
     None
@@ -626,6 +629,20 @@ pub fn try_compiled(
     if !slot.get(unsafe { &*plan_ptr }).enabled {
         return Ok(false);
     }
+    {
+        let nodes: Vec<_> = unsafe { &*plan_ptr }
+            .nodes
+            .iter()
+            .filter(|n| crate::ops::attention::needs_rotary_position_validation(n))
+            .cloned()
+            .collect();
+        if !nodes.is_empty() {
+            let mut ctx = TranslationContext::new(unsafe { &mut *plan_ptr }, api, kctx, stream);
+            if !crate::ops::attention::validate_compiled_rotary_positions(&mut ctx, &nodes)? {
+                return Ok(false);
+            }
+        }
+    }
     let general = &unsafe { &*plan_ptr }.general;
     let host_specialization_token = if slot == Slot::General
         && (general.control_flow_specialization_enabled
@@ -674,7 +691,7 @@ pub fn try_compiled(
             .any(|n| n.op_type == "GroupQueryAttention");
         let has_separate_attention = plan.nodes.iter().any(is_separate_qkv_attention);
         let has_fused_gqa_rope = plan.nodes.iter().any(|n| {
-            n.op_type == "GroupQueryAttention" && n.ints.get("do_rotary").copied().unwrap_or(1) != 0
+            n.op_type == "GroupQueryAttention" && n.ints.get("do_rotary").copied().unwrap_or(0) != 0
         });
         if has_gqa && !has_fused_gqa_rope {
             // Qwen exports standalone RotaryEmbedding nodes and sets GQA do_rotary=0. Keep the
@@ -711,6 +728,16 @@ pub fn try_compiled(
     }
     if !slot.get(unsafe { &*plan_ptr }).valid {
         return Ok(false);
+    }
+    if cfg.kv_alias {
+        let Some((shared, _, _)) = detect_shared_kv(unsafe { &*plan_ptr }, api, kctx) else {
+            return Ok(false);
+        };
+        if shared != slot.get(unsafe { &*plan_ptr }).shared_kv {
+            // Equal-shaped live lengths may switch growing versus fixed-capacity cache semantics.
+            // Reuse the closure only for the cache contract it traced.
+            return Ok(false);
+        }
     }
 
     // Shape-keyed guard: skip (=> eager) when any dynamic input is an empty tensor (a zero-size dim).
@@ -1055,8 +1082,7 @@ fn build_closure(
                 if node.op_type != "GroupQueryAttention" || node.inputs.len() < 9 {
                     continue;
                 }
-                let do_rotary = !node.ints.contains_key("do_rotary")
-                    || node.ints.get("do_rotary").copied() != Some(0);
+                let do_rotary = node.ints.get("do_rotary").copied().unwrap_or(0) != 0;
                 if !do_rotary {
                     continue;
                 }
@@ -1065,7 +1091,7 @@ fn build_closure(
                     if synth_seen.insert(nm.clone()) {
                         synth_ropes.push(SynthRope {
                             key: rope_row_key(nm),
-                            cache_name: nm.clone(),
+                            cache_name: node.inputs[idx].cache_key(),
                         });
                     }
                 }
