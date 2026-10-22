@@ -25,9 +25,9 @@ from pathlib import Path
 from hatchling.builders.hooks.plugin.interface import BuildHookInterface
 
 PLUGIN_DYLIB = "libonnxruntime_mlx_ep.dylib"
-MLX_VERSION = "0.32.2"
-MLX_COMMIT = "1f8e74e3f12f31365464a6867c6579f0e9b29d85"
-MLXC_COMMIT = "c74db5307cc8ce122f48d97ef951b30578674e7f"
+MLX_VERSION = "0.32.4"
+MLX_COMMIT = "36969c094354086e15d2a327a9c50feb20b9cf11"
+MLXC_COMMIT = "57731b00e8bed710e0750e7356da9f18f8eb3e20"
 
 
 def _dependency_prefix(env_name: str) -> Path:
@@ -107,12 +107,12 @@ def _ensure_mlx(project_root: Path) -> None:
     expected = (
         "#define MLX_VERSION_MAJOR 0",
         "#define MLX_VERSION_MINOR 32",
-        "#define MLX_VERSION_PATCH 2",
+        "#define MLX_VERSION_PATCH 4",
     )
     if not all(line in version_text for line in expected):
         raise RuntimeError(f"MLX_PREFIX must provide MLX {MLX_VERSION}: {mlx_prefix}")
     if "mlx_cumsum_axis(" not in ops_text or "force_fused" not in fast_text:
-        raise RuntimeError(f"MLXC_PREFIX does not provide the MLX 0.32.2 C ABI: {mlxc_prefix}")
+        raise RuntimeError(f"MLXC_PREFIX does not provide the MLX {MLX_VERSION} C ABI: {mlxc_prefix}")
 
 
 class CustomBuildHook(BuildHookInterface):

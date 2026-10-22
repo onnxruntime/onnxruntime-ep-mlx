@@ -65,12 +65,13 @@ fragmentation.
 ## Build from source
 
 Source builds require a Rust toolchain, CMake 3.25+, a C++20 compiler, `curl`, `unzip`, and the
-ONNX Runtime 1.31 headers. The setup script pins MLX 0.32.2 (`1f8e74e3`) and mlx-c (`c74db530`);
+ONNX Runtime 1.31 headers. The setup script pins MLX 0.32.4 (`36969c09`) and mlx-c (`57731b00`);
 both are required build dependencies.
+The mlx-c revision explicitly targets MLX 0.32.4; its latest tag, v0.7.0, still targets 0.32.2.
 
 ```sh
-rust/scripts/setup_mlx.sh "$PWD/.deps/mlx-0.32.2"
-export MLX_PREFIX="$PWD/.deps/mlx-0.32.2"
+rust/scripts/setup_mlx.sh "$PWD/.deps/mlx-0.32.4"
+export MLX_PREFIX="$PWD/.deps/mlx-0.32.4"
 export MLXC_PREFIX="$MLX_PREFIX"
 export ORT_HOME=/path/to/onnxruntime-osx-arm64-1.31.0
 cargo build --manifest-path rust/Cargo.toml --release

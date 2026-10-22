@@ -23,9 +23,19 @@ fn div_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
     let a = ctx.resolve(&n.inputs[0])?;
     let b = ctx.resolve(&n.inputs[1])?;
     let r = if ctx.dtype_of(a) == mlx::mlx_dtype__MLX_INT32 {
-        // MLX 0.32.2's integer floor_divide emits Divide with integer inputs: its kernel
-        // uses integer `/` (truncation toward zero), unlike divide's fp32 promotion.
-        ctx.binary(mlx::mlx_floor_divide, a, b)?
+        // MLX 0.32.4 floors integer quotients; ONNX truncates toward zero.
+        // Correct only inexact opposite-sign quotients, without float promotion
+        // or negating INT_MIN.
+        let quotient = ctx.binary(mlx::mlx_floor_divide, a, b)?;
+        let remainder = ctx.binary(mlx::mlx_remainder, a, b)?;
+        let zero = ctx.scalar_i32(0);
+        let negative_a = ctx.binary(mlx::mlx_less, a, zero)?;
+        let negative_b = ctx.binary(mlx::mlx_less, b, zero)?;
+        let opposite_signs = ctx.binary(mlx::mlx_not_equal, negative_a, negative_b)?;
+        let inexact = ctx.binary(mlx::mlx_not_equal, remainder, zero)?;
+        let correction = ctx.binary(mlx::mlx_logical_and, opposite_signs, inexact)?;
+        let correction = ctx.astype(correction, mlx::mlx_dtype__MLX_INT32)?;
+        ctx.binary(mlx::mlx_add, quotient, correction)?
     } else {
         ctx.binary(mlx::mlx_divide, a, b)?
     };

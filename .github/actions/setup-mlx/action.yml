@@ -9,7 +9,7 @@ inputs:
     description: Immutable MLX release commit
     required: true
   mlxc-commit:
-    description: mlx-c commit whose CMake pin matches the MLX release
+    description: Immutable mlx-c commit whose CMake pin matches the MLX release
     required: true
 
 runs:

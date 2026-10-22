@@ -37,9 +37,9 @@ jobs:
       ORT_VERSION: "1.31.0"
       # Latest released ONNX; backend.prepare handles proven runtime/API capability limits.
       ONNX_VERSION: "1.23.2"
-      MLX_VERSION: "0.32.2"
-      MLX_COMMIT: "1f8e74e3f12f31365464a6867c6579f0e9b29d85"
-      MLXC_COMMIT: "c74db5307cc8ce122f48d97ef951b30578674e7f"
+      MLX_VERSION: "0.32.4"
+      MLX_COMMIT: "36969c094354086e15d2a327a9c50feb20b9cf11"
+      MLXC_COMMIT: "57731b00e8bed710e0750e7356da9f18f8eb3e20"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -134,9 +134,9 @@ jobs:
     runs-on: macos-15
     env:
       ORT_VERSION: "1.31.0"
-      MLX_VERSION: "0.32.2"
-      MLX_COMMIT: "1f8e74e3f12f31365464a6867c6579f0e9b29d85"
-      MLXC_COMMIT: "c74db5307cc8ce122f48d97ef951b30578674e7f"
+      MLX_VERSION: "0.32.4"
+      MLX_COMMIT: "36969c094354086e15d2a327a9c50feb20b9cf11"
+      MLXC_COMMIT: "57731b00e8bed710e0750e7356da9f18f8eb3e20"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 

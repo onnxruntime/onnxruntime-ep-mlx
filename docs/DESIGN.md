@@ -237,8 +237,8 @@ Removed historical paths are listed in §8.
 `mlx-c` is a **hard build dependency**:
 
 ```sh
-rust/scripts/setup_mlx.sh "$PWD/.deps/mlx-0.32.2"
-export MLX_PREFIX="$PWD/.deps/mlx-0.32.2"
+rust/scripts/setup_mlx.sh "$PWD/.deps/mlx-0.32.4"
+export MLX_PREFIX="$PWD/.deps/mlx-0.32.4"
 export MLXC_PREFIX="$MLX_PREFIX"
 ```
 
