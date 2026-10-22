@@ -415,7 +415,12 @@ def test_geometry_compile_routes(tmp_path):
     paths = [e["args"] for e in json.loads(trace.read_text()) if e.get("cat") == "ep.path"]
     for op in ["Conv", "ConvTranspose", "DeformConv"]:
         actual = [e for e in paths if e["ops"] == op]
-        assert actual and {e["path"] for e in actual} == {"general"}
+        if op == "DeformConv":
+            assert actual and {e["path"] for e in actual} == {"general"}
+        else:
+            # Empty boundary inputs deliberately use the engine's eager route.
+            assert [e["path"] for e in actual] == ["general", "general", "eager", "general", "general"]
+            assert [e["cache"] for e in actual] == ["MISS", "RETRACE", "n/a", "HIT", "MISS"]
         assert {"MISS", "HIT", "RETRACE"} <= {e["cache"] for e in actual}
     col = [e for e in paths if "Col2Im" in e["ops"]]
     assert {e["path"] for e in col} == {"general", "eager"}
