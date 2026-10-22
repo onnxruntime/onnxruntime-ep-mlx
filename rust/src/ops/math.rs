@@ -22,19 +22,21 @@ fn is_mlx_float_dtype(t: mlx::mlx_dtype) -> bool {
 fn div_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
     let a = ctx.resolve(&n.inputs[0])?;
     let b = ctx.resolve(&n.inputs[1])?;
-    let r = if ctx.dtype_of(a) == mlx::mlx_dtype__MLX_INT32 {
+    let dtype = ctx.dtype_of(a);
+    let r = if matches!(dtype, mlx::mlx_dtype__MLX_INT32 | mlx::mlx_dtype__MLX_INT64) {
         // MLX 0.32.4 floors integer quotients; ONNX truncates toward zero.
         // Correct only inexact opposite-sign quotients, without float promotion
         // or negating INT_MIN.
         let quotient = ctx.binary(mlx::mlx_floor_divide, a, b)?;
         let remainder = ctx.binary(mlx::mlx_remainder, a, b)?;
         let zero = ctx.scalar_i32(0);
+        let zero = ctx.astype(zero, dtype)?;
         let negative_a = ctx.binary(mlx::mlx_less, a, zero)?;
         let negative_b = ctx.binary(mlx::mlx_less, b, zero)?;
         let opposite_signs = ctx.binary(mlx::mlx_not_equal, negative_a, negative_b)?;
         let inexact = ctx.binary(mlx::mlx_not_equal, remainder, zero)?;
         let correction = ctx.binary(mlx::mlx_logical_and, opposite_signs, inexact)?;
-        let correction = ctx.astype(correction, mlx::mlx_dtype__MLX_INT32)?;
+        let correction = ctx.astype(correction, dtype)?;
         ctx.binary(mlx::mlx_add, quotient, correction)?
     } else {
         ctx.binary(mlx::mlx_divide, a, b)?
@@ -654,7 +656,7 @@ fn shrink_claim(node: &NodeView) -> ClaimResult {
     Ok(())
 }
 
-/// Div: float or int32, same dtype in/out, scalar-or-suffix broadcast.
+/// Div: float or int32/int64, same dtype in/out, scalar-or-suffix broadcast.
 fn div_claim(node: &NodeView) -> ClaimResult {
     require!(
         node.num_inputs() == 2 && node.num_outputs() == 1,
@@ -676,8 +678,10 @@ fn div_claim(node: &NodeView) -> ClaimResult {
     require!(
         is_mlx_cpu_float(a.dtype)
             || a.dtype
-                == crate::sys::ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32,
-        "dtype {} not supported (float fp32/fp16/bf16/fp64 or int32 only)",
+                == crate::sys::ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32
+            || a.dtype
+                == crate::sys::ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64,
+        "dtype {} not supported (float fp32/fp16/bf16/fp64 or int32/int64 only)",
         crate::registry::ort_dtype_name(a.dtype)
     );
     require!(
