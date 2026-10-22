@@ -302,7 +302,15 @@ supported. Floating-point payloads include float64 on the MLX CPU stream;
 float64 stash statistics also select that stream independently of payload dtype.
 Concrete group reshapes use shape-keyed compilation.
 
-`SkipSimplifiedLayerNormalization` is translated as skip-add followed by `mlx_fast_rms_norm` for `fp32`/`fp16`/`bf16` input/skip/gamma.
+`SkipLayerNormalization` and `SkipSimplifiedLayerNormalization` support optional
+bias, broadcast skip inputs, and the residual sum at fixed output slot 3.
+Both use their schema's default epsilon of `1e-12`. Narrow inputs accumulate the
+residual and normalization in float32 before casting output tensors back.
+Empty extents are supported; dynamic forms use shape-keyed compilation.
+Training diagnostic outputs at slots 1 and 2 are not implemented and are
+declined when consumed or exported; declared-but-unused diagnostics remain
+accepted. This is an inference-only contract, not a claim that those training
+statistics are mathematically impossible.
 
 ### 3.4 Quantized embedding gather
 
