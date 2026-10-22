@@ -142,13 +142,7 @@ fn gather_elements_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), 
     Ok(())
 }
 
-// ---- GatherND (ai.onnx, batch_dims=0) ----------------------------------------------------------
-// Gather full slices of `data` addressed by the last axis of `indices`:
-//   m = indices.shape[-1];  output.shape = indices.shape[:-1] ++ data.shape[m:].
-// Compile-safe — the output shape is static (from the operand shapes); only the index VALUES are
-// runtime, which `mlx_take` handles. We flatten the first m data axes to one row axis, fold each
-// index tuple to a flat row index (Σ idx[j]·stride[j], negatives wrapped by +data_shape[j]), and
-// gather the rows. batch_dims > 0 is declined.
+// ---- GatherND --------------------------------------------------------------------------------
 fn i64_row(ctx: &mut TranslationContext, data: &[i64]) -> mlx::mlx_array {
     ctx.keep(Array::from_data(
         data.as_ptr() as *const std::os::raw::c_void,
@@ -157,28 +151,51 @@ fn i64_row(ctx: &mut TranslationContext, data: &[i64]) -> mlx::mlx_array {
     ))
 }
 
+fn gathernd_extent_product(shape: &[i32]) -> Result<i32, MlxError> {
+    shape.iter().try_fold(1i32, |product, &extent| {
+        product
+            .checked_mul(extent)
+            .ok_or_else(|| "GatherND: flattened extent exceeds MLX int32 indexing".to_string())
+    })
+}
+
 fn gathernd_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
     let data = ctx.resolve(&n.inputs[0])?;
     let indices = ctx.resolve(&n.inputs[1])?;
     let dshape = ctx.shape_of(data);
     let ishape = ctx.shape_of(indices);
     let (r, q) = (dshape.len(), ishape.len());
+    let batch_dims = usize::try_from(int_attr(n, "batch_dims", 0))
+        .map_err(|_| "GatherND: batch_dims must be non-negative".to_string())?;
+    if batch_dims >= r.min(q) || dshape[..batch_dims] != ishape[..batch_dims] {
+        return Err("GatherND: invalid or mismatched batch dimensions".to_string());
+    }
     let m = *ishape
         .last()
         .ok_or("GatherND: indices must have rank >= 1")? as usize;
-    if m == 0 || m > r {
+    if m == 0 || m > r - batch_dims {
         return Err(format!(
-            "GatherND: indices last dim {m} out of range for data rank {r}"
+            "GatherND: indices last dim {m} out of range for data rank {r} and batch_dims {batch_dims}"
         ));
     }
-    let rows: i32 = dshape[..m].iter().product();
-    let tail: i32 = dshape[m..].iter().product::<i32>().max(1);
+    let mut oshape = ishape[..q - 1].to_vec();
+    oshape.extend_from_slice(&dshape[batch_dims + m..]);
+    if oshape.contains(&0) {
+        let out = ctx.zeros(&oshape, ctx.dtype_of(data))?;
+        ctx.bind(&n.outputs[0], out);
+        return Ok(());
+    }
+    let rows = gathernd_extent_product(&dshape[..batch_dims + m])?;
+    let tail = gathernd_extent_product(&dshape[batch_dims + m..])?;
     let data_flat = ctx.reshape(data, &[rows, tail])?;
-    let p: i32 = ishape[..q - 1].iter().product::<i32>().max(1);
+    let p = gathernd_extent_product(&ishape[..q - 1])?;
     let idx2d = ctx.reshape(indices, &[p, m as i32])?;
     let idx64 = ctx.astype(idx2d, mlx::mlx_dtype__MLX_INT64)?;
 
-    let dims: Vec<i64> = dshape[..m].iter().map(|&d| d as i64).collect();
+    let dims: Vec<i64> = dshape[batch_dims..batch_dims + m]
+        .iter()
+        .map(|&d| d as i64)
+        .collect();
     let mut strides = vec![0i64; m];
     let mut acc = 1i64;
     for j in (0..m).rev() {
@@ -195,12 +212,23 @@ fn gathernd_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxErro
     let idxpos = ctx.where_(neg, wrapped, idx64)?;
     // flat row index per tuple, then gather.
     let scaled = ctx.binary(mlx::mlx_multiply, idxpos, strides_a)?; // [P,m]
-    let flat = ctx.emit(|res, s| unsafe { mlx::mlx_sum_axis(res, scaled, 1, false, s) })?; // [P]
+    let mut flat = ctx.emit(|res, s| unsafe { mlx::mlx_sum_axis(res, scaled, 1, false, s) })?;
+    if batch_dims > 0 {
+        let batches = gathernd_extent_product(&dshape[..batch_dims])?;
+        let per_batch = gathernd_extent_product(&ishape[batch_dims..q - 1])?;
+        let batch = ctx.arange(0.0, batches as f64, 1.0, mlx::mlx_dtype__MLX_INT64)?;
+        let stride = ctx.scalar_i64(acc);
+        let offsets = ctx.binary(mlx::mlx_multiply, batch, stride)?;
+        let offsets = ctx.reshape(offsets, &[batches, 1])?;
+        let offsets = ctx.emit(|res, s| unsafe {
+            mlx::mlx_broadcast_to(res, offsets, [batches, per_batch].as_ptr(), 2, s)
+        })?;
+        let offsets = ctx.reshape(offsets, &[p])?;
+        flat = ctx.binary(mlx::mlx_add, flat, offsets)?;
+    }
     let flat = ctx.astype(flat, mlx::mlx_dtype__MLX_INT32)?;
     let gathered = ctx.emit(|res, s| unsafe { mlx::mlx_take_axis(res, data_flat, flat, 0, s) })?; // [P,tail]
 
-    let mut oshape: Vec<i32> = ishape[..q - 1].to_vec();
-    oshape.extend_from_slice(&dshape[m..]);
     let out = ctx.reshape(gathered, &oshape)?;
     let out = ctx.contiguous(out)?;
     ctx.bind(&n.outputs[0], out);
@@ -213,10 +241,6 @@ fn gathernd_claim(node: &NodeView) -> ClaimResult {
         "GatherND expects 2 inputs and 1 output, got {}in/{}out",
         node.num_inputs(),
         node.num_outputs()
-    );
-    require!(
-        node.int_attr("batch_dims", 0) == 0,
-        "GatherND: only batch_dims=0 is supported"
     );
     let (data, out) = match movable_io(node) {
         Some(v) => v,
@@ -238,18 +262,25 @@ fn gathernd_claim(node: &NodeView) -> ClaimResult {
         "GatherND indices must be int32/int64, got {}",
         crate::registry::ort_dtype_name(idt)
     );
-    // The last axis of indices (the index-tuple width) must be a known static extent.
-    match node.input_info(1) {
-        Some(i) => require!(
-            !i.shape.is_empty() && *i.shape.last().unwrap() > 0,
-            "GatherND: indices last dimension (tuple width) must be a known static extent, got {:?}",
-            i.shape
-        ),
-        None => deny!("missing indices shape info"),
-    }
-    match node.input_info(0) {
-        Some(i) => require!(!i.shape.is_empty(), "GatherND: data must have rank >= 1"),
-        None => deny!("missing data shape info"),
+    let data = node.input_info(0).expect("validated data above");
+    let indices = node.input_info(1).expect("validated indices above");
+    let batch_dims = node.int_attr("batch_dims", 0);
+    require!(
+        batch_dims >= 0 && batch_dims < data.shape.len().min(indices.shape.len()) as i64,
+        "GatherND: batch_dims must be in [0, min(data rank, indices rank))"
+    );
+    let batch_dims = batch_dims as usize;
+    let width = *indices.shape.last().expect("validated indices rank above");
+    require!(
+        width > 0 && width <= (data.shape.len() - batch_dims) as i64,
+        "GatherND: tuple width must be known and in [1, data rank - batch_dims]"
+    );
+    for axis in 0..batch_dims {
+        let (data_dim, index_dim) = (data.shape[axis], indices.shape[axis]);
+        require!(
+            data_dim < 0 || index_dim < 0 || data_dim == index_dim,
+            "GatherND: data and indices batch dimension {axis} must match"
+        );
     }
     Ok(())
 }
@@ -2668,7 +2699,13 @@ fn shape_keyed(
 
 pub fn register(registry: &mut OpRegistry) {
     shapeless(registry, "Gather", gather_op, gather_like_claim);
-    shapeless(registry, "GatherND", gathernd_op, gathernd_claim);
+    shape_keyed(
+        registry,
+        "GatherND",
+        gathernd_op,
+        gathernd_claim,
+        "conservatively shape-keyed: GatherND flattening strides and batch offsets depend on concrete input extents",
+    );
     shapeless(
         registry,
         "GatherElements",
