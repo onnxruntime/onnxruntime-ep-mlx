@@ -106,6 +106,10 @@ fn host_parameter_indices(n: &NodeDesc) -> &'static [usize] {
         "ConstantOfShape" => &[0],
         "Slice" => &[1, 2, 3, 4],
         "Range" => &[0, 1, 2],
+        "DFT" => &[1, 2],
+        "STFT" => &[1, 3],
+        "HannWindow" | "HammingWindow" | "BlackmanWindow" => &[0],
+        "MelWeightMatrix" => &[0, 1, 2, 3, 4],
         "CumSum" | "CumProd" => &[1],
         "ReduceSum" | "ReduceMean" | "ReduceMax" | "ReduceMin" | "ReduceProd"
         | "ReduceSumSquare" | "ReduceL1" | "ReduceL2" | "ReduceLogSum" | "ReduceLogSumExp" => &[1],
@@ -116,7 +120,15 @@ fn host_parameter_indices(n: &NodeDesc) -> &'static [usize] {
 fn guarded_boundary_parameter(n: &NodeDesc, r: &crate::engine::TensorRef) -> bool {
     matches!(
         n.op_type.as_str(),
-        "Reshape" | "Expand" | "Slice" | "ConstantOfShape"
+        "Reshape"
+            | "Expand"
+            | "Slice"
+            | "ConstantOfShape"
+            | "DFT"
+            | "STFT"
+            | "HannWindow"
+            | "HammingWindow"
+            | "BlackmanWindow"
     ) && r.source == Src::CtxInput
 }
 
@@ -1498,6 +1510,60 @@ mod shape_inference_tests {
             let node = cumulative(op, Src::Initializer, "runtime reduction axes");
             assert!(!reads_data_dependent_parameter(&node));
         }
+    }
+
+    #[test]
+    fn signal_parameters_require_value_keys_or_eager_execution() {
+        for (op, parameters) in [
+            ("DFT", vec![1, 2]),
+            ("STFT", vec![1, 3]),
+            ("HannWindow", vec![0]),
+            ("HammingWindow", vec![0]),
+            ("BlackmanWindow", vec![0]),
+        ] {
+            let mut node = NodeDesc::new(
+                op.to_string(),
+                String::new(),
+                20,
+                CompileShapeSafety::ShapeKeyedOnly {
+                    reason: "host-read signal controls",
+                },
+            );
+            node.inputs = (0..4)
+                .map(|i| {
+                    let mut r = input(&format!("input{i}"), Src::CtxInput);
+                    r.ctx_index = i;
+                    r
+                })
+                .collect();
+            assert!(reads_data_dependent_parameter(&node));
+            assert!(!reads_unguarded_parameter(&node, true));
+            assert_eq!(
+                boundary_shape_inputs(std::slice::from_ref(&node)),
+                parameters
+            );
+            for &i in &parameters {
+                node.inputs[i].source = Src::Intermediate;
+            }
+            assert!(reads_unguarded_parameter(&node, true));
+            for &i in &parameters {
+                node.inputs[i].source = Src::Initializer;
+            }
+            assert!(!reads_data_dependent_parameter(&node));
+        }
+        let mut mel = NodeDesc::new(
+            "MelWeightMatrix".to_string(),
+            String::new(),
+            17,
+            CompileShapeSafety::ShapeKeyedOnly {
+                reason: "host-computed weights",
+            },
+        );
+        mel.inputs = (0..5)
+            .map(|i| input(&format!("input{i}"), Src::CtxInput))
+            .collect();
+        assert!(reads_unguarded_parameter(&mel, true));
+        assert!(boundary_shape_inputs(&[mel]).is_empty());
     }
 
     #[test]

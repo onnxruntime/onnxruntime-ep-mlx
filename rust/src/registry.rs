@@ -1365,6 +1365,9 @@ impl NodeView {
                 t if t == ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT => {
                     Some(*(data as *const f32) as f64)
                 }
+                t if t == ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_DOUBLE => {
+                    Some(*(data as *const f64))
+                }
                 t if t == ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16 => {
                     Some(f16::from_bits(*(data as *const u16)).to_f64())
                 }
