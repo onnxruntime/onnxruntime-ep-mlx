@@ -5,8 +5,8 @@
 use crate::engine::{MlxError, NodeDesc, TranslationContext, mlx_dtype_from_onnx};
 use crate::registry::{
     ClaimResult, K_ANY_OPSET, NodeView, OpRegistration, OpRegistry, is_float64, is_int_index,
-    is_mlx_cpu_float, is_mlx_float, is_mlx_numeric, is_mlx_supported, is_signed_integer,
-    is_unsigned_integer, scalar_or_suffix_broadcast,
+    is_mlx_cpu_float, is_mlx_float, is_mlx_numeric, is_mlx_supported, is_movable,
+    is_signed_integer, is_unsigned_integer, scalar_or_suffix_broadcast,
 };
 use crate::sys::mlx;
 use crate::sys::ort;
@@ -69,10 +69,7 @@ fn cast_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
 }
 
 fn cast_like_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
-    let x = ctx.resolve(&n.inputs[0])?;
-    let r = ctx.astype(x, mlx_dtype_from_onnx(n.outputs[0].otype))?;
-    ctx.bind(&n.outputs[0], r);
-    Ok(())
+    cast_op(ctx, n)
 }
 
 fn bit_cast_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
@@ -417,52 +414,17 @@ fn softmax_claim(node: &NodeView) -> ClaimResult {
     Ok(())
 }
 
-/// Cast conversions MLX's `mlx_astype` produces bit-identically to ORT CPU:
-///   * float<->float among fp32/fp16/bf16 (distinct pair);
-///   * int32<->int64 (exact within range);
-///   * int32/int64 -> fp32/fp16 (round-to-nearest, matching CPU static_cast/convert);
-///   * fp32/fp16 -> int32/int64 (truncation toward zero, matching ONNX Cast + CPU static_cast).
-///   * bool -> int32/int64 (false=0, true=1).
-///   * bool -> fp32/fp16 (false=0, true=1).
-///   * int32/int64 -> bool (zero=false, nonzero=true).
-///     float64/uint and float casts to bool are intentionally excluded.
 fn cast_pair_claimable(
     src: ort::ONNXTensorElementDataType,
     dst: ort::ONNXTensorElementDataType,
 ) -> bool {
-    if is_mlx_float(src) && is_mlx_float(dst) && src != dst {
-        return true;
-    }
-    // int32 <-> int64 (exact).
-    if is_int_index(src) && is_int_index(dst) && src != dst {
-        return true;
-    }
-    // int32/int64 -> fp32/fp16.
-    if is_int_index(src) && is_cast_float(dst) {
-        return true;
-    }
-    // fp32/fp16 -> int32/int64 (truncation toward zero).
-    if is_cast_float(src) && is_int_index(dst) {
-        return true;
-    }
-    if is_bool(src) && (is_int_index(dst) || is_cast_float(dst)) {
-        return true;
-    }
-    if is_int_index(src) && is_bool(dst) {
-        return true;
-    }
-    false
-}
-
-/// fp32/fp16 — the float side of the claimable integer<->float casts (bf16 is not feedable/readable
-/// through the ORT Python binding and its CPU-match is covered separately via the float<->float path).
-fn is_cast_float(t: ort::ONNXTensorElementDataType) -> bool {
-    t == ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT
-        || t == ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16
+    // ONNX Cast excludes complex types; all mapped real numeric types support astype.
+    // DOUBLE is isolated onto MLX's CPU stream by the existing float64 routing.
+    is_movable(src) && is_movable(dst)
 }
 
 /// Cast: the dtype-agnostic handler just calls `astype` to the output dtype, so the predicate is the
-/// only gate. See `cast_pair_claimable` for the exact set of conversions verified against ORT CPU.
+/// only gate. Float64 conversions use the existing isolated MLX CPU-stream route.
 fn cast_claim(node: &NodeView) -> ClaimResult {
     require!(
         node.num_inputs() == 1 && node.num_outputs() == 1,
@@ -476,8 +438,7 @@ fn cast_claim(node: &NodeView) -> ClaimResult {
     };
     require!(
         cast_pair_claimable(i.dtype, o.dtype),
-        "Cast {}->{} is not claimed: only float<->float (fp32/fp16/bf16), int32<->int64, \
-         int32/int64<->fp32/fp16, bool<->int32/int64, and bool->fp32/fp16 are verified bit-identical to CPU",
+        "Cast {}->{} requires MLX-supported bool, integer, or floating-point types",
         crate::registry::ort_dtype_name(i.dtype),
         crate::registry::ort_dtype_name(o.dtype)
     );
@@ -502,11 +463,8 @@ fn cast_like_claim(node: &NodeView) -> ClaimResult {
         crate::registry::ort_dtype_name(target.dtype)
     );
     require!(
-        (x.dtype == out.dtype
-            && crate::registry::is_movable(x.dtype)
-            && x.dtype != ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT64)
-            || cast_pair_claimable(x.dtype, out.dtype),
-        "CastLike {}->{} is outside the verified Cast conversion set",
+        cast_pair_claimable(x.dtype, out.dtype),
+        "CastLike {}->{} requires MLX-supported bool, integer, or floating-point types",
         crate::registry::ort_dtype_name(x.dtype),
         crate::registry::ort_dtype_name(out.dtype)
     );

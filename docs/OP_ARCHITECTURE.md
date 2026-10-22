@@ -70,7 +70,7 @@ The following table is the current support contract. Do not broaden claims witho
 | **Mul** | `ai.onnx` | `fp32`/`fp16`/`bf16` | MLX elementwise multiply | Floating forms only. |
 | **Sub** | `ai.onnx` | `fp32`/`fp16`/`bf16`, `int64` | MLX elementwise subtract | Covers supported numeric/bookkeeping forms only. |
 | **Sigmoid** | `ai.onnx`, `com.microsoft` | `fp32`/`fp16`/`bf16` | MLX elementwise sigmoid | Standalone `SiLU`/`Swish` are not claimed. |
-| **Cast / CastLike** | `ai.onnx` | float↔float among `fp32`/`fp16`/`bf16`, `int32`↔`int64`, `int32`/`int64`↔`fp32`/`fp16`, bool↔`int32`/`int64`, bool→`fp32`/`fp16` | MLX cast | Bool→float maps false/true exactly to 0/1. Other casts remain on CPU. |
+| **Cast / CastLike** | `ai.onnx` | all pairs among bool, signed/unsigned 8/16/32/64-bit integers, `fp16`/`bf16`/`fp32`/`fp64` (13 types, including same-type) | MLX astype | Float64 conversions use the isolated MLX CPU stream; other types use Metal. CastLike reads only the target's declared dtype, not its values or shape. |
 | **Div** | `ai.onnx` | same-dtype float or `int32`, scalar-or-suffix broadcast | MLX divide; integer `floor_divide` entry point | In pinned MLX 0.32.2 the integer entry point emits an integer Divide kernel, truncating toward zero without float conversion. Integer division by zero and unrepresentable quotients are not defined by this support contract. |
 | **Conv** | `ai.onnx` | rank-3/4, static positive W shape; symbolic X batch/channel/spatial dimensions allowed | MLX conv1d/conv2d/conv_general | W and group determine the required input channels; concrete channels are checked at execution. |
 | **RNN / GRU / LSTM** | `ai.onnx` | layout=0, default activations, no sequence_lens; symbolic sequence length allowed | shape-keyed unrolling | Each concrete input shape gets its own trace. Empty sequences preserve initial states and produce an empty Y. |
@@ -79,6 +79,19 @@ Runtime-bounded **Range** and runtime-repeat **Tile** remain on ORT CPU. Their p
 determine output extents and cannot safely be baked into a shape/dtype-keyed closure. Constant
 initializer forms remain supported. These coverage changes do not reproduce or establish a speedup
 for the Nemotron streaming workload in issue #10.
+
+Cast/CastLike integer narrowing discards high bits, floating-to-integer conversions truncate toward
+zero for representable values, and numeric-to-bool uses zero/nonzero (including signed floating
+zeros, infinities and NaNs). Floating-to-integer out-of-range values are undefined by ONNX and are
+not assigned a new contract here. Tests cover the full type-pair matrix against NumPy and ORT CPU,
+large integer rounding, integer boundaries, floating subnormals/signed zeros and eager/compiled
+execution. An empty or changing-shape CastLike target does not become a compiled data dependency;
+other consumers of that tensor still read its live values.
+
+String, float8/float4 and packed int4/uint4 conversions remain on ORT CPU: the pinned MLX dtype
+mapping/conversion backend does not support those ONNX types. MLX complex64 is not a Cast/CastLike
+option because ONNX's schemas exclude complex types. The float8-only `saturate`/`round_mode`
+attributes are not approximated for unsupported types; those nodes retain CPU fallback.
 
 ### 2.1 Numeric `ai.onnx.ml` acceleration
 

@@ -962,7 +962,11 @@ fn build_closure(
             dyn_inputs: &mut Vec<DynInput>,
         ) {
             for node in nodes {
-                for inp in &node.inputs {
+                for (i, inp) in node.inputs.iter().enumerate() {
+                    if node.op_type == "CastLike" && i == 1 {
+                        // Only the statically declared dtype is used, never target data or shape.
+                        continue;
+                    }
                     if inp.source == Src::CtxInput && !inp.constant && seen.insert(inp.name.clone())
                     {
                         dyn_inputs.push(DynInput {
@@ -979,7 +983,11 @@ fn build_closure(
             }
         }
         for node in &plan.nodes {
-            for inp in &node.inputs {
+            for (i, inp) in node.inputs.iter().enumerate() {
+                if node.op_type == "CastLike" && i == 1 {
+                    // Other consumers still collect this input if they need its live data.
+                    continue;
+                }
                 if inp.source == Src::CtxInput && !inp.constant && seen.insert(inp.name.clone()) {
                     dyn_inputs.push(DynInput {
                         name: inp.name.clone(),
