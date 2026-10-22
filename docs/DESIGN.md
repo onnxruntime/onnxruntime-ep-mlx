@@ -196,6 +196,8 @@ not a GQA cross-attention contract.
 Sliding-cache bias retains its absolute `total_sequence_length` final axis. Resident or
 staged attention gathers columns starting at the resident absolute origin, not column
 zero. Multi-token staging, capacity slack and ragged members use their own origins.
+Each sliding member's live total must cover the query step; ordinary first-prompt
+right-padding is not a valid sliding-cache input.
 As in ORT, a rollback crossing a compaction boundary requires caller-rematerialized cache
 rows; the operator cannot recover evicted history. These forms are claimed eager without
 changing the ordinary compiled decoder guards. Sliding QK diagnostics, quantized KV

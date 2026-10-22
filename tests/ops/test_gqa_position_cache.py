@@ -389,6 +389,31 @@ def test_gqa_new_forms_runtime_validation(invalid):
         session.run(None, feeds)
 
 
+@pytest.mark.parametrize("sliding", [False, True])
+def test_gqa_rejects_short_nonpadding_lengths(sliding):
+    model, feeds = _case(batch=2 if sliding else 1, seq=3, new_seq=3 if sliding else 0,
+                         sliding=sliding, window=2 if sliding else -1)
+    if sliding:
+        feeds["total"][:] = 3
+        feeds["lengths"][:] = 2
+        feeds["bias"] = feeds["bias"][..., :3].copy()
+    session = _strict_session(model)
+    session.disable_fallback()
+    actual = session.run(None, feeds)
+    cpu = m.run_cpu(model, {name: value.copy() for name, value in feeds.items()})
+    np.testing.assert_allclose(actual[0], cpu[0], rtol=3e-3, atol=3e-3)
+    if sliding:
+        feeds["lengths"][1] = 1
+    else:
+        feeds["total"][:] = 2
+        feeds["lengths"][:] = 1
+        feeds["bias"] = feeds["bias"][..., :2].copy()
+    with pytest.raises(Exception, match="too small for sequence_length"):
+        m.run_cpu(model, {name: value.copy() for name, value in feeds.items()})
+    with pytest.raises(Exception, match="invalid.*sequence lengths"):
+        session.run(None, feeds)
+
+
 def _resident(total, cap, window):
     gap = cap - window + 1
     return total if total <= cap else total - gap * ((total - cap + gap - 1) // gap)

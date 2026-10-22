@@ -436,6 +436,7 @@ fn gqa_rope(
     concat2(ctx, rotated, tail, 3)
 }
 
+/// New eager forms combine rotary terms before rounding back to activation storage.
 fn gqa_rope_f32(
     ctx: &mut TranslationContext,
     x: mlx::mlx_array,
@@ -538,7 +539,9 @@ fn gqa_batched(
         || total.len() != 1
         || total[0] <= 0
         || total[0] > i32::MAX as i64
-        || lengths.iter().any(|&n| n < 0 || n >= total[0])
+        || lengths
+            .iter()
+            .any(|&n| n < 0 || n >= total[0] || (total[0] != seq as i64 && n + 1 < seq as i64))
         || lengths.iter().max().copied() != Some(total[0] - 1)
     {
         return Err(
@@ -1020,7 +1023,9 @@ fn group_query_attention_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Resul
         if seqlens.len() != b as usize
             || total.len() != 1
             || total[0] <= 0
-            || seqlens.iter().any(|&v| v < 0 || v >= total[0])
+            || seqlens
+                .iter()
+                .any(|&v| v < 0 || v >= total[0] || v + 1 < s as i64)
             || seqlens.iter().max().copied() != Some(total[0] - 1)
         {
             return Err("GroupQueryAttention: invalid sliding sequence lengths".to_string());
@@ -2238,8 +2243,7 @@ fn group_query_attention_claim(node: &NodeView) -> ClaimResult {
         "expects 7 required inputs plus optional rotary/bias/QK-norm inputs, got {}",
         ninputs
     );
-    // The 11-input Gemma3n variant only maps to MLX when rotary is external (do_rotary=0): cos/sin at
-    // 7,8 are absent, so we must not require their dtype and must not resolve them in the handler.
+    // External-rotary exports may omit cos/sin even when later position/bias inputs are present.
     let has_bias = node.input_present(10);
     let do_rotary = node.int_attr("do_rotary", 0) != 0;
     require!(
@@ -2272,9 +2276,7 @@ fn group_query_attention_claim(node: &NodeView) -> ClaimResult {
         packed_qkv || (node.input_present(0) && node.input_present(1) && node.input_present(2)),
         "Q/K/V must be either all separate or packed in input 0 with inputs 1 and 2 absent"
     );
-    // Float inputs that must match the output dtype. cos/sin (7,8) exist only in the 9-input form
-    // WITH in-op rotary (do_rotary=1); with external rotary (do_rotary=0) they are absent, as is the
-    // whole 11-input Gemma3n variant.
+    // All used floating inputs share the output dtype; unused external-rotary caches are ignored.
     let mut float_idx = if packed_qkv {
         vec![0usize]
     } else {
