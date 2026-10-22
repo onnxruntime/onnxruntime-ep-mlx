@@ -103,6 +103,7 @@ fn is_general_compile_unsafe(n: &NodeDesc) -> bool {
 fn host_parameter_indices(n: &NodeDesc) -> &'static [usize] {
     match n.op_type.as_str() {
         "Reshape" | "Expand" => &[1],
+        "ConstantOfShape" => &[0],
         "Slice" => &[1, 2, 3, 4],
         "Range" => &[0, 1, 2],
         "CumSum" | "CumProd" => &[1],
@@ -113,7 +114,10 @@ fn host_parameter_indices(n: &NodeDesc) -> &'static [usize] {
 }
 
 fn guarded_boundary_parameter(n: &NodeDesc, r: &crate::engine::TensorRef) -> bool {
-    matches!(n.op_type.as_str(), "Reshape" | "Expand" | "Slice") && r.source == Src::CtxInput
+    matches!(
+        n.op_type.as_str(),
+        "Reshape" | "Expand" | "Slice" | "ConstantOfShape"
+    ) && r.source == Src::CtxInput
 }
 
 pub fn boundary_shape_inputs(nodes: &[NodeDesc]) -> Vec<usize> {
@@ -1432,6 +1436,32 @@ mod shape_inference_tests {
             false
         ));
         assert!(!compile_shape_mode_supported(&[eager_only_gqa], true));
+    }
+
+    #[test]
+    fn constant_of_shape_guards_the_first_input() {
+        let mut node = NodeDesc::new(
+            "ConstantOfShape".to_string(),
+            String::new(),
+            23,
+            CompileShapeSafety::ShapeKeyedOnly {
+                reason: "runtime fill shape requires shape/value guards",
+            },
+        );
+        let mut shape = input("shape", Src::CtxInput);
+        shape.ctx_index = 3;
+        node.inputs = vec![shape];
+        assert!(reads_data_dependent_parameter(&node));
+        assert!(!reads_unguarded_parameter(&node, true));
+        assert_eq!(boundary_shape_inputs(std::slice::from_ref(&node)), vec![3]);
+        assert!(!compile_shape_mode_supported(
+            std::slice::from_ref(&node),
+            true
+        ));
+        node.inputs[0].source = Src::Intermediate;
+        assert!(reads_unguarded_parameter(&node, true));
+        node.inputs[0].shape_const = true;
+        assert!(!reads_unguarded_parameter(&node, true));
     }
 
     #[test]
