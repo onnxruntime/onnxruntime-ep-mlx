@@ -325,7 +325,7 @@ def test_causal_no_past_attributes(channels_last, dilation):
 @pytest.mark.parametrize("eager", [False, True])
 @pytest.mark.parametrize("mode", ["linear", "circular"])
 @pytest.mark.parametrize("dtype,np_dtype", [
-    (DT.FLOAT, np.float32), (DT.FLOAT16, np.float16), (DT.BOOL, np.bool_),
+    (DT.FLOAT, np.float32), (DT.FLOAT16, np.float16), (DT.DOUBLE, np.float64), (DT.BOOL, np.bool_),
     (DT.INT8, np.int8), (DT.INT16, np.int16), (DT.INT32, np.int32), (DT.INT64, np.int64),
     (DT.UINT8, np.uint8), (DT.UINT16, np.uint16), (DT.UINT32, np.uint32), (DT.UINT64, np.uint64),
 ])
@@ -425,25 +425,26 @@ def test_scatter_dynamic_geometry_error_recovery(mode):
 
 
 @pytest.mark.parametrize("mode", ["linear", "circular"])
-def test_scatter_initializer_indices_compiled_replay(mode):
+@pytest.mark.parametrize("dtype,np_dtype", [(DT.INT64, np.int64), (DT.DOUBLE, np.float64)])
+def test_scatter_initializer_indices_compiled_replay(mode, dtype, np_dtype):
     offsets = [1, 3] if mode == "linear" else [np.iinfo(np.int64).max, np.iinfo(np.int64).min]
     indices = initz("indices", np.array(offsets, np.int64))
     model = build(
         "TensorScatter",
         [
-            m.tensor("past", DT.INT64, [2, 2, "capacity", 3]),
-            m.tensor("update", DT.INT64, [2, 2, "time", 3]),
+            m.tensor("past", dtype, [2, 2, "capacity", 3]),
+            m.tensor("update", dtype, [2, 2, "time", 3]),
             indices,
         ],
-        [m.tensor("present", DT.INT64, [2, 2, "capacity", 3])],
+        [m.tensor("present", dtype, [2, 2, "capacity", 3])],
         attrs=[ir.AttrString("mode", mode)],
         inits=(indices,),
     )
     session = strict_session(model)
     rng = np.random.default_rng(2406)
     for capacity, time in [(8, 3), (8, 3), (5, 2), (8, 3), (8, 0)]:
-        past = rng.integers(0, 100, (2, 2, capacity, 3), dtype=np.int64) + (1 << 50)
-        update = -rng.integers(0, 100, (2, 2, time, 3), dtype=np.int64) - (1 << 51)
+        past = rng.integers(0, 100, (2, 2, capacity, 3), dtype=np.int64).astype(np_dtype) + (1 << 50)
+        update = -rng.integers(0, 100, (2, 2, time, 3), dtype=np.int64).astype(np_dtype) - (1 << 51)
         expected = past.copy()
         for batch in range(2):
             for token in range(time):
@@ -483,6 +484,7 @@ def test_scatter_intermediate_indices_remain_live():
 
 
 @pytest.mark.parametrize("dtype,np_dtype,bits,patterns", [
+    (DT.DOUBLE, np.float64, np.uint64, [0x8000000000000000, 0x7FF8123456789ABC, 0xFFF0000000000000, 0x7FF0000000000000]),
     (DT.FLOAT, np.float32, np.uint32, [0x80000000, 0x7FC12345, 0xFF800000, 0x7F800000]),
     (DT.FLOAT16, np.float16, np.uint16, [0x8000, 0x7E15, 0xFC00, 0x7C00]),
 ])

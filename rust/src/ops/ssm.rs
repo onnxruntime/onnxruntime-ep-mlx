@@ -13,7 +13,7 @@
 use crate::engine::{MlxError, NodeDesc, Src, TranslationContext, mlx_dtype_from_onnx};
 use crate::registry::{
     ClaimPredicate, ClaimResult, K_ANY_OPSET, NodeView, OpHandler, OpRegistration, OpRegistry,
-    is_mlx_float, is_mlx_supported,
+    is_mlx_float, is_movable,
 };
 use crate::sys::mlx;
 use crate::sys::ort;
@@ -45,7 +45,7 @@ fn compatible_shape(a: &[i64], b: &[i64]) -> bool {
 }
 
 // =============================================================================================
-// TensorScatter (ai.onnx) — write `update` into `past_cache` along `axis` at write_indices[0]/0.
+// TensorScatter (ai.onnx) — per-batch linear/circular cache writes, with exact native copies.
 // =============================================================================================
 fn tensor_scatter_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
     let past = ctx.resolve(&n.inputs[0])?;
@@ -146,7 +146,7 @@ fn tensor_scatter_claim(node: &NodeView) -> ClaimResult {
         _ => deny!("missing tensor type/shape info on an input or the output"),
     };
     require!(
-        is_mlx_supported(past.dtype) && update.dtype == past.dtype && out.dtype == past.dtype,
+        is_movable(past.dtype) && update.dtype == past.dtype && out.dtype == past.dtype,
         "past/update/output must share one MLX copy dtype, got {} / {} -> {}",
         crate::registry::ort_dtype_name(past.dtype),
         crate::registry::ort_dtype_name(update.dtype),
