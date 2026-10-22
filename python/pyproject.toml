@@ -74,6 +74,7 @@ exclude = [
 
 [tool.hatch.build.targets.sdist.force-include]
 "../rust/Cargo.toml" = "rust/Cargo.toml"
+"../rust/Cargo.lock" = "rust/Cargo.lock"
 "../rust/build.rs" = "rust/build.rs"
 "../rust/src" = "rust/src"
 "../rust/wrapper_mlx.h" = "rust/wrapper_mlx.h"
