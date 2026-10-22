@@ -2,7 +2,8 @@
 
 Covers the ops the MLX EP registers in ``RegisterAttentionExtOps``:
 
-* ``Attention`` (ai.onnx) at **opset 23** and **opset 24** — MHA / GQA / MQA, 3D ``(B,S,H*hd)`` and
+* ``Attention`` (ai.onnx), primarily **opsets 23/24**, with cache-free replay coverage at declared
+  **opsets 23–26** — MHA / GQA / MQA, 3D ``(B,S,H*hd)`` and
   4D ``(B,H,S,hd)`` layouts, custom scale, ``is_causal``, bool / float ``attn_mask``, and the in-op
   past/present KV concat.
 * ``MultiHeadAttention`` (com.microsoft) — separate Q/K/V with optional projection bias, additive
@@ -26,14 +27,17 @@ import subprocess
 import sys
 
 import numpy as np
+import onnx
 import onnx_ir as ir
 import onnxruntime as ort
+from onnxruntime.capi.onnxruntime_pybind11_state import Fail, InvalidGraph
 import pytest
 from onnx_ir import DataType as DT
 
 import _models as m
 
 FLOAT = np.float32
+_STATELESS_ATTENTION_OPSETS = (23, 24, 25, 26)
 
 
 @pytest.mark.skipif(
@@ -44,7 +48,7 @@ def test_stateless_attention_general_compile_child():
     from test_attention_semantics import _attention_reference
 
     rng = np.random.default_rng(73)
-    for opset in [23, 24]:
+    for opset in _STATELESS_ATTENTION_OPSETS:
         for causal in [False, True]:
             for boolean in [False, True]:
                 q = _t("q", [1, 2, 4, 8])
@@ -95,6 +99,7 @@ def test_stateless_attention_general_compile_child():
                     )
                     np.testing.assert_allclose(
                         session.run(None, feeds)[0], expected, rtol=1e-4, atol=1e-6,
+                        err_msg=f"opset={opset}, causal={causal}, boolean={boolean}, step={step}",
                     )
 
 
@@ -119,8 +124,41 @@ def test_stateless_attention_uses_general_compile(tmp_path):
         event["args"] for event in json.loads(trace.read_text())
         if event.get("cat") == "ep.path" and "Attention" in event["args"].get("ops", "").split(",")
     ]
-    assert [event["path"] for event in events] == ["general"] * 40
-    assert [event["cache"] for event in events] == ["MISS", "HIT", "RETRACE", "HIT", "HIT"] * 8
+    cases = len(_STATELESS_ATTENTION_OPSETS) * 4
+    assert [event["path"] for event in events] == ["general"] * (cases * 5)
+    assert [event["cache"] for event in events] == ["MISS", "HIT", "RETRACE", "HIT", "HIT"] * cases
+
+
+@pytest.mark.skipif(
+    not ort.__version__.startswith("1.31."),
+    reason="checks the pinned ORT 1.31 default released-opset fence, not future runtime limits",
+)
+@pytest.mark.parametrize("providers", [["CPUExecutionProvider"], m.EP_PROVIDERS], ids=["cpu", "mlx"])
+def test_attention_default_runtime_opset_fence(providers):
+    model = build_model(
+        "Attention", [_t(name, [1, 2, 3, 8]) for name in ("q", "k", "v")],
+        [_t("y", [1, 2, 3, 8])], opset=27,
+    )
+    onnx.checker.check_model(onnx.load_model_from_string(model))
+    with pytest.raises(Fail, match=r"Current official support for domain ai.onnx is till opset 26"):
+        ort.InferenceSession(model, providers=providers)
+
+
+@pytest.mark.skipif(
+    not ort.__version__.startswith("1.31."),
+    reason="checks the pinned ORT 1.31 Attention schema fence, not future schema support",
+)
+@pytest.mark.parametrize("opset", [25, 26])
+@pytest.mark.parametrize("attribute", ["left_window_size", "right_window_size"])
+@pytest.mark.parametrize("providers", [["CPUExecutionProvider"], m.EP_PROVIDERS], ids=["cpu", "mlx"])
+def test_attention_default_runtime_window_attribute_fence(opset, attribute, providers):
+    model = build_model(
+        "Attention", [_t(name, [1, 2, 3, 8]) for name in ("q", "k", "v")],
+        [_t("y", [1, 2, 3, 8])], attributes={attribute: 1}, opset=opset,
+    )
+    onnx.checker.check_model(onnx.load_model_from_string(model))
+    with pytest.raises(InvalidGraph, match=f"Unrecognized attribute: {attribute} for operator Attention"):
+        ort.InferenceSession(model, providers=providers)
 
 
 # --- IR builder (optional inputs -> empty-name placeholders) -------------------------------------
