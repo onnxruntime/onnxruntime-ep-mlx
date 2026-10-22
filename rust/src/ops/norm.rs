@@ -295,45 +295,101 @@ fn standard_norm_op(
 /// SkipLayerNormalization (com.microsoft): residual = input + skip (+ bias);
 /// Y = layer_norm(residual, gamma, beta, eps). out[0]=Y; optional out[3]=residual sum.
 fn skip_layer_norm_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
-    let input = ctx.resolve(&n.inputs[0])?;
-    let skip = ctx.resolve(&n.inputs[1])?;
-    let gamma = ctx.resolve(&n.inputs[2])?;
-    let beta = if present(n, 3) {
-        ctx.resolve(&n.inputs[3])?
-    } else {
-        empty_array()
-    };
-    let mut residual = add(ctx, input, skip)?;
-    if present(n, 4) {
-        let bias = ctx.resolve(&n.inputs[4])?;
-        residual = add(ctx, residual, bias)?;
-    }
-    let eps = epsilon(n, 1e-5);
-    let r =
-        ctx.emit(|res, s| unsafe { mlx::mlx_fast_layer_norm(res, residual, gamma, beta, eps, s) })?;
-    ctx.mark_fast("mlx_fast_layer_norm");
-    ctx.bind(&n.outputs[0], r);
-    if n.outputs.len() >= 4 && !n.outputs[3].name.is_empty() {
-        ctx.bind(&n.outputs[3], residual);
-    }
-    Ok(())
+    skip_norm_op(ctx, n, true)
 }
 
-/// SkipSimplifiedLayerNormalization (com.microsoft): residual = input + skip;
-/// out = rms_norm(residual) * gamma. out[0]=normalized, out[last]=residual.
+/// SkipSimplifiedLayerNormalization: input + skip (+ bias), normalized Y and optional slot3 residual.
 fn skip_rms_norm_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
+    skip_norm_op(ctx, n, false)
+}
+
+fn skip_shapes_compatible(input: &[i64], skip: &[i64]) -> bool {
+    matches!(input.len(), 2 | 3)
+        && (2..=input.len()).contains(&skip.len())
+        && input[input.len() - skip.len()..]
+            .iter()
+            .zip(skip)
+            .enumerate()
+            .all(|(i, (&a, &b))| {
+                a < 0
+                    || b < 0
+                    || a == b
+                    || (input.len() == 3 && skip.len() == 3 && i == 0 && b == 1)
+            })
+}
+
+fn skip_norm_op(
+    ctx: &mut TranslationContext,
+    n: &NodeDesc,
+    centered: bool,
+) -> Result<(), MlxError> {
+    if !(3..=if centered { 5 } else { 4 }).contains(&n.inputs.len()) {
+        return Err(format!(
+            "{}: invalid input count {}",
+            n.op_type,
+            n.inputs.len()
+        ));
+    }
     let input = ctx.resolve(&n.inputs[0])?;
     let skip = ctx.resolve(&n.inputs[1])?;
-    let gamma = ctx.resolve(&n.inputs[2])?;
-    let eps = epsilon(n, 1e-6);
-    let residual = add(ctx, input, skip)?;
-    let norm =
-        ctx.emit(|res, s| unsafe { mlx::mlx_fast_rms_norm(res, residual, gamma, eps, s) })?;
-    ctx.mark_fast("mlx_fast_rms_norm");
-    ctx.bind(&n.outputs[0], norm);
-    if n.outputs.len() >= 2 {
-        let last = n.outputs.len() - 1;
-        ctx.bind(&n.outputs[last], residual);
+    let shape: Vec<i64> = ctx.shape_of(input).iter().map(|&d| i64::from(d)).collect();
+    let skip_shape: Vec<i64> = ctx.shape_of(skip).iter().map(|&d| i64::from(d)).collect();
+    if !skip_shapes_compatible(&shape, &skip_shape) {
+        return Err(format!(
+            "{}: incompatible input/skip shapes {shape:?}/{skip_shape:?}",
+            n.op_type
+        ));
+    }
+    let dtype = ctx.dtype_of(input);
+    let compute_dtype = mlx::mlx_dtype__MLX_FLOAT32;
+    let input = ctx.astype(input, compute_dtype)?;
+    let skip = ctx.astype(skip, compute_dtype)?;
+    let mut affine = [None; 3];
+    for i in 2..n.inputs.len() {
+        if present(n, i) {
+            let value = ctx.resolve(&n.inputs[i])?;
+            if ctx.shape_of(value) != [shape[shape.len() - 1] as i32] {
+                return Err(format!(
+                    "{}: affine input {i} must have hidden-size vector shape",
+                    n.op_type
+                ));
+            }
+            affine[i - 2] = Some(ctx.astype(value, compute_dtype)?);
+        }
+    }
+    let gamma = affine[0].ok_or_else(|| format!("{}: missing gamma input", n.op_type))?;
+    let beta = if centered { affine[1] } else { None };
+    let bias = affine[if centered { 2 } else { 1 }];
+    let mut residual = add(ctx, input, skip)?;
+    if let Some(bias) = bias {
+        residual = add(ctx, residual, bias)?;
+    }
+    let output = if ctx.size_of(residual) == 0 {
+        ctx.mark_composed("empty skip normalization");
+        residual
+    } else if centered {
+        ctx.mark_fast("mlx_fast_layer_norm");
+        ctx.emit(|res, s| unsafe {
+            mlx::mlx_fast_layer_norm(
+                res,
+                residual,
+                gamma,
+                beta.unwrap_or_else(empty_array),
+                epsilon(n, 1e-12),
+                s,
+            )
+        })?
+    } else {
+        ctx.mark_fast("mlx_fast_rms_norm");
+        ctx.emit(|res, s| unsafe {
+            mlx::mlx_fast_rms_norm(res, residual, gamma, epsilon(n, 1e-12), s)
+        })?
+    };
+    let output = ctx.astype(output, dtype)?;
+    ctx.bind(&n.outputs[0], output);
+    if n.outputs.get(3).is_some_and(|o| !o.name.is_empty()) {
+        let residual = ctx.astype(residual, dtype)?;
+        ctx.bind(&n.outputs[3], residual);
     }
     Ok(())
 }
@@ -698,55 +754,19 @@ fn standard_norm_compile_shape_safety(node: &NodeView) -> CompileShapeSafety {
     }
 }
 
-/// SkipSimplifiedLayerNormalization (com.microsoft): input, skip, gamma. fp32/fp16/bf16. 3-input.
 fn skip_rms_norm_claim(node: &NodeView) -> ClaimResult {
-    require!(
-        node.num_inputs() == 3 && node.num_outputs() > 0,
-        "expects 3 inputs and at least 1 output, got {}in/{}out",
-        node.num_inputs(),
-        node.num_outputs()
-    );
-    let (x, out) = match (node.input_info(0), node.output_info(0)) {
-        (Some(x), Some(o)) => (x, o),
-        _ => deny!("missing tensor type/shape info on X or the first output"),
-    };
-    require!(
-        is_mlx_float(x.dtype) && out.dtype == x.dtype,
-        "X and output must share one float dtype (fp32/fp16/bf16), got {} -> {}",
-        crate::registry::ort_dtype_name(x.dtype),
-        crate::registry::ort_dtype_name(out.dtype)
-    );
-    // The handler produces only out[0] (normalized) and the optional out[last] (residual sum);
-    // reject if mean (out[1]) or inv-std (out[2]) are requested — mlx_fast_rms_norm doesn't compute
-    // them, so claiming would leave those outputs unbound (mirrors skip_layer_norm_claim).
-    // mean (out[1]) / inv-std (out[2]) are optional diagnostic outputs the RMS handler does not
-    // produce. When the graph actually CONSUMES them they become fused-subgraph boundary outputs and
-    // ORT would flag them unbound; when they are declared-but-unused (the common transformers.js /
-    // Mobius export case) they are never boundary outputs, so MLX simply DCEs them. We therefore
-    // accept them here and let the framework's unused-output elision handle it — a consuming model
-    // fails loudly (unbound output), never silently wrong.
-    for (i, name) in [(1, "skip"), (2, "gamma")] {
-        let dtype = match tensor_dtype(node, i) {
-            Some(dtype) => dtype,
-            None => deny!("missing tensor type/shape info on {name} input"),
-        };
-        require!(
-            dtype == x.dtype,
-            "{name} must match X dtype {}, got {}",
-            crate::registry::ort_dtype_name(x.dtype),
-            crate::registry::ort_dtype_name(dtype)
-        );
-    }
-    Ok(())
+    skip_norm_claim(node, false)
 }
 
-/// SkipLayerNormalization: input, skip, gamma (+ optional beta, bias), all same float dtype.
-/// Only out[0] (Y) and optional out[3] (residual sum) are produced; mean/inv-std outputs → CPU.
 fn skip_layer_norm_claim(node: &NodeView) -> ClaimResult {
+    skip_norm_claim(node, true)
+}
+
+fn skip_norm_claim(node: &NodeView, centered: bool) -> ClaimResult {
     let nin = node.num_inputs();
     require!(
-        (3..=5).contains(&nin) && node.num_outputs() > 0,
-        "expects 3-5 inputs and at least 1 output, got {}in/{}out",
+        (3..=if centered { 5 } else { 4 }).contains(&nin) && (1..=4).contains(&node.num_outputs()),
+        "invalid skip normalization input/output count: {}in/{}out",
         nin,
         node.num_outputs()
     );
@@ -760,29 +780,67 @@ fn skip_layer_norm_claim(node: &NodeView) -> ClaimResult {
         crate::registry::ort_dtype_name(x.dtype),
         crate::registry::ort_dtype_name(out.dtype)
     );
+    let skip = match node.input_info(1) {
+        Some(skip) => skip,
+        None => deny!("missing skip tensor"),
+    };
+    require!(
+        skip_shapes_compatible(&x.shape, &skip.shape),
+        "incompatible input/skip shapes {:?}/{:?}",
+        x.shape,
+        skip.shape
+    );
+    let hidden = x.shape[x.shape.len() - 1];
     for i in 1..nin {
-        if !node.input_present(i) {
+        if i >= 3 && !node.input_present(i) {
             continue;
         }
-        let dtype = match tensor_dtype(node, i) {
-            Some(dtype) => dtype,
+        let info = match node.input_info(i) {
+            Some(info) => info,
             None => deny!("missing tensor type/shape info on input {i}"),
         };
         require!(
-            dtype == x.dtype,
+            info.dtype == x.dtype,
             "input {i} must match X dtype {}, got {}",
             crate::registry::ort_dtype_name(x.dtype),
-            crate::registry::ort_dtype_name(dtype)
+            crate::registry::ort_dtype_name(info.dtype)
+        );
+        if i >= 2 {
+            require!(
+                info.shape.len() == 1
+                    && (info.shape[0] < 0 || hidden < 0 || info.shape[0] == hidden),
+                "affine input {i} must have hidden-size vector shape"
+            );
+        }
+    }
+    for i in 1..=2 {
+        let used = node.output_is_used(i).map_err(std::borrow::Cow::Owned)?;
+        require!(!used, "training diagnostic output {i} is not implemented");
+    }
+    if node.output_present(3) {
+        require!(
+            node.output_info(3).is_some_and(|o| o.dtype == x.dtype),
+            "residual output must match input dtype"
         );
     }
-    // Reject if mean (out[1]) or inv-std (out[2]) are requested — we do not compute them.
-    // mean (out[1]) / inv-std (out[2]) are optional diagnostic outputs the RMS handler does not
-    // produce. When the graph actually CONSUMES them they become fused-subgraph boundary outputs and
-    // ORT would flag them unbound; when they are declared-but-unused (the common transformers.js /
-    // Mobius export case) they are never boundary outputs, so MLX simply DCEs them. We therefore
-    // accept them here and let the framework's unused-output elision handle it — a consuming model
-    // fails loudly (unbound output), never silently wrong.
+    require!(
+        node.float_attr("epsilon", 1e-12) >= 0.0,
+        "epsilon must be nonnegative"
+    );
     Ok(())
+}
+
+fn skip_norm_compile_shape_safety(node: &NodeView) -> CompileShapeSafety {
+    if node
+        .input_info(0)
+        .is_some_and(|x| x.shape.iter().all(|&d| d > 0))
+    {
+        CompileShapeSafety::Shapeless
+    } else {
+        CompileShapeSafety::ShapeKeyedOnly {
+            reason: "conservatively shape-keyed: empty versus fused skip normalization depends on concrete extents",
+        }
+    }
 }
 
 /// GroupNormalization: versioned affine shape and independently selected stash precision.
@@ -1116,20 +1174,26 @@ pub fn register_norm(registry: &mut OpRegistry) {
             standard_norm_compile_shape_safety,
         );
     }
-    shapeless(
-        registry,
-        "com.microsoft",
-        "SkipLayerNormalization",
-        K_ANY_OPSET,
-        skip_layer_norm_op,
-        skip_layer_norm_claim,
+    registry.register_shape_classified(
+        OpRegistration {
+            domain: "com.microsoft",
+            op_type: "SkipLayerNormalization",
+            min_opset: 1,
+            max_opset: K_ANY_OPSET,
+            handler: skip_layer_norm_op,
+            claim: skip_layer_norm_claim,
+        },
+        skip_norm_compile_shape_safety,
     );
-    shapeless(
-        registry,
-        "com.microsoft",
-        "SkipSimplifiedLayerNormalization",
-        K_ANY_OPSET,
-        skip_rms_norm_op,
-        skip_rms_norm_claim,
+    registry.register_shape_classified(
+        OpRegistration {
+            domain: "com.microsoft",
+            op_type: "SkipSimplifiedLayerNormalization",
+            min_opset: 1,
+            max_opset: K_ANY_OPSET,
+            handler: skip_rms_norm_op,
+            claim: skip_rms_norm_claim,
+        },
+        skip_norm_compile_shape_safety,
     );
 }
