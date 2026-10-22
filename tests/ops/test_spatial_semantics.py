@@ -159,6 +159,14 @@ def test_deform_conv_large_fp16_coordinates(opset, execution_mode):
     expected[..., :-1] += x[..., 1:].astype(np.float32) * 0.25
     m.assert_matches_ref(model, feeds, [expected.astype(np.float16)], rtol=0, atol=0)
     m.assert_mlx_claims(model, feeds)
+    session = ort.InferenceSession(model, providers=m.EP_PROVIDERS)
+    for fraction, weight in [(0.5, 2), (0, -1), (0.25, 1)]:
+        feeds["offset"][:, 1] = fraction
+        feeds["w"].fill(weight)
+        expected = x.astype(np.float32) * (1 - fraction)
+        expected[..., :-1] += x[..., 1:].astype(np.float32) * fraction
+        expected *= weight
+        np.testing.assert_array_equal(session.run(None, feeds)[0], expected.astype(np.float16))
 
 
 @pytest.mark.parametrize("rank", [3, 4, 5, 6])
