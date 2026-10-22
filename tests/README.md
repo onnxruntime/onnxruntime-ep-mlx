@@ -55,6 +55,28 @@ still produce `0 * NaN` in the value contraction. The cached decode tests in
 An empty allowed key set must produce zero, not a uniform attention average or NaN; the guard is
 based on the additive mask, never a blanket NaN replacement.
 
+### Window pooling
+
+`test_pool_windows.py` covers 1D/2D/3D AveragePool, MaxPool, and LpPool in eager
+and shape-keyed compiled execution: dilations, ceil-mode tails and last-window
+correction, explicit/asymmetric/automatic padding, average denominators,
+optional original-coordinate int64 MaxPool indices and both storage orders.
+It also exercises integer MaxPool kernels, BF16 compositions, noncontiguous and
+broadcast producers, symbolic shape/value replay, legal empty outputs, and
+invalid geometry followed by recovery.
+
+The geometry matrix cross-checks CPU results against a scalar ONNX-coordinate
+oracle. ORT 1.31's `SAME_*` plus dilation computes padding from the undilated
+kernel and can return too few windows; those cases use equivalent explicit-pad
+CPU models as well as the coordinate oracle. ONNX 1.23.2's LpPool reference
+rescales a padded mean, and its common ceil helper can move extra tail padding
+to the beginning, so those helpers are not used as authoritative oracles for
+these interactions. No pooling cases are skipped for these oracle limitations.
+
+```sh
+python -m pytest tests/ops/test_pool_windows.py -q
+```
+
 ### Attention FP16 comparisons
 
 Two ONNX 1.23.2 cases, `test_attention_4d_causal_fp16` and its `_expanded` variant, have a
