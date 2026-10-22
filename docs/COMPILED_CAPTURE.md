@@ -101,6 +101,16 @@ shape selects the corresponding MLX trace, using the same mechanism as static co
 specialization. Changing parameter values with otherwise identical input shapes therefore retraces;
 returning to an earlier value reuses its trace. Ordinary activation/cache inputs remain live data.
 
+Recurrent `RNN`/`GRU`/`LSTM` sequence lengths (input 4) use the same value guard. Their masks
+remain device operations, but every new length vector must pass the `[0, sequence_length]` check
+before its trace can run. Cached valid vectors reuse their traces; invalid vectors never reuse a
+previously validated trace. Data-dependent interior lengths use eager MLX and validate each run.
+Both layouts and all standard activations are supported. Float64 runs on the MLX CPU stream only
+when every selected activation preserves double precision (not native Sigmoid or Softplus).
+Clipping applies to every activation input, including LSTM's final cell activation; carried cell
+states and `Y_c` are not clipped. For the legacy Affine/ScaledTanh activations, which have no
+corresponding ONNX operator schemas, omitted parameters retain ORT's zero defaults.
+
 This does not infer or restore `shape_const` provenance. It is safe even when the boundary values
 really are data-dependent. Each parameter must contain 1–64 int32/int64 elements, and the general
 plan retains at most 16 host-value specializations (shared with control-flow decisions). New values

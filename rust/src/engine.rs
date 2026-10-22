@@ -142,6 +142,7 @@ pub struct NodeDesc {
     pub int_arrays: HashMap<String, Vec<i64>>,
     pub float_arrays: HashMap<String, Vec<f32>>,
     pub strings: HashMap<String, String>,
+    pub string_arrays: HashMap<String, Vec<String>>,
     /// TENSOR-valued attributes (Constant/ConstantOfShape `value`), keyed by attribute name.
     #[allow(dead_code)] // Consumed by upcoming Constant/ConstantOfShape handler waves.
     pub tensors: HashMap<String, ConstTensor>,
@@ -170,6 +171,7 @@ impl NodeDesc {
             int_arrays: HashMap::new(),
             float_arrays: HashMap::new(),
             strings: HashMap::new(),
+            string_arrays: HashMap::new(),
             tensors: HashMap::new(),
             inputs: Vec::new(),
             outputs: Vec::new(),

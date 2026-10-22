@@ -7,14 +7,14 @@
 //! each computing gate pre-activations via matmuls (Xt·Wᵀ + H_{t-1}·Rᵀ + bias) then activations.
 //!
 //! Directions: forward, reverse, bidirectional. `hidden_size`, `clip`, optional B / initial_h /
-//! (LSTM) initial_c / P supported. Only DEFAULT activations are translatable (RNN=Tanh,
-//! GRU=Sigmoid/Tanh, LSTM=Sigmoid/Tanh/Tanh); non-default activations, sequence_lens, and non-default
-//! layout remain on ORT CPU.
+//! (LSTM) initial_c / P, per-batch sequence lengths, both layouts, and all schema activations
+//! are supported. Sequence lengths use device masks; boundary lengths are value-guarded so range
+//! validation cannot be bypassed by compiled replay. Data-dependent interior lengths run eagerly.
 
 use crate::engine::{MlxError, NodeDesc, Src, TranslationContext};
 use crate::registry::{
     ClaimPredicate, ClaimResult, K_ANY_OPSET, NodeView, OpHandler, OpRegistration, OpRegistry,
-    is_mlx_float,
+    is_float64, is_mlx_cpu_float,
 };
 use crate::sys::mlx;
 use crate::{deny, require};
@@ -115,20 +115,166 @@ fn step_slab(
     ctx.reshape(s, &[b, gh])
 }
 
-/// Clamp `pre` to [-clip, clip] when clip > 0.
+/// Clamp activation inputs when the attribute is present, including a zero threshold.
 fn clip_(
     ctx: &mut TranslationContext,
     pre: mlx::mlx_array,
-    clip: f32,
+    clip: Option<f32>,
     dt: mlx::mlx_dtype,
 ) -> Result<mlx::mlx_array, MlxError> {
-    if clip <= 0.0 {
+    let Some(clip) = clip else {
         return Ok(pre);
-    }
+    };
     let hi_s = scalar(ctx, clip, dt)?;
     let hi = ctx.binary(mlx::mlx_minimum, pre, hi_s)?;
     let lo_s = scalar(ctx, -clip, dt)?;
     ctx.binary(mlx::mlx_maximum, hi, lo_s)
+}
+
+fn default_activations(op: &str) -> &'static [&'static str] {
+    match op {
+        "RNN" => &["Tanh"],
+        "GRU" => &["Sigmoid", "Tanh"],
+        _ => &["Sigmoid", "Tanh", "Tanh"],
+    }
+}
+
+fn activation_name(name: &str) -> Option<&'static str> {
+    [
+        "Relu",
+        "Tanh",
+        "Sigmoid",
+        "Affine",
+        "LeakyRelu",
+        "ThresholdedRelu",
+        "ScaledTanh",
+        "HardSigmoid",
+        "Elu",
+        "Softsign",
+        "Softplus",
+    ]
+    .into_iter()
+    .find(|candidate| candidate.eq_ignore_ascii_case(name))
+}
+
+struct Activation {
+    name: String,
+    alpha: f32,
+    beta: f32,
+}
+
+impl Activation {
+    fn apply(
+        &self,
+        ctx: &mut TranslationContext,
+        x: mlx::mlx_array,
+        clip: Option<f32>,
+        dt: mlx::mlx_dtype,
+    ) -> Result<mlx::mlx_array, MlxError> {
+        let x = clip_(ctx, x, clip, dt)?;
+        match self.name.as_str() {
+            "Tanh" => tanh_(ctx, x),
+            "Sigmoid" => sigmoid(ctx, x),
+            "Relu" => {
+                let zero = scalar(ctx, 0.0, dt)?;
+                ctx.binary(mlx::mlx_maximum, x, zero)
+            }
+            "Affine" | "HardSigmoid" => {
+                let alpha = scalar(ctx, self.alpha, dt)?;
+                let beta = scalar(ctx, self.beta, dt)?;
+                let ax = ctx.mul(alpha, x)?;
+                let y = ctx.add(ax, beta)?;
+                if self.name == "Affine" {
+                    Ok(y)
+                } else {
+                    let zero = scalar(ctx, 0.0, dt)?;
+                    let one = scalar(ctx, 1.0, dt)?;
+                    let y = ctx.binary(mlx::mlx_maximum, y, zero)?;
+                    ctx.binary(mlx::mlx_minimum, y, one)
+                }
+            }
+            "LeakyRelu" | "Elu" => {
+                let zero = scalar(ctx, 0.0, dt)?;
+                let alpha = scalar(ctx, self.alpha, dt)?;
+                let negative = if self.name == "Elu" {
+                    let expm1 = ctx.unary(mlx::mlx_expm1, x)?;
+                    ctx.mul(alpha, expm1)?
+                } else {
+                    ctx.mul(alpha, x)?
+                };
+                let positive = ctx.binary(mlx::mlx_greater_equal, x, zero)?;
+                ctx.where_(positive, x, negative)
+            }
+            "ThresholdedRelu" => {
+                let alpha = scalar(ctx, self.alpha, dt)?;
+                let zero = scalar(ctx, 0.0, dt)?;
+                let keep = ctx.binary(mlx::mlx_greater_equal, x, alpha)?;
+                ctx.where_(keep, x, zero)
+            }
+            "ScaledTanh" => {
+                let alpha = scalar(ctx, self.alpha, dt)?;
+                let beta = scalar(ctx, self.beta, dt)?;
+                let bx = ctx.mul(beta, x)?;
+                let tanh = tanh_(ctx, bx)?;
+                ctx.mul(alpha, tanh)
+            }
+            "Softsign" => {
+                let abs = ctx.unary(mlx::mlx_abs, x)?;
+                let one = scalar(ctx, 1.0, dt)?;
+                let denom = ctx.add(one, abs)?;
+                ctx.binary(mlx::mlx_divide, x, denom)
+            }
+            "Softplus" => {
+                let zero = scalar(ctx, 0.0, dt)?;
+                ctx.binary(mlx::mlx_logaddexp, zero, x)
+            }
+            name => Err(format!("MLX recurrent: unsupported activation {name}")),
+        }
+    }
+}
+
+fn activations(n: &NodeDesc, directions: usize) -> Vec<Activation> {
+    let defaults = default_activations(&n.op_type);
+    let names = n.string_arrays.get("activations");
+    let mut alpha = n.float_arrays.get("activation_alpha").into_iter().flatten();
+    let mut beta = n.float_arrays.get("activation_beta").into_iter().flatten();
+    (0..directions * defaults.len())
+        .map(|i| {
+            let name = names
+                .and_then(|names| names.get(i))
+                .map(String::as_str)
+                .unwrap_or(defaults[i % defaults.len()]);
+            let name = activation_name(name).unwrap_or(name);
+            let default_alpha = match name {
+                "LeakyRelu" => 0.01,
+                "HardSigmoid" => 0.2,
+                // Neither legacy activation has a corresponding ONNX operator schema.
+                // Preserve ORT's defaults for omitted parameters.
+                "Affine" | "ScaledTanh" => 0.0,
+                _ => 1.0,
+            };
+            let needs_alpha = matches!(
+                name,
+                "Affine" | "LeakyRelu" | "ThresholdedRelu" | "ScaledTanh" | "HardSigmoid" | "Elu"
+            );
+            let needs_beta = matches!(name, "Affine" | "ScaledTanh" | "HardSigmoid");
+            Activation {
+                name: name.to_owned(),
+                alpha: if needs_alpha {
+                    alpha.next().copied()
+                } else {
+                    None
+                }
+                .unwrap_or(default_alpha),
+                beta: if needs_beta {
+                    beta.next().copied()
+                } else {
+                    None
+                }
+                .unwrap_or(if name == "HardSigmoid" { 0.5 } else { 0.0 }),
+            }
+        })
+        .collect()
 }
 
 /// One direction's weight / state slabs (the [num_directions, ...] tensors, un-sliced).
@@ -143,6 +289,7 @@ struct DirInputs {
     init_c: Option<mlx::mlx_array>,
     has_peephole: bool,
     p: Option<mlx::mlx_array>,
+    sequence_lens: Option<mlx::mlx_array>,
 }
 
 struct DirResult {
@@ -163,10 +310,11 @@ fn run_direction(
     b_sz: i32,
     h: i32,
     gh: i32,
-    clip: f32,
+    clip: Option<f32>,
     linear_before_reset: i32,
     input_forget: i32,
     dt: mlx::mlx_dtype,
+    acts: &[Activation],
 ) -> Result<DirResult, MlxError> {
     let wd = dir_slab(ctx, din.w, d)?; // [G*H, I]
     let rd = dir_slab(ctx, din.r, d)?; // [G*H, H]
@@ -231,6 +379,8 @@ fn run_direction(
 
     let mut ys: Vec<mlx::mlx_array> = vec![x; s_len as usize]; // placeholder handles
     for step in 0..s_len {
+        let old_h = h_prev;
+        let old_c = c_prev;
         let t = if reverse { s_len - 1 - step } else { step };
         let xg = step_slab(ctx, xproj, t, b_sz, gh)?; // [B, G*H] (already carries Wb)
         let mut hf = ctx.matmul(h_prev, rdt)?; // [B, G*H]
@@ -243,8 +393,7 @@ fn run_direction(
 
         if op == "RNN" {
             let sum = ctx.add(xg, hf)?;
-            let pre = clip_(ctx, sum, clip, dt)?;
-            let h_new = tanh_(ctx, pre)?;
+            let h_new = acts[0].apply(ctx, sum, clip, dt)?;
             ys[t as usize] = h_new;
             h_prev = h_new;
         } else if op == "GRU" {
@@ -255,11 +404,9 @@ fn run_direction(
             let hz = gate_col(ctx, hf, 0, h)?;
             let hr = gate_col(ctx, hf, 1, h)?;
             let zsum = ctx.add(xz, hz)?;
-            let zc = clip_(ctx, zsum, clip, dt)?;
-            let zt = sigmoid(ctx, zc)?;
+            let zt = acts[0].apply(ctx, zsum, clip, dt)?;
             let rsum = ctx.add(xr, hr)?;
-            let rc = clip_(ctx, rsum, clip, dt)?;
-            let rt = sigmoid(ctx, rc)?;
+            let rt = acts[0].apply(ctx, rsum, clip, dt)?;
             let htpre = if linear_before_reset != 0 {
                 // ht = g(xh + rt ∘ (H_{t-1}·Rhᵀ + Rbh)); Hf's h column already carries Rbh.
                 let hh = gate_col(ctx, hf, 2, h)?;
@@ -282,8 +429,7 @@ fn run_direction(
                 }
                 ctx.add(xh, hh)?
             };
-            let htc = clip_(ctx, htpre, clip, dt)?;
-            let ht = tanh_(ctx, htc)?;
+            let ht = acts[1].apply(ctx, htpre, clip, dt)?;
             // Ht = (1 - zt) ∘ ht + zt ∘ H_{t-1}
             let one = scalar(ctx, 1.0, dt)?;
             let one_minus_z = ctx.sub(one, zt)?;
@@ -318,19 +464,16 @@ fn run_direction(
                 )?;
                 fpre = ctx.add(fpre, pfc)?;
             }
-            let ipc = clip_(ctx, ipre, clip, dt)?;
-            let it = sigmoid(ctx, ipc)?;
+            let it = acts[0].apply(ctx, ipre, clip, dt)?;
             // Couple input/forget gates: ft = 1 - it when input_forget != 0.
             let ft = if input_forget != 0 {
                 let one = scalar(ctx, 1.0, dt)?;
                 ctx.sub(one, it)?
             } else {
-                let fpc = clip_(ctx, fpre, clip, dt)?;
-                sigmoid(ctx, fpc)?
+                acts[0].apply(ctx, fpre, clip, dt)?
             };
             let csum = ctx.add(xc, hc)?;
-            let cc = clip_(ctx, csum, clip, dt)?;
-            let ct = tanh_(ctx, cc)?;
+            let ct = acts[1].apply(ctx, csum, clip, dt)?;
             let cp = c_prev.ok_or_else(|| "LSTM: cell state missing".to_string())?;
             let fc = ctx.mul(ft, cp)?;
             let ic = ctx.mul(it, ct)?;
@@ -344,17 +487,37 @@ fn run_direction(
                 )?;
                 opre = ctx.add(opre, poc)?;
             }
-            let opc = clip_(ctx, opre, clip, dt)?;
-            let ot = sigmoid(ctx, opc)?;
-            let tc = tanh_(ctx, c_new)?;
+            let ot = acts[0].apply(ctx, opre, clip, dt)?;
+            let tc = acts[2].apply(ctx, c_new, clip, dt)?;
             let h_new = ctx.mul(ot, tc)?;
 
             ys[t as usize] = h_new;
             h_prev = h_new;
             c_prev = Some(c_new);
         }
+        if let Some(lens) = din.sequence_lens {
+            let time = ctx.scalar_i32(t);
+            let valid = ctx.binary(mlx::mlx_less, time, lens)?;
+            let valid = ctx.reshape(valid, &[b_sz, 1])?;
+            let zero = scalar(ctx, 0.0, dt)?;
+            ys[t as usize] = ctx.where_(valid, h_prev, zero)?;
+            h_prev = ctx.where_(valid, h_prev, old_h)?;
+            if let (Some(new_c), Some(old_c)) = (c_prev, old_c) {
+                c_prev = Some(ctx.where_(valid, new_c, old_c)?);
+            }
+        }
     }
 
+    if let Some(lens) = din.sequence_lens {
+        let zero_i = ctx.scalar_i32(0);
+        let nonempty = ctx.binary(mlx::mlx_greater, lens, zero_i)?;
+        let nonempty = ctx.reshape(nonempty, &[b_sz, 1])?;
+        let zero = scalar(ctx, 0.0, dt)?;
+        h_prev = ctx.where_(nonempty, h_prev, zero)?;
+        if let Some(c) = c_prev {
+            c_prev = Some(ctx.where_(nonempty, c, zero)?);
+        }
+    }
     Ok(DirResult {
         ys,
         final_h: h_prev,
@@ -368,10 +531,15 @@ fn recurrent_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxErr
     let op = n.op_type.clone();
     let g = gate_count(&op);
 
-    let h = *n
-        .ints
-        .get("hidden_size")
-        .ok_or_else(|| "MLX recurrent: missing hidden_size".to_string())? as i32;
+    let r = ctx.resolve(&n.inputs[2])?;
+    let rsh = ctx.shape_of(r);
+    let h = match n.ints.get("hidden_size") {
+        Some(&h) => i32::try_from(h).map_err(|_| "MLX recurrent: invalid hidden_size")?,
+        None => *rsh.get(2).ok_or("MLX recurrent: R must have rank 3")?,
+    };
+    if h <= 0 || h > i32::MAX / (2 * g) {
+        return Err("MLX recurrent: hidden_size is out of range".into());
+    }
     let direction = n
         .strings
         .get("direction")
@@ -379,12 +547,19 @@ fn recurrent_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxErr
         .unwrap_or_else(|| "forward".to_string());
     let bidir = direction == "bidirectional";
     let reverse = direction == "reverse";
-    let clip = n.floats.get("clip").copied().unwrap_or(0.0);
+    let clip = n.floats.get("clip").copied();
     let linear_before_reset = n.ints.get("linear_before_reset").copied().unwrap_or(0) as i32;
     let input_forget = n.ints.get("input_forget").copied().unwrap_or(0) as i32;
 
-    let x = ctx.resolve(&n.inputs[0])?; // [S, B, I]
+    let layout = n.ints.get("layout").copied().unwrap_or(0);
+    let mut x = ctx.resolve(&n.inputs[0])?;
+    if layout == 1 {
+        x = ctx.transpose(x, &[1, 0, 2])?;
+    }
     let xsh = ctx.shape_of(x);
+    if xsh.len() != 3 {
+        return Err("MLX recurrent: X must have rank 3".into());
+    }
     let s_len = xsh[0];
     let b_sz = xsh[1];
     let gh = g * h;
@@ -392,7 +567,7 @@ fn recurrent_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxErr
 
     let mut din = DirInputs {
         w: ctx.resolve(&n.inputs[1])?,
-        r: ctx.resolve(&n.inputs[2])?,
+        r,
         has_bias: false,
         b: None,
         has_init_h: false,
@@ -401,12 +576,16 @@ fn recurrent_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxErr
         init_c: None,
         has_peephole: false,
         p: None,
+        sequence_lens: if present(n, 4) {
+            Some(ctx.resolve(&n.inputs[4])?)
+        } else {
+            None
+        },
     };
     if present(n, 3) {
         din.has_bias = true;
         din.b = Some(ctx.resolve(&n.inputs[3])?);
     }
-    // input index 4 is sequence_lens (claimed only when absent).
     if present(n, 5) {
         din.has_init_h = true;
         din.init_h = Some(ctx.resolve(&n.inputs[5])?);
@@ -419,6 +598,66 @@ fn recurrent_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxErr
         if present(n, 7) {
             din.has_peephole = true;
             din.p = Some(ctx.resolve(&n.inputs[7])?);
+        }
+    }
+    if layout == 1 {
+        if let Some(state) = din.init_h {
+            din.init_h = Some(ctx.transpose(state, &[1, 0, 2])?);
+        }
+        if let Some(state) = din.init_c {
+            din.init_c = Some(ctx.transpose(state, &[1, 0, 2])?);
+        }
+    }
+    let directions = if bidir { 2 } else { 1 };
+    let check_shape = |array, expected: &[i32], name| -> Result<(), MlxError> {
+        let actual = ctx.shape_of(array);
+        if actual != expected {
+            return Err(format!(
+                "MLX recurrent: {name} shape {actual:?}, expected {expected:?}"
+            ));
+        }
+        Ok(())
+    };
+    check_shape(din.w, &[directions, gh, xsh[2]], "W")?;
+    check_shape(din.r, &[directions, gh, h], "R")?;
+    for (array, expected, name) in [
+        (din.b, vec![directions, 2 * gh], "B"),
+        (din.init_h, vec![directions, b_sz, h], "initial_h"),
+        (din.init_c, vec![directions, b_sz, h], "initial_c"),
+        (din.p, vec![directions, 3 * h], "P"),
+        (din.sequence_lens, vec![b_sz], "sequence_lens"),
+    ] {
+        if let Some(array) = array {
+            check_shape(array, &expected, name)?;
+        }
+    }
+    let acts = activations(n, directions as usize);
+    let per_direction = default_activations(&op).len();
+    if present(n, 4) {
+        let lengths = if n.inputs[4].source == Src::Intermediate {
+            ctx.read_ints_eval(&n.inputs[4])?
+        } else {
+            let host = ctx.raw_host(&n.inputs[4])?;
+            if host.count != b_sz as usize
+                || (host.count > 0 && host.data.is_null())
+                || host.dtype
+                    != crate::sys::ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32
+            {
+                return Err("MLX recurrent: sequence_lens must contain batch_size int32 values".into());
+            }
+            if host.count == 0 {
+                Vec::new()
+            } else {
+                unsafe { std::slice::from_raw_parts(host.data.cast::<i32>(), host.count) }
+                    .iter()
+                    .map(|&len| i64::from(len))
+                    .collect()
+            }
+        };
+        if lengths.iter().any(|&len| len < 0 || len > i64::from(s_len)) {
+            return Err(
+                "MLX recurrent: sequence_lens entries must be in [0, sequence_length]".into(),
+            );
         }
     }
 
@@ -439,6 +678,7 @@ fn recurrent_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxErr
             linear_before_reset,
             input_forget,
             dt,
+            &acts[..per_direction],
         )?);
         results.push(run_direction(
             ctx,
@@ -455,6 +695,7 @@ fn recurrent_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxErr
             linear_before_reset,
             input_forget,
             dt,
+            &acts[per_direction..],
         )?);
     } else {
         results.push(run_direction(
@@ -472,6 +713,7 @@ fn recurrent_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxErr
             linear_before_reset,
             input_forget,
             dt,
+            &acts[..per_direction],
         )?);
     }
     // Y : [S, num_dir, B, H]. Per direction: stack Ys along axis 0 -> [S,B,H], expand -> [S,1,B,H];
@@ -490,10 +732,11 @@ fn recurrent_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxErr
                 Some(prev) => ctx.concat2(prev, ydir, 1)?,
             });
         }
-        ctx.bind(
-            &n.outputs[0],
-            y.ok_or_else(|| "RNN: no directions produced Y".to_string())?,
-        );
+        let mut y = y.ok_or_else(|| "RNN: no directions produced Y".to_string())?;
+        if layout == 1 {
+            y = ctx.transpose(y, &[2, 0, 1, 3])?;
+        }
+        ctx.bind(&n.outputs[0], y);
     }
 
     // Y_h : [num_dir, B, H].
@@ -506,10 +749,11 @@ fn recurrent_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxErr
                 Some(prev) => ctx.concat2(prev, hd, 0)?,
             });
         }
-        ctx.bind(
-            &n.outputs[1],
-            yh.ok_or_else(|| "RNN: no directions produced Y_h".to_string())?,
-        );
+        let mut yh = yh.ok_or_else(|| "RNN: no directions produced Y_h".to_string())?;
+        if layout == 1 {
+            yh = ctx.transpose(yh, &[1, 0, 2])?;
+        }
+        ctx.bind(&n.outputs[1], yh);
     }
 
     // Y_c : [num_dir, B, H] (LSTM only).
@@ -527,10 +771,11 @@ fn recurrent_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxErr
                 Some(prev) => ctx.concat2(prev, cd, 0)?,
             });
         }
-        ctx.bind(
-            &n.outputs[2],
-            yc.ok_or_else(|| "LSTM: no directions produced Y_c".to_string())?,
-        );
+        let mut yc = yc.ok_or_else(|| "LSTM: no directions produced Y_c".to_string())?;
+        if layout == 1 {
+            yc = ctx.transpose(yc, &[1, 0, 2])?;
+        }
+        ctx.bind(&n.outputs[2], yc);
     }
     Ok(())
 }
@@ -542,27 +787,6 @@ fn float_ok(node: &NodeView, i: usize, xt: crate::sys::ort::ONNXTensorElementDat
         return true;
     }
     matches!(node.input_info(i), Some(info) if info.dtype == xt)
-}
-
-fn ieq(a: &str, b: &str) -> bool {
-    a.eq_ignore_ascii_case(b)
-}
-
-/// True iff every activation matches the op's default pattern (cyclically). ORT may surface the
-/// schema default (e.g. RNN `["Tanh","Tanh"]`) with more entries than `num_directions`, so we do not
-/// require an exact count — only that each entry equals the corresponding default. A genuinely
-/// non-default activation (e.g. Relu) mismatches and the node is left to ORT CPU.
-fn activations_are_default(op: &str, acts: &[String]) -> bool {
-    let base: &[&str] = match op {
-        "RNN" => &["tanh"],
-        "GRU" => &["sigmoid", "tanh"],
-        _ => &["sigmoid", "tanh", "tanh"], // LSTM
-    };
-    !acts.is_empty()
-        && acts
-            .iter()
-            .enumerate()
-            .all(|(i, a)| ieq(a, base[i % base.len()]))
 }
 
 /// Shared claim predicate for RNN / GRU / LSTM.
@@ -582,7 +806,7 @@ fn recurrent_claim(node: &NodeView, op: &str) -> ClaimResult {
     };
     let xt = xinfo.dtype;
     require!(
-        is_mlx_float(xt) && winfo.dtype == xt && rinfo.dtype == xt,
+        is_mlx_cpu_float(xt) && winfo.dtype == xt && rinfo.dtype == xt,
         "X, W, and R must share one MLX float dtype, got {}, {}, {}",
         crate::registry::ort_dtype_name(xt),
         crate::registry::ort_dtype_name(winfo.dtype),
@@ -604,15 +828,8 @@ fn recurrent_claim(node: &NodeView, op: &str) -> ClaimResult {
         );
     }
 
-    require!(!node.input_present(4), "sequence_lens is unsupported");
-    require!(
-        node.int_attr("layout", 0) == 0,
-        "only layout=0 is supported"
-    );
-    require!(
-        node.has_attr("hidden_size"),
-        "missing required hidden_size attribute"
-    );
+    let layout = node.int_attr("layout", 0);
+    require!(layout == 0 || layout == 1, "layout must be 0 or 1");
 
     let direction = node.string_attr("direction", "forward");
     require!(
@@ -620,13 +837,121 @@ fn recurrent_claim(node: &NodeView, op: &str) -> ClaimResult {
         "unsupported direction {:?}",
         direction
     );
-
-    if let Some(acts) = node.strings_attr("activations") {
+    let directions = if direction == "bidirectional" { 2 } else { 1 };
+    let g = i64::from(gate_count(op));
+    require!(
+        winfo.shape.len() == 3 && rinfo.shape.len() == 3,
+        "W and R must have rank 3"
+    );
+    let inferred_h = rinfo.shape[2];
+    let h = node.int_attr("hidden_size", inferred_h);
+    require!(
+        (h > 0 && h <= i64::from(i32::MAX) / (2 * g)) || (!node.has_attr("hidden_size") && h < 0),
+        "hidden_size must be positive, representable, or inferable from R"
+    );
+    let (sequence, batch) = if layout == 0 {
+        (xinfo.shape[0], xinfo.shape[1])
+    } else {
+        (xinfo.shape[1], xinfo.shape[0])
+    };
+    let state = if layout == 0 {
+        vec![directions, batch, h]
+    } else {
+        vec![batch, directions, h]
+    };
+    let matches_shape = |actual: &[i64], expected: &[i64]| {
+        actual.len() == expected.len()
+            && actual
+                .iter()
+                .zip(expected)
+                .all(|(&a, &b)| a < 0 || b < 0 || a == b)
+    };
+    let gh = if h > 0 { g * h } else { -1 };
+    for (index, expected) in [
+        (1, vec![directions, gh, xinfo.shape[2]]),
+        (2, vec![directions, gh, h]),
+        (3, vec![directions, if h > 0 { 2 * gh } else { -1 }]),
+        (4, vec![batch]),
+        (5, state.clone()),
+        (6, state.clone()),
+        (7, vec![directions, if h > 0 { 3 * h } else { -1 }]),
+    ] {
+        if node.input_present(index) {
+            let Some(info) = node.input_info(index) else {
+                deny!("missing input {index} metadata");
+            };
+            require!(
+                matches_shape(&info.shape, &expected),
+                "input {} shape {:?} does not match {:?}",
+                index,
+                info.shape,
+                expected
+            );
+            if index == 4 {
+                require!(
+                    info.dtype == crate::sys::ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32,
+                    "sequence_lens must be int32"
+                );
+            }
+        }
+    }
+    let yshape = if layout == 0 {
+        vec![sequence, directions, batch, h]
+    } else {
+        vec![batch, sequence, directions, h]
+    };
+    for (i, shape) in [yshape, state.clone(), state].iter().enumerate() {
+        if let Some(info) = node.output_info(i) {
+            require!(
+                info.dtype == xt && matches_shape(&info.shape, shape),
+                "output {} must have X dtype and shape {:?}",
+                i,
+                shape
+            );
+        }
+    }
+    for flag in ["linear_before_reset", "input_forget"] {
         require!(
-            activations_are_default(op, &acts),
-            "only default {} activations are supported, got {:?}",
+            matches!(node.int_attr(flag, 0), 0 | 1),
+            "{} must be 0 or 1",
+            flag
+        );
+    }
+    if let Some(clip) = node.float_attr_opt("clip") {
+        require!(
+            clip.is_finite() && clip >= 0.0,
+            "clip must be finite and nonnegative"
+        );
+    }
+    if let Some(lengths) = node.read_const_ints_any(4) {
+        require!(
+            lengths
+                .iter()
+                .all(|&len| len >= 0 && (sequence < 0 || len <= sequence)),
+            "sequence_lens entries must be in [0, sequence_length]"
+        );
+    }
+
+    let acts = node.strings_attr("activations");
+    if let Some(acts) = &acts {
+        require!(
+            acts.len() >= directions as usize * default_activations(op).len()
+                && acts.iter().all(|a| activation_name(a).is_some()),
+            "invalid or unsupported {} activations {:?}",
             op,
             acts
+        );
+    }
+    if is_float64(xt) {
+        let exact = |name: &str| {
+            !name.eq_ignore_ascii_case("Sigmoid") && !name.eq_ignore_ascii_case("Softplus")
+        };
+        require!(
+            acts.as_ref().map_or_else(
+                || default_activations(op).iter().all(|name| exact(name)),
+                |acts| acts.iter().all(|name| exact(name))
+            ),
+            "MLX CPU Sigmoid/Softplus do not preserve float64 precision"
         );
     }
 
