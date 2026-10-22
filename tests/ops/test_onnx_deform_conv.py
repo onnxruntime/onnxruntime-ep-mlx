@@ -123,6 +123,24 @@ CASES = [
         },
         id="stride-pad-dilation",
     ),
+    *[
+        pytest.param(
+            {
+                "x_shape": (2, 4, 5, 6),
+                "weight_shape": (6, 2, 2, 2),
+                "group": 2,
+                "offset_group": offset_group,
+                "strides": (1, 2),
+                "pads": (1, 0, 0, 1),
+                "dilations": (2, 1),
+                "offset_scale": 0.35,
+                "with_bias": True,
+                "with_mask": True,
+            },
+            id=f"independent-offset-group-{offset_group}-all-attributes",
+        )
+        for offset_group in [1, 2, 4]
+    ],
 ]
 
 
