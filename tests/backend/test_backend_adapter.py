@@ -38,12 +38,22 @@ def cpu_adapter(monkeypatch):
     create_session = ort.InferenceSession
 
     def cpu_session(model, *, sess_options, providers):
-        assert providers == [_backend.EP_NAME, "CPUExecutionProvider"]
+        assert providers in (
+            [_backend.EP_NAME, "CPUExecutionProvider"],
+            ["CPUExecutionProvider"],
+        )
         assert sess_options.graph_optimization_level == ort.GraphOptimizationLevel.ORT_DISABLE_ALL
         return create_session(model, sess_options=sess_options, providers=["CPUExecutionProvider"])
 
     monkeypatch.setattr(_backend, "_ensure_registered", lambda: None)
     monkeypatch.setattr(_backend.ort, "InferenceSession", cpu_session)
+
+
+@pytest.fixture(autouse=True)
+def clear_bfloat16_probe_cache():
+    _backend._bfloat16_numpy_io_rejections.cache_clear()
+    yield
+    _backend._bfloat16_numpy_io_rejections.cache_clear()
 
 
 def identity_model(*, ir=7, opset=13, domain="", domain_opset=1):
@@ -358,3 +368,146 @@ def test_output_mismatch_is_a_failure(reference_runner):
             rtol=1e-3,
             atol=1e-7,
         )
+
+
+def bfloat16_identity_model():
+    model = identity_model(ir=8, opset=16)
+    model.graph.input[0].type.tensor_type.elem_type = TensorProto.BFLOAT16
+    model.graph.output[0].type.tensor_type.elem_type = TensorProto.BFLOAT16
+    return model
+
+
+def test_real_bfloat16_numpy_input_output_probes_are_cached():
+    rejected = _backend._bfloat16_numpy_io_rejections()
+    assert set(rejected) == {"input", "output"}
+    assert "can't be converted to MLDataType" in rejected["input"]
+    assert "No corresponding Numpy type" in rejected["output"]
+    assert _backend._bfloat16_numpy_io_rejections() is rejected
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "test_attention_3d_causal_bf16",
+        "test_attention_3d_causal_bf16_expanded",
+        "test_attention_4d_attn_mask_causal_bf16",
+        "test_attention_4d_attn_mask_causal_bf16_expanded",
+        "test_attention_4d_causal_bf16",
+        "test_attention_4d_causal_bf16_expanded",
+        "test_attention_4d_causal_padded_kv_bf16",
+        "test_attention_4d_causal_padded_kv_bf16_expanded",
+        "test_attention_4d_padded_kv_bf16",
+        "test_attention_4d_padded_kv_bf16_expanded",
+    ],
+)
+def test_bfloat16_interface_limit_skips_valid_cases_without_rewriting(cpu_adapter, node_cases, name):
+    model = node_cases[name].model
+    original = model.SerializeToString()
+    with pytest.raises(unittest.SkipTest, match="BFLOAT16 NumPy.*independent public CPU"):
+        MlxBackend.prepare(model)
+    assert model.SerializeToString() == original
+
+
+@pytest.mark.parametrize("direction", ["input", "output"])
+def test_bfloat16_skip_requires_failure_in_the_required_direction(monkeypatch, direction):
+    model = bfloat16_identity_model()
+    other = "output" if direction == "input" else "input"
+    # Inspect interface metadata only; these modified models are not executed.
+    getattr(model.graph, other)[0].type.tensor_type.elem_type = TensorProto.FLOAT
+    monkeypatch.setattr(_backend, "_bfloat16_numpy_io_rejections", lambda: {other: "unsupported"})
+    assert _backend._bfloat16_io_rejection(model) is None
+    monkeypatch.setattr(_backend, "_bfloat16_numpy_io_rejections", lambda: {direction: "proven"})
+    assert _backend._bfloat16_io_rejection(model) == "proven"
+
+
+def test_internal_bfloat16_does_not_trigger_interface_skip(monkeypatch):
+    model = identity_model()
+    model.graph.initializer.append(
+        helper.make_tensor("unused", TensorProto.BFLOAT16, [1], [1.0])
+    )
+
+    def unexpected_probe():
+        pytest.fail("Non-BFLOAT16 model interface must not trigger the probe")
+
+    monkeypatch.setattr(_backend, "_bfloat16_numpy_io_rejections", unexpected_probe)
+    assert _backend._bfloat16_io_rejection(model) is None
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        RuntimeError("CPU provider initialization failed"),
+        RuntimeError("Numpy_type 123 can't be converted to MLDataType."),
+        InvalidArgument("invalid input shape"),
+        NotImplemented("Could not find an implementation for Shape"),
+    ],
+)
+def test_bfloat16_probe_does_not_suppress_unrelated_errors(monkeypatch, error):
+    class Session:
+        def run(self, *args, **kwargs):
+            raise error
+
+    monkeypatch.setattr(_backend.ort, "InferenceSession", lambda *args, **kwargs: Session())
+    with pytest.raises(type(error)) as caught:
+        _backend._bfloat16_numpy_io_rejections()
+    assert caught.value is error
+
+
+def test_bfloat16_probe_preserves_support_when_conversion_works(monkeypatch):
+    class Session:
+        def __init__(self, model, **kwargs):
+            self.ref = ReferenceEvaluator(onnx.load_from_string(model))
+
+        def run(self, output_names, feeds):
+            return self.ref.run(output_names, feeds)
+
+    monkeypatch.setattr(_backend.ort, "InferenceSession", Session)
+    assert _backend._bfloat16_numpy_io_rejections() == {}
+    assert _backend._bfloat16_io_rejection(bfloat16_identity_model()) is None
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        Fail("Type parameter (T) of Add bound to different types"),
+        NotImplemented("Could not find an implementation for Pad(24)"),
+        RuntimeError("provider execution failure"),
+    ],
+)
+def test_bfloat16_model_errors_propagate_when_io_is_supported(monkeypatch, error):
+    monkeypatch.setattr(_backend, "_ensure_registered", lambda: None)
+    monkeypatch.setattr(_backend, "_bfloat16_numpy_io_rejections", lambda: {})
+
+    def fail(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(_backend.ort, "InferenceSession", fail)
+    with pytest.raises(type(error)) as caught:
+        MlxBackend.prepare(bfloat16_identity_model())
+    assert caught.value is error
+
+
+def test_bfloat16_probe_rejects_silent_dtype_or_value_changes(monkeypatch):
+    class Session:
+        def run(self, *args, **kwargs):
+            return [np.array([2.0], dtype=np.float32)]
+
+    monkeypatch.setattr(_backend.ort, "InferenceSession", lambda *args, **kwargs: Session())
+    with pytest.raises(RuntimeError, match="probe changed dtype or values"):
+        _backend._bfloat16_numpy_io_rejections()
+
+
+def test_malformed_bfloat16_model_is_not_skipped(cpu_adapter):
+    model = bfloat16_identity_model()
+    model.graph.node[0].input[0] = "missing_input"
+    with pytest.raises(onnx.checker.ValidationError):
+        MlxBackend.prepare(model)
+
+
+def test_bfloat16_registration_failure_is_not_skipped(monkeypatch):
+    def fail():
+        raise RuntimeError("provider registration failed")
+
+    monkeypatch.setattr(_backend, "_ensure_registered", fail)
+    with pytest.raises(RuntimeError, match="provider registration failed"):
+        MlxBackend.prepare(bfloat16_identity_model())

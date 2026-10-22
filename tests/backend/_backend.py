@@ -5,10 +5,11 @@ from __future__ import annotations
 import os
 import re
 import unittest
+from functools import cache
 
 import numpy as np
 import onnxruntime as ort
-from onnx import ModelProto, defs
+from onnx import ModelProto, TensorProto, defs, helper, numpy_helper
 from onnx.backend.base import Backend, BackendRep
 from onnx.backend.test.runner import Runner
 from onnxruntime.capi.onnxruntime_pybind11_state import Fail, InvalidGraph
@@ -124,6 +125,76 @@ def _schema_rejection(model: ModelProto, message: str) -> str | None:
     return None
 
 
+@cache
+def _bfloat16_numpy_io_rejections() -> dict[str, str]:
+    """Probe public NumPy input/output conversion independently of the MLX EP."""
+    tensor = helper.make_tensor("value", TensorProto.BFLOAT16, [2], [1.25, -2.5])
+    sample = numpy_helper.to_array(tensor)
+    probes = (
+        (
+            "input",
+            helper.make_node("Shape", ["x"], ["y"]),
+            [helper.make_tensor_value_info("x", TensorProto.BFLOAT16, [2])],
+            helper.make_tensor_value_info("y", TensorProto.INT64, [1]),
+            {"x": sample},
+            np.array([2], dtype=np.int64),
+            f"Numpy_type {sample.dtype.num} can't be converted to MLDataType.",
+        ),
+        (
+            "output",
+            helper.make_node("Constant", [], ["y"], value=tensor),
+            [],
+            helper.make_tensor_value_info("y", TensorProto.BFLOAT16, [2]),
+            {},
+            sample,
+            "No corresponding Numpy type for Tensor Type. bfloat16",
+        ),
+    )
+    rejected = {}
+    for direction, node, inputs, output, feeds, expected, conversion_error in probes:
+        model = helper.make_model(
+            helper.make_graph([node], f"bfloat16_numpy_{direction}", inputs, [output]),
+            ir_version=8,
+            opset_imports=[helper.make_opsetid("", 16)],
+        )
+        opts = ort.SessionOptions()
+        opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+        sess = ort.InferenceSession(
+            model.SerializeToString(), sess_options=opts, providers=["CPUExecutionProvider"]
+        )
+        try:
+            outputs = sess.run(["y"], feeds)
+        except RuntimeError as exc:
+            if str(exc) != conversion_error:
+                raise
+            rejected[direction] = f"BFLOAT16 NumPy {direction} conversion: {exc}"
+        else:
+            if (
+                len(outputs) != 1
+                or outputs[0].dtype != expected.dtype
+                or not np.array_equal(outputs[0], expected)
+            ):
+                raise RuntimeError(f"BFLOAT16 NumPy {direction} probe changed dtype or values")
+    return rejected
+
+
+def _bfloat16_io_rejection(model: ModelProto) -> str | None:
+    required = [
+        direction
+        for direction, values in (("input", model.graph.input), ("output", model.graph.output))
+        if any(
+            value.type.HasField("tensor_type")
+            and value.type.tensor_type.elem_type == TensorProto.BFLOAT16
+            for value in values
+        )
+    ]
+    if not required:
+        return None
+    rejected = _bfloat16_numpy_io_rejections()
+    reasons = [rejected[direction] for direction in required if direction in rejected]
+    return "; ".join(reasons) or None
+
+
 class MlxBackend(Backend):
     """Execute the unmodified model on MLX with CPU fallback available."""
 
@@ -131,6 +202,12 @@ class MlxBackend(Backend):
     def prepare(cls, model, device="CPU", **kwargs):  # noqa: ANN001
         super().prepare(model, device, **kwargs)
         _ensure_registered()
+        reason = _bfloat16_io_rejection(model)
+        if reason is not None:
+            raise unittest.SkipTest(
+                f"ONNX Runtime {ort.__version__}: {reason} "
+                "(independent public CPU Shape/Constant probes)"
+            )
         opts = ort.SessionOptions()
         opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
         try:

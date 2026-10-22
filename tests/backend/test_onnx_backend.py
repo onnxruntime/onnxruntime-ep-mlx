@@ -17,6 +17,8 @@ Notes
   the heavy model-zoo / "real" tests (which download large models) are skipped.
 * Ops the EP does not claim run on the CPU fallback and still validate for
   correctness; claimed ops get genuine MLX validation against the ONNX data.
+* BF16 tensor I/O requires working public ORT NumPy conversions. Independent
+  CPU Shape/Constant probes establish missing conversions before such cases skip.
 * ``float64`` and other Apple-GPU-unsupported forms fall back to CPU and pass;
   genuinely-broken cases can be excluded in ``_EXCLUDE`` as discovered.
 """

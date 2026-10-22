@@ -249,6 +249,11 @@ python -m pytest tests/backend -q
   rejections become version-reasoned skips. Attention-25 window attributes added
   in ONNX 1.23 are also skipped only when ORT rejects that exact official
   attribute on the matching valid model node; other invalid-graph errors fail.
+  BF16 tensor inputs/outputs skip only when independent public ORT CPU probes
+  demonstrate the required NumPy input/output conversion is unavailable. The
+  probes use Shape/Constant (no casts), preserve dtype/values when supported,
+  and are cached per process. They do not rewrite real models or suppress
+  internal-BF16-only models, malformed graphs, or unrelated runtime failures.
   No models are rewritten. Kernel errors and output mismatches
   still fail, with CPU fallback available for ops MLX does not claim.
   The loader/adapter regressions can run without Metal:
