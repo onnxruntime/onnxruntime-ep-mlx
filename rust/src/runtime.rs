@@ -415,15 +415,18 @@ mod tests {
 
     #[test]
     fn float64_statistics_require_cpu_without_float64_tensor_slots() {
-        for op in [
-            "RMSNormalization",
-            "LayerNormalization",
-            "GroupNormalization",
+        for (domain, op) in [
+            ("", "RMSNormalization"),
+            ("", "LayerNormalization"),
+            ("", "GroupNormalization"),
+            ("", "SimplifiedLayerNormalization"),
+            ("com.microsoft", "SimplifiedLayerNormalization"),
         ] {
             let mut node = node_with_output(
                 ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
             );
             node.op_type = op.to_string();
+            node.domain = domain.to_string();
             node.ints.insert("stash_type".to_string(), 11);
             let plan = Plan::new(vec![node]);
             assert!(plan.requires_cpu_stream);

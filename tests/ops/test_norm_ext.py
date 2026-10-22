@@ -32,6 +32,7 @@ _TOL = {
     np.dtype("float16"): dict(rtol=2e-2, atol=2e-2),
 }
 DTYPES = [np.float32, np.float16]
+STANDARD_NORMS = ["RMSNormalization", "LayerNormalization", "SimplifiedLayerNormalization"]
 
 
 def ir_of(dt) -> ir.DataType:
@@ -99,7 +100,7 @@ def _norm_reference(x, scale, axis, centered, *, stash=np.float32, bias=None, ep
     return output.astype(scale.dtype), mean, inv
 
 
-@pytest.mark.parametrize("op", ["RMSNormalization", "LayerNormalization"])
+@pytest.mark.parametrize("op", STANDARD_NORMS)
 @pytest.mark.parametrize("axis", [-3, -2, -1, 0, 1, 2])
 @pytest.mark.parametrize("affine_shape", [(), (1,), (4,), (1, 1, 4)])
 @pytest.mark.parametrize("dt", DTYPES)
@@ -172,9 +173,10 @@ def test_layer_norm_optional_statistics(axes, statistics, stash, stash_numpy):
 
 @pytest.mark.parametrize("x_dtype", [np.float16, np.float32, np.float64])
 @pytest.mark.parametrize("scale_dtype", [np.float16, np.float32, np.float64])
-def test_rms_norm_mixed_types(x_dtype, scale_dtype):
+@pytest.mark.parametrize("op", ["RMSNormalization", "SimplifiedLayerNormalization"])
+def test_rms_norm_mixed_types(x_dtype, scale_dtype, op):
     model = build(
-        "RMSNormalization",
+        op,
         [m.tensor("x", ir_of(x_dtype), [2, 4]), m.tensor("scale", ir_of(scale_dtype), [4])],
         [m.tensor("out", ir_of(scale_dtype), [2, 4])],
     )
@@ -186,7 +188,7 @@ def test_rms_norm_mixed_types(x_dtype, scale_dtype):
     np.testing.assert_allclose(actual, expected, rtol=2e-2 if np.float16 in [x_dtype, scale_dtype] else 1e-5, atol=1e-6)
 
 
-@pytest.mark.parametrize("op", ["RMSNormalization", "LayerNormalization"])
+@pytest.mark.parametrize("op", STANDARD_NORMS)
 @pytest.mark.parametrize("shape", [(0, 3), (2, 0), (0, 0)])
 def test_standard_norm_empty(op, shape):
     model = build(
@@ -199,7 +201,7 @@ def test_standard_norm_empty(op, shape):
     assert actual.shape == shape
 
 
-@pytest.mark.parametrize("op", ["RMSNormalization", "LayerNormalization"])
+@pytest.mark.parametrize("op", STANDARD_NORMS)
 def test_standard_norm_dynamic_affine_dispatch(op):
     model = build(
         op, [m.tensor("x", DT.FLOAT, ["B", "D"]), m.tensor("scale", DT.FLOAT, ["G"])],
@@ -214,7 +216,7 @@ def test_standard_norm_dynamic_affine_dispatch(op):
         np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-6)
 
 
-@pytest.mark.parametrize("op", ["RMSNormalization", "LayerNormalization"])
+@pytest.mark.parametrize("op", STANDARD_NORMS)
 @pytest.mark.parametrize("shape", [(4,), (2, 1, 3, 4), (1, 2, 1, 2, 4)])
 @pytest.mark.parametrize("axis", [0, -1])
 def test_standard_norm_rank_boundaries(op, shape, axis):
@@ -262,7 +264,7 @@ def test_layer_norm_empty_statistics(shape):
     np.testing.assert_array_equal(inv, expected)
 
 
-@pytest.mark.parametrize("op", ["RMSNormalization", "LayerNormalization"])
+@pytest.mark.parametrize("op", STANDARD_NORMS)
 @pytest.mark.parametrize("stash,np_stash", [(DT.FLOAT16, np.float16), (DT.DOUBLE, np.float64)])
 def test_standard_norm_stash(op, stash, np_stash):
     model = build(
@@ -276,7 +278,7 @@ def test_standard_norm_stash(op, stash, np_stash):
     np.testing.assert_allclose(actual, expected, rtol=1e-3 if stash == DT.FLOAT16 else 1e-6, atol=1e-6)
 
 
-@pytest.mark.parametrize("op", ["RMSNormalization", "LayerNormalization"])
+@pytest.mark.parametrize("op", STANDARD_NORMS)
 @pytest.mark.parametrize("axis", [-1, 0])
 @pytest.mark.parametrize("affine_shape", [(), (1,), (4,), (1, 1, 4)])
 @pytest.mark.parametrize("stash", [DT.FLOAT, DT.BFLOAT16])
@@ -307,9 +309,10 @@ def test_standard_norm_bfloat16_interior(op, axis, affine_shape, stash):
 
 
 @pytest.mark.parametrize("x_dtype", [np.float32, np.float64])
-def test_rms_norm_double_affine_exact(x_dtype):
+@pytest.mark.parametrize("op", ["RMSNormalization", "SimplifiedLayerNormalization"])
+def test_rms_norm_double_affine_exact(x_dtype, op):
     model = build(
-        "RMSNormalization",
+        op,
         [m.tensor("x", ir_of(x_dtype), [2, 4]), m.tensor("scale", DT.DOUBLE, [4])],
         [m.tensor("out", DT.DOUBLE, [2, 4])],
         attrs=[ir.AttrFloat32("epsilon", 0)],
@@ -319,7 +322,7 @@ def test_rms_norm_double_affine_exact(x_dtype):
     np.testing.assert_array_equal(actual, np.broadcast_to(scale, (2, 4)))
 
 
-@pytest.mark.parametrize("op", ["RMSNormalization", "LayerNormalization"])
+@pytest.mark.parametrize("op", STANDARD_NORMS)
 def test_standard_norm_float64_statistics_exact(op):
     model = build(
         op, [m.tensor("x", DT.DOUBLE, [2]), m.tensor("scale", DT.DOUBLE, [2])],
@@ -328,7 +331,7 @@ def test_standard_norm_float64_statistics_exact(op):
     )
     x = np.array([1 + 2**-30, 1 - 2**-30], np.float64)
     actual = _strict_mlx_session(model).run(None, {"x": x, "scale": np.ones(2, np.float64)})[0]
-    expected = x if op == "RMSNormalization" else np.array([1, -1], np.float64)
+    expected = np.array([1, -1], np.float64) if op == "LayerNormalization" else x
     np.testing.assert_array_equal(actual, expected)
 
 
@@ -352,9 +355,9 @@ def test_standard_norm_compile_and_cpu_routes(tmp_path):
     )
     events = json.loads(trace.read_text())
     paths = [e["args"] for e in events if e.get("cat") == "ep.path"]
-    assert [e["path"] for e in paths] == ["general"] * 8 + ["eager"] * 2
-    assert [e["cache"] for e in paths] == ["MISS", "RETRACE", "RETRACE", "HIT"] * 2 + ["n/a"] * 2
-    assert {e["ops"] for e in paths[-2:]} == {"RMSNormalization", "LayerNormalization"}
+    assert [e["path"] for e in paths] == ["general"] * 12 + ["eager"] * 3
+    assert [e["cache"] for e in paths] == ["MISS", "RETRACE", "RETRACE", "HIT"] * 3 + ["n/a"] * 3
+    assert {e["ops"] for e in paths[-3:]} == set(STANDARD_NORMS)
 
 
 # --- LayerNormalization -----------------------------------------------------------------------
@@ -413,9 +416,7 @@ def test_simplified_layer_norm():
 
 
 def test_simplified_layer_norm_default_domain():
-    """SPECIAL CASE: Microsoft's exporter sometimes stamps the com.microsoft contrib op
-    SimplifiedLayerNormalization into the DEFAULT domain (domain ""). We register it there too, so
-    it must be CLAIMED (not fall back) and match CPU. (gemma-4-E2B vision encoder has 113 of these.)"""
+    """ORT exposes this extension in the default domain; it must be claimed."""
     rng = np.random.default_rng(4)
     x = rng.standard_normal((2, 4, 8)).astype(np.float32)
     scale = rng.standard_normal((8,)).astype(np.float32)
@@ -439,6 +440,63 @@ def test_simplified_layer_norm_default_domain():
         rtol=1e-4,
         atol=1e-5,
     )
+
+
+@pytest.mark.parametrize("dt", DTYPES)
+@pytest.mark.parametrize("axis", [-1, 0])
+@pytest.mark.parametrize("stash,precision", [(DT.FLOAT, np.float32), (DT.DOUBLE, np.float64)])
+@pytest.mark.parametrize("eager", [False, True])
+def test_simplified_layer_norm_inverse_statistics(dt, axis, stash, precision, eager, monkeypatch):
+    monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_COMPILE", "1" if eager else "0")
+    shape = [2, 3, 4]
+    stats_shape = [2, 3, 1] if axis == -1 else [1, 1, 1]
+    model = build(
+        "SimplifiedLayerNormalization",
+        [m.tensor("x", ir_of(dt), shape), m.tensor("s", ir_of(dt), [4])],
+        [m.tensor("y", ir_of(dt), shape), m.tensor("inv", stash, stats_shape)],
+        attrs=[ir.AttrInt64("axis", axis), ir.AttrInt64("stash_type", int(stash))],
+    )
+    session = _strict_mlx_session(model)
+    for factor in [1, 2, -1]:
+        feeds = {"x": randn(dt, *shape) * dt(factor), "s": np.full(4, 1.25, dt)}
+        actual, inv = session.run(None, feeds)
+        expected, _, expected_inv = _norm_reference(feeds["x"], feeds["s"], axis, False, stash=precision)
+        np.testing.assert_allclose(actual, expected, **tol(dt))
+        assert inv.dtype == np.dtype(precision)
+        np.testing.assert_allclose(inv, expected_inv, rtol=1e-12 if stash == DT.DOUBLE else 1e-6, atol=1e-12)
+        if dt == np.float32 and stash == DT.FLOAT:
+            cpu = ort.InferenceSession(model, providers=["CPUExecutionProvider"])
+            cpu_out = cpu.run(None, feeds)
+            np.testing.assert_allclose(actual, cpu_out[0], **tol(dt))
+            np.testing.assert_allclose(inv, cpu_out[1], rtol=1e-6, atol=1e-6)
+
+
+@pytest.mark.parametrize("shape", [(0, 3), (2, 0)])
+def test_simplified_layer_norm_empty_inverse_statistics(shape):
+    model = build(
+        "SimplifiedLayerNormalization",
+        [m.tensor("x", DT.FLOAT, list(shape)), m.tensor("s", DT.FLOAT, [])],
+        [m.tensor("y", DT.FLOAT, list(shape)), m.tensor("inv", DT.FLOAT, [shape[0], 1])],
+    )
+    y, inv = _strict_mlx_session(model).run(
+        None, {"x": np.empty(shape, np.float32), "s": np.array(1, np.float32)}
+    )
+    assert y.shape == shape
+    np.testing.assert_array_equal(inv, np.full([shape[0], 1], np.nan, np.float32))
+
+
+def test_simplified_layer_norm_omitted_inverse_slot():
+    x, scale = m.tensor("x", DT.FLOAT, [2, 4]), m.tensor("scale", DT.FLOAT, [])
+    y, omitted = m.tensor("y", DT.FLOAT, [2, 4]), ir.Value(name="")
+    node = ir.node("SimplifiedLayerNormalization", [x, scale], outputs=[y, omitted])
+    graph = ir.Graph([x, scale], [y], nodes=[node], name="omitted_inverse", opset_imports={"": 23})
+    proto = ir.to_proto(ir.Model(graph, ir_version=11))
+    proto.graph.node[0].output.append("")
+    assert proto.graph.node[0].output[1] == ""
+    feeds = {"x": randn(np.float32, 2, 4), "scale": np.array(1.25, np.float32)}
+    actual = _strict_mlx_session(proto.SerializeToString()).run(None, feeds)[0]
+    expected, _, _ = _norm_reference(feeds["x"], feeds["scale"], -1, False)
+    np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-6)
 
 
 @pytest.mark.parametrize("dt", DTYPES)
