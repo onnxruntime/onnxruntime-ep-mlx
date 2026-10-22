@@ -1563,11 +1563,12 @@ pub fn node_uses_float64(node: &NodeView) -> bool {
 }
 
 pub(crate) fn uses_float64_statistics(domain: &str, op_type: &str, stash_type: i64) -> bool {
-    domain.is_empty()
+    (domain.is_empty()
         && matches!(
             op_type,
             "RMSNormalization" | "LayerNormalization" | "GroupNormalization"
         )
+        || matches!(domain, "" | "com.microsoft") && op_type == "SimplifiedLayerNormalization")
         && stash_type == 11
 }
 
