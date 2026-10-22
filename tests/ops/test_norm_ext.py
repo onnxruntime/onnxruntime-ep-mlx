@@ -626,15 +626,13 @@ def test_skip_norm_bfloat16_interior(op):
     np.testing.assert_array_equal(actual_residual, residual.astype(ml_dtypes.bfloat16).astype(np.float32))
 
 
-@pytest.mark.parametrize("op", ["SkipLayerNormalization", "SkipSimplifiedLayerNormalization"])
-@pytest.mark.parametrize("port", [1, 2])
 @pytest.mark.parametrize("consumer", [False, True])
-def test_skip_norm_live_training_diagnostics_declined(op, port, consumer):
+def test_skip_rms_live_mean_contract_unavailable(consumer):
     proto = onnx.load_model_from_string(
-        _skip_norm_model(op, np.float32, [2, 3, 4], [2, 3, 4], "none", outputs="y")
+        _skip_norm_model("SkipSimplifiedLayerNormalization", np.float32,
+                         [2, 3, 4], [2, 3, 4], "none", outputs="y")
     )
     node = proto.graph.node[0]
-    node.output.extend([""] * (port - len(node.output)))
     node.output.append("diagnostic")
     value = onnx.helper.make_tensor_value_info("diagnostic", onnx.TensorProto.FLOAT, [2, 3, 1])
     if consumer:
@@ -644,6 +642,206 @@ def test_skip_norm_live_training_diagnostics_declined(op, port, consumer):
     proto.graph.output.append(value)
     with pytest.raises(Exception, match="fallback to CPU EP has been explicitly disabled"):
         _strict_mlx_session(proto.SerializeToString())
+
+
+def _skip_statistic_model(op, dt, shape, skip_shape, optional, ports, *, consumer=False, unused_mean=False):
+    boundary = np.float32 if dt == ml_dtypes.bfloat16 else dt
+    proto = onnx.load_model_from_string(
+        _skip_norm_model(op, boundary, shape, skip_shape, optional, outputs="y")
+    )
+    node = proto.graph.node[0]
+    node.output.extend([""] * 3)
+    if unused_mean:
+        node.output[1] = "unused_mean"
+    for port in ports:
+        name = f"saved_{port}"
+        node.output[port] = name
+        dtype = onnx.TensorProto.FLOAT if port < 3 else int(ir_of(boundary))
+        dimensions = [*shape[:-1], 1] if port < 3 else shape
+        value = onnx.helper.make_tensor_value_info(name, dtype, dimensions)
+        if consumer:
+            proto.graph.value_info.append(value)
+            proto.graph.node.append(onnx.helper.make_node("Identity", [name], [f"consumed_{port}"]))
+            value.name = f"consumed_{port}"
+        proto.graph.output.append(value)
+    if dt == ml_dtypes.bfloat16:
+        casts = []
+        for value in proto.graph.input:
+            inner = f"{value.name}_bf16"
+            casts.append(onnx.helper.make_node("Cast", [value.name], [inner], to=onnx.TensorProto.BFLOAT16))
+            for i, name in enumerate(node.input):
+                if name == value.name:
+                    node.input[i] = inner
+        output_casts = []
+        for port in [0, 3]:
+            name = node.output[port]
+            if name:
+                node.output[port] = f"{name}_bf16"
+                output_casts.append(
+                    onnx.helper.make_node("Cast", [f"{name}_bf16"], [name], to=onnx.TensorProto.FLOAT)
+                )
+        nodes = casts + [node] + output_casts + list(proto.graph.node[1:])
+        del proto.graph.node[:]
+        proto.graph.node.extend(nodes)
+    return proto.SerializeToString()
+
+
+def _skip_statistic_reference(op, dt, feeds):
+    rounded = {name: value.astype(dt).astype(np.float32) for name, value in feeds.items()}
+    residual = rounded["x"] + rounded["skip"]
+    if "bias" in rounded:
+        residual = residual + rounded["bias"]
+    if residual.shape[-1] == 0:
+        mean = np.full((*residual.shape[:-1], 1), np.nan, np.float32)
+        inverse, output = mean.copy(), residual
+    else:
+        output, mean, inverse = _norm_reference(
+            residual, rounded["gamma"], -1, op == "SkipLayerNormalization",
+            epsilon=1e-12, bias=rounded.get("beta"),
+        )
+    boundary = np.float32 if dt == ml_dtypes.bfloat16 else dt
+    return {
+        0: output.astype(dt).astype(boundary), 1: mean, 2: inverse,
+        3: residual.astype(dt).astype(boundary),
+    }
+
+
+_SKIP_STATISTIC_FORMS = [
+    (op, ports, optional)
+    for op in ["SkipLayerNormalization", "SkipSimplifiedLayerNormalization"]
+    for ports in ([(1,), (2,), (1, 2), (1, 2, 3)] if op == "SkipLayerNormalization" else [(2,), (2, 3)])
+    for optional in (["none", "beta", "bias", "both"] if op == "SkipLayerNormalization" else ["none", "bias"])
+]
+
+
+@pytest.mark.parametrize("op,ports,optional", _SKIP_STATISTIC_FORMS)
+@pytest.mark.parametrize("dt", [np.float32, np.float16, ml_dtypes.bfloat16])
+@pytest.mark.parametrize("skip_shape", [[2, 3, 4], [1, 3, 4], [3, 4]])
+@pytest.mark.parametrize("eager", [False, True])
+@pytest.mark.parametrize("consumer", [False, True])
+def test_skip_norm_saved_statistics(op, ports, optional, dt, skip_shape, eager, consumer, monkeypatch):
+    monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_COMPILE", "1" if eager else "0")
+    model = _skip_statistic_model(op, dt, [2, 3, 4], skip_shape, optional, ports, consumer=consumer)
+    session = _strict_mlx_session(model)
+    boundary = np.float32 if dt == ml_dtypes.bfloat16 else dt
+    for factor in [1, 2, -1]:
+        feeds = {"x": (randn(boundary, 2, 3, 4) * factor).astype(boundary),
+                 "skip": randn(boundary, *skip_shape), "gamma": np.full(4, 1.25, boundary)}
+        if optional in ["beta", "both"]:
+            feeds["beta"] = np.full(4, 0.125, boundary)
+        if optional in ["bias", "both"]:
+            feeds["bias"] = np.full(4, 0.25, boundary)
+        expected = _skip_statistic_reference(op, dt, feeds)
+        actual = session.run(None, feeds)
+        np.testing.assert_allclose(actual[0], expected[0], **tol(boundary))
+        for port, result in zip(ports, actual[1:]):
+            assert result.shape == expected[port].shape
+            assert result.dtype == expected[port].dtype
+            if port < 3:
+                np.testing.assert_allclose(result, expected[port], rtol=2e-6, atol=1e-7)
+            else:
+                np.testing.assert_array_equal(result, expected[port])
+
+
+@pytest.mark.parametrize("op,ports", [("SkipLayerNormalization", (1, 2, 3)),
+                                    ("SkipSimplifiedLayerNormalization", (2, 3))])
+@pytest.mark.parametrize("eager", [False, True])
+def test_skip_statistics_dynamic_empty(op, ports, eager, monkeypatch):
+    monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_COMPILE", "1" if eager else "0")
+    model = _skip_statistic_model(op, np.float32, ["B", "S", "D"], ["B", "S", "D"], "none", ports)
+    session = _strict_mlx_session(model)
+    for shape in [[2, 3, 4], [1, 2, 8], [0, 2, 4], [2, 0, 4], [2, 3, 0], [2, 3, 4]]:
+        feeds = {"x": randn(np.float32, *shape), "skip": randn(np.float32, *shape),
+                 "gamma": np.ones(shape[-1], np.float32)}
+        expected = _skip_statistic_reference(op, np.float32, feeds)
+        actual = session.run(None, feeds)
+        for port, result in zip((0, *ports), actual):
+            assert result.shape == expected[port].shape
+            np.testing.assert_allclose(result, expected[port], rtol=2e-6, atol=1e-7)
+
+
+def test_skip_statistics_half_residual_precision():
+    model = _skip_statistic_model("SkipLayerNormalization", np.float16, [1, 2, 4],
+                                  [1, 2, 4], "bias", (1, 2, 3))
+    feeds = {"x": np.full((1, 2, 4), 1024, np.float16),
+             "skip": np.full((1, 2, 4), 0.5, np.float16),
+             "gamma": np.ones(4, np.float16), "bias": np.full(4, 0.5, np.float16)}
+    _, mean, inverse, residual = _strict_mlx_session(model).run(None, feeds)
+    np.testing.assert_array_equal(mean, np.full((1, 2, 1), 1025, np.float32))
+    np.testing.assert_array_equal(inverse, np.full((1, 2, 1), 1e6, np.float32))
+    np.testing.assert_array_equal(residual, np.full((1, 2, 4), 1025, np.float16))
+
+
+def test_skip_rms_unused_mean_and_live_inverse():
+    op = "SkipSimplifiedLayerNormalization"
+    model = _skip_statistic_model(op, np.float32, [2, 3, 4], [2, 3, 4], "none",
+                                  (2, 3), unused_mean=True)
+    feeds = {"x": randn(np.float32, 2, 3, 4), "skip": randn(np.float32, 2, 3, 4),
+             "gamma": np.ones(4, np.float32)}
+    expected = _skip_statistic_reference(op, np.float32, feeds)
+    for port, result in zip((0, 2, 3), _strict_mlx_session(model).run(None, feeds)):
+        np.testing.assert_allclose(result, expected[port], rtol=2e-6, atol=1e-7)
+
+
+def test_skip_saved_statistics_match_layer_normalization():
+    shape = [2, 3, 4]
+    model = _skip_statistic_model("SkipLayerNormalization", np.float32, shape, shape, "both", (1, 2, 3))
+    feeds = {"x": randn(np.float32, *shape), "skip": randn(np.float32, *shape),
+             "gamma": np.full(4, 1.25, np.float32), "beta": np.full(4, 0.125, np.float32),
+             "bias": np.full(4, 0.25, np.float32)}
+    residual = feeds["x"] + feeds["skip"] + feeds["bias"]
+    reference = m.make_model(
+        "LayerNormalization",
+        [m.tensor("residual", DT.FLOAT, shape), m.tensor("gamma", DT.FLOAT, [4]),
+         m.tensor("beta", DT.FLOAT, [4])],
+        [m.tensor("y", DT.FLOAT, shape), m.tensor("mean", DT.FLOAT, [2, 3, 1]),
+         m.tensor("inverse", DT.FLOAT, [2, 3, 1])],
+        attributes={"axis": -1, "epsilon": 1e-12},
+    )
+    expected = m.run_cpu(reference, {"residual": residual, "gamma": feeds["gamma"], "beta": feeds["beta"]})
+    actual = _strict_mlx_session(model).run(None, feeds)
+    for result, value in zip(actual[:3], expected):
+        np.testing.assert_allclose(result, value, rtol=2e-6, atol=1e-7)
+    np.testing.assert_array_equal(actual[3], residual)
+
+
+@pytest.mark.parametrize("form", ["inference", "saved", "unused"])
+def test_skip_statistics_trace_cases(form):
+    op = "SkipSimplifiedLayerNormalization" if form == "unused" else "SkipLayerNormalization"
+    shape = ["B", "S", "D"] if form == "saved" else [2, 3, 4]
+    ports = (1, 2, 3) if form == "saved" else (3,)
+    model = _skip_statistic_model(op, np.float32, shape, shape, "none", ports,
+                                  unused_mean=form == "unused")
+    session = _strict_mlx_session(model)
+    shapes = [[2, 3, 4], [1, 2, 8], [2, 1, 4], [2, 3, 4]] if form == "saved" else [[2, 3, 4]] * 4
+    for current in shapes:
+        feeds = {"x": randn(np.float32, *current), "skip": randn(np.float32, *current),
+                 "gamma": np.ones(current[-1], np.float32)}
+        expected = _skip_statistic_reference(op, np.float32, feeds)
+        for port, result in zip((0, *ports), session.run(None, feeds)):
+            np.testing.assert_allclose(result, expected[port], rtol=2e-6, atol=1e-7)
+
+
+def test_skip_statistics_compile_routes(tmp_path):
+    trace = tmp_path / "skip_statistics.json"
+    subprocess.run(
+        [sys.executable, "-m", "pytest", Path(__file__).name, "-k", "test_skip_statistics_trace_cases",
+         "-q", "-p", "no:cacheprovider"], cwd=Path(__file__).parent,
+        env={**os.environ, "ONNXRUNTIME_EP_MLX_TRACE": str(trace),
+             "ONNXRUNTIME_EP_MLX_NO_COMPILE": "0", "ONNXRUNTIME_EP_MLX_NO_GENERAL_COMPILE": "0"},
+        check=True, timeout=120,
+    )
+    events = json.loads(trace.read_text())
+    paths = [e["args"] for e in events if e.get("cat") == "ep.path"]
+    assert [e["path"] for e in paths] == ["general"] * 12
+    assert [e["cache"] for e in paths] == (
+        ["MISS", "HIT", "HIT", "HIT"] + ["MISS", "RETRACE", "RETRACE", "HIT"]
+        + ["MISS", "HIT", "HIT", "HIT"]
+    )
+    for op in ["SkipLayerNormalization", "SkipSimplifiedLayerNormalization"]:
+        assert any(e.get("cat") == "op.fast" and e["name"].startswith(op) for e in events)
+    assert any(e.get("cat") == "op.composed" and e["name"].startswith("SkipLayerNormalization")
+               for e in events)
 
 
 @pytest.mark.parametrize("op", ["SkipLayerNormalization", "SkipSimplifiedLayerNormalization"])
