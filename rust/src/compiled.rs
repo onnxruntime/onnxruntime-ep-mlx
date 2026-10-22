@@ -626,6 +626,20 @@ pub fn try_compiled(
     if !slot.get(unsafe { &*plan_ptr }).enabled {
         return Ok(false);
     }
+    {
+        let nodes: Vec<_> = unsafe { &*plan_ptr }
+            .nodes
+            .iter()
+            .filter(|n| crate::ops::attention::needs_rotary_position_validation(n))
+            .cloned()
+            .collect();
+        if !nodes.is_empty() {
+            let mut ctx = TranslationContext::new(unsafe { &mut *plan_ptr }, api, kctx, stream);
+            if !crate::ops::attention::validate_compiled_rotary_positions(&mut ctx, &nodes)? {
+                return Ok(false);
+            }
+        }
+    }
     let general = &unsafe { &*plan_ptr }.general;
     let host_specialization_token = if slot == Slot::General
         && (general.control_flow_specialization_enabled
@@ -674,7 +688,7 @@ pub fn try_compiled(
             .any(|n| n.op_type == "GroupQueryAttention");
         let has_separate_attention = plan.nodes.iter().any(is_separate_qkv_attention);
         let has_fused_gqa_rope = plan.nodes.iter().any(|n| {
-            n.op_type == "GroupQueryAttention" && n.ints.get("do_rotary").copied().unwrap_or(1) != 0
+            n.op_type == "GroupQueryAttention" && n.ints.get("do_rotary").copied().unwrap_or(0) != 0
         });
         if has_gqa && !has_fused_gqa_rope {
             // Qwen exports standalone RotaryEmbedding nodes and sets GQA do_rotary=0. Keep the
@@ -1055,8 +1069,7 @@ fn build_closure(
                 if node.op_type != "GroupQueryAttention" || node.inputs.len() < 9 {
                     continue;
                 }
-                let do_rotary = !node.ints.contains_key("do_rotary")
-                    || node.ints.get("do_rotary").copied() != Some(0);
+                let do_rotary = node.ints.get("do_rotary").copied().unwrap_or(0) != 0;
                 if !do_rotary {
                     continue;
                 }
