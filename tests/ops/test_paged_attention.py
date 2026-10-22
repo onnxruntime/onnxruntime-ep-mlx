@@ -7,8 +7,8 @@ a model runs on Apple Silicon. We therefore validate against a numpy port of ORT
 ORT validates its CUDA kernel against. Each case is proven to actually run on the MLX EP (per-node
 profiling) and compared, tolerance-gated, to that reference.
 
-Supported subset: separate Q/K/V, GQA, causal, optional RoPE (structured cos/sin cache). Softcap and
-sliding-window (local_window_size) are declined by the claim.
+Supported forms include separate/packed QKV, GQA, causal/bidirectional left windows,
+softcap, per-head sinks, and optional RoPE using supplied cos/sin cache values.
 """
 
 from __future__ import annotations
@@ -82,6 +82,9 @@ def _paged_ref(
     norm_eps=1e-6,
     return_cache=False,
     is_causal=True,
+    softcap=0.0,
+    local_window_size=-1,
+    activation_dtype=None,
 ):
     batch = len(cum) - 1
     scale = 1.0 / math.sqrt(d)
@@ -104,8 +107,13 @@ def _paged_ref(
             kb = kb / np.sqrt(np.mean(kb * kb, axis=-1, keepdims=True) + norm_eps) * k_norm
         if cos is not None:
             pos = np.arange(pastb, total)
-            qb = _apply_rope(qb, cos, sin, pos, interleaved)
-            kb = _apply_rope(kb, cos, sin, pos, interleaved)
+            if activation_dtype is not None:
+                qb, kb = qb.astype(activation_dtype), kb.astype(activation_dtype)
+                rope_cos, rope_sin = cos.astype(activation_dtype), sin.astype(activation_dtype)
+            else:
+                rope_cos, rope_sin = cos, sin
+            qb = _apply_rope(qb, rope_cos, rope_sin, pos, interleaved).astype(np.float32)
+            kb = _apply_rope(kb, rope_cos, rope_sin, pos, interleaved).astype(np.float32)
         for i in range(nq):
             p = pastb + i
             if slot_mapping is None:
@@ -127,10 +135,14 @@ def _paged_ref(
         keys, vals = np.repeat(keys, g, 1), np.repeat(vals, g, 1)
         qh, kh, vh = qb.transpose(1, 0, 2), keys.transpose(1, 0, 2), vals.transpose(1, 0, 2)
         scores = np.einsum("hqd,hkd->hqk", qh, kh) * scale
+        if softcap > 0:
+            scores = softcap * np.tanh(scores / softcap)
         col = np.arange(total)[None, :]
         row = (pastb + np.arange(nq))[:, None]
         if is_causal:
             scores = np.where((col > row)[None], -np.inf, scores)
+        if local_window_size > 0:
+            scores = np.where((col < row - local_window_size + 1)[None], -np.inf, scores)
         if head_sink is None:
             scores -= scores.max(-1, keepdims=True)
             e = np.exp(scores)
