@@ -331,6 +331,18 @@ The translator supports the exact elementwise and cast forms listed in §2:
 
 Unsupported dtype combinations fall back to CPU.
 
+`TopK` handles legacy `k` attributes and current initializer, runtime, or
+shape-derived K inputs. Native floating-point and signed/unsigned integer
+payloads retain exact values and lower-index tie-breaking. Float64 runs on the
+MLX CPU stream. Both `largest` settings and `sorted=0/1` are supported;
+`sorted=0` may return sorted results because its output order is unspecified.
+K must remain positive and within the selected axis, including after replay;
+empty outer dimensions are supported. Live boundary K values use bounded
+value specialization, while live same-partition data-derived K runs eagerly.
+Dynamic/empty geometry and live K use shape-keyed compilation; static,
+immutable-K forms retain shapeless compilation. Float8 and sub-byte payloads
+remain unsupported.
+
 ---
 
 ## 4. Caching and lifetime model
