@@ -762,6 +762,10 @@ pub fn try_compiled(
     let mut input = VectorArray::new();
     {
         let dyn_inputs = slot.get(unsafe { &*plan_ptr }).dyn_inputs.clone();
+        let has_gqa = unsafe { &*plan_ptr }
+            .nodes
+            .iter()
+            .any(|n| n.op_type == "GroupQueryAttention");
         let stable_cross_indices = if unsafe { &*plan_ptr }.stable_cross_cache_enabled {
             unsafe { &*plan_ptr }.stable_cross_ctx_indices.clone()
         } else {
@@ -778,6 +782,11 @@ pub fn try_compiled(
                 continue;
             }
             let (data, shape, dtype) = read_ctx_input_raw(api, kctx, di.ctx_index)?;
+            // Empty boundaries can become read-only K/V through intermediate elementwise ops.
+            // Never replay the decoder trace's total-S append or delta writeback for that call.
+            if has_gqa && shape.contains(&0) {
+                return Ok(false);
+            }
             let ishape: Vec<i32> = shape
                 .iter()
                 .map(|&d| dim_i32(d))

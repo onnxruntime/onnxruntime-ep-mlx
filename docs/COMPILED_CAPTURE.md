@@ -84,10 +84,13 @@ The MLX 0.32.2 audit found these missing-`output_shapes` primitives in current l
 `GroupQueryAttention` is classified per node. Single-batch causal forms with past caches, without
 sliding/local windows or attention bias, retain the slice-free shapeless decode configuration
 (exact data-fed RoPE cache rows plus shape-preserving cache updates). Ragged/dynamic batches,
-no-past, local/bidirectional, sliding-window, attention-bias, softcap, QK diagnostic and
+no-past, local/bidirectional, sliding-window, attention-bias, custom rotary position IDs,
+empty-new-KV read-only cache reuse, softcap, QK diagnostic and
 smooth-softmax/head-sink forms remain claimed but `EagerOnly`:
 their per-batch cache writes, rotary positions and masks use live sequence lengths on every call.
 Supplied rotary caches are never replaced by frequencies inferred from a sample row.
+Symbolic boundary K/V inputs are checked on every compiled call: an empty new-KV sequence
+uses eager read-only reuse, never the decoder trace's append offset or delta writeback.
 The growing/fixed-capacity cache contract is also checked on every apply: equal-shaped rollback
 lengths that change that contract use eager lowering, while returning to the traced contract reuses
 the existing closure.

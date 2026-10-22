@@ -436,6 +436,22 @@ fn gqa_rope(
     concat2(ctx, rotated, tail, 3)
 }
 
+fn gqa_rope_f32(
+    ctx: &mut TranslationContext,
+    x: mlx::mlx_array,
+    cos: mlx::mlx_array,
+    sin: mlx::mlx_array,
+    half: i32,
+    interleaved: bool,
+) -> Result<mlx::mlx_array, MlxError> {
+    let dt = ctx.dtype_of(x);
+    let x = ctx.astype(x, mlx::mlx_dtype__MLX_FLOAT32)?;
+    let cos = ctx.astype(cos, mlx::mlx_dtype__MLX_FLOAT32)?;
+    let sin = ctx.astype(sin, mlx::mlx_dtype__MLX_FLOAT32)?;
+    let out = gqa_rope(ctx, x, cos, sin, half, interleaved)?;
+    ctx.astype(out, dt)
+}
+
 /// Slice the cos/sin cache rows for positions [past, past+S) -> [S, half] (eager static slice).
 fn cos_sin_row(
     ctx: &mut TranslationContext,
@@ -449,6 +465,54 @@ fn cos_sin_row(
         return Err("RotaryEmbedding: requested positions exceed the supplied cache".to_string());
     }
     slice(ctx, cache, &[past, 0], &[past + seq, half])
+}
+
+#[allow(clippy::too_many_arguments)]
+fn gqa_rotary_rows(
+    ctx: &mut TranslationContext,
+    n: &NodeDesc,
+    cos: mlx::mlx_array,
+    sin: mlx::mlx_array,
+    batch: i32,
+    member: i32,
+    seq: i32,
+    past: i32,
+    total: i64,
+) -> Result<(mlx::mlx_array, mlx::mlx_array), MlxError> {
+    let half = ctx.shape_of(cos)[1];
+    if !present(n, 9) {
+        return Ok((
+            cos_sin_row(ctx, cos, past, seq, half)?,
+            cos_sin_row(ctx, sin, past, seq, half)?,
+        ));
+    }
+    let pos = ctx.resolve(&n.inputs[9])?;
+    let shape = ctx.shape_of(pos);
+    if shape.len() != 2 || shape[0] != batch || shape[1] < seq {
+        return Err("GroupQueryAttention: position_ids must be int64 [batch,>=sequence]".into());
+    }
+    let positions = read_int_input(ctx, &n.inputs[9])?;
+    let rows = ctx.shape_of(cos)[0].min(ctx.shape_of(sin)[0]) as i64;
+    // ORT 1.31 uses format 0 on the first prompt: only the first supplied ID is an offset.
+    // Later calls use the first B*S flattened IDs, even when the supplied second axis exceeds S.
+    let indices: Vec<i64> = if total == seq as i64 {
+        let offset = positions[0];
+        if offset < 0 || offset > rows - seq as i64 {
+            return Err("GroupQueryAttention: position_ids exceed the supplied cache".into());
+        }
+        (offset..offset + seq as i64).collect()
+    } else {
+        let start = member as usize * seq as usize;
+        positions[start..start + seq as usize].to_vec()
+    };
+    if indices.iter().any(|&p| p < 0 || p >= rows) {
+        return Err("GroupQueryAttention: position_ids exceed the supplied cache".into());
+    }
+    let indices: Vec<i32> = indices.into_iter().map(|p| p as i32).collect();
+    let indices = i32_host_array(ctx, &indices);
+    let cr = ctx.emit(|res, st| unsafe { mlx::mlx_take_axis(res, cos, indices, 0, st) })?;
+    let sr = ctx.emit(|res, st| unsafe { mlx::mlx_take_axis(res, sin, indices, 0, st) })?;
+    Ok((cr, sr))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -466,6 +530,7 @@ fn gqa_batched(
     let ks = ctx.shape_of(k);
     let (batch, heads, seq, head) = (qs[0], qs[1], qs[2], qs[3]);
     let kv_heads = ks[1];
+    let new_seq = ks[2];
     let cap = ctx.shape_of(past_k)[2];
     let lengths = read_int_input(ctx, &n.inputs[5])?;
     let total = read_int_input(ctx, &n.inputs[6])?;
@@ -512,23 +577,30 @@ fn gqa_batched(
     let mut diagnostics = VectorArray::new();
     for b in 0..batch {
         let length = lengths[b as usize] as i32 + 1;
-        let past = (length - seq).max(0);
-        let new_rows = length - past;
+        let query_past = (length - seq).max(0);
+        let past = if new_seq == 0 { length } else { query_past };
+        let new_rows = if new_seq == 0 { 0 } else { length - past };
         if past > cap || (!present(n, 3) && past != 0) {
             return Err(
                 "GroupQueryAttention: sequence length exceeds available past cache".to_string(),
             );
         }
         let mut qb = slice(ctx, q, &[b, 0, 0, 0], &[b + 1, heads, seq, head])?;
-        let mut kb = slice(ctx, k, &[b, 0, 0, 0], &[b + 1, kv_heads, seq, head])?;
+        let mut kb = slice(ctx, k, &[b, 0, 0, 0], &[b + 1, kv_heads, new_seq, head])?;
         let vb = slice(ctx, v, &[b, 0, 0, 0], &[b + 1, kv_heads, new_rows, head])?;
         if let Some((cos, sin)) = rotary {
             let half = ctx.shape_of(cos)[1];
-            let cr = cos_sin_row(ctx, cos, past, seq, half)?;
-            let sr = cos_sin_row(ctx, sin, past, seq, half)?;
+            let (cr, sr) = gqa_rotary_rows(ctx, n, cos, sin, batch, b, seq, query_past, total[0])?;
             let interleaved = attr_int(n, "rotary_interleaved", 0) != 0;
-            qb = gqa_rope(ctx, qb, cr, sr, half, interleaved)?;
-            kb = gqa_rope(ctx, kb, cr, sr, half, interleaved)?;
+            let rotate = if present(n, 9) || new_seq == 0 {
+                gqa_rope_f32
+            } else {
+                gqa_rope
+            };
+            qb = rotate(ctx, qb, cr, sr, half, interleaved)?;
+            if new_seq != 0 {
+                kb = rotate(ctx, kb, cr, sr, half, interleaved)?;
+            }
         }
         let kb = slice(ctx, kb, &[0, 0, 0, 0], &[1, kv_heads, new_rows, head])?;
         let pk = slice(ctx, past_k, &[b, 0, 0, 0], &[b + 1, kv_heads, cap, head])?;
@@ -539,9 +611,9 @@ fn gqa_batched(
         let av = concat2(ctx, old_v, vb, 2)?;
         let dt = ctx.dtype_of(qb);
         let mut mask = if window > 0 {
-            causal_window_mask(ctx, seq, length, past, window, dt)?
+            causal_window_mask(ctx, seq, length, query_past, window, dt)?
         } else if causal {
-            causal_mask_topleft(ctx, seq, length, past, dt)?
+            causal_mask_topleft(ctx, seq, length, query_past, dt)?
         } else {
             ctx.zeros(&[seq, length], dt)?
         };
@@ -621,8 +693,16 @@ fn gqa_batched(
         } else {
             ctx.zeros(&[1, kv_heads, tail_len, head], dt)?
         };
-        let pk = concat2(ctx, ak, tail_k, 2)?;
-        let pv = concat2(ctx, av, tail_v, 2)?;
+        let pk = if new_seq == 0 {
+            pk
+        } else {
+            concat2(ctx, ak, tail_k, 2)?
+        };
+        let pv = if new_seq == 0 {
+            pv
+        } else {
+            concat2(ctx, av, tail_v, 2)?
+        };
         // A growing ragged cache can require padding beyond its original capacity.
         let pad = capacity - ctx.shape_of(pk)[2];
         if pad > 0 {
@@ -796,6 +876,12 @@ fn group_query_attention_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Resul
     };
     let qs = ctx.shape_of(q);
     let (b, s) = (qs[0], qs[1]);
+    let ks = ctx.shape_of(k);
+    let vs = ctx.shape_of(v);
+    let new_seq = ks[1];
+    if ks != vs || ks[0] != b || (new_seq != s && (new_seq != 0 || !present(n, 3) || sliding)) {
+        return Err("GroupQueryAttention: K/V must match Q sequence or be empty with paired non-sliding past".into());
+    }
     let head = qs[2] / num_heads;
     let (past_k, past_v) = if present(n, 3) {
         (ctx.resolve(&n.inputs[3])?, ctx.resolve(&n.inputs[4])?)
@@ -836,7 +922,7 @@ fn group_query_attention_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Resul
             );
         }
         let total = total as i32;
-        let vp = total - s;
+        let vp = total - new_seq;
         if b == 1 && present(n, 3) {
             let lengths = read_int_input(ctx, &n.inputs[5])?;
             if lengths != [total as i64 - 1] || vp < 0 || vp > cap {
@@ -856,15 +942,18 @@ fn group_query_attention_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Resul
     let scale = attr_scale(n, head);
 
     let mut qh = split_heads(ctx, q, b, s, num_heads, head)?;
-    let mut kh = split_heads(ctx, k, b, s, kv_heads, head)?;
-    let vh = split_heads(ctx, v, b, s, kv_heads, head)?;
+    let mut kh = split_heads(ctx, k, b, new_seq, kv_heads, head)?;
+    let vh = split_heads(ctx, v, b, new_seq, kv_heads, head)?;
 
     if present(n, 14) {
         let q_weight = ctx.resolve(&n.inputs[14])?;
         let k_weight = ctx.resolve(&n.inputs[15])?;
         let eps = n.floats.get("qk_norm_epsilon").copied().unwrap_or(1e-6);
         qh = ctx.emit(|res, st| unsafe { mlx::mlx_fast_rms_norm(res, qh, q_weight, eps, st) })?;
-        kh = ctx.emit(|res, st| unsafe { mlx::mlx_fast_rms_norm(res, kh, k_weight, eps, st) })?;
+        if new_seq != 0 {
+            kh =
+                ctx.emit(|res, st| unsafe { mlx::mlx_fast_rms_norm(res, kh, k_weight, eps, st) })?;
+        }
     }
 
     if !sliding
@@ -872,7 +961,9 @@ fn group_query_attention_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Resul
             || !present(n, 3)
             || attr_int(n, "causal", 1) == 0
             || local_window >= 0
-            || gqa_composed(n))
+            || gqa_composed(n)
+            || (do_rotary && present(n, 9))
+            || new_seq == 0)
     {
         return gqa_batched(ctx, n, qh, kh, vh, past_k, past_v, scale);
     }
@@ -925,9 +1016,30 @@ fn group_query_attention_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Resul
     //   * Growing: concat past+new along the sequence axis (unchanged legacy behavior).
     let (present_k, present_v, attn) = if sliding {
         let seqlens = read_int_input(ctx, &n.inputs[5])?;
-        if seqlens.len() != b as usize {
-            return Err("GroupQueryAttention: seqlens_k must have one value per batch".to_string());
+        let total = read_int_input(ctx, &n.inputs[6])?;
+        if seqlens.len() != b as usize
+            || total.len() != 1
+            || total[0] <= 0
+            || seqlens.iter().any(|&v| v < 0 || v >= total[0])
+            || seqlens.iter().max().copied() != Some(total[0] - 1)
+        {
+            return Err("GroupQueryAttention: invalid sliding sequence lengths".to_string());
         }
+        let bias = if present(n, 10) {
+            let bias = ctx.resolve(&n.inputs[10])?;
+            let shape = ctx.shape_of(bias);
+            if shape.len() != 4
+                || (shape[0] != 1 && shape[0] != b)
+                || (shape[1] != 1 && shape[1] != num_heads)
+                || shape[2] != s
+                || shape[3] as i64 != total[0]
+            {
+                return Err("GroupQueryAttention: sliding attention_bias requires absolute total_sequence_length columns".into());
+            }
+            Some(bias)
+        } else {
+            None
+        };
         if local_window <= 0 || cap < local_window {
             return Err(
                 "GroupQueryAttention: sliding cache requires 0 < local_window_size <= capacity"
@@ -990,10 +1102,15 @@ fn group_query_attention_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Resul
                 &[batch_index + 1, kv_heads, s, head],
             )?;
             if let Some((cos, sin, half)) = rope_data {
-                let cr = cos_sin_row(ctx, cos, absolute_past, s, half)?;
-                let sr = cos_sin_row(ctx, sin, absolute_past, s, half)?;
-                qb = gqa_rope(ctx, qb, cr, sr, half, interleaved)?;
-                kb = gqa_rope(ctx, kb, cr, sr, half, interleaved)?;
+                let (cr, sr) =
+                    gqa_rotary_rows(ctx, n, cos, sin, b, batch_index, s, absolute_past, total[0])?;
+                let rotate = if present(n, 9) || bias.is_some() {
+                    gqa_rope_f32
+                } else {
+                    gqa_rope
+                };
+                qb = rotate(ctx, qb, cr, sr, half, interleaved)?;
+                kb = rotate(ctx, kb, cr, sr, half, interleaved)?;
             }
 
             let past_kb = slice(
@@ -1028,7 +1145,20 @@ fn group_query_attention_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Resul
             let mask =
                 causal_window_mask(ctx, s, k_len, seed_rows, local_window, ctx.dtype_of(qb))?;
             let mask = ctx.reshape(mask, &[1, 1, s, k_len])?;
-            let ab = if gqa_composed(n) {
+            let bias = if let Some(bias) = bias {
+                let shape = ctx.shape_of(bias);
+                let bi = if shape[0] == 1 { 0 } else { batch_index };
+                let origin = absolute_past - end_before + seed_start;
+                Some(slice(
+                    ctx,
+                    bias,
+                    &[bi, 0, 0, origin],
+                    &[bi + 1, shape[1], s, origin + k_len],
+                )?)
+            } else {
+                None
+            };
+            let ab = if gqa_composed(n) || bias.is_some() {
                 let sink = if present(n, 11) {
                     Some(ctx.resolve(&n.inputs[11])?)
                 } else if attr_int(n, "smooth_softmax", 0) == 1 {
@@ -1043,16 +1173,23 @@ fn group_query_attention_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Resul
                 let k32 = gqa_repeat_heads(ctx, k32, kv_heads, num_heads / kv_heads, k_len, head)?;
                 let v32 = gqa_repeat_heads(ctx, v32, kv_heads, num_heads / kv_heads, k_len, head)?;
                 let mask = ctx.astype(mask, mlx::mlx_dtype__MLX_FLOAT32)?;
-                let out = paged_sdpa(
+                let mut scores = capped_attention_logits(
                     ctx,
                     qb,
                     k32,
-                    v32,
                     scale,
-                    mask,
-                    sink,
                     n.floats.get("softcap").copied().unwrap_or(0.0),
                 )?;
+                if let Some(bias) = bias {
+                    let bias = ctx.astype(bias, mlx::mlx_dtype__MLX_FLOAT32)?;
+                    scores = ctx.add(scores, bias)?;
+                }
+                let zero = ctx.scalar_f32(0.0);
+                let visible = ctx.binary(mlx::mlx_equal, mask, zero)?;
+                let neg = ctx.scalar_f32(f32::NEG_INFINITY);
+                let scores = ctx.where_(visible, scores, neg)?;
+                let probs = attention_probs_with_sink(ctx, scores, sink)?;
+                let out = ctx.matmul(probs, v32)?;
                 ctx.astype(out, dt)?
             } else {
                 sdpa(ctx, qb, work_k, work_v, scale, b"array\0", mask)?
@@ -2057,9 +2194,8 @@ fn is_int32(t: ort::ONNXTensorElementDataType) -> bool {
 /// GroupQueryAttention (com.microsoft): separate-QKV decode/prefill layout. Three accepted layouts:
 ///   * 7-input (q, k, v, past_k, past_v, seqlens_k, total_seq) — external/no RoPE decoder.
 ///   * 9-input (q, k, v, past_k, past_v, seqlens_k, total_seq, cos, sin) — in-op RoPE decoder.
-///   * 11-input (…, seqlens_k, total_seq, cos, sin, position_ids, attention_bias) — the Gemma3n
-///     variant with `do_rotary=0` (cos/sin absent, rotary applied by external RotaryEmbedding nodes)
-///     and an additive `attention_bias` mask (input 10). `position_ids` (input 9) is ignored.
+///   * 11-input (…, seqlens_k, total_seq, cos, sin, position_ids, attention_bias) — optional custom
+///     rotary IDs and additive bias. IDs are ignored when rotary is external (`do_rotary=0`).
 ///     All floating inputs/outputs share one dtype; seqlens_k / total_sequence_length are int32.
 fn group_query_attention_claim(node: &NodeView) -> ClaimResult {
     require!(
@@ -2114,10 +2250,6 @@ fn group_query_attention_claim(node: &NodeView) -> ClaimResult {
         require!(
             node.int_attr("local_window_size", -1) > 0,
             "sliding_window_cache=1 requires local_window_size > 0"
-        );
-        require!(
-            !has_bias,
-            "sliding_window_cache is incompatible with attention_bias"
         );
         require!(
             node.output_present(1) && node.output_present(2),
@@ -2259,10 +2391,17 @@ fn group_query_attention_claim(node: &NodeView) -> ClaimResult {
                 kv.shape.len() == 3
                     && kv.shape[2] == kvh * head
                     && (kv.shape[0] < 0 || q.shape[0] < 0 || kv.shape[0] == q.shape[0])
-                    && (kv.shape[1] < 0 || q.shape[1] < 0 || kv.shape[1] == q.shape[1]),
+                    && (kv.shape[1] < 0
+                        || q.shape[1] < 0
+                        || kv.shape[1] == q.shape[1]
+                        || (kv.shape[1] == 0 && node.input_present(3) && !sliding)),
                 "key/value must match query batch, sequence length and KV head geometry"
             );
         }
+        require!(
+            node.input_info(1).unwrap().shape == node.input_info(2).unwrap().shape,
+            "key/value shapes must match"
+        );
     }
     for idx in [3, 4] {
         if let Some(cache) = node.input_info(idx) {
@@ -2321,10 +2460,16 @@ fn group_query_attention_claim(node: &NodeView) -> ClaimResult {
             total_heads
         );
     }
-    require!(
-        !node.input_present(9) || !do_rotary,
-        "custom position_ids with in-op rotary are unsupported"
-    );
+    if node.input_present(9) && do_rotary {
+        require!(
+            node.input_info(9).is_some_and(|v| v.dtype
+                == ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64
+                && v.shape.len() == 2
+                && (v.shape[0] < 0 || q.shape[0] < 0 || v.shape[0] == q.shape[0])
+                && (v.shape[1] < 0 || q.shape[1] < 0 || v.shape[1] >= q.shape[1])),
+            "position_ids must be int64 [batch,>=sequence_length]"
+        );
+    }
     if node.input_present(11) {
         require!(
             node.input_info(11)
@@ -2428,6 +2573,15 @@ fn group_query_attention_compile_shape_safety_for(
 }
 
 fn group_query_attention_compile_shape_safety(node: &NodeView) -> CompileShapeSafety {
+    if (node.int_attr("do_rotary", 0) != 0 && node.input_present(9))
+        || node
+            .input_info(1)
+            .is_some_and(|k| k.shape.get(1) == Some(&0))
+    {
+        return CompileShapeSafety::EagerOnly {
+            reason: "custom rotary IDs and read-only empty-KV GQA use live eager geometry",
+        };
+    }
     if node.float_attr("softcap", 0.0) > 0.0
         || node.int_attr("qk_output", 0) != 0
         || node.int_attr("smooth_softmax", 0) == 1
