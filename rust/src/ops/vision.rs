@@ -15,7 +15,8 @@ use std::os::raw::c_void;
 use crate::engine::{MlxError, NodeDesc, TensorRef, TranslationContext, mlx_dtype_from_onnx};
 use crate::mlx::{Array, VectorArray};
 use crate::registry::{
-    ClaimResult, K_ANY_OPSET, NodeView, OpRegistration, OpRegistry, is_int_index, is_mlx_float,
+    ClaimResult, K_ANY_OPSET, NodeView, OpRegistration, OpRegistry, is_int_index, is_mlx_cpu_float,
+    is_mlx_float,
 };
 use crate::sys::mlx;
 use crate::sys::ort;
@@ -492,44 +493,107 @@ fn grid_sample_claim(node: &NodeView) -> ClaimResult {
 }
 
 // =================================================================================================
-// AffineGrid (2D)
+// AffineGrid (2D / 3D)
 // =================================================================================================
 
-fn affine_grid_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
-    let size = read_const_ints(ctx, &n.inputs[1])?; // (N, C, H, W)
-    let nd = size[0] as i32;
-    let hd = size[2] as i32;
-    let wd = size[3] as i32;
-    let align = n.ints.get("align_corners").copied().unwrap_or(0) != 0;
+fn affine_grid_shape(theta: &[i32], size: &[i64]) -> Result<Vec<i32>, MlxError> {
+    if !matches!(size.len(), 4 | 5) {
+        return Err("AffineGrid: size must contain 4 or 5 dimensions".into());
+    }
+    let rank = size.len() - 2;
+    if theta.len() != 3
+        || theta[1] != rank as i32
+        || theta[2] != rank as i32 + 1
+        || i64::from(theta[0]) != size[0]
+    {
+        return Err(
+            "AffineGrid: theta must have shape [size[0], spatial_rank, spatial_rank+1]".into(),
+        );
+    }
+    if size
+        .iter()
+        .enumerate()
+        .any(|(axis, &d)| d < 0 || (axis != 1 && d > i64::from(i32::MAX)))
+        || size[2..].contains(&0)
+    {
+        return Err("AffineGrid: size requires nonnegative N/C and positive spatial dimensions within int32".into());
+    }
+    let spatial = size[2..].iter().try_fold(1i64, |p, &d| p.checked_mul(d));
+    let base_count = spatial.and_then(|p| p.checked_mul(rank as i64 + 1));
+    let out_count = spatial
+        .and_then(|p| p.checked_mul(size[0]))
+        .and_then(|p| p.checked_mul(rank as i64));
+    if base_count.is_none_or(|p| p > i64::from(i32::MAX))
+        || out_count.is_none_or(|p| p > i64::from(i32::MAX))
+    {
+        return Err("AffineGrid: grid element count exceeds int32 indexing".into());
+    }
+    let mut shape = vec![theta[0]];
+    shape.extend(size[2..].iter().map(|&d| d as i32));
+    shape.push(rank as i32);
+    Ok(shape)
+}
 
-    let coord = |i: i32, l: i32| -> f32 {
+fn affine_grid_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
+    let size = ctx.read_ints_eval(&n.inputs[1])?;
+    let t0 = ctx.resolve(&n.inputs[0])?;
+    let out_shape = affine_grid_shape(&ctx.shape_of(t0), &size)?;
+    let rank = size.len() - 2;
+    let align = n.ints.get("align_corners").copied().unwrap_or(0) != 0;
+    if align && size[2..].contains(&1) {
+        return Err("AffineGrid: align_corners=1 singleton axes are not supported".into());
+    }
+    if size[0] == 0 {
+        let y = ctx.emit(|res, s| unsafe {
+            mlx::mlx_zeros(res, out_shape.as_ptr(), out_shape.len(), out_dtype(n), s)
+        })?;
+        ctx.bind(&n.outputs[0], y);
+        return Ok(());
+    }
+    let coord = |i: i64, l: i64| -> f64 {
         if align {
-            if l <= 1 {
-                -1.0
-            } else {
-                -1.0 + i as f32 * (2.0 / (l - 1) as f32)
-            }
+            -1.0 + i as f64 * (2.0 / (l - 1) as f64)
         } else {
-            ((2.0 * i as f64 + 1.0) / l as f64 - 1.0) as f32
+            (2.0 * i as f64 + 1.0) / l as f64 - 1.0
         }
     };
-    let mut base = vec![0f32; (hd as usize) * (wd as usize) * 3];
-    for h in 0..hd {
-        let yh = coord(h, hd);
-        for w in 0..wd {
-            let r = ((h as usize * wd as usize) + w as usize) * 3;
-            base[r] = coord(w, wd);
-            base[r + 1] = yh;
-            base[r + 2] = 1.0;
+    let points: i64 = size[2..].iter().product();
+    let mut base = Vec::new();
+    base.try_reserve_exact(points as usize * (rank + 1))
+        .map_err(|e| format!("AffineGrid: cannot allocate homogeneous grid: {e}"))?;
+    for point in 0..points {
+        let mut remaining = point;
+        for &dim in size[2..].iter().rev() {
+            base.push(coord(remaining % dim, dim));
+            remaining /= dim;
         }
+        base.push(1.0);
     }
-    let base_arr = host_f32(ctx, &base, &[1, hd * wd, 3]);
+    let base_shape = [1, points as i32, rank as i32 + 1];
+    let double = out_dtype(n) == mlx::mlx_dtype__MLX_FLOAT64;
+    let base_arr = if double {
+        ctx.from_host(
+            base.as_ptr().cast(),
+            &base_shape,
+            mlx::mlx_dtype__MLX_FLOAT64,
+        )
+    } else {
+        let base: Vec<f32> = base.iter().map(|&v| v as f32).collect();
+        host_f32(ctx, &base, &base_shape)
+    };
 
-    let t0 = ctx.resolve(&n.inputs[0])?;
-    let theta = astype(ctx, t0, mlx::mlx_dtype__MLX_FLOAT32)?; // [N,2,3]
-    let theta_t = ctx.transpose(theta, &[0, 2, 1])?; // [N,3,2]
-    let grid = matmul(ctx, base_arr, theta_t)?; // [N,H*W,2]
-    let grid = reshape(ctx, grid, &[nd, hd, wd, 2])?;
+    let theta = astype(
+        ctx,
+        t0,
+        if double {
+            mlx::mlx_dtype__MLX_FLOAT64
+        } else {
+            mlx::mlx_dtype__MLX_FLOAT32
+        },
+    )?;
+    let theta_t = ctx.transpose(theta, &[0, 2, 1])?;
+    let grid = matmul(ctx, base_arr, theta_t)?;
+    let grid = reshape(ctx, grid, &out_shape)?;
     let grid = astype(ctx, grid, out_dtype(n))?;
     let y = contiguous(ctx, grid)?;
     ctx.bind(&n.outputs[0], y);
@@ -543,37 +607,67 @@ fn affine_grid_claim(node: &NodeView) -> ClaimResult {
         node.num_inputs(),
         node.num_outputs()
     );
-    let (t, out) = match (node.input_info(0), node.output_info(0)) {
-        (Some(t), Some(o)) => (t, o),
-        _ => deny!("missing tensor type/shape info on theta or output"),
+    let (t, size_info, out) = match (node.input_info(0), node.input_info(1), node.output_info(0)) {
+        (Some(t), Some(s), Some(o)) => (t, s, o),
+        _ => deny!("missing tensor type/shape info on theta, size, or output"),
     };
     require!(
-        is_mlx_float(t.dtype) && is_mlx_float(out.dtype),
-        "theta and output must be float, got {} -> {}",
+        is_mlx_cpu_float(t.dtype) && out.dtype == t.dtype,
+        "theta and output must share one supported float dtype, got {} -> {}",
         crate::registry::ort_dtype_name(t.dtype),
         crate::registry::ort_dtype_name(out.dtype)
     );
     require!(
-        node.is_const_int_tensor(1),
-        "size must be a constant integer initializer"
+        size_info.dtype == ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64
+            && size_info.shape.len() == 1
+            && matches!(size_info.shape[0], 4 | 5),
+        "size must be an int64 vector of length 4 or 5"
     );
-    let size = match node.read_const_ints_any(1) {
-        Some(v) => v,
-        None => deny!("size must be a constant integer initializer"),
-    };
+    let rank = size_info.shape[0] - 2;
     require!(
-        size.len() == 4,
-        "size must contain 4 dimensions, got {size:?}"
-    );
-    require!(
-        t.shape.len() == 3 && t.shape[1] == 2 && t.shape[2] == 3 && t.shape.iter().all(|&d| d >= 0),
-        "theta must have static shape [N,2,3], got {:?}",
+        t.shape.len() == 3
+            && (t.shape[1] < 0 || t.shape[1] == rank)
+            && (t.shape[2] < 0 || t.shape[2] == rank + 1),
+        "theta must have shape [N,{rank},{}], got {:?}",
+        rank + 1,
         t.shape
     );
     require!(
-        size.iter().all(|&d| d >= 1),
-        "all size dimensions must be positive, got {size:?}"
+        out.shape.len() == rank as usize + 2
+            && (out.shape[0] < 0 || t.shape[0] < 0 || out.shape[0] == t.shape[0])
+            && (out.shape.last().is_some_and(|&d| d < 0 || d == rank)),
+        "output must have shape [N,spatial...,{rank}], got {:?}",
+        out.shape
     );
+    let align = node.int_attr("align_corners", 0);
+    require!(matches!(align, 0 | 1), "align_corners must be 0 or 1");
+    if let Some(size) = node.read_const_ints_any(1) {
+        let mut theta = vec![size.first().copied().unwrap_or(-1), rank, rank + 1];
+        if t.shape[0] >= 0 {
+            theta[0] = t.shape[0];
+        }
+        let theta: Option<Vec<i32>> = theta.iter().map(|&d| i32::try_from(d).ok()).collect();
+        let shape = match theta.and_then(|t| affine_grid_shape(&t, &size).ok()) {
+            Some(shape) => shape,
+            None => deny!("invalid or oversized AffineGrid theta/size geometry"),
+        };
+        require!(
+            out.shape
+                .iter()
+                .zip(&shape)
+                .all(|(&a, &b)| a < 0 || a == i64::from(b)),
+            "output shape disagrees with size"
+        );
+        require!(
+            align == 0 || !size[2..].contains(&1),
+            "align_corners=1 singleton axes have conflicting ONNX function/reference/ORT semantics"
+        );
+    } else {
+        require!(
+            align == 0,
+            "live size with align_corners=1 may select unresolved singleton-axis semantics"
+        );
+    }
     Ok(())
 }
 
@@ -1628,7 +1722,17 @@ pub fn register_vision(registry: &mut OpRegistry) {
         grid_sample_claim,
         crate::registry::MLX_SLICE_SHAPE_REASON,
     );
-    shapeless(registry, "AffineGrid", affine_grid_op, affine_grid_claim);
+    registry.register_shape_keyed(
+        OpRegistration {
+            domain: "",
+            op_type: "AffineGrid",
+            min_opset: 20,
+            max_opset: K_ANY_OPSET,
+            handler: affine_grid_op,
+            claim: affine_grid_claim,
+        },
+        "conservatively specialize host-generated homogeneous grid to size values",
+    );
     shape_keyed(
         registry,
         "Col2Im",
@@ -1663,4 +1767,41 @@ pub fn register_vision(registry: &mut OpRegistry) {
         non_max_suppression_op,
         non_max_suppression_claim,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::affine_grid_shape;
+
+    #[test]
+    fn affine_grid_geometry_is_checked_before_indexing_or_allocation() {
+        assert_eq!(
+            affine_grid_shape(&[2, 3, 4], &[2, 0, 1, 2, 3]).unwrap(),
+            [2, 1, 2, 3, 3]
+        );
+        assert_eq!(
+            affine_grid_shape(&[0, 2, 3], &[0, 0, 2, 3]).unwrap(),
+            [0, 2, 3, 2]
+        );
+        assert_eq!(
+            affine_grid_shape(&[2, 2, 3], &[2, 1 << 40, 2, 3]).unwrap(),
+            [2, 2, 3, 2]
+        );
+        for (theta, size) in [
+            (vec![2, 2, 3], vec![2, 1, 2]),
+            (vec![2, 2], vec![2, 1, 2, 3]),
+            (vec![2, 3, 4], vec![2, 1, 2, 3]),
+            (vec![2, 2, 3], vec![3, 1, 2, 3]),
+            (vec![2, 2, 3], vec![2, -1, 2, 3]),
+            (vec![2, 2, 3], vec![2, 1, 0, 3]),
+            (vec![2, 2, 3], vec![2, 1, 1 << 32, 3]),
+            (vec![2, 2, 3], vec![2, 1, 1 << 30, 3]),
+            (vec![2, 3, 4], vec![2, 1, i64::MAX, i64::MAX, i64::MAX]),
+        ] {
+            assert!(
+                affine_grid_shape(&theta, &size).is_err(),
+                "{theta:?} / {size:?}"
+            );
+        }
+    }
 }
