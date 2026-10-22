@@ -430,9 +430,8 @@ pub struct Plan {
     pub cache: HashMap<String, Array>,
     pub native_attention_decode: bool,
     pub dedicated_decode_stream: bool,
-    /// This subgraph carries float64 tensors and must run on an MLX **CPU** stream: MLX rejects
-    /// float64 on Metal outright. GetCapability guarantees an fp64 cluster contains only fp64 nodes,
-    /// so flipping the whole plan to the CPU stream never drags fp32 work off the GPU.
+    /// This subgraph carries float64 tensors or computes float64 statistics and must run on an MLX
+    /// CPU stream. GetCapability isolates CPU-required nodes from ordinary GPU work.
     pub requires_cpu_stream: bool,
     pub stable_cross_cache_enabled: bool,
     /// Boundary K/V inputs used directly by cross-attention MHA nodes.
@@ -587,11 +586,16 @@ impl Plan {
             !std::env::var_os("ONNXRUNTIME_EP_MLX_NO_STABLE_CROSS_CACHE")
                 .map(|value| value != "0" && !value.is_empty())
                 .unwrap_or(false);
-        // Best-effort fp64 detection from the descriptors alone (declared output dtypes + hoisted
-        // initializers). `build_plan` ORs in the authoritative claim-time answer, which also sees
+        // Best-effort fp64 detection from descriptors (outputs, initializers, and stash precision).
+        // `build_plan` ORs in the authoritative claim-time answer, which also sees
         // input dtypes; this covers the plans built directly in tests and control-flow bodies.
         let requires_cpu_stream = nodes.iter().any(|node| {
-            node.outputs
+            crate::registry::uses_float64_statistics(
+                &node.domain,
+                &node.op_type,
+                node.ints.get("stash_type").copied().unwrap_or(1),
+            ) || node
+                .outputs
                 .iter()
                 .any(|o| crate::registry::is_float64(o.otype))
                 || node.inputs.iter().any(|i| {
