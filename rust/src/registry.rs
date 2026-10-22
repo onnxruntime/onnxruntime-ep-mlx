@@ -750,6 +750,36 @@ impl NodeView {
         }
     }
 
+    /// Whether an output is consumed or exported, including graph outputs with no node consumers.
+    pub fn output_is_used(&self, i: usize) -> Result<bool, String> {
+        if !self.output_present(i) {
+            return Ok(false);
+        }
+        let value = self.outputs_raw()[i];
+        let check = |status: *mut ort::OrtStatus| {
+            if status.is_null() {
+                Ok(())
+            } else {
+                let message = unsafe { self.cstr((self.api().GetErrorMessage.unwrap())(status)) };
+                unsafe { self.release_status(status) };
+                Err(format!("cannot query output {i} usage: {message}"))
+            }
+        };
+        unsafe {
+            let mut graph_output = false;
+            check((self.api().ValueInfo_IsGraphOutput.unwrap())(
+                value,
+                &mut graph_output,
+            ))?;
+            let mut consumers = 0;
+            check((self.api().ValueInfo_GetValueNumConsumers.unwrap())(
+                value,
+                &mut consumers,
+            ))?;
+            Ok(graph_output || consumers != 0)
+        }
+    }
+
     /// Read an INTS attribute. Returns `(present, values)`: `present` is whether the node carries a
     /// genuine INTS attribute of that name (mirrors `IntsAttribute`).
     pub fn ints_attr(&self, name: &str) -> (bool, Vec<i64>) {

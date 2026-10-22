@@ -521,6 +521,147 @@ def test_skip_layer_norm(dt):
     m.assert_matches_cpu(model, feeds, **tol(dt))
 
 
+def _skip_norm_model(op, dt, shape, skip_shape, optional, outputs="residual"):
+    values = [m.tensor("x", ir_of(dt), shape), m.tensor("skip", ir_of(dt), skip_shape),
+              m.tensor("gamma", ir_of(dt), [shape[-1]])]
+    inputs = list(values)
+    if op == "SkipLayerNormalization" and optional in ["beta", "bias", "both"]:
+        beta = m.tensor("beta", ir_of(dt), [shape[-1]]) if optional in ["beta", "both"] else None
+        inputs.append(beta)
+        if beta is not None:
+            values.append(beta)
+    if optional in ["bias", "both"]:
+        bias = m.tensor("bias", ir_of(dt), [shape[-1]])
+        inputs.append(bias)
+        values.append(bias)
+    y = m.tensor("y", ir_of(dt), shape)
+    ports, results = [y], [y]
+    if outputs == "residual":
+        residual = m.tensor("residual", ir_of(dt), shape)
+        ports.extend([ir.Value(name=""), ir.Value(name=""), residual])
+        results.append(residual)
+    node = ir.node(op, inputs, domain="com.microsoft", outputs=ports)
+    graph = ir.Graph(values, results, nodes=[node], name="skip_norm",
+                     opset_imports={"": 24, "com.microsoft": 1})
+    return ir.to_proto(ir.Model(graph, ir_version=11)).SerializeToString()
+
+
+@pytest.mark.parametrize("op,optional", [
+    ("SkipLayerNormalization", "none"), ("SkipLayerNormalization", "beta"),
+    ("SkipLayerNormalization", "bias"), ("SkipLayerNormalization", "both"),
+    ("SkipSimplifiedLayerNormalization", "none"), ("SkipSimplifiedLayerNormalization", "bias"),
+])
+@pytest.mark.parametrize("dt", DTYPES)
+@pytest.mark.parametrize("skip_shape", [[2, 3, 4], [1, 3, 4], [3, 4]])
+@pytest.mark.parametrize("eager", [False, True])
+def test_skip_norm_optional_forms_and_default_epsilon(op, optional, dt, skip_shape, eager, monkeypatch):
+    monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_COMPILE", "1" if eager else "0")
+    shape = [2, 3, 4]
+    model = _skip_norm_model(op, dt, shape, skip_shape, optional)
+    session = _strict_mlx_session(model)
+    for factor in [1, 2, -1]:
+        feeds = {"x": (randn(dt, *shape) * 1e-6 * factor).astype(dt),
+                 "skip": (randn(dt, *skip_shape) * 1e-6).astype(dt), "gamma": np.full(4, 1.25, dt)}
+        if optional in ["beta", "both"]:
+            feeds["beta"] = np.full(4, 0.125, dt)
+        if optional in ["bias", "both"]:
+            feeds["bias"] = np.full(4, 1e-6, dt)
+        residual = feeds["x"].astype(np.float32) + feeds["skip"].astype(np.float32)
+        if "bias" in feeds:
+            residual = residual + feeds["bias"].astype(np.float32)
+        expected, _, _ = _norm_reference(
+            residual, feeds["gamma"].astype(np.float32), -1, op == "SkipLayerNormalization",
+            epsilon=1e-12, bias=feeds["beta"].astype(np.float32) if "beta" in feeds else None,
+        )
+        actual, actual_residual = session.run(None, feeds)
+        np.testing.assert_allclose(actual, expected.astype(dt), **tol(dt))
+        np.testing.assert_array_equal(actual_residual, residual.astype(dt))
+        cpu = ort.InferenceSession(model, providers=["CPUExecutionProvider"])
+        np.testing.assert_allclose(actual, cpu.run(None, feeds)[0], **tol(dt))
+
+
+@pytest.mark.parametrize("op", ["SkipLayerNormalization", "SkipSimplifiedLayerNormalization"])
+def test_skip_norm_half_residual_accumulation(op):
+    model = _skip_norm_model(op, np.float16, [1, 2, 4], [1, 2, 4], "bias")
+    feeds = {"x": np.full((1, 2, 4), 1024, np.float16),
+             "skip": np.full((1, 2, 4), 0.5, np.float16),
+             "gamma": np.ones(4, np.float16), "bias": np.full(4, 0.5, np.float16)}
+    actual = _strict_mlx_session(model).run(None, feeds)[1]
+    np.testing.assert_array_equal(actual, np.full((1, 2, 4), 1025, np.float16))
+
+
+@pytest.mark.parametrize("op", ["SkipLayerNormalization", "SkipSimplifiedLayerNormalization"])
+def test_skip_norm_bfloat16_interior(op):
+    optional = "both" if op == "SkipLayerNormalization" else "bias"
+    shape = [2, 3, 4]
+    proto = onnx.load_model_from_string(_skip_norm_model(op, np.float32, shape, shape, optional))
+    skip_node = proto.graph.node[0]
+    casts = []
+    for value in proto.graph.input:
+        inner = f"{value.name}_bf16"
+        casts.append(onnx.helper.make_node("Cast", [value.name], [inner], to=onnx.TensorProto.BFLOAT16))
+        for i, name in enumerate(skip_node.input):
+            if name == value.name:
+                skip_node.input[i] = inner
+    output_casts = []
+    for i, name in enumerate(skip_node.output):
+        if name:
+            skip_node.output[i] = f"{name}_bf16"
+            output_casts.append(onnx.helper.make_node("Cast", [f"{name}_bf16"], [name], to=onnx.TensorProto.FLOAT))
+    nodes = casts + [skip_node] + output_casts
+    del proto.graph.node[:]
+    proto.graph.node.extend(nodes)
+    feeds = {"x": randn(np.float32, *shape), "skip": randn(np.float32, *shape),
+             "gamma": np.full(4, 1.25, np.float32), "bias": np.full(4, 0.125, np.float32)}
+    if optional == "both":
+        feeds["beta"] = np.full(4, 0.25, np.float32)
+    rounded = {name: value.astype(ml_dtypes.bfloat16).astype(np.float32) for name, value in feeds.items()}
+    residual = rounded["x"] + rounded["skip"] + rounded["bias"]
+    expected, _, _ = _norm_reference(
+        residual, rounded["gamma"], -1, op == "SkipLayerNormalization",
+        epsilon=1e-12, bias=rounded.get("beta"),
+    )
+    actual, actual_residual = _strict_mlx_session(proto.SerializeToString()).run(None, feeds)
+    np.testing.assert_allclose(actual, expected.astype(ml_dtypes.bfloat16).astype(np.float32), rtol=1e-3, atol=1e-3)
+    np.testing.assert_array_equal(actual_residual, residual.astype(ml_dtypes.bfloat16).astype(np.float32))
+
+
+@pytest.mark.parametrize("op", ["SkipLayerNormalization", "SkipSimplifiedLayerNormalization"])
+@pytest.mark.parametrize("port", [1, 2])
+@pytest.mark.parametrize("consumer", [False, True])
+def test_skip_norm_live_training_diagnostics_declined(op, port, consumer):
+    proto = onnx.load_model_from_string(
+        _skip_norm_model(op, np.float32, [2, 3, 4], [2, 3, 4], "none", outputs="y")
+    )
+    node = proto.graph.node[0]
+    node.output.extend([""] * (port - len(node.output)))
+    node.output.append("diagnostic")
+    value = onnx.helper.make_tensor_value_info("diagnostic", onnx.TensorProto.FLOAT, [2, 3, 1])
+    if consumer:
+        proto.graph.value_info.append(value)
+        proto.graph.node.append(onnx.helper.make_node("Identity", ["diagnostic"], ["consumed"]))
+        value.name = "consumed"
+    proto.graph.output.append(value)
+    with pytest.raises(Exception, match="fallback to CPU EP has been explicitly disabled"):
+        _strict_mlx_session(proto.SerializeToString())
+
+
+@pytest.mark.parametrize("op", ["SkipLayerNormalization", "SkipSimplifiedLayerNormalization"])
+def test_skip_norm_dynamic_empty_and_recovery(op):
+    model = _skip_norm_model(op, np.float32, ["B", "S", "D"], ["B", "S", "D"], "none")
+    session = _strict_mlx_session(model)
+    for shape in ([2, 3, 4], [1, 2, 8], [0, 2, 4], [2, 0, 4], [2, 3, 0], [2, 3, 4]):
+        feeds = {"x": randn(np.float32, *shape), "skip": randn(np.float32, *shape),
+                 "gamma": np.ones(shape[-1], np.float32)}
+        outputs = session.run(None, feeds)
+        assert all(result.shape == tuple(shape) for result in outputs)
+        np.testing.assert_array_equal(outputs[1], feeds["x"] + feeds["skip"])
+    bad = {**feeds, "gamma": np.ones(3, np.float32)}
+    with pytest.raises(Exception, match="affine input 2 must have hidden-size vector shape"):
+        session.run(None, bad)
+    np.testing.assert_array_equal(session.run(None, feeds)[1], feeds["x"] + feeds["skip"])
+
+
 # --- GroupNormalization -----------------------------------------------------------------------
 def _group_norm_model(shape, version, groups, dt, stash):
     affine = groups if version < 21 else shape[1]
