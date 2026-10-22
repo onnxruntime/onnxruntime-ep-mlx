@@ -77,6 +77,25 @@ def test_div(dtype: DT, np_dtype, tol: float) -> None:
     m.assert_matches_cpu(model, feeds, rtol=tol, atol=tol)
 
 
+@pytest.mark.parametrize("scalar", [False, True], ids=["suffix", "scalar"])
+def test_div_int32(scalar: bool) -> None:
+    a = np.array(
+        [
+            [-7, 7, -7, 7, 0, 1, -1, 2147483647],
+            [-2147483648, -2147483648, 16777217, -16777217, 8, -8, 2, -2],
+        ],
+        dtype=np.int32,
+    )
+    b = np.array(-3 if scalar else [3, -3, -3, 3, -1, 1, 2, 1], dtype=np.int32)
+    model = m.make_model(
+        "Div",
+        [m.tensor("a", DT.INT32, list(a.shape)), m.tensor("b", DT.INT32, list(b.shape))],
+        [m.tensor("out", DT.INT32, list(a.shape))],
+    )
+    m.assert_mlx_claims(model, {"a": a, "b": b})
+    m.assert_matches_cpu(model, {"a": a, "b": b}, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("op", ["Min", "Max"])
 @pytest.mark.parametrize("dtype,np_dtype,tol", FLOAT_CASES, ids=["fp32", "fp16"])
 def test_variadic_min_max(op: str, dtype: DT, np_dtype, tol: float) -> None:

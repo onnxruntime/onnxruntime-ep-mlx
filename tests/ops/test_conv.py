@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 import onnx_ir as ir
+import onnxruntime as ort
 import pytest
 
 import _models as m
@@ -459,6 +460,41 @@ DYN_POOL_CASES = [
     pytest.param((1, 3, 8, 8), (2, 2), (2, 2), None, "SAME_UPPER", id="maxpool-dyn-same_upper"),
     pytest.param((1, 3, 8, 8), (2, 2), (1, 1), None, "VALID", id="maxpool-dyn-valid"),
 ]
+
+
+@pytest.mark.parametrize("spatial_rank", [1, 2])
+@pytest.mark.parametrize("group", [1, 2, 4], ids=["dense", "grouped", "depthwise"])
+def test_conv_dynamic_channels(spatial_rank: int, group: int) -> None:
+    weight_shape = (4, 4 // group, *([3] * spatial_rank))
+    weight = _initializer("weight", _sample(weight_shape, DT.FLOAT))
+    x = ir.Value(
+        name="x",
+        type=ir.TensorType(DT.FLOAT),
+        shape=ir.Shape(["batch", "channels", *[f"sp{i}" for i in range(spatial_rank)]]),
+    )
+    model = _model(
+        "Conv",
+        [x, weight],
+        ir.Value(
+            name="out",
+            type=ir.TensorType(DT.FLOAT),
+            shape=ir.Shape(["batch", 4, *[f"out{i}" for i in range(spatial_rank)]]),
+        ),
+        initializers=[weight],
+        attributes=[ir.AttrInt64("group", group), ir.AttrString("auto_pad", "SAME_UPPER")],
+    )
+    feeds = {"x": _sample((1, 4, *([7] * spatial_rank)), DT.FLOAT)}
+    m.assert_mlx_claims(model, feeds)
+    sessions = [m._session(model, providers) for providers in (m.EP_PROVIDERS, ["CPUExecutionProvider"])]
+    for batch, extent in [(1, 7), (2, 9), (1, 5), (1, 7)]:
+        feeds = {"x": _sample((batch, 4, *([extent] * spatial_rank)), DT.FLOAT)}
+        actual, expected = [session.run(None, feeds)[0] for session in sessions]
+        np.testing.assert_allclose(actual, expected, **_tolerance(DT.FLOAT))
+    sessions[0].disable_fallback()
+    with pytest.raises(ort.capi.onnxruntime_pybind11_state.EPFail, match="channel"):
+        sessions[0].run(None, {"x": _sample((1, 3, *([7] * spatial_rank)), DT.FLOAT)})
+    actual, expected = [session.run(None, feeds)[0] for session in sessions]
+    np.testing.assert_allclose(actual, expected, **_tolerance(DT.FLOAT))
 
 
 @pytest.mark.parametrize("dtype", [DT.FLOAT, DT.FLOAT16], ids=["fp32", "fp16"])

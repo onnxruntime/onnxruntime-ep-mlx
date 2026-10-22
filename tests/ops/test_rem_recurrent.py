@@ -1,10 +1,9 @@
 """Op-correctness tests for the recurrent family (rust/src/ops/recurrent.rs) vs ORT CPU.
 
-RNN / GRU / LSTM are unrolled over a STATICALLY-KNOWN sequence length into a fixed MLX graph. Each
+RNN / GRU / LSTM are unrolled over the concrete sequence length into a shape-keyed MLX graph. Each
 claimed form (forward / reverse, with and without bias / initial state / peepholes) is parametrised
 against ORT's CPU EP. Forms the handler leaves to ORT CPU are recorded as explicit skips:
 
-  * dynamic (symbolic) seq_length  — the unroll needs a constant S;
   * a `sequence_lens` input        — variable-length masking;
   * non-default `activations`      — only RNN=Tanh / GRU=Sigmoid,Tanh / LSTM=Sigmoid,Tanh,Tanh
                                      are translatable (the STRINGS attr is not carried to the graph).
@@ -17,6 +16,7 @@ import onnx_ir as ir
 import pytest
 
 from _models import DataType, assert_matches_cpu, tensor
+import _models as m
 
 # Gate multiplier packed into W/R per op.
 _GATES = {"RNN": 1, "GRU": 3, "LSTM": 4}
@@ -37,6 +37,7 @@ def _recurrent_model(
     input_forget: int | None = None,
     clip: float | None = None,
     outputs: tuple[str, ...] = ("Y", "Y_h", "Y_c"),
+    dynamic_sequence: bool = False,
 ) -> tuple[bytes, dict[str, np.ndarray]]:
     """Build a single-node RNN/GRU/LSTM model plus random feeds."""
     num_dir = 2 if direction == "bidirectional" else 1
@@ -51,7 +52,7 @@ def _recurrent_model(
     r = rand(num_dir, gates * hidden, hidden)
 
     in_values: list[ir.Value | None] = [
-        tensor("X", DataType.FLOAT, [seq, batch, input_size]),
+        tensor("X", DataType.FLOAT, ["sequence" if dynamic_sequence else seq, batch, input_size]),
         tensor("W", DataType.FLOAT, [num_dir, gates * hidden, input_size]),
         tensor("R", DataType.FLOAT, [num_dir, gates * hidden, hidden]),
     ]
@@ -75,7 +76,7 @@ def _recurrent_model(
 
     out_values: list[ir.Value] = []
     out_specs = {
-        "Y": [seq, num_dir, batch, hidden],
+        "Y": ["sequence" if dynamic_sequence else seq, num_dir, batch, hidden],
         "Y_h": [num_dir, batch, hidden],
         "Y_c": [num_dir, batch, hidden],
     }
@@ -243,12 +244,51 @@ def test_bidirectional(op: str) -> None:
     assert_matches_cpu(model, feeds, rtol=1e-3, atol=1e-3)
 
 
+@pytest.mark.parametrize("op", ["RNN", "GRU", "LSTM"])
+@pytest.mark.parametrize("direction", ["forward", "reverse", "bidirectional"])
+@pytest.mark.parametrize("initial", [False, True])
+def test_dynamic_sequence(op: str, direction: str, initial: bool) -> None:
+    model, feeds = _recurrent_model(
+        op,
+        seq=3,
+        batch=2,
+        input_size=4,
+        hidden=5,
+        direction=direction,
+        bias=True,
+        initial=initial,
+        dynamic_sequence=True,
+    )
+    m.assert_mlx_claims(model, feeds)
+    sessions = [m._session(model, providers) for providers in (m.EP_PROVIDERS, ["CPUExecutionProvider"])]
+    rng = np.random.default_rng(123)
+    for sequence in [3, 1, 0, 5, 3]:
+        feeds["X"] = (rng.standard_normal((sequence, 2, 4)) * 0.5).astype(np.float32)
+        if initial:
+            for name in ["initial_h", "initial_c"] if op == "LSTM" else ["initial_h"]:
+                feeds[name] = (rng.standard_normal(feeds[name].shape) * 0.5).astype(np.float32)
+        actual = sessions[0].run(None, feeds)
+        if sequence == 0:
+            # ORT CPU's zero-length recurrent kernels can abort. With no timesteps, ONNX's
+            # recurrence leaves the initial states unchanged and Y has an empty sequence axis.
+            directions = 2 if direction == "bidirectional" else 1
+            state_shape = (directions, 2, 5)
+            expected = [
+                np.empty((0, directions, 2, 5), dtype=np.float32),
+                feeds["initial_h"] if initial else np.zeros(state_shape, dtype=np.float32),
+            ]
+            if op == "LSTM":
+                expected.append(
+                    feeds["initial_c"] if initial else np.zeros(state_shape, dtype=np.float32)
+                )
+        else:
+            expected = sessions[1].run(None, feeds)
+        for got, want in zip(actual, expected, strict=True):
+            assert got.shape == want.shape
+            np.testing.assert_allclose(got, want, rtol=1e-3, atol=1e-3)
+
+
 # --- Forms deliberately left to ORT CPU (documented, not exercised on MLX) ------------------------
-@pytest.mark.skip(reason="dynamic (symbolic) seq_length is left to ORT CPU — the unroll needs a static S")
-def test_dynamic_seq_left_to_cpu() -> None:
-    ...
-
-
 @pytest.mark.skip(reason="sequence_lens (variable-length masking) is left to ORT CPU")
 def test_sequence_lens_left_to_cpu() -> None:
     ...

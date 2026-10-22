@@ -133,6 +133,14 @@ fn conv_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
         .unwrap_or("NOTSET");
     let x = to_channels_last(ctx, x0, spatial_rank)?;
     let w0 = ctx.resolve(&n.inputs[1])?;
+    let xs = ctx.shape_of(x0);
+    let ws = ctx.shape_of(w0);
+    if i64::from(xs[1]) != i64::from(ws[1]) * i64::from(group) {
+        return Err(format!(
+            "Conv: input channels {} must equal W channels {} times group {group}",
+            xs[1], ws[1]
+        ));
+    }
     let pads: Vec<i64> = if auto_pad == "NOTSET" {
         attr_or(n, "pads", 2 * spatial_rank as usize, 0)
     } else {
@@ -862,11 +870,6 @@ fn conv_claim(node: &NodeView) -> ClaimResult {
     );
     let spatial_rank = x.shape.len() - 2;
     require!(
-        channels_static_dyn_batch_spatial(&x.shape, spatial_rank + 2),
-        "X channel dim must be statically known and positive (shape {:?}); dynamic batch/spatial dims are supported",
-        x.shape
-    );
-    require!(
         static_positive_shape(&w.shape, spatial_rank + 2),
         "W must have rank {} with all dims statically known and positive (shape {:?})",
         spatial_rank + 2,
@@ -940,19 +943,23 @@ fn conv_claim(node: &NodeView) -> ClaimResult {
         }
     }
     let group = node.int_attr("group", 1);
-    let channels = x.shape[1];
     let out_channels = w.shape[0];
-    require!(group > 0, "group must be positive (got {group})");
     require!(
-        channels % group == 0 && out_channels % group == 0,
-        "group {group} must divide both input channels {channels} and output channels {out_channels}"
+        group > 0 && group <= i32::MAX as i64,
+        "group must be positive and fit int32 (got {group})"
+    );
+    let Some(channels) = w.shape[1].checked_mul(group) else {
+        deny!("W channels times group overflows int64");
+    };
+    require!(
+        out_channels % group == 0,
+        "group {group} must divide output channels {out_channels}"
     );
     require!(
-        w.shape[1] == channels / group,
-        "W input-channel dim must equal X channels/group (got {} vs {}/{})",
-        w.shape[1],
-        channels,
-        group
+        x.shape[1] <= 0 || x.shape[1] == channels,
+        "X channels {} must equal W channels {} times group {group}",
+        x.shape[1],
+        w.shape[1]
     );
     require!(
         optional_bias_is_valid(node, x.dtype, out_channels),

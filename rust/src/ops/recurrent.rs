@@ -1,16 +1,15 @@
 //! Recurrent op handlers (ai.onnx opset-17+): RNN, GRU, LSTM. Faithful port of the C++
 //! `ops/recurrent.cc` (see docs/OP_ARCHITECTURE.md §5).
 //!
-//! Static-length unrolling: RNN/GRU/LSTM are SINGLE nodes carrying weight inputs W/R/(B)/(P) and a
-//! `hidden_size` attribute; the recurrence runs over the sequence axis of X ([S, B, I]). When S is
-//! STATICALLY KNOWN we UNROLL into a fixed MLX graph — a host loop over t = 0..S-1 builds S steps,
+//! Shape-keyed unrolling: RNN/GRU/LSTM are SINGLE nodes carrying weight inputs W/R/(B)/(P) and a
+//! `hidden_size` attribute; the recurrence runs over the sequence axis of X ([S, B, I]). The concrete
+//! runtime S selects a compiled MLX graph — a host loop over t = 0..S-1 builds S steps,
 //! each computing gate pre-activations via matmuls (Xt·Wᵀ + H_{t-1}·Rᵀ + bias) then activations.
 //!
 //! Directions: forward, reverse, bidirectional. `hidden_size`, `clip`, optional B / initial_h /
 //! (LSTM) initial_c / P supported. Only DEFAULT activations are translatable (RNN=Tanh,
-//! GRU=Sigmoid/Tanh, LSTM=Sigmoid/Tanh/Tanh); since the STRINGS `activations` attribute is not
-//! carried into NodeDesc, a node that carries ANY `activations` attribute is conservatively left to
-//! ORT CPU. Every other unclaimed form (dynamic S, sequence_lens, non-default layout) → CPU.
+//! GRU=Sigmoid/Tanh, LSTM=Sigmoid/Tanh/Tanh); non-default activations, sequence_lens, and non-default
+//! layout remain on ORT CPU.
 
 use crate::engine::{MlxError, NodeDesc, Src, TranslationContext};
 use crate::registry::{
@@ -480,7 +479,11 @@ fn recurrent_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxErr
     if !n.outputs.is_empty() && !n.outputs[0].name.is_empty() {
         let mut y: Option<mlx::mlx_array> = None;
         for result in &results {
-            let stacked = ctx.stack(&result.ys, 0)?; // [S,B,H]
+            let stacked = if result.ys.is_empty() {
+                ctx.zeros(&[0, b_sz, h], dt)?
+            } else {
+                ctx.stack(&result.ys, 0)? // [S,B,H]
+            };
             let ydir = ctx.expand_dims(stacked, 1)?; // [S,1,B,H]
             y = Some(match y {
                 None => ydir,
@@ -572,7 +575,7 @@ fn recurrent_claim(node: &NodeView, op: &str) -> ClaimResult {
         node.num_outputs()
     );
 
-    // X (rank-3, static positive seq length), W, R — all the same float dtype.
+    // X (rank-3), W, R — all the same float dtype. The shape-keyed trace observes runtime S.
     let (xinfo, winfo, rinfo) = match (node.input_info(0), node.input_info(1), node.input_info(2)) {
         (Some(a), Some(b), Some(c)) => (a, b, c),
         _ => deny!("missing tensor type/shape info on X, W, or R"),
@@ -586,8 +589,8 @@ fn recurrent_claim(node: &NodeView, op: &str) -> ClaimResult {
         crate::registry::ort_dtype_name(rinfo.dtype)
     );
     require!(
-        xinfo.shape.len() == 3 && xinfo.shape[0] > 0,
-        "X must have rank 3 and a static positive sequence length, got shape {:?}",
+        xinfo.shape.len() == 3,
+        "X must have rank 3, got shape {:?}",
         xinfo.shape
     );
 

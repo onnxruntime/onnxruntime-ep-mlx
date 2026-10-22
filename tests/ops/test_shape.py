@@ -444,6 +444,47 @@ def test_split_to_sequence_v24_declines_container_output(
 
 
 # --- Tile -------------------------------------------------------------------------------------
+
+
+def test_tile_runtime_repeats_stay_on_cpu():
+    model = m.make_model(
+        "Tile",
+        [m.tensor("x", DT.FLOAT, [2, 2]), m.tensor("repeats", DT.INT64, [2])],
+        [m.tensor("out", DT.FLOAT, ["rows", "columns"])],
+    )
+    feeds = {
+        "x": np.arange(4, dtype=np.float32).reshape(2, 2),
+        "repeats": np.array([1, 2], dtype=np.int64),
+    }
+    m.assert_op_declined(model, feeds, "Tile")
+    session = m._session(model, m.EP_PROVIDERS)
+    for repeats in [[1, 2], [2, 1], [0, 3], [1, 2]]:
+        feeds["repeats"] = np.array(repeats, dtype=np.int64)
+        np.testing.assert_array_equal(session.run(None, feeds)[0], np.tile(feeds["x"], repeats))
+
+
+def test_range_runtime_bounds_stay_on_cpu():
+    model = m.make_model(
+        "Range",
+        [m.tensor(name, DT.INT64, []) for name in ["start", "limit", "delta"]],
+        [m.tensor("out", DT.INT64, ["length"])],
+    )
+    feeds = {
+        name: np.array(value, dtype=np.int64)
+        for name, value in zip(["start", "limit", "delta"], [1, 7, 2], strict=True)
+    }
+    m.assert_op_declined(model, feeds, "Range")
+    session = m._session(model, m.EP_PROVIDERS)
+    for start, limit, delta in [(1, 7, 2), (4, 0, -1), (1, 7, 1), (7, 1, 2)]:
+        feeds = {
+            name: np.array(value, dtype=np.int64)
+            for name, value in zip(["start", "limit", "delta"], [start, limit, delta], strict=True)
+        }
+        np.testing.assert_array_equal(
+            session.run(None, feeds)[0], np.arange(start, limit, delta, dtype=np.int64)
+        )
+
+
 @pytest.mark.parametrize("dt", MOVE_DTYPES)
 def test_tile(dt):
     data = sample(dt, [2, 2])

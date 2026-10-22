@@ -22,7 +22,13 @@ fn is_mlx_float_dtype(t: mlx::mlx_dtype) -> bool {
 fn div_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
     let a = ctx.resolve(&n.inputs[0])?;
     let b = ctx.resolve(&n.inputs[1])?;
-    let r = ctx.binary(mlx::mlx_divide, a, b)?;
+    let r = if ctx.dtype_of(a) == mlx::mlx_dtype__MLX_INT32 {
+        // MLX 0.32.2's integer floor_divide emits Divide with integer inputs: its kernel
+        // uses integer `/` (truncation toward zero), unlike divide's fp32 promotion.
+        ctx.binary(mlx::mlx_floor_divide, a, b)?
+    } else {
+        ctx.binary(mlx::mlx_divide, a, b)?
+    };
     ctx.bind(&n.outputs[0], r);
     Ok(())
 }
@@ -638,7 +644,7 @@ fn shrink_claim(node: &NodeView) -> ClaimResult {
     Ok(())
 }
 
-/// Div: fp32/fp16/bf16, same dtype in/out, scalar-or-suffix broadcast.
+/// Div: float or int32, same dtype in/out, scalar-or-suffix broadcast.
 fn div_claim(node: &NodeView) -> ClaimResult {
     require!(
         node.num_inputs() == 2 && node.num_outputs() == 1,
@@ -658,8 +664,10 @@ fn div_claim(node: &NodeView) -> ClaimResult {
         crate::registry::ort_dtype_name(out.dtype)
     );
     require!(
-        is_mlx_cpu_float(a.dtype),
-        "dtype {} not supported (float fp32/fp16/bf16/fp64 only)",
+        is_mlx_cpu_float(a.dtype)
+            || a.dtype
+                == crate::sys::ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32,
+        "dtype {} not supported (float fp32/fp16/bf16/fp64 or int32 only)",
         crate::registry::ort_dtype_name(a.dtype)
     );
     require!(

@@ -46,6 +46,7 @@ fastlane/test_output
 # --- ONNX Runtime MLX EP (Rust) ---
 # Cargo build output (the plugin dylib is rebuilt from source: `cargo build`).
 /rust/target/
+/.deps/
 build/
 # Scratch reference material downloaded during development.
 .ref/

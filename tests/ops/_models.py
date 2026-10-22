@@ -8,6 +8,8 @@ reference, tolerance-gated.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import numpy as np
 import onnx_ir as ir
 import onnxruntime as ort
@@ -17,7 +19,7 @@ EP_PROVIDERS = ["MLXExecutionProvider", "CPUExecutionProvider"]
 
 
 # --- IR construction ----------------------------------------------------------------------------
-def tensor(name: str, dtype: ir.DataType, shape: list[int]) -> ir.Value:
+def tensor(name: str, dtype: ir.DataType, shape: Sequence[int | str]) -> ir.Value:
     """A named, typed, shaped IR value — used for graph inputs and outputs."""
     return ir.Value(name=name, type=ir.TensorType(dtype), shape=ir.Shape(shape))
 

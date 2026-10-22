@@ -458,6 +458,8 @@ _INT_FLOAT_CAST_CASES = [
     # bool -> int
     (DT.BOOL, DT.INT32, np.array([[False, True, False], [True, True, False]], dtype=np.bool_)),
     (DT.BOOL, DT.INT64, np.array([[False, True, False], [True, True, False]], dtype=np.bool_)),
+    (DT.BOOL, DT.FLOAT, np.array([[False, True, False], [True, True, False]], dtype=np.bool_)),
+    (DT.BOOL, DT.FLOAT16, np.array([[False, True, False], [True, True, False]], dtype=np.bool_)),
     (DT.INT32, DT.BOOL, np.array([[0, 1, -1], [7, 0, -9]], dtype=np.int32)),
     (DT.INT64, DT.BOOL, np.array([[0, 1, -1], [7, 0, -9]], dtype=np.int64)),
 ]
@@ -476,6 +478,24 @@ def test_cast_int_float(src: DT, dst: DT, x: np.ndarray) -> None:
         attributes={"to": int(dst)},
     )
     check(model, {"x": x}, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("dst", [DT.FLOAT, DT.FLOAT16])
+def test_cast_like_bool_float(dst: DT) -> None:
+    model = m.make_model(
+        "CastLike",
+        [m.tensor("x", DT.BOOL, [4]), m.tensor("target", dst, [])],
+        [m.tensor("out", dst, [4])],
+    )
+    check(
+        model,
+        {
+            "x": np.array([False, True, True, False]),
+            "target": np.array(0, dtype=np.float32 if dst == DT.FLOAT else np.float16),
+        },
+        rtol=0,
+        atol=0,
+    )
 
 
 # --- Add / Mul on int32 / int64 ------------------------------------------------------------------
