@@ -452,17 +452,24 @@ def test_reduction_axes_input_opset18() -> None:
     m.assert_matches_cpu(model, feeds)
 
 
-@pytest.mark.parametrize("op", ["ReduceSum", "ReduceSumSquare"])
-def test_reduce_noop_with_empty_axes(op: str) -> None:
+@pytest.mark.parametrize("op", ["ReduceSum", "ReduceSumSquare", "ReduceMax"])
+@pytest.mark.parametrize("omit_axes", [False, True], ids=["empty", "omitted"])
+def test_reduce_noop_with_empty_axes(op: str, omit_axes: bool) -> None:
+    inputs = [m.tensor("x", DT.FLOAT, [2, 3])]
+    if not omit_axes:
+        inputs.append(m.tensor("axes", DT.INT64, [0]))
     model = m.make_model(
         op,
-        [m.tensor("x", DT.FLOAT, [2, 3]), m.tensor("axes", DT.INT64, [0])],
+        inputs,
         [m.tensor("out", DT.FLOAT, [2, 3])],
         attributes={"keepdims": 1, "noop_with_empty_axes": 1},
         opset=18,
     )
     x = np.arange(6, dtype=np.float32).reshape(2, 3)
-    m.assert_matches_cpu(model, {"x": x, "axes": np.empty((0,), dtype=np.int64)})
+    feeds = {"x": x}
+    if not omit_axes:
+        feeds["axes"] = np.empty((0,), dtype=np.int64)
+    m.assert_matches_cpu(model, feeds)
 
 
 _CUMSUM_DTYPES = [
