@@ -2,13 +2,13 @@
 //! ai.onnx integer/QLinear coverage. Faithful port of the C++ `ops/quant.cc`, `ops/quantize.cc` and
 //! `ops/quant2.cc`:
 //!
-//!   * MatMulNBits — int4/int8 block-quantized weight matmul. BOTH the 3-input SYMMETRIC form
-//!     (implicit midpoint zero point) AND the 4-input ASYMMETRIC form with an explicit uint8
-//!     `zero_points` input. Dequant is w = (q - zp) * scale. For MLX-supported group sizes
+//!   * MatMulNBits — int2/int4/int8 block-quantized weight matmul, with implicit midpoint,
+//!     packed uint8 or floating zero points and optional output bias. Dequant is
+//!     w = (q - zp) * scale. For immutable weights and MLX-supported group sizes
 //!     (32/64/128) the weight is repacked ONCE to MLX affine uint32 words + per-block scales/biases
 //!     and run through `mlx_quantized_matmul` (weights stay compressed — the decode memory win). For
-//!     block_size 16 (which `mlx_quantized_matmul` does not support) the weight is dequantized
-//!     in-graph to fp32 [N,K] and a dense `mlx_matmul` runs.
+//!     other block sizes or live/intermediate weights, dequantization stays in the MLX graph
+//!     followed by dense matmul, preserving live-value dependencies during compiled replay.
 //!   * GatherBlockQuantized — int4 block-quantized embedding gather + dequant, SYMMETRIC (zp=8) and
 //!     ASYMMETRIC (explicit packed-int4 `zero_points`) forms.
 //!   * QuantizeLinear — y = saturate(round(x / scale) + zero_point).
@@ -107,8 +107,8 @@ fn present(n: &NodeDesc, i: usize) -> bool {
 }
 
 /// Reshape a 1-D per-axis parameter (scale / zero point) of length L to a rank-`rank` shape that is 1
-/// on every axis except `axis` (= L), so it broadcasts against the data tensor. A scalar (size <= 1)
-/// parameter already broadcasts and is returned unchanged.
+/// on every axis except `axis` (= L), so it broadcasts against the data tensor. Single-element
+/// parameters are normalized to scalars so scalar inputs keep rank zero.
 fn align_per_axis(
     ctx: &mut TranslationContext,
     param: mlx::mlx_array,
@@ -116,8 +116,8 @@ fn align_per_axis(
     axis: usize,
 ) -> Result<mlx::mlx_array, MlxError> {
     let len = ctx.size_of(param);
-    if len <= 1 {
-        return Ok(param);
+    if len == 1 {
+        return ctx.reshape(param, &[]);
     }
     let mut shape = vec![1i32; rank.max(1)];
     let ax = axis.min(shape.len() - 1);
@@ -136,9 +136,8 @@ fn quant_axis(rank: usize, mut axis: i64) -> Option<usize> {
     (0..r).contains(&axis).then_some(axis as usize)
 }
 
-fn node_quant_axis(n: &NodeDesc, rank: usize) -> Result<usize, MlxError> {
-    // ONNX uses axis=1 as the default even though rank-one inputs are always per-tensor.
-    if rank == 1 {
+fn node_quant_axis(n: &NodeDesc, rank: usize, per_tensor: bool) -> Result<usize, MlxError> {
+    if per_tensor && n.ints.get("block_size").copied().unwrap_or(0) == 0 {
         return Ok(0);
     }
     quant_axis(rank, n.ints.get("axis").copied().unwrap_or(1)).ok_or_else(|| {
@@ -161,6 +160,10 @@ fn align_quant_param(
     block_size: i64,
 ) -> Result<mlx::mlx_array, MlxError> {
     if block_size == 0 {
+        let len = ctx.size_of(param);
+        if len != 1 && data_shape.get(axis).copied() != i32::try_from(len).ok() {
+            return Err("Q/DQ: per-axis parameter length must match the data axis".to_string());
+        }
         return align_per_axis(ctx, param, data_shape.len(), axis);
     }
 
@@ -269,23 +272,29 @@ fn unpack_nibbles(
     ctx: &mut TranslationContext,
     packed_u8: mlx::mlx_array,
 ) -> Result<mlx::mlx_array, MlxError> {
+    unpack_bits(ctx, packed_u8, 4)
+}
+
+fn unpack_bits(
+    ctx: &mut TranslationContext,
+    packed_u8: mlx::mlx_array,
+    bits: i64,
+) -> Result<mlx::mlx_array, MlxError> {
     let sh = ctx.shape_of(packed_u8);
     let bs = sh[0];
     let p = sh[1];
     let g32 = ctx.astype(packed_u8, mlx::mlx_dtype__MLX_UINT32)?;
-    let mask = u32_scalar(ctx, 0x0F);
-    let low = ctx.binary(mlx::mlx_bitwise_and, g32, mask)?;
-    let four = u32_scalar(ctx, 4);
-    let hi_sh = ctx.binary(mlx::mlx_right_shift, g32, four)?;
-    let mask2 = u32_scalar(ctx, 0x0F);
-    let high = ctx.binary(mlx::mlx_bitwise_and, hi_sh, mask2)?;
-
+    let mask = u32_scalar(ctx, (1 << bits) - 1);
     let mut pair = VectorArray::new();
-    pair.append(low);
-    pair.append(high);
-    let stacked = ctx.emit(|res, s| unsafe { mlx::mlx_stack_axis(res, pair.as_raw(), 2, s) })?; // [BS,P,2]
+    for lane in 0..(8 / bits) {
+        let shift = u32_scalar(ctx, (lane * bits) as u32);
+        let shifted = ctx.binary(mlx::mlx_right_shift, g32, shift)?;
+        let value = ctx.binary(mlx::mlx_bitwise_and, shifted, mask)?;
+        pair.append(value);
+    }
+    let stacked = ctx.emit(|res, s| unsafe { mlx::mlx_stack_axis(res, pair.as_raw(), 2, s) })?;
     drop(pair);
-    ctx.reshape(stacked, &[bs, p * 2])
+    ctx.reshape(stacked, &[bs, p * (8 / bits) as i32])
 }
 
 /// Broadcast a per-block float tensor [BS, nblocks] up to per-element [BS, nblocks*block]: element j
@@ -733,7 +742,7 @@ fn matmulnbits_repack(
     bits: i64,
 ) -> Result<mlx::mlx_array, MlxError> {
     let wref = &n.inputs[1];
-    let key = format!("{}#qw", wref.name);
+    let key = format!("{}#qw", wref.cache_key());
     if (wref.constant || wref.source == Src::Initializer)
         && let Some(w) = ctx.cache_get(&key)
     {
@@ -776,11 +785,7 @@ fn matmulnbits_repack(
                 let lane = within % values_per_byte;
                 let idx = ((row * nblocks + blk) * blob + byte) as usize;
                 let b = bytes[idx];
-                let q = if bits == 4 {
-                    ((b >> (lane * bits)) & 0x0F) as u32
-                } else {
-                    b as u32
-                };
+                let q = ((b >> (lane * bits)) & ((1u16 << bits) - 1) as u8) as u32;
                 let word = (row as usize) * words + (kk / values_per_word) as usize;
                 packed[word] |= q << (((kk % values_per_word) * bits) as u32);
             }
@@ -847,6 +852,27 @@ fn matmulnbits_zp8_f32(
     ctx.astype(zp, mlx::mlx_dtype__MLX_FLOAT32)
 }
 
+fn matmulnbits_zero_points(
+    ctx: &mut TranslationContext,
+    n: &NodeDesc,
+    big_n: i32,
+    nblocks: i32,
+    bits: i64,
+) -> Result<mlx::mlx_array, MlxError> {
+    let zp = ctx.resolve(&n.inputs[3])?;
+    if ctx.dtype_of(zp) != mlx::mlx_dtype__MLX_UINT8 || bits == 8 {
+        return matmulnbits_zp8_f32(ctx, n, big_n, nblocks);
+    }
+    if bits == 4 {
+        return matmulnbits_zp_f32(ctx, n, big_n, nblocks);
+    }
+    let pack = (8 / bits) as i32;
+    let zp = ctx.reshape(zp, &[big_n, (nblocks + pack - 1) / pack])?;
+    let unpacked = unpack_bits(ctx, zp, bits)?;
+    let unpacked = trim_block_values(ctx, unpacked, big_n, nblocks)?;
+    ctx.astype(unpacked, mlx::mlx_dtype__MLX_FLOAT32)
+}
+
 fn matmulnbits_scales(
     ctx: &mut TranslationContext,
     n: &NodeDesc,
@@ -854,7 +880,7 @@ fn matmulnbits_scales(
     nblocks: i32,
 ) -> Result<mlx::mlx_array, MlxError> {
     let scales_ref = &n.inputs[2];
-    let key = format!("{}#qs#{big_n}x{nblocks}", scales_ref.name);
+    let key = format!("{}#qs#{big_n}x{nblocks}", scales_ref.cache_key());
     if (scales_ref.constant || scales_ref.source == Src::Initializer)
         && let Some(scales) = ctx.cache_get(&key)
     {
@@ -896,7 +922,7 @@ fn matmulnbits_symmetric_biases(
     scales2d: mlx::mlx_array,
 ) -> Result<mlx::mlx_array, MlxError> {
     let scales_ref = &n.inputs[2];
-    let key = format!("{}#qb#{big_n}x{nblocks}b{bits}", scales_ref.name);
+    let key = format!("{}#qb#{big_n}x{nblocks}b{bits}", scales_ref.cache_key());
     if (scales_ref.constant || scales_ref.source == Src::Initializer)
         && let Some(biases) = ctx.cache_get(&key)
     {
@@ -957,6 +983,7 @@ fn matmulnbits_symmetric_biases(
         Ok(ctx.cache_put(key, biases))
     } else {
         let neg_mid = f32(ctx, -((1i64 << (bits - 1)) as f32));
+        let neg_mid = ctx.astype(neg_mid, ctx.dtype_of(scales2d))?;
         mul(ctx, scales2d, neg_mid)
     }
 }
@@ -975,12 +1002,14 @@ fn matmulnbits_asymmetric_biases(
         && (zp_ref.constant || zp_ref.source == Src::Initializer);
     let key = format!(
         "{}#{}#qab#{big_n}x{nblocks}b{bits}",
-        scales_ref.name, zp_ref.name
+        scales_ref.cache_key(),
+        zp_ref.cache_key()
     );
     if constant && let Some(biases) = ctx.cache_get(&key) {
         return Ok(biases);
     }
-    if constant {
+    let zp = ctx.resolve(zp_ref)?;
+    if constant && bits != 2 && ctx.dtype_of(zp) == mlx::mlx_dtype__MLX_UINT8 {
         let scales = ctx.raw_host(scales_ref)?;
         let zps = ctx.raw_host(zp_ref)?;
         let count = (big_n as usize) * (nblocks as usize);
@@ -1064,11 +1093,8 @@ fn matmulnbits_asymmetric_biases(
         return Ok(ctx.cache_put(key, biases));
     }
 
-    let zpf = if bits == 4 {
-        matmulnbits_zp_f32(ctx, n, big_n, nblocks)?
-    } else {
-        matmulnbits_zp8_f32(ctx, n, big_n, nblocks)?
-    };
+    let zpf = matmulnbits_zero_points(ctx, n, big_n, nblocks, bits)?;
+    let zpf = ctx.astype(zpf, ctx.dtype_of(scales2d))?;
     let neg_zp = ctx.unary(mlx::mlx_negative, zpf)?;
     mul(ctx, neg_zp, scales2d)
 }
@@ -1087,13 +1113,19 @@ fn matmulnbits_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxE
 
     let a = ctx.resolve(&n.inputs[0])?;
     let ashape = ctx.shape_of(a);
+    if ashape.last().copied() != Some(k as i32) {
+        return Err("MatMulNBits: activation last dimension must equal K".to_string());
+    }
     let mut m: i32 = 1;
     for &d in &ashape[..ashape.len().saturating_sub(1)] {
         m *= d;
     }
     let act_dt = ctx.dtype_of(a);
 
-    let supported = block == 32 || block == 64 || block == 128;
+    // Host repacking must never capture live boundary/intermediate bytes as trace constants.
+    // Mutable weights use graph dequantization, including inside compiled replay.
+    let supported = matches!(block, 32 | 64 | 128)
+        && (n.inputs[1].constant || n.inputs[1].source == Src::Initializer);
     let y = if supported {
         // Repacked uint32 weight + per-block scales/biases, shared by the explicit-FP16 prefill
         // route and the activation-dtype `mlx_quantized_matmul` fallback.
@@ -1132,7 +1164,7 @@ fn matmulnbits_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxE
                 && (!has_zp || n.inputs[3].constant || n.inputs[3].source == Src::Initializer);
             let scales_fp16 = if scales_constant {
                 ctx.cache_astype(
-                    format!("{}#qs_fp16#{big_n}x{nblocks}", n.inputs[2].name),
+                    format!("{}#qs_fp16#{big_n}x{nblocks}", n.inputs[2].cache_key()),
                     scales2d,
                     mlx::mlx_dtype__MLX_FLOAT16,
                 )?
@@ -1143,11 +1175,11 @@ fn matmulnbits_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxE
                 ctx.cache_astype(
                     format!(
                         "{}#{}#qb_fp16#{big_n}x{nblocks}b{bits}",
-                        n.inputs[2].name,
+                        n.inputs[2].cache_key(),
                         n.inputs
                             .get(3)
-                            .map(|input| input.name.as_str())
-                            .unwrap_or("")
+                            .map(|input| input.cache_key())
+                            .unwrap_or_default()
                     ),
                     biases,
                     mlx::mlx_dtype__MLX_FLOAT16,
@@ -1177,19 +1209,11 @@ fn matmulnbits_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxE
             crate::engine::dtype_name(comp_dt)
         ));
         let wpacked = ctx.resolve(&n.inputs[1])?;
-        let q = if bits == 4 {
-            let wflat = ctx.reshape(wpacked, &[big_n as i32, (padded_k / 2) as i32])?;
-            unpack_nibbles(ctx, wflat)?
-        } else {
-            ctx.reshape(wpacked, &[big_n as i32, padded_k as i32])?
-        };
+        let wflat = ctx.reshape(wpacked, &[big_n as i32, (padded_k * bits / 8) as i32])?;
+        let q = unpack_bits(ctx, wflat, bits)?;
         let qf = ctx.astype(q, comp_dt)?;
         let centered = if has_zp {
-            let zpf = if bits == 4 {
-                matmulnbits_zp_f32(ctx, n, big_n as i32, nblocks)?
-            } else {
-                matmulnbits_zp8_f32(ctx, n, big_n as i32, nblocks)?
-            };
+            let zpf = matmulnbits_zero_points(ctx, n, big_n as i32, nblocks, bits)?;
             let zpf = ctx.astype(zpf, comp_dt)?;
             let zp_full = broadcast_blocks(ctx, zpf, big_n as i32, nblocks, block as i32)?;
             sub(ctx, qf, zp_full)?
@@ -1214,7 +1238,11 @@ fn matmulnbits_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxE
     } else {
         oshape.push(big_n as i32);
     }
-    let out = ctx.reshape(y, &oshape)?;
+    let mut out = ctx.reshape(y, &oshape)?;
+    if present(n, 5) {
+        let bias = ctx.resolve(&n.inputs[5])?;
+        out = ctx.add(out, bias)?;
+    }
     ctx.bind(&n.outputs[0], out);
     Ok(())
 }
@@ -1250,7 +1278,7 @@ fn gather_block_quantized_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Resu
 
     let packed = ctx.shape_of(g)[1];
     let d = packed * 2;
-    let nblocks = d / block;
+    let nblocks = (d + block - 1) / block;
 
     let q = unpack_nibbles(ctx, g)?; // [BS, D] uint32
     let qf = ctx.astype(q, mlx::mlx_dtype__MLX_FLOAT32)?;
@@ -1282,6 +1310,7 @@ fn gather_block_quantized_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Resu
         };
         let zpf = ctx.astype(zp_un, mlx::mlx_dtype__MLX_FLOAT32)?;
         let zp_full = broadcast_blocks(ctx, zpf, bs, nblocks, block)?;
+        let zp_full = trim_block_values(ctx, zp_full, bs, d)?;
         sub(ctx, qf, zp_full)?
     } else {
         let eight = f32(ctx, 8.0);
@@ -1289,6 +1318,7 @@ fn gather_block_quantized_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Resu
     };
 
     let sc_full = broadcast_blocks(ctx, sg, bs, nblocks, block)?;
+    let sc_full = trim_block_values(ctx, sc_full, bs, d)?;
     let w = mul(ctx, centered, sc_full)?;
     let valid = ctx.reshape(valid, &[bs, 1])?;
     let zero = ctx.scalar_f32(0.0);
@@ -1309,7 +1339,7 @@ fn quantize_linear_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), 
     let x0 = ctx.resolve(&n.inputs[0])?;
     let s0 = ctx.resolve(&n.inputs[1])?;
     let data_shape = ctx.shape_of(x0);
-    let axis = node_quant_axis(n, data_shape.len())?;
+    let axis = node_quant_axis(n, data_shape.len(), ctx.size_of(s0) == 1)?;
     let precision = quant_precision(ctx, n, s0)?;
     let x = ctx.astype(x0, precision)?;
     let scale = ctx.astype(s0, precision)?;
@@ -1325,6 +1355,9 @@ fn quantize_linear_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), 
     let mut q = ctx.astype(q, mlx::mlx_dtype__MLX_FLOAT32)?;
     if present(n, 2) {
         let z0 = ctx.resolve(&n.inputs[2])?;
+        if ctx.shape_of(z0) != ctx.shape_of(s0) {
+            return Err("Q/DQ: scale and zero_point shapes must match".to_string());
+        }
         let zp = ctx.astype(z0, mlx::mlx_dtype__MLX_FLOAT32)?;
         let zp = align_quant_param(
             ctx,
@@ -1351,7 +1384,7 @@ fn dequantize_linear_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<()
     let mut x = ctx.astype(x0, mlx::mlx_dtype__MLX_FLOAT32)?;
     let s0 = ctx.resolve(&n.inputs[1])?;
     let data_shape = ctx.shape_of(x);
-    let axis = node_quant_axis(n, data_shape.len())?;
+    let axis = node_quant_axis(n, data_shape.len(), ctx.size_of(s0) == 1)?;
     let output_dtype = mlx_float_dtype(n.outputs[0].otype).ok_or_else(|| {
         "DequantizeLinear: output must be float32, float16, or bfloat16".to_string()
     })?;
@@ -1359,6 +1392,9 @@ fn dequantize_linear_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<()
 
     if present(n, 2) {
         let z0 = ctx.resolve(&n.inputs[2])?;
+        if ctx.shape_of(z0) != ctx.shape_of(s0) {
+            return Err("Q/DQ: scale and zero_point shapes must match".to_string());
+        }
         let zp = ctx.astype(z0, mlx::mlx_dtype__MLX_FLOAT32)?;
         let zp = align_quant_param(
             ctx,
@@ -1757,7 +1793,11 @@ fn is_dequant_input(t: ort::ONNXTensorElementDataType) -> bool {
 }
 
 fn block_shape_ok(data: &[i64], param: &[i64], axis: usize, block_size: i64) -> bool {
-    if block_size <= 0 || data.len() != param.len() || data.iter().any(|&d| d <= 0) {
+    if block_size <= 0
+        || axis >= data.len()
+        || data.len() != param.len()
+        || data.iter().any(|&d| d <= 0)
+    {
         return false;
     }
     if data
@@ -1783,15 +1823,17 @@ fn quant_param_shape_ok(data: &[i64], param: &[i64], axis: usize, block_size: i6
         0 => {
             param.is_empty()
                 || param == [1]
-                || (data.len() > 1 && param.len() == 1 && param[0] == data[axis])
+                || (!data.is_empty()
+                    && param.len() == 1
+                    && (param[0] == data[axis] || param[0] < 0 || data[axis] < 0))
         }
         _ => block_shape_ok(data, param, axis, block_size),
     }
 }
 
 fn claim_quant_axis(rank: usize, axis: i64, param_shape: &[i64]) -> Option<usize> {
-    if rank == 1 && (param_shape.is_empty() || param_shape == [1]) {
-        // ONNX's default axis is 1, but rank-one inputs only admit per-tensor quantization.
+    if param_shape.is_empty() || param_shape == [1] {
+        // Axis is irrelevant for per-tensor quantization, including scalar data.
         Some(0)
     } else {
         quant_axis(rank, axis)
@@ -1898,7 +1940,7 @@ fn matmulnbits_compile_shape_safety_for(
         };
     }
     let nblocks = k / block;
-    if has_zero_points && bits == 4 && nblocks % 2 != 0 {
+    if has_zero_points && bits < 8 && nblocks % (8 / bits) != 0 {
         CompileShapeSafety::ShapeKeyedOnly {
             reason: crate::registry::MLX_SLICE_SHAPE_REASON,
         }
@@ -1922,16 +1964,14 @@ fn gather_block_quantized_compile_shape_safety_for(
     block: i64,
     has_zero_points: bool,
 ) -> CompileShapeSafety {
-    if !has_zero_points {
-        return CompileShapeSafety::Shapeless;
-    }
-    if packed_data <= 0 || packed_zero_points <= 0 || block <= 0 {
+    if packed_data <= 0 || block <= 0 || (has_zero_points && packed_zero_points <= 0) {
         return CompileShapeSafety::ShapeKeyedOnly {
             reason: QUANT_GEOMETRY_SHAPE_REASON,
         };
     }
-    let nblocks = (packed_data * 2) / block;
-    if packed_zero_points * 2 != nblocks {
+    let d = packed_data * 2;
+    let nblocks = (d + block - 1) / block;
+    if d % block != 0 || (has_zero_points && packed_zero_points * 2 != nblocks) {
         CompileShapeSafety::ShapeKeyedOnly {
             reason: crate::registry::MLX_SLICE_SHAPE_REASON,
         }
@@ -1989,29 +2029,66 @@ fn matmulnbits_claim(node: &NodeView) -> ClaimResult {
         crate::registry::ort_dtype_name(s.dtype),
         crate::registry::ort_dtype_name(out.dtype)
     );
-    // Only the 3-input symmetric or 4-input asymmetric (uint8 packed int4 zero_points) forms.
+    require!(
+        node.int_attr("weight_prepacked", 0) == 0,
+        "weight_prepacked layouts are unsupported; raw block-packed weights are required"
+    );
     if node.input_present(3) {
         match node.input_info(3) {
-            Some(zp) if is_uint8(zp.dtype) => {}
-            _ => deny!("zero_points must be uint8 when present"),
+            Some(zp) if is_uint8(zp.dtype) || zp.dtype == a.dtype => {}
+            _ => deny!("zero_points must be packed uint8 or share the activation float dtype"),
         }
     }
-    // Reject g_idx / bias (any present input beyond slot 3) — left to ORT CPU.
-    for i in 4..nin {
-        if node.input_present(i) {
-            deny!("g_idx and bias inputs are not supported");
-        }
-    }
+    require!(nin <= 6 && !node.input_present(4), "g_idx is unsupported");
     let bits = node.int_attr("bits", 4);
     let block = node.int_attr("block_size", 32);
     require!(
-        bits == 4 || bits == 8,
-        "only 4-bit and 8-bit weights are supported"
+        matches!(bits, 2 | 4 | 8),
+        "only 2-bit, 4-bit and 8-bit weights are supported"
     );
     require!(
-        matches!(block, 16 | 32 | 64 | 128),
-        "block_size must be 16, 32, 64, or 128 (got {block})"
+        block >= 16 && block <= i32::MAX as i64 && (block as u64).is_power_of_two(),
+        "block_size must be a power of two >=16 within MLX limits (got {block})"
     );
+    let k = node.int_attr("K", 0);
+    let big_n = node.int_attr("N", 0);
+    require!(
+        k > 0 && k <= i32::MAX as i64 && big_n > 0 && big_n <= i32::MAX as i64,
+        "K and N must be positive within MLX limits"
+    );
+    let nblocks = (k + block - 1) / block;
+    require!(
+        nblocks * block <= i32::MAX as i64,
+        "padded K must fit MLX dimensions"
+    );
+    require!(
+        !a.shape.is_empty() && a.shape.last().is_some_and(|&d| d == k || d < 0),
+        "activation last dimension must equal K"
+    );
+    require!(
+        b.shape == [big_n, nblocks, block * bits / 8]
+            && s.shape.iter().all(|&d| d > 0)
+            && s.shape.iter().try_fold(1i64, |a, &d| a.checked_mul(d)) == Some(big_n * nblocks),
+        "packed weight geometry and scale count must match N, K, block_size and bits"
+    );
+    if let Some(zp) = node.input_info(3) {
+        let cols = if is_uint8(zp.dtype) {
+            (nblocks + 8 / bits - 1) / (8 / bits)
+        } else {
+            nblocks
+        };
+        require!(
+            zp.shape.iter().all(|&d| d > 0)
+                && zp.shape.iter().try_fold(1i64, |a, &d| a.checked_mul(d)) == Some(big_n * cols),
+            "zero_points count must match packed or floating block geometry"
+        );
+    }
+    if let Some(bias) = node.input_info(5) {
+        require!(
+            bias.dtype == a.dtype && bias.shape == [big_n],
+            "bias must be activation dtype [N]"
+        );
+    }
     Ok(())
 }
 
@@ -2026,7 +2103,11 @@ fn gather_block_quantized_claim(node: &NodeView) -> ClaimResult {
         _ => deny!("missing tensor type/shape info on an input"),
     };
     require!(
-        data.shape.len() == 2 && data.shape[0] > 0,
+        data.shape.len() == 2
+            && data.shape[0] > 0
+            && data.shape[0] <= i32::MAX as i64
+            && data.shape[1] > 0
+            && data.shape[1] <= (i32::MAX / 2) as i64,
         "only rank-2 data with a positive row count is supported"
     );
     if !is_uint8(data.dtype)
@@ -2047,13 +2128,32 @@ fn gather_block_quantized_claim(node: &NodeView) -> ClaimResult {
         "only 4-bit data is supported"
     );
     require!(
-        node.int_attr("gather_axis", 0) == 0 && node.int_attr("quantize_axis", 1) == 1,
+        matches!(node.int_attr("gather_axis", 0), 0 | -2)
+            && matches!(node.int_attr("quantize_axis", 1), 1 | -1),
         "only gather_axis=0 and quantize_axis=1 are supported"
     );
     require!(
-        node.int_attr("block_size", 128) >= 16,
-        "block_size must be at least 16"
+        node.int_attr("block_size", 128) >= 16
+            && node.int_attr("block_size", 128) <= i32::MAX as i64
+            && (node.int_attr("block_size", 128) as u64).is_power_of_two(),
+        "block_size must be a power of two at least 16"
     );
+    let blocks = (data.shape[1] * 2 + node.int_attr("block_size", 128) - 1)
+        / node.int_attr("block_size", 128);
+    require!(
+        blocks * node.int_attr("block_size", 128) <= i32::MAX as i64,
+        "expanded block geometry must fit MLX dimensions"
+    );
+    require!(
+        scales.shape == [data.shape[0], blocks],
+        "scales must have shape [rows, ceil(D/block_size)]"
+    );
+    if let Some(zp) = node.input_info(3) {
+        require!(
+            zp.shape == [data.shape[0], (blocks + 1) / 2],
+            "zero_points must have shape [rows, ceil(blocks/2)]"
+        );
+    }
     Ok(())
 }
 
@@ -2663,6 +2763,16 @@ fn qmoe_activation(
 fn qmoe_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
     let k_top = *n.ints.get("k").unwrap_or(&1) as i32;
     let bits = *n.ints.get("expert_weight_bits").unwrap_or(&4);
+    let bits1 = n
+        .ints
+        .get("fc1_expert_weight_bits")
+        .copied()
+        .unwrap_or(bits);
+    let bits2 = n
+        .ints
+        .get("fc2_expert_weight_bits")
+        .copied()
+        .unwrap_or(bits);
     let block_size = *n.ints.get("block_size").unwrap_or(&0);
     let fusion = *n.ints.get("swiglu_fusion").unwrap_or(&0);
     let act = n
@@ -2704,15 +2814,28 @@ fn qmoe_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
     }
     let inter = fi / f;
 
-    // Routing gate [T, E]: softmax over the top-k logits (== masked softmax with non-top-k -> -inf).
-    // Threshold = the k-th largest logit per row (ascending sort, column E-k).
+    // ORT CPU orders (logit, expert-index) pairs descending, including ties.
     let router = ctx.resolve(&n.inputs[QMOE_IN_ROUTER])?;
+    let router = ctx.reshape(router, &[t as i32, e as i32])?;
     let router_f = ctx.astype(router, mlx::mlx_dtype__MLX_FLOAT32)?;
-    let sorted = ctx.emit(|res, s| unsafe { mlx::mlx_sort_axis(res, router_f, 1, s) })?; // [T, E] asc
-    let kcol = (e as i32) - k_top;
-    let thr = ctx.slice(sorted, &[0, kcol], &[t as i32, kcol + 1])?; // [T, 1] k-th largest
-    let mask = ctx.binary(mlx::mlx_greater_equal, router_f, thr)?; // [T, E] bool
-    let neg_inf = f32(ctx, -3.0e38);
+    let indices = ctx.arange(0.0, e as f64, 1.0, mlx::mlx_dtype__MLX_INT32)?;
+    let sentinel = ctx.scalar_i32(-1);
+    let neg_inf = f32(ctx, f32::NEG_INFINITY);
+    let zeros = ctx.zeros_like(router_f)?;
+    let mut mask = ctx.binary(mlx::mlx_less, zeros, zeros)?;
+    for _ in 0..k_top {
+        let remaining = ctx.where_(mask, neg_inf, router_f)?;
+        let maximum =
+            ctx.emit(|res, s| unsafe { mlx::mlx_max_axis(res, remaining, 1, true, s) })?;
+        let equal = ctx.binary(mlx::mlx_equal, remaining, maximum)?;
+        let not_selected = ctx.unary(mlx::mlx_logical_not, mask)?;
+        let eligible = ctx.binary(mlx::mlx_logical_and, equal, not_selected)?;
+        let candidates = ctx.where_(eligible, indices, sentinel)?;
+        let chosen =
+            ctx.emit(|res, s| unsafe { mlx::mlx_max_axis(res, candidates, 1, true, s) })?;
+        let selected = ctx.binary(mlx::mlx_equal, indices, chosen)?;
+        mask = ctx.binary(mlx::mlx_logical_or, mask, selected)?;
+    }
     let masked = ctx.where_(mask, router_f, neg_inf)?;
     let gate_f = ctx.softmax_axis(masked, 1)?; // [T, E] f32
     let gate = ctx.astype(gate_f, comp_dt)?;
@@ -2726,7 +2849,7 @@ fn qmoe_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
         e,
         fi,
         hidden,
-        bits,
+        bits1,
         block_size,
         comp_dt,
     )?;
@@ -2738,7 +2861,7 @@ fn qmoe_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
         e,
         hidden,
         inter,
-        bits,
+        bits2,
         block_size,
         comp_dt,
     )?;
@@ -2786,6 +2909,11 @@ fn qmoe_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
     // Weighted sum over experts: out[t,:] = sum_e gate[t,e] * C2[e,t,:].
     let gate_t = ctx.transpose(gate, &[1, 0])?; // [E, T]
     let gate_e = ctx.reshape(gate_t, &[e as i32, t as i32, 1])?;
+    let mask_t = ctx.transpose(mask, &[1, 0])?;
+    let mask_e = ctx.reshape(mask_t, &[e as i32, t as i32, 1])?;
+    let zero = ctx.scalar_f32(0.0);
+    let zero = ctx.astype(zero, comp_dt)?;
+    let c2 = ctx.where_(mask_e, c2, zero)?;
     let weighted = mul(ctx, c2, gate_e)?; // [E, T, H]
     let out_e = ctx.emit(|res, s| unsafe { mlx::mlx_sum_axis(res, weighted, 0, false, s) })?; // [T, H]
     let out = ctx.astype(out_e, out_dt)?;
@@ -2832,6 +2960,12 @@ fn qmoe_claim(node: &NodeView) -> ClaimResult {
         bits == 4 || bits == 8,
         "expert_weight_bits must be 4 or 8 (got {bits})"
     );
+    let bits1 = node.int_attr("fc1_expert_weight_bits", bits);
+    let bits2 = node.int_attr("fc2_expert_weight_bits", bits);
+    require!(
+        matches!(bits1, 4 | 8) && matches!(bits2, 4 | 8),
+        "effective fc1/fc2 expert weight bits must be 4 or 8"
+    );
     require!(
         node.input_present(QMOE_IN_FC1_W) && node.input_present(QMOE_IN_FC2_W),
         "requires fc1/fc2 expert weights"
@@ -2866,6 +3000,10 @@ fn qmoe_claim(node: &NodeView) -> ClaimResult {
         act
     );
     let fusion = node.int_attr("swiglu_fusion", 0);
+    require!(
+        fusion == 0 || node.int_attr("fc3_expert_weight_bits", bits) == bits1,
+        "fused fc3_expert_weight_bits must equal effective fc1_expert_weight_bits"
+    );
     if act == "swiglu" {
         require!(
             fusion == 1,
@@ -2895,6 +3033,94 @@ fn qmoe_claim(node: &NodeView) -> ClaimResult {
         }
         None => deny!("fc1_experts_weights lacks tensor type/shape info"),
     }
+    let input = node.input_info(QMOE_IN_INPUT).unwrap();
+    let w1 = node.input_info(QMOE_IN_FC1_W).unwrap();
+    require!(
+        matches!(input.shape.len(), 2 | 3) && input.shape.last().is_some_and(|&d| d > 0),
+        "input must have rank 2 or 3 and a positive static hidden size"
+    );
+    let hidden = *input.shape.last().unwrap();
+    let experts = w1.shape[0];
+    let fi = w1.shape[1];
+    let factor = if fusion > 0 { 2 } else { 1 };
+    require!(
+        fi % factor == 0,
+        "fc1 output size must divide the fusion factor"
+    );
+    let inter = fi / factor;
+    require!(
+        hidden % (8 / bits1) == 0 && inter % (8 / bits2) == 0,
+        "expert weight rows must be byte-aligned"
+    );
+    let block = node.int_attr("block_size", 0);
+    require!(
+        block == 0
+            || (block >= 16
+                && (block as u64).is_power_of_two()
+                && hidden % block == 0
+                && inter % block == 0),
+        "block_size must be zero or a power of two >=16 dividing hidden and intermediate sizes"
+    );
+    for (weight_idx, scale_idx, bias_idx, rows, cols, width) in [
+        (
+            QMOE_IN_FC1_W,
+            QMOE_IN_FC1_S,
+            QMOE_IN_FC1_B,
+            fi,
+            hidden,
+            bits1,
+        ),
+        (
+            QMOE_IN_FC2_W,
+            QMOE_IN_FC2_S,
+            QMOE_IN_FC2_B,
+            hidden,
+            inter,
+            bits2,
+        ),
+    ] {
+        let w = match node.input_info(weight_idx) {
+            Some(w) => w,
+            None => deny!("expert weight tensor is missing"),
+        };
+        require!(
+            is_uint8(w.dtype) && w.shape == [experts, rows, cols * width / 8],
+            "expert weight dtype/shape disagrees with effective projection bits"
+        );
+        let s = match node.input_info(scale_idx) {
+            Some(s) => s,
+            None => deny!("expert scales tensor is missing"),
+        };
+        let scale_shape = if block == 0 {
+            vec![experts, rows]
+        } else {
+            vec![experts, rows, cols / block]
+        };
+        require!(
+            is_mlx_float(s.dtype) && s.shape == scale_shape,
+            "expert scales must be MLX float tensors matching projection geometry"
+        );
+        if let Some(bias) = node.input_info(bias_idx) {
+            require!(
+                bias.dtype == out_dt && bias.shape == [experts, rows],
+                "expert bias must match activation dtype and projection geometry"
+            );
+        }
+    }
+    let router = match node.input_info(QMOE_IN_ROUTER) {
+        Some(router) => router,
+        None => deny!("router tensor is missing"),
+    };
+    let flat_tokens = input.shape[..input.shape.len() - 1]
+        .iter()
+        .try_fold(1i64, |a, &d| if d < 0 { None } else { a.checked_mul(d) });
+    require!(
+        router.dtype == out_dt
+            && router.shape.len() == 2
+            && router.shape[1] == experts
+            && (router.shape[0] < 0 || flat_tokens.is_none_or(|t| router.shape[0] == t)),
+        "router must match activation dtype and have one expert-logit row per token"
+    );
     Ok(())
 }
 
@@ -3234,10 +3460,10 @@ mod compile_shape_safety_tests {
         assert!(quant_param_shape_ok(&[2, 3], &[], 1, 0));
         assert!(quant_param_shape_ok(&[2, 3], &[3], 1, 0));
         assert!(!quant_param_shape_ok(&[2, 3], &[2], 1, 0));
-        // Rank-one inputs are per-tensor only; a length-one vector remains accepted for
-        // compatibility with existing ORT exporters.
-        assert!(!quant_param_shape_ok(&[3], &[3], 0, 0));
+        assert!(quant_param_shape_ok(&[3], &[3], 0, 0));
         assert!(quant_param_shape_ok(&[3], &[1], 0, 0));
+        assert!(quant_param_shape_ok(&[], &[], 0, 0));
+        assert_eq!(claim_quant_axis(0, 1, &[]), Some(0));
         assert_eq!(claim_quant_axis(1, 1, &[]), Some(0));
         assert_eq!(claim_quant_axis(1, 1, &[1]), Some(0));
         assert_eq!(claim_quant_axis(1, 1, &[3]), None);
