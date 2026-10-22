@@ -19,17 +19,108 @@ placeholders in the node's input list while being excluded from the graph inputs
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
+import subprocess
+import sys
 
 import numpy as np
 import onnx_ir as ir
+import onnxruntime as ort
 import pytest
 from onnx_ir import DataType as DT
 
 import _models as m
 
 FLOAT = np.float32
+
+
+@pytest.mark.skipif(
+    os.environ.get("ONNXRUNTIME_EP_MLX_STATELESS_ATTENTION_CHILD") != "1",
+    reason="run by test_stateless_attention_uses_general_compile",
+)
+def test_stateless_attention_general_compile_child():
+    from test_attention_semantics import _attention_reference
+
+    rng = np.random.default_rng(73)
+    for opset in [23, 24]:
+        for causal in [False, True]:
+            for boolean in [False, True]:
+                q = _t("q", [1, 2, 4, 8])
+                k = _t("k", [1, 2, 5, 8])
+                v = _t("v", [1, 2, 5, 8])
+                mask = _t("mask", [1, 1, 1, 5], DT.BOOL if boolean else DT.FLOAT)
+                end = _t("end", [1], DT.INT64)
+                constants = [
+                    ir.Value(
+                        name=name, type=ir.TensorType(DT.INT64), shape=ir.Shape([1]),
+                        const_value=ir.tensor(np.array([value], np.int64)),
+                    )
+                    for name, value in [("start", 0), ("axis", 2)]
+                ]
+                sliced = _t("sliced", [1, 2, "S", 8])
+                output = _t("y", [1, 2, "S", 8])
+                nodes = [
+                    ir.node("Slice", [q, constants[0], end, constants[1]], outputs=[sliced]),
+                    ir.node(
+                        "Attention", [sliced, k, v, mask], outputs=[output],
+                        attributes={"is_causal": int(causal), "scale": 0.3},
+                    ),
+                ]
+                graph = ir.Graph(
+                    [q, k, v, mask, end], [output], nodes=nodes, initializers=constants,
+                    name="stateless_attention_general", opset_imports={"": opset},
+                )
+                model = ir.to_proto(ir.Model(graph, ir_version=11)).SerializeToString()
+                options = ort.SessionOptions()
+                options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+                session = ort.InferenceSession(model, options, providers=m.EP_PROVIDERS)
+                for step, length in enumerate([3, 3, 2, 2, 3]):
+                    feeds = {
+                        name: rng.normal(size=shape).astype(np.float32)
+                        for name, shape in [("q", (1, 2, 4, 8)), ("k", (1, 2, 5, 8)),
+                                            ("v", (1, 2, 5, 8))]
+                    }
+                    allowed = np.arange(5) < (0 if step == 3 else 2 + step % 3)
+                    feeds["mask"] = (allowed if boolean else np.where(allowed, 0, -np.inf).astype(
+                        np.float32
+                    )).reshape(1, 1, 1, 5)
+                    feeds["end"] = np.array([length], np.int64)
+                    if causal:
+                        allowed = allowed & (np.arange(5)[None, :] <= np.arange(length)[:, None])
+                    expected = _attention_reference(
+                        feeds["q"][:, :, :length] * (0.3 * np.sqrt(8)),
+                        feeds["k"], feeds["v"], allowed,
+                    )
+                    np.testing.assert_allclose(
+                        session.run(None, feeds)[0], expected, rtol=1e-4, atol=1e-6,
+                    )
+
+
+def test_stateless_attention_uses_general_compile(tmp_path):
+    trace = tmp_path / "stateless_attention.json"
+    subprocess.run(
+        [sys.executable, "-m", "pytest",
+         f"{Path(__file__).name}::test_stateless_attention_general_compile_child",
+         "-q", "-p", "no:cacheprovider"],
+        cwd=Path(__file__).parent,
+        env={
+            **os.environ,
+            "ONNXRUNTIME_EP_MLX_TRACE": str(trace),
+            "ONNXRUNTIME_EP_MLX_NO_COMPILE": "0",
+            "ONNXRUNTIME_EP_MLX_NO_GENERAL_COMPILE": "0",
+            "ONNXRUNTIME_EP_MLX_STATELESS_ATTENTION_CHILD": "1",
+        },
+        check=True,
+        timeout=120,
+    )
+    events = [
+        event["args"] for event in json.loads(trace.read_text())
+        if event.get("cat") == "ep.path" and "Attention" in event["args"].get("ops", "").split(",")
+    ]
+    assert [event["path"] for event in events] == ["general"] * 40
+    assert [event["cache"] for event in events] == ["MISS", "HIT", "RETRACE", "HIT", "HIT"] * 8
 
 
 # --- IR builder (optional inputs -> empty-name placeholders) -------------------------------------

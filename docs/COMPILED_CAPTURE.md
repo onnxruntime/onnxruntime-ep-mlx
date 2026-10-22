@@ -166,8 +166,8 @@ reference's NaN; integer outputs for that undefined conversion produce an explic
 
 - **decode** = `{ Shapeless, kv_alias, rope_as_data, delta_copyout }` — shapeless so a growing KV length
   never retraces; RoPE position + valid-past fed as **data**; delta KV copy-out.
-- **general** = `{ ShapeKeyed, contiguous_outputs }` — retraces on a shape change; no attention/KV
-  specialisation.
+- **general** = `{ ShapeKeyed, contiguous_outputs }` — retraces on a shape change; supports cache-free
+  standard `Attention`, without decoder KV aliasing or delta-copy specialisation.
 - **prefill** = `{ ShapeKeyed, kv_alias, rope_as_data, delta_copyout }` — the **same** decoder subgraph
   as decode but at query length `S > 1`, so it is shape-keyed (see §4).
 
@@ -245,13 +245,15 @@ sees empty inputs (`compiled.rs:309-321`).
 
 ---
 
-## 6. Current limitation (deferred)
+## 6. Attention capture routes
 
-The shapeless growing-KV decode capture is currently hardwired to `com.microsoft::GroupQueryAttention`
-(`detect_shared_kv`, and the `kv_alias` / `rope_as_data` / `delta_copyout` machinery). Generalizing it to
-ai.onnx `Attention` is a larger change because that op has a different KV/mask contract (additive mask +
-`is_causal`, no `seqlens_k`), so it does not yet get the shapeless decode fast path. Static-shape
-`Attention` subgraphs are still eligible for the **general** `ShapeKeyed` capture.
+The shared-buffer `kv_alias` / `rope_as_data` / `delta_copyout` machinery is specialized for
+`com.microsoft::GroupQueryAttention`. Separate-QKV decoder attention also has a growing-concat,
+non-aliased shapeless route. Cache-free standard `Attention` with only its primary output can use
+the **general** `ShapeKeyed` route, including inside encoder partitions containing `Slice`.
+Attention with past/present cache inputs/outputs retains its existing specialized routes; composed
+forms still honor their per-node `EagerOnly` classification. This is not a general exemption for
+attention or runtime-valued shape parameters.
 
 ---
 
@@ -324,3 +326,90 @@ Attribution used separate diagnostic runs, never their timings as final performa
   copy volume was not eliminated. Evaluation remains GPU-inclusive wall time, including lazy JIT
   work on first use, not a measurement of pure GPU kernel duration. Warmup excludes that first-use
   work from the steady-state table above; closure-build counters alone do not quantify it.
+
+## 8. Nemotron opset 17 versus Attention export (issue #10)
+
+The replacement export is **opset 23**, not 24: PyTorch 2.14.1, IR 10, 1891 encoder nodes, including
+24 standard `Attention` nodes using the opset-23 schema. All 24 have separate rank-4 Q/K/V, an
+additive relative-position mask, `is_causal=0`, no past-K/V inputs and only the primary output.
+The streaming caches are maintained by surrounding graph operators, not by Attention's optional
+cache interface. The legacy IR-8/opset-17 encoder has 5870 nodes and 24 explicit Softmax blocks.
+There is no legacy-pattern-to-SDPA substitution in this provider: its existing speedup comes from
+whole-partition `mlx_compile`; the new Attention lowering already selects MLX fast SDPA.
+
+Both exports were pinned before comparison, in Hugging Face `altunenes/parakeet-rs`,
+directory `nemotron-speech-streaming-en-0.6b`:
+
+| Artifact | Revision / SHA256 |
+|---|---|
+| Old revision | `4d2a8bc71f5c896ec40faa59732e6716295edaf2` |
+| New revision | `b53b9101fa87271041773b5036aeb8db9d810d40` |
+| Old encoder | `5c5110ca2e961c3ff5edc2b0ff49f29888b5213287624f7865c60f7384ac02f0` |
+| New encoder | `ac093bfc3f8d01355bc0860a94bed02a2f4db2bc1417c76b45c3b507d82f4d28` |
+| New external weights | `992b42cb1deaca0b4758ab00dbb87f05065a32150c001c898f40287134387bac` |
+| New decoder | `637bac59ac84100896c30cee6b5d9493977460abcc997f3ce52c3122ff4b1bd5` |
+
+The unchanged §7 Rust harness, audio SHA256, state reset, 560 ms chunking, 75 calls including three
+flush chunks, thread settings and three-full-warmup/ten-timed protocol were reused. The new graph's
+metadata still specifies seven output frames and nine pre-encode cache frames; its input/output
+names and cache shapes fit the same harness. Both encoder and decoder were changed together for
+each export. Hardware remained M1 Max/32 GiB/macOS 27.0.1 on AC; this comparison used ORT 1.31.0,
+MLX 0.32.4 (`36969c09`), mlx-c `57731b00`, Rust 1.98.0 and baseline provider source `4df5057`.
+All final timing processes were sequential with diagnostics/capture/kill switches disabled and
+other agents' native builds/GPU tests paused.
+
+| Export / provider | Warm median (s) | p95 (s) | Encoder / decoder median (s) |
+|---|---:|---:|---:|
+| Opset 17 / CPU | 8.037 | 8.074 | 7.734 / 0.272 |
+| Opset 23 / CPU | 7.897 | 8.187 | 7.590 / 0.279 |
+| Opset 17 / baseline MLX | 2.797 | 3.175 | 2.344 / 0.422 |
+| Opset 23 / baseline MLX | 3.150 | 3.339 | 2.725 / 0.402 |
+| Opset 23 / fixed MLX | **2.633** | **2.934** | 2.211 / 0.396 |
+| Opset 17 / fixed MLX | 2.713 | 3.049 | 2.300 / 0.387 |
+
+Run order matches the table. The new export's median improved by **16.4%** (1.20x throughput);
+its ~3% advantage over the fixed legacy export is small and should not be overinterpreted.
+The legacy model was already well optimized; Attention nodes do not fuse its convolutions,
+projections, relative-position calculation or cache copies into one attention kernel.
+
+Separate diagnostics identified two necessary fixes:
+
+- General capture incorrectly excluded every separate-QKV Attention, including these cache-free
+  encoder nodes. The exemption is restricted to standard-domain Attention with no optional inputs
+  after the mask and no auxiliary outputs; decoder/cache routes and composed-form guards remain.
+- Four int64 `Div` nodes stayed on CPU, breaking shape-derived control chains into boundary values.
+  Internal `Expand`/`Slice` parameters then correctly failed the general compiler's provenance check.
+  Reusing the existing exact integer floor-quotient/remainder/sign correction for int64 keeps these
+  chains in the same partition and restores the existing shape-constant proof. No intermediate
+  runtime value is newly treated as constant and no host-value cache key/limit is weakened.
+
+The Attention exemption alone passed the focused regression but **did not** compile this model.
+With both fixes, the encoder claims 1883/1890 optimized nodes in three partitions, with only
+six runtime Range nodes and one Tile on CPU. Across encoder and decoder, the diagnostic utterance
+ran 1537 general executions, five misses, 1532 hits, **zero eager executions and zero retraces**.
+The 1585-node Attention-containing partition had one miss and 74 hits, versus 75 eager executions
+for the baseline's 1646-node partition. Baseline CPU islands totaled ~8.0 ms per utterance; remaining
+Range/Tile totaled ~2.8 ms. Their direct kernel time was not the main problem: lost compilation was.
+Trace translation/evaluation spans are GPU-inclusive wall time, not pure CPU or GPU kernel time.
+Full copy-out remained ~2642 MiB per diagnostic utterance; the fix does not eliminate cache copies.
+
+All warmups/timed runs for both exports/providers produced the same 131 token IDs and transcript,
+75 encoder calls and 656 decoder calls. The maximum emitted-token logprob difference across runs
+was `1.15e-5`. Identical first/middle/final feeds (calls 0/37/74, then a return to call 0 in the same
+session) matched each export's CPU encoder outputs/caches at `rtol=1e-4, atol=1e-4`; integer outputs
+were exact. Maximum absolute errors for old/new exports respectively were `9.24e-7 / 5.67e-7`
+(features), `4.71e-6 / 3.85e-6` (channel cache) and `1.31e-4 / 2.41e-4` (convolution cache).
+Fixed new-export first/steady/final-audio/flush chunk medians were 34.02/35.20/34.75/34.04 ms.
+
+Session-load / first-utterance wall times, separately from the warm table, were 5.21/8.42 s
+(old CPU), 4.75/8.63 s (new CPU), 6.08/15.74 s (old baseline MLX), 4.87/3.49 s (new baseline MLX),
+0.68/3.02 s (new fixed MLX), and 5.02/3.27 s (old fixed MLX). These are fresh-process observations,
+**not controlled cold-cache benchmarks**: OS weight-page caches and MLX's persistent kernel cache
+were not cleared. Do not attribute those first-use differences solely to this change.
+Swap stayed at ~4.43 GiB used; no thermal/performance warnings were recorded. Shared-host activity
+and run order still limit precision. Weights, audio, transcripts and raw profiles remain local.
+
+Baseline/fixed provider SHA256:
+`82909220e0375a62d25254be74432c7dea6cfc13ecd1a74e5f79b71a934c2069` /
+`6788fc690b2fb279d199cec9f39fd9f1c02bbed16b40a900469c756cae4a0cd1`.
+The ORT dylib SHA256 is the same `83973572...62e31` recorded in §7.
