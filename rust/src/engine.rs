@@ -2333,6 +2333,11 @@ pub(crate) fn copy_out_raw_delta(
         let mut was_delta = false;
         let mut moved_bytes: u64 = (count * itemsize) as u64;
         match delta {
+            // A read-only cache can retain the managed input storage through to its aliased output.
+            // copy_nonoverlapping forbids even identical pointers.
+            _ if src == dst as *const u8 => {
+                moved_bytes = 0;
+            }
             // Partial copy: only the newly written rows along `axis`, and ONLY when `present` really
             // aliases `past` in ORT memory (dst pointer matches the recorded `past` address). `past`
             // supplies every other row, so they are already correct. For a row-major [outer.., axis,
@@ -2375,9 +2380,10 @@ pub(crate) fn copy_out_raw_delta(
                 moved_bytes = (outer * run) as u64;
             }
             // No delta, or `present` did NOT alias `past`: full contiguous copy (growing path is
-            // bit-for-bit unchanged; also the safe fallback whenever aliasing can't be confirmed).
+            // bit-for-bit unchanged). IOBinding can place read-only cache outputs in overlapping
+            // input storage, so the full-copy fallback must permit overlap.
             _ => {
-                std::ptr::copy_nonoverlapping(src, dst as *mut u8, count * itemsize);
+                std::ptr::copy(src, dst as *mut u8, count * itemsize);
             }
         }
         if let Some(t0) = t0 {
