@@ -107,6 +107,7 @@ fn host_parameter_indices(n: &NodeDesc) -> &'static [usize] {
         "Slice" => &[1, 2, 3, 4],
         "Range" => &[0, 1, 2],
         "CumSum" | "CumProd" => &[1],
+        "TopK" => &[1],
         "ReduceSum" | "ReduceMean" | "ReduceMax" | "ReduceMin" | "ReduceProd"
         | "ReduceSumSquare" | "ReduceL1" | "ReduceL2" | "ReduceLogSum" | "ReduceLogSumExp" => &[1],
         _ => &[],
@@ -116,7 +117,7 @@ fn host_parameter_indices(n: &NodeDesc) -> &'static [usize] {
 fn guarded_boundary_parameter(n: &NodeDesc, r: &crate::engine::TensorRef) -> bool {
     matches!(
         n.op_type.as_str(),
-        "Reshape" | "Expand" | "Slice" | "ConstantOfShape"
+        "Reshape" | "Expand" | "Slice" | "ConstantOfShape" | "TopK"
     ) && r.source == Src::CtxInput
 }
 
@@ -1567,7 +1568,7 @@ mod shape_inference_tests {
 
     #[test]
     fn prefill_does_not_exempt_general_route_boundary_guards() {
-        for op in ["Reshape", "Expand", "Slice"] {
+        for op in ["Reshape", "Expand", "Slice", "TopK"] {
             let mut parameterized = NodeDesc::new(
                 op.to_string(),
                 String::new(),
