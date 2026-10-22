@@ -183,6 +183,16 @@ produce a negative final chunk. Empty partitions follow ONNX shape inference,
 the reference, and equivalent explicit-size partitions, even where ORT 1.31's
 `num_outputs` kernel rejects them.
 
+Constant int64 `Range` bounds and values are generated with checked integer
+arithmetic, not through floating-point start/step arguments. All three bounds
+must be scalars, the output length must fit native int32 geometry, and its
+exact count must agree with ORT's inferred extent. Full-width bounds with small
+spans follow the ONNX function, including cases where ORT 1.31's native kernel
+incorrectly returns empty. Forms whose exact count disagrees with the inferred
+extent remain unclaimed rather than capturing an incorrect shape. Runtime
+bounds and float64 `Range` remain open coverage partitions, not proven backend
+limitations.
+
 Metal has no float64 kernels; supported float64 forms run through MLX CPU, while
 other forms fall back to ORT CPU. Empty/dynamic support is per-handler, not a
 blanket guarantee. Claimed control-flow nodes translate supported tensor bodies;
