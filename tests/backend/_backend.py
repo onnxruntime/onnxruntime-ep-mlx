@@ -8,10 +8,10 @@ import unittest
 
 import numpy as np
 import onnxruntime as ort
-from onnx import ModelProto
+from onnx import ModelProto, defs
 from onnx.backend.base import Backend, BackendRep
 from onnx.backend.test.runner import Runner
-from onnxruntime.capi.onnxruntime_pybind11_state import Fail
+from onnxruntime.capi.onnxruntime_pybind11_state import Fail, InvalidGraph
 
 EP_NAME = os.environ.get("MLX_EP_NAME", "MLXExecutionProvider")
 _registered = False
@@ -90,6 +90,40 @@ def _version_rejection(model: ModelProto, message: str) -> str | None:
     return None
 
 
+def _schema_rejection(model: ModelProto, message: str) -> str | None:
+    # ONNX 1.23 adds Attention-25 window attributes absent from ORT 1.31's
+    # vendored schemas, even though its domain-level opset fence admits 25.
+    rejected = re.search(
+        r'In Node, \("([^"]*)", Attention, "", -1\).*?'
+        r"Error Unrecognized attribute: (left_window_size|right_window_size) "
+        r"for operator Attention\s*$",
+        message,
+        re.DOTALL,
+    )
+    if not rejected:
+        return None
+    version = next(
+        (item.version for item in model.opset_import if item.domain == ""), None
+    )
+    if version is None or version < 25:
+        return None
+    schema = defs.get_schema("Attention", version, "")
+    if schema.since_version < 25 or rejected[2] not in schema.attributes:
+        return None
+    for node in model.graph.node:
+        if (
+            node.name == rejected[1]
+            and node.op_type == "Attention"
+            and node.domain == ""
+            and any(attr.name == rejected[2] for attr in node.attribute)
+        ):
+            return (
+                f"Attention-{schema.since_version}: runtime rejected official "
+                f"attribute {rejected[2]}"
+            )
+    return None
+
+
 class MlxBackend(Backend):
     """Execute the unmodified model on MLX with CPU fallback available."""
 
@@ -108,6 +142,11 @@ class MlxBackend(Backend):
         except Fail as exc:
             # The generated-node Runner does not call Backend.is_compatible.
             reason = _version_rejection(model, str(exc))
+            if reason is None:
+                raise
+            raise unittest.SkipTest(f"ONNX Runtime {ort.__version__}: {reason}") from exc
+        except InvalidGraph as exc:
+            reason = _schema_rejection(model, str(exc))
             if reason is None:
                 raise
             raise unittest.SkipTest(f"ONNX Runtime {ort.__version__}: {reason}") from exc

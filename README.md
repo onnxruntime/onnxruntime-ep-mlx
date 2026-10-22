@@ -245,8 +245,11 @@ python -m pytest tests/backend -q
   input/expected datasets in memory via `load_model_tests(kind="node")`; packaged
   node fixture directories and the generate-data CLI are not needed. Collection
   fails if any intended category is empty. Models run unchanged with their
-  original datasets and tolerances; only explicit runtime IR/domain-opset limit
-  rejections become version-reasoned skips. Kernel errors and output mismatches
+  original datasets and tolerances. Explicit runtime IR/domain-opset limit
+  rejections become version-reasoned skips. Attention-25 window attributes added
+  in ONNX 1.23 are also skipped only when ORT rejects that exact official
+  attribute on the matching valid model node; other invalid-graph errors fail.
+  No models are rewritten. Kernel errors and output mismatches
   still fail, with CPU fallback available for ops MLX does not claim.
   The loader/adapter regressions can run without Metal:
   `python -m pytest tests/backend/test_backend_adapter.py -q`.

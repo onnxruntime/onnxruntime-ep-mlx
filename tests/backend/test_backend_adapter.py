@@ -15,7 +15,12 @@ from onnx.backend.base import Backend, BackendRep
 from onnx.backend.test.loader import load_model_tests
 from onnx.backend.test.runner import Runner
 from onnx.reference import ReferenceEvaluator
-from onnxruntime.capi.onnxruntime_pybind11_state import Fail, InvalidArgument, NotImplemented
+from onnxruntime.capi.onnxruntime_pybind11_state import (
+    Fail,
+    InvalidArgument,
+    InvalidGraph,
+    NotImplemented,
+)
 
 import _backend
 from _backend import MlxBackend, MlxBackendRep, WANTED_CATEGORIES, backend_test_cases
@@ -213,11 +218,77 @@ def test_generated_node_runner_reports_version_skip(cpu_adapter):
 
 
 @pytest.mark.parametrize(
+    "name",
+    ["test_attention_local_window_default", "test_attention_local_window_ext_cache_rank2_mask"],
+)
+def test_runtime_rejects_valid_attention25_schema(cpu_adapter, node_cases, name):
+    case = node_cases[name]
+    original = case.model.SerializeToString()
+    onnx.checker.check_model(case.model)
+    with pytest.raises(unittest.SkipTest, match="Attention-25: runtime rejected official attribute"):
+        MlxBackend.prepare(case.model)
+    assert case.model.SerializeToString() == original
+
+
+def test_runtime_rejects_valid_right_window_attribute(cpu_adapter, node_cases):
+    model = onnx.ModelProto()
+    model.CopyFrom(node_cases["test_attention_local_window_default"].model)
+    node = model.graph.node[0]
+    attributes = [attr for attr in node.attribute if attr.name != "left_window_size"]
+    del node.attribute[:]
+    node.attribute.extend(attributes)
+    with pytest.raises(unittest.SkipTest, match="runtime rejected official attribute right_window_size"):
+        MlxBackend.prepare(model)
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        'In Node, ("", Attention, "", -1) : Error Unrecognized attribute: typo for operator Attention',
+        'In Node, ("", Identity, "", -1) : Error Unrecognized attribute: left_window_size for operator Identity',
+        'In Node, ("another_node", Attention, "", -1) : Error Unrecognized attribute: left_window_size for operator Attention',
+        "provider initialization failed",
+    ],
+)
+def test_unrelated_invalid_graph_errors_on_attention_propagate(monkeypatch, node_cases, message):
+    monkeypatch.setattr(_backend, "_ensure_registered", lambda: None)
+    error = InvalidGraph(message)
+
+    def fail(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(_backend.ort, "InferenceSession", fail)
+    with pytest.raises(InvalidGraph) as caught:
+        MlxBackend.prepare(node_cases["test_attention_local_window_default"].model)
+    assert caught.value is error
+
+
+@pytest.mark.parametrize("change", ["opset", "domain", "attribute", "operator"])
+def test_schema_skip_requires_matching_official_model_metadata(node_cases, change):
+    model = onnx.ModelProto()
+    model.CopyFrom(node_cases["test_attention_local_window_default"].model)
+    message = (
+        'In Node, ("", Attention, "", -1) : Error Unrecognized attribute: '
+        "left_window_size for operator Attention"
+    )
+    if change == "opset":
+        model.opset_import[0].version = 24
+    elif change == "domain":
+        model.graph.node[0].domain = "custom"
+    elif change == "attribute":
+        del model.graph.node[0].attribute[:]
+    else:
+        model.graph.node[0].op_type = "Identity"
+    assert _backend._schema_rejection(model, message) is None
+
+
+@pytest.mark.parametrize(
     "error",
     [
         Fail("provider initialization failed"),
         Fail("malformed graph: invalid input"),
         InvalidArgument("invalid input shape"),
+        InvalidGraph("This is an invalid model"),
         NotImplemented("Could not find an implementation for Pow(15)"),
         RuntimeError("MLX provider failure"),
         Fail("Unsupported model IR version: 999, max supported IR version: 13"),

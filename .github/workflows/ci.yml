@@ -35,7 +35,7 @@ jobs:
     runs-on: macos-15
     env:
       ORT_VERSION: "1.31.0"
-      # Latest released ONNX; backend.prepare skips only explicit runtime IR/opset limits.
+      # Latest released ONNX; backend.prepare handles precise runtime version/schema limits.
       ONNX_VERSION: "1.23.2"
       MLX_VERSION: "0.32.2"
       MLX_COMMIT: "1f8e74e3f12f31365464a6867c6579f0e9b29d85"
