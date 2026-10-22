@@ -1,0 +1,113 @@
+"""Attention masking/precision oracles independent of version-specific backend fixtures."""
+
+from __future__ import annotations
+
+import numpy as np
+import pytest
+from onnx_ir import DataType as DT
+
+import _models as m
+from test_attention_ext import _t, assert_mlx_claims, build_model
+
+
+def _attention_reference(q, k, v, allowed):
+    """Stable real-arithmetic SDPA, including zero probabilities for empty key sets."""
+    q, k, v = (x.astype(np.float64) for x in (q, k, v))
+    groups = q.shape[1] // k.shape[1]
+    k = np.repeat(k, groups, axis=1)
+    v = np.repeat(v, groups, axis=1)
+    scores = (q @ k.swapaxes(-1, -2)) / np.sqrt(q.shape[-1])
+    scores = np.where(allowed, scores, -np.inf)
+    row_max = scores.max(axis=-1, keepdims=True)
+    scores -= np.where(np.isneginf(row_max), 0, row_max)
+    probs = np.exp(scores)
+    denominator = probs.sum(axis=-1, keepdims=True)
+    probs /= np.where(denominator == 0, 1, denominator)
+    return probs @ v
+
+
+@pytest.mark.parametrize("opset", [23, 24])
+@pytest.mark.parametrize("dtype", [np.float16, np.float32])
+@pytest.mark.parametrize("mask_type", ["bool", "float"])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("mask_rank", [0, 1, 2, 3, 4])
+def test_attention_fully_masked_rows(opset, dtype, mask_type, causal, mask_rank):
+    rng = np.random.default_rng(42)
+    q = rng.random((1, 4, 3, 8)).astype(dtype)
+    k = rng.random((1, 2, 3, 8)).astype(dtype)
+    v = rng.random((1, 2, 3, 8)).astype(dtype)
+    allowed = np.array([[False, False, False], [False, False, True], [True, True, True]])
+    if mask_rank == 0:
+        allowed = np.array(False)
+    elif mask_rank == 1:
+        allowed = allowed[0]
+    elif mask_rank == 3:
+        allowed = allowed[None]
+    elif mask_rank == 4:
+        allowed = allowed[None, None]
+    mask = allowed if mask_type == "bool" else np.where(allowed, 0, -np.inf).astype(dtype)
+    dt = DT.FLOAT16 if dtype == np.float16 else DT.FLOAT
+    model = build_model(
+        "Attention",
+        [_t("Q", list(q.shape), dt), _t("K", list(k.shape), dt),
+         _t("V", list(v.shape), dt), _t("M", list(mask.shape), DT.BOOL if mask_type == "bool" else dt)],
+        [_t("Y", list(q.shape), dt)],
+        attributes={"is_causal": int(causal)},
+        opset=opset,
+    )
+    feeds = {"Q": q, "K": k, "V": v, "M": mask}
+    if causal:
+        allowed = allowed & np.tri(3, dtype=bool)
+    expected = _attention_reference(q, k, v, allowed)
+    assert_mlx_claims(model, feeds)
+    actual = m.run_mlx(model, feeds)[0]
+    np.testing.assert_allclose(actual, expected, rtol=0.001, atol=1e-7)
+    empty = np.broadcast_to(~allowed.any(axis=-1, keepdims=True), actual.shape)
+    np.testing.assert_array_equal(actual[empty], np.zeros_like(actual[empty]))
+
+
+@pytest.mark.parametrize("special_form", [False, True])
+@pytest.mark.parametrize("invalid_score", [np.nan, np.inf])
+def test_attention_mask_guard_is_not_nan_to_num(special_form, invalid_score):
+    q = np.ones((1, 2, 3, 8), dtype=np.float32)
+    q[:, :, 0] = invalid_score
+    q[:, :, 1] = np.nan
+    k = np.ones_like(q)
+    v = np.ones_like(q)
+    mask = np.array([[False, False, False], [True, True, True], [True, True, True]])
+    attributes = {"softmax_precision": int(DT.FLOAT)} if special_form else {}
+    model = build_model(
+        "Attention",
+        [_t("Q", list(q.shape)), _t("K", list(k.shape)), _t("V", list(v.shape)),
+         _t("M", list(mask.shape), DT.BOOL)],
+        [_t("Y", list(q.shape))],
+        attributes=attributes,
+    )
+    feeds = {"Q": q, "K": k, "V": v, "M": mask}
+    assert_mlx_claims(model, feeds)
+    actual = m.run_mlx(model, feeds)[0]
+    np.testing.assert_array_equal(actual[:, :, 0], 0)
+    assert np.isnan(actual[:, :, 1]).all(), "An attended input NaN must not be cleared"
+    np.testing.assert_array_equal(actual[:, :, 2], 1)
+
+
+def test_attention_fp16_external_cache_softmax_accuracy():
+    """FP16 storage must not force a low-accuracy FP16 softmax accumulator."""
+    rng = np.random.RandomState(0)
+    q = rng.rand(2, 4, 1, 8).astype(np.float16)
+    k = rng.rand(2, 2, 8, 8).astype(np.float16)
+    v = rng.rand(2, 2, 8, 8).astype(np.float16)
+    lengths = np.array([8, 5], dtype=np.int64)
+    model = build_model(
+        "Attention",
+        [_t("Q", list(q.shape), DT.FLOAT16), _t("K", list(k.shape), DT.FLOAT16),
+         _t("V", list(v.shape), DT.FLOAT16), None, None, None,
+         _t("lengths", [2], DT.INT64)],
+        [_t("Y", list(q.shape), DT.FLOAT16)],
+        attributes={"is_causal": 1},
+    )
+    feeds = {"Q": q, "K": k, "V": v, "lengths": lengths}
+    allowed = np.arange(8) < lengths[:, None, None, None]
+    expected = _attention_reference(q, k, v, allowed)
+    assert_mlx_claims(model, feeds)
+    np.testing.assert_allclose(m.run_mlx(model, feeds)[0], expected, rtol=0.001, atol=1e-7)

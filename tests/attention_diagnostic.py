@@ -83,15 +83,17 @@ def main():
                     options.log_severity_level = 3
                     options.enable_profiling = True
                     options.profile_file_prefix = str(Path(directory) / "profile")
-                    options.optimized_model_filepath = str(Path(directory) / "optimized.onnx")
+                    if eps == ["CPUExecutionProvider"]:
+                        options.optimized_model_filepath = str(Path(directory) / "optimized.onnx")
                     if disabled:
                         options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
                     session = ort.InferenceSession(case.model.SerializeToString(), options, providers=eps)
                     actual = session.run(None, feeds)[0]
                     events = json.loads(Path(session.end_profiling()).read_text())
-                    optimized = onnx.load(options.optimized_model_filepath)
                     print("PROVIDERS", eps, "DISABLE_OPT", disabled, flush=True)
-                    print("OPTIMIZED", [n.op_type for n in optimized.graph.node], flush=True)
+                    if options.optimized_model_filepath:
+                        optimized = onnx.load(options.optimized_model_filepath)
+                        print("OPTIMIZED", [n.op_type for n in optimized.graph.node], flush=True)
                     print("EXECUTION", [
                         (e.get("name"), e["args"].get("provider"), e["args"].get("op_name"))
                         for e in events if e.get("cat") == "Node" and "provider" in e.get("args", {})

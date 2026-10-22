@@ -35,3 +35,8 @@ jobs:
           export ONNXRUNTIME_MLX_EP_LIB="$PWD/rust/target/release/libonnxruntime_mlx_ep.dylib"
           export DYLD_LIBRARY_PATH="$ORT_HOME/lib"
           python tests/attention_diagnostic.py
+      - name: Focused semantic regressions
+        run: |
+          export ONNXRUNTIME_MLX_EP_LIB="$PWD/rust/target/release/libonnxruntime_mlx_ep.dylib"
+          export DYLD_LIBRARY_PATH="$ORT_HOME/lib"
+          python -m pytest tests/ops/test_attention_semantics.py -q --tb=short
