@@ -78,11 +78,16 @@ def test_div(dtype: DT, np_dtype, tol: float) -> None:
 
 
 @pytest.mark.parametrize("scalar", [False, True], ids=["suffix", "scalar"])
-def test_div_int32(scalar: bool) -> None:
+@pytest.mark.parametrize("eager", [False, True], ids=["compiled", "eager"])
+def test_div_int32(scalar: bool, eager: bool, monkeypatch) -> None:
+    monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_COMPILE", "1" if eager else "0")
+    monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_GENERAL_COMPILE", "0")
     a = np.array(
         [
             [-7, 7, -7, 7, 0, 1, -1, 2147483647],
             [-2147483648, -2147483648, 16777217, -16777217, 8, -8, 2, -2],
+            [-2147483648, 2147483647, -2147483648, 2147483647, -6, 6, -6, 6],
+            [2147483647, -2147483648, 0, -1, -2147483647, -2147483648, 2147483647, -2147483648],
         ],
         dtype=np.int32,
     )
@@ -93,7 +98,21 @@ def test_div_int32(scalar: bool) -> None:
         [m.tensor("out", DT.INT32, list(a.shape))],
     )
     m.assert_mlx_claims(model, {"a": a, "b": b})
-    m.assert_matches_cpu(model, {"a": a, "b": b}, rtol=0, atol=0)
+    session = m._session(model, m.EP_PROVIDERS)
+    for values in [a, np.flip(a, axis=0).copy(), a]:
+        feeds = {"a": values, "b": b}
+        numerators, divisors = np.broadcast_arrays(values, b)
+        expected = np.array(
+            [
+                (abs(int(x)) // abs(int(y))) * (-1 if (x < 0) != (y < 0) else 1)
+                for x, y in zip(numerators.flat, divisors.flat, strict=True)
+            ],
+            dtype=np.int32,
+        ).reshape(values.shape)
+        actual = session.run(None, feeds)[0]
+        assert actual.dtype == np.int32
+        np.testing.assert_array_equal(actual, expected)
+        np.testing.assert_array_equal(actual, m.run_cpu(model, feeds)[0])
 
 
 @pytest.mark.parametrize("op", ["Min", "Max"])

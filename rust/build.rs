@@ -4,7 +4,7 @@ use std::path::PathBuf;
 fn dependency_prefix(env_name: &str) -> String {
     env::var(env_name).unwrap_or_else(|_| {
         panic!(
-            "{env_name} is required. Run `scripts/setup_mlx.sh \"$PWD/.deps/mlx-0.32.2\"` from the \
+            "{env_name} is required. Run `scripts/setup_mlx.sh \"$PWD/.deps/mlx-0.32.4\"` from the \
              published crate (or `rust/scripts/setup_mlx.sh` from the repository), then set \
              MLX_PREFIX and MLXC_PREFIX to that prefix."
         )
