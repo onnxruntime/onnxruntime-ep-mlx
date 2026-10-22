@@ -108,12 +108,26 @@ set is small and repeating (prefill prompt lengths, CNN batch sizes), pathologic
 ### Value-guarded boundary shape parameters
 
 The general route can also specialize direct ORT boundary parameters of `Reshape`, `Expand`,
-`Slice`, `DFT` (length/axis), `STFT` (step/frame length), and the three cosine-sum windows (size).
+`AffineGrid` (size), `Slice`, `DFT` (length/axis), `STFT` (step/frame length), and the three
+cosine-sum windows (size).
 Before **every** apply it reads their integer values from the current kernel context,
 including dtype and tensor shape in an explicit host key. An unused synthetic input with a unique
 shape selects the corresponding MLX trace, using the same mechanism as static control-flow
 specialization. Changing parameter values with otherwise identical input shapes therefore retraces;
 returning to an earlier value reuses its trace. Ordinary activation/cache inputs remain live data.
+
+`AffineGrid` builds a homogeneous 2D/3D grid and applies the live affine matrices with MLX
+matmul. Its int64 size vector is checked for matching batch, positive spatial extents, and
+bounded element counts before allocation. Runtime-valued interior sizes stay eager; constant
+sizes can compile. Float16/bfloat16 payloads accumulate in float32 on Metal, while float64
+coordinates and matmul retain double precision on the MLX CPU stream.
+
+For `align_corners=0` (including the default), singleton axes have coordinate zero; live sizes
+are supported. `align_corners=1` is claimed only for constant sizes with every spatial extent
+greater than one. ONNX 1.23.2's function divides by zero for singleton H/W, special-cases singleton
+D to coordinate -1, and its Python reference raises on singleton extents; ORT 1.31's native kernel
+instead produces +1 for singleton axes. Singleton aligned axes and aligned live sizes remain
+an **open semantic-contract gap**, not an MLX capability limit, and are deliberately declined.
 
 Recurrent `RNN`/`GRU`/`LSTM` sequence lengths (input 4) use the same value guard. Their masks
 remain device operations, but every new length vector must pass the `[0, sequence_length]` check

@@ -6,13 +6,13 @@ against ORT's CPU EP, tolerance-gated:
   * GridSample — X[N,C,H,W] sampled at grid[N,Hout,Wout,2]; parametrized over mode
     (linear/nearest) x padding_mode (zeros/border) x align_corners (0/1). The forms the EP leaves to
     CPU (padding_mode="reflection", mode="cubic", the 5-D volumetric form) are not exercised here.
-  * AffineGrid — the 2-D form (theta[N,2,3] + constant size[4]); parametrized over align_corners. The
-    3-D form is left to CPU.
+  * AffineGrid — the 2-D form (theta[N,2,3] + constant size[4]); parametrized over align_corners.
+    The full 2D/3D, live-size, dtype, and compile-route matrix is in test_affine_grid.py.
   * Col2Im — the static (constant image_shape / block_shape) 2-D form; parametrized over
     stride / dilation / pad. Non-float payloads and dynamic shapes are left to CPU.
 
-Shape parameters (AffineGrid `size`, Col2Im `image_shape` / `block_shape`) are supplied as constant
-initializers — the only forms the EP claims — mirroring a constant-folded real model.
+Shape parameters in this module are supplied as constant initializers, mirroring a constant-folded
+real model; AffineGrid also supports value-guarded live sizes with align_corners=0.
 """
 
 from __future__ import annotations
