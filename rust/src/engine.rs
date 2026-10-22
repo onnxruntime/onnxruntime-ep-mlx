@@ -445,6 +445,12 @@ pub struct Plan {
     pub general: CompiledSubgraph,
 }
 
+impl Drop for Plan {
+    fn drop(&mut self) {
+        crate::trace::forget_partition(&self.nodes);
+    }
+}
+
 pub(crate) fn is_separate_qkv_attention_op(domain: &str, op_type: &str) -> bool {
     op_type == "MultiHeadAttention" || (domain.is_empty() && op_type == "Attention")
 }

@@ -1,3 +1,2 @@
 /target
-Cargo.lock
 rust/.mlx_bindings_ref.rs
