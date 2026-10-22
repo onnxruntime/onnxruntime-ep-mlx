@@ -1078,7 +1078,7 @@ fn build_closure(
                     if synth_seen.insert(nm.clone()) {
                         synth_ropes.push(SynthRope {
                             key: rope_row_key(nm),
-                            cache_name: nm.clone(),
+                            cache_name: node.inputs[idx].cache_key(),
                         });
                     }
                 }

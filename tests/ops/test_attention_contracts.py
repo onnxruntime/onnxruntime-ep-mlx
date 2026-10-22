@@ -154,12 +154,14 @@ def test_gqa_exact_rotary_and_ragged_positions(dtype, batch, sliding, interleave
             model.graph.input.remove(inp)
     model = model.SerializeToString()
     session = ort.InferenceSession(model, providers=m.EP_PROVIDERS)
-    for step in range(2):
-        lengths = np.full(batch, 3 + step, np.int32)
+    for step in range(3):
+        lengths = np.full(batch, 3 + min(step, 1), np.int32)
         if batch == 2:
-            lengths[1] = 1 + step
+            lengths[1] = 1 + min(step, 1)
         if not constant:
-            cos[2] += dtype(step * 0.5)
+            cos[2:] += dtype(step * 0.5)
+            sin[2:] += dtype(step * 0.25)
+        v += dtype(step * 0.125)
         feeds = {name: value.copy() for name, value in arrays.items() if not constant or name not in ("cos", "sin")}
         feeds.update(lengths=lengths - 1, total=np.array([lengths.max()], np.int32))
         expected_k, expected_v = pk.copy(), pv.copy()
@@ -191,7 +193,11 @@ def test_gqa_exact_rotary_and_ragged_positions(dtype, batch, sliding, interleave
             np.testing.assert_array_equal(actual_v[b, :, :length], expected_v[b, :, :length])
 
 
-def test_gqa_decode_trace_proves_replay(tmp_path):
+@pytest.mark.parametrize("target", [
+    "test_gqa_live_lengths_defaults_and_causality[True-1-1--1-False]",
+    "test_gqa_exact_rotary_and_ragged_positions[True-False-1-False-float32]",
+])
+def test_gqa_decode_trace_proves_replay(tmp_path, target):
     import json
     import os
     from pathlib import Path
@@ -201,7 +207,7 @@ def test_gqa_decode_trace_proves_replay(tmp_path):
     trace = tmp_path / "gqa_replay.json"
     subprocess.run(
         [sys.executable, "-m", "pytest",
-         f"{Path(__file__).name}::test_gqa_live_lengths_defaults_and_causality[True-1-1--1-False]",
+         f"{Path(__file__).name}::{target}",
          "-q", "-p", "no:cacheprovider"],
         check=True, cwd=Path(__file__).parent,
         env={**os.environ, "ONNXRUNTIME_EP_MLX_TRACE": str(trace)}, timeout=120,
