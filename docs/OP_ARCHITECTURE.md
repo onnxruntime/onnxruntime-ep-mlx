@@ -288,6 +288,12 @@ precision; float64 statistics stay on an isolated MLX CPU stream even when all
 boundary tensors are float32. LayerNormalization also produces optional mean and
 inverse-standard-deviation outputs, including omitted output slots.
 
+ORT's default-domain `SimplifiedLayerNormalization` extension shares RMS
+normalization's suffix axes, broadcast/mixed affine types, stash precision, and
+empty/dynamic support, and can produce its optional inverse-standard-deviation
+output. The existing `com.microsoft` compatibility alias is retained for runtimes
+that expose it. This extension is not an ONNX standard operator.
+
 `GroupNormalization` supports opset 18's per-group affine parameters and opset
 21+'s per-channel affine parameters and stash precision. Batch, channel, and
 spatial extents may change between calls; channels must be divisible by the

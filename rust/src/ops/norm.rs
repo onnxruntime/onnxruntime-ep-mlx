@@ -2,7 +2,7 @@
 //!
 //!   * RMSNormalization (ai.onnx opset 23+)             — fused or composed suffix normalization
 //!   * LayerNormalization (ai.onnx opset 17+)           — fused or composed, optional statistics
-//!   * SimplifiedLayerNormalization (com.microsoft)     — mlx_fast_rms_norm
+//!   * SimplifiedLayerNormalization (ORT extension)    — RMS normalization, optional inverse std
 //!   * SkipLayerNormalization (com.microsoft)           — residual add + mlx_fast_layer_norm
 //!   * SkipSimplifiedLayerNormalization (com.microsoft) — residual add + mlx_fast_rms_norm
 //!   * GroupNormalization (ai.onnx opset 18+)           — versioned affine and stash precision
@@ -147,15 +147,9 @@ fn rms_norm_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxErro
     standard_norm_op(ctx, n, false)
 }
 
-/// SimplifiedLayerNormalization (com.microsoft): Y = rms_norm(X) * scale over the last axis.
+/// ORT SimplifiedLayerNormalization shares RMS statistics and adds an optional inverse std output.
 fn simplified_layer_norm_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
-    let x = ctx.resolve(&n.inputs[0])?;
-    let scale = ctx.resolve(&n.inputs[1])?;
-    let eps = epsilon(n, 1e-5);
-    let r = ctx.emit(|res, s| unsafe { mlx::mlx_fast_rms_norm(res, x, scale, eps, s) })?;
-    ctx.mark_fast("mlx_fast_rms_norm");
-    ctx.bind(&n.outputs[0], r);
-    Ok(())
+    standard_norm_op(ctx, n, false)
 }
 
 fn layer_norm_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
@@ -289,6 +283,10 @@ fn standard_norm_op(
         if n.outputs.get(2).is_some_and(|o| !o.name.is_empty()) {
             ctx.bind(&n.outputs[2], inv_std);
         }
+    } else if n.op_type == "SimplifiedLayerNormalization"
+        && n.outputs.get(1).is_some_and(|o| !o.name.is_empty())
+    {
+        ctx.bind(&n.outputs[1], inv_std);
     }
     ctx.mark_composed("normalization with explicit stash precision and broadcast affine");
     Ok(())
@@ -587,45 +585,14 @@ fn tensor_dtype(node: &NodeView, i: usize) -> Option<ort::ONNXTensorElementDataT
     node.input_info(i).map(|s| s.dtype)
 }
 
-/// RMSNormalization (ai.onnx): X, scale, axis == -1. fp32/fp16/bf16 (mlx_fast_rms_norm is generic).
+/// RMSNormalization (ai.onnx): floating input and independently typed broadcast scale.
 fn rms_norm_claim(node: &NodeView) -> ClaimResult {
     standard_norm_claim(node, false)
 }
 
-/// SimplifiedLayerNormalization (com.microsoft): X + scale, last-axis, single output.
+/// ORT SimplifiedLayerNormalization: RMS normalization with optional inverse std.
 fn simplified_layer_norm_claim(node: &NodeView) -> ClaimResult {
-    require!(
-        node.num_inputs() == 2 && node.num_outputs() == 1,
-        "expects 2 inputs and 1 output, got {}in/{}out",
-        node.num_inputs(),
-        node.num_outputs()
-    );
-    let (x, g, out) = match (
-        node.input_info(0),
-        tensor_dtype(node, 1),
-        node.output_info(0),
-    ) {
-        (Some(x), Some(g), Some(o)) => (x, g, o),
-        _ => deny!("missing tensor type/shape info on an input or the output"),
-    };
-    require!(
-        is_mlx_float(x.dtype) && g == x.dtype && out.dtype == x.dtype,
-        "X, scale, and output must share one float dtype (fp32/fp16/bf16), got {}, {} -> {}",
-        crate::registry::ort_dtype_name(x.dtype),
-        crate::registry::ort_dtype_name(g),
-        crate::registry::ort_dtype_name(out.dtype)
-    );
-    require!(
-        !x.shape.is_empty(),
-        "input must have rank >= 1 (got a scalar)"
-    );
-    let axis = node.int_attr("axis", -1);
-    require!(
-        axis == -1 || axis == x.shape.len() as i64 - 1,
-        "only the last axis is supported (got axis={axis} for rank {})",
-        x.shape.len()
-    );
-    Ok(())
+    standard_norm_claim(node, false)
 }
 
 fn layer_norm_claim(node: &NodeView) -> ClaimResult {
@@ -634,9 +601,16 @@ fn layer_norm_claim(node: &NodeView) -> ClaimResult {
 
 fn standard_norm_claim(node: &NodeView, centered: bool) -> ClaimResult {
     let nin = node.num_inputs();
+    let max_outputs = if centered {
+        3
+    } else if node.op_type() == "SimplifiedLayerNormalization" {
+        2
+    } else {
+        1
+    };
     require!(
         (2..=if centered { 3 } else { 2 }).contains(&nin)
-            && (1..=if centered { 3 } else { 1 }).contains(&node.num_outputs()),
+            && (1..=max_outputs).contains(&node.num_outputs()),
         "invalid normalization input/output count: {}in/{}out",
         nin,
         node.num_outputs()
@@ -1128,29 +1102,20 @@ pub fn register_norm(registry: &mut OpRegistry) {
         lrn_claim,
         "emits MLX Pad and Slice, which lack Primitive::output_shapes in MLX 0.32.2",
     );
-    shapeless(
-        registry,
-        "com.microsoft",
-        "SimplifiedLayerNormalization",
-        K_ANY_OPSET,
-        simplified_layer_norm_op,
-        simplified_layer_norm_claim,
-    );
-    // SPECIAL CASE / UPSTREAM BUG WORKAROUND: SimplifiedLayerNormalization is a `com.microsoft`
-    // CONTRIB op, but Microsoft's exporter accidentally stamps some graphs with it in the DEFAULT
-    // ONNX domain (domain "") instead of com.microsoft (seen in gemma-3n / RoBERTa ONNX from
-    // onnx-community). It is the exact same op with the exact same semantics
-    // (Y = rms_norm(X) * scale over the last axis), so we register it under "" as well — otherwise
-    // every one of these norms (113 in the gemma-4-E2B vision encoder) fragments the graph onto CPU.
-    // This is NOT a real default-domain op; it only exists there because of that mis-stamping.
-    shapeless(
-        registry,
-        "",
-        "SimplifiedLayerNormalization",
-        K_ANY_OPSET,
-        simplified_layer_norm_op,
-        simplified_layer_norm_claim,
-    );
+    // ORT exposes this extension in the default domain. Retain the exporter compatibility alias.
+    for domain in ["", "com.microsoft"] {
+        registry.register_shape_classified(
+            OpRegistration {
+                domain,
+                op_type: "SimplifiedLayerNormalization",
+                min_opset: 1,
+                max_opset: K_ANY_OPSET,
+                handler: simplified_layer_norm_op,
+                claim: simplified_layer_norm_claim,
+            },
+            standard_norm_compile_shape_safety,
+        );
+    }
     shapeless(
         registry,
         "com.microsoft",
