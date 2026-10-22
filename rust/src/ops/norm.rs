@@ -5,7 +5,7 @@
 //!   * SimplifiedLayerNormalization (com.microsoft)     — mlx_fast_rms_norm
 //!   * SkipLayerNormalization (com.microsoft)           — residual add + mlx_fast_layer_norm
 //!   * SkipSimplifiedLayerNormalization (com.microsoft) — residual add + mlx_fast_rms_norm
-//!   * GroupNormalization (ai.onnx opset 21 form)       — composed mean/var/rsqrt
+//!   * GroupNormalization (ai.onnx opset 18+)           — versioned affine and stash precision
 //!   * InstanceNormalization (ai.onnx)                   — composed spatial mean/var/affine
 //!   * LpNormalization (ai.onnx)                        — composed abs/sum or square/sum/sqrt
 //!   * BatchNormalization (ai.onnx, inference form)     — composed per-channel affine
@@ -79,23 +79,6 @@ fn sum_axis(
 ) -> Result<mlx::mlx_array, MlxError> {
     ctx.emit(|res, s| unsafe { mlx::mlx_sum_axis(res, a, axis, keepdims, s) })
 }
-fn mean_axis(
-    ctx: &mut TranslationContext,
-    a: mlx::mlx_array,
-    axis: i32,
-    keepdims: bool,
-) -> Result<mlx::mlx_array, MlxError> {
-    ctx.emit(|res, s| unsafe { mlx::mlx_mean_axis(res, a, axis, keepdims, s) })
-}
-fn var_axis(
-    ctx: &mut TranslationContext,
-    a: mlx::mlx_array,
-    axis: i32,
-    keepdims: bool,
-) -> Result<mlx::mlx_array, MlxError> {
-    ctx.emit(|res, s| unsafe { mlx::mlx_var_axis(res, a, axis, keepdims, 0, s) })
-}
-
 /// A 0-d scalar of dtype `dt` holding `v` (eps constant), matching the compute dtype so no unwanted
 /// upcast occurs.
 fn scalar_like(
@@ -357,45 +340,80 @@ fn skip_rms_norm_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), Ml
     Ok(())
 }
 
-/// GroupNormalization (ai.onnx opset 21 form): normalize within each of `num_groups` channel groups,
-/// then apply per-channel scale/bias. X=[N,C,*S], scale/bias=[C].
+/// GroupNormalization: opset 18 uses per-group affine parameters, opset 21 per-channel.
 fn group_norm_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
     let x = ctx.resolve(&n.inputs[0])?;
     let scale = ctx.resolve(&n.inputs[1])?;
     let bias = ctx.resolve(&n.inputs[2])?;
     let shape = ctx.shape_of(x);
     let rank = shape.len();
-    let n_dim = shape[0];
+    if rank < 2 {
+        return Err("GroupNormalization requires rank >= 2".to_string());
+    }
     let c = shape[1];
-    let groups = n.ints.get("num_groups").copied().unwrap_or(0) as i32;
-    if groups <= 0 {
-        return Err("MLX GroupNormalization requires num_groups > 0".to_string());
+    let groups = i32::try_from(n.ints.get("num_groups").copied().unwrap_or(0))
+        .map_err(|_| "GroupNormalization num_groups exceeds MLX dimension range".to_string())?;
+    if groups <= 0 || c % groups != 0 {
+        return Err(format!(
+            "GroupNormalization num_groups {groups} must be positive and divide channel count {c}"
+        ));
     }
-    let eps = epsilon(n, 1e-5);
-
-    let mut per_group: i32 = 1;
-    for &d in &shape[1..rank] {
-        per_group *= d;
+    let per_channel = n.since_version >= 21;
+    let affine_size = if per_channel { c } else { groups };
+    for affine in [scale, bias] {
+        if ctx.shape_of(affine) != [affine_size] {
+            return Err(format!(
+                "GroupNormalization affine parameters must have shape [{affine_size}]"
+            ));
+        }
     }
-    per_group /= groups; // (C/groups) * prod(spatial)
-
-    let grp = ctx.reshape(x, &[n_dim, groups, per_group])?;
-    let mean = mean_axis(ctx, grp, 2, true)?;
-    let var = var_axis(ctx, grp, 2, true)?;
-    let eps_s = scalar_like(ctx, eps, ctx.dtype_of(x))?;
-    let var_eps = add(ctx, var, eps_s)?;
-    let inv = rsqrt(ctx, var_eps)?;
+    let per_group = if shape[1..].contains(&0) {
+        0
+    } else {
+        shape[2..].iter().try_fold(c / groups, |size, &dim| {
+            size.checked_mul(dim).ok_or_else(|| {
+                "GroupNormalization group extent exceeds MLX dimension range".to_string()
+            })
+        })?
+    };
+    let input_dtype = ctx.dtype_of(x);
+    let stash_dtype = if per_channel {
+        crate::engine::mlx_dtype_from_onnx(
+            n.ints.get("stash_type").copied().unwrap_or(1) as ort::ONNXTensorElementDataType
+        )
+    } else {
+        input_dtype
+    };
+    let compute = ctx.astype(x, stash_dtype)?;
+    let grp = ctx.reshape(compute, &[shape[0], groups, per_group])?;
+    let mean = norm_mean_axes(ctx, grp, &[2], stash_dtype)?;
     let centered = sub(ctx, grp, mean)?;
-    let normed = mul(ctx, centered, inv)?;
-    let normed = ctx.reshape(normed, &shape)?;
-
-    let sb = channel_broadcast(ctx, scale, rank, c)?;
-    let bb = channel_broadcast(ctx, bias, rank, c)?;
+    let squared = mul(ctx, grp, grp)?;
+    let mean_squared = norm_mean_axes(ctx, squared, &[2], stash_dtype)?;
+    let squared_mean = mul(ctx, mean, mean)?;
+    let var = sub(ctx, mean_squared, squared_mean)?;
+    let eps_s = scalar_like(ctx, epsilon(n, 1e-5), stash_dtype)?;
+    let var_eps = add(ctx, var, eps_s)?;
+    let stddev = sqrt(ctx, var_eps)?;
+    let normed = divide(ctx, centered, stddev)?;
+    let normed = ctx.astype(normed, input_dtype)?;
+    let (normed, sb, bb) = if per_channel {
+        (
+            ctx.reshape(normed, &shape)?,
+            channel_broadcast(ctx, scale, rank, c)?,
+            channel_broadcast(ctx, bias, rank, c)?,
+        )
+    } else {
+        (
+            normed,
+            ctx.reshape(scale, &[1, groups, 1])?,
+            ctx.reshape(bias, &[1, groups, 1])?,
+        )
+    };
     let scaled = mul(ctx, normed, sb)?;
     let out = add(ctx, scaled, bb)?;
-    ctx.mark_composed(
-        "GroupNormalization composed (mean/var/rsqrt) — no fused last-axis norm kernel",
-    );
+    let out = ctx.reshape(out, &shape)?;
+    ctx.mark_composed("GroupNormalization with versioned affine parameters and stash precision");
     ctx.bind(&n.outputs[0], out);
     Ok(())
 }
@@ -793,7 +811,7 @@ fn skip_layer_norm_claim(node: &NodeView) -> ClaimResult {
     Ok(())
 }
 
-/// GroupNormalization: X=[N,C,*S] float, scale/bias=[C], static C divisible by num_groups.
+/// GroupNormalization: versioned affine shape and independently selected stash precision.
 fn group_norm_claim(node: &NodeView) -> ClaimResult {
     require!(
         node.num_inputs() == 3 && node.num_outputs() == 1,
@@ -805,16 +823,19 @@ fn group_norm_claim(node: &NodeView) -> ClaimResult {
         (Some(x), Some(scale), Some(o)) => (x, scale, o),
         _ => deny!("missing tensor type/shape info on X, scale, or output"),
     };
-    let bias = match tensor_dtype(node, 2) {
+    let bias = match node.input_info(2) {
         Some(b) => b,
         None => deny!("missing tensor type/shape info on bias"),
     };
     require!(
-        is_mlx_float(x.dtype) && scale.dtype == x.dtype && bias == x.dtype && out.dtype == x.dtype,
-        "X, scale, bias, and output must share one float dtype (fp32/fp16/bf16), got {}, {}, {} -> {}",
+        is_mlx_cpu_float(x.dtype)
+            && scale.dtype == x.dtype
+            && bias.dtype == x.dtype
+            && out.dtype == x.dtype,
+        "X, scale, bias, and output must share one supported float dtype, got {}, {}, {} -> {}",
         crate::registry::ort_dtype_name(x.dtype),
         crate::registry::ort_dtype_name(scale.dtype),
-        crate::registry::ort_dtype_name(bias),
+        crate::registry::ort_dtype_name(bias.dtype),
         crate::registry::ort_dtype_name(out.dtype)
     );
     require!(
@@ -823,27 +844,30 @@ fn group_norm_claim(node: &NodeView) -> ClaimResult {
         x.shape.len()
     );
     let c = x.shape[1];
-    require!(
-        c > 0,
-        "channel dimension must be static and positive (got {c})"
-    );
-    // Batch and spatial dims may be dynamic (-1): the group reshape only needs a
-    // static channel count, and the translator builds the reshape from the
-    // concrete trace-time shape (same as Conv, which is claimed on dynamic-spatial
-    // UNets). Real diffusion UNets export with dynamic N/H/W, so requiring all
-    // dims static here needlessly forced every GroupNorm onto CPU and fragmented
-    // the graph. Only the channel dim must be known to split into groups.
     let groups = node.int_attr("num_groups", 0);
     require!(
-        groups > 0 && c % groups == 0,
+        groups > 0 && groups <= i64::from(i32::MAX) && (c < 0 || c % groups == 0),
         "num_groups must be positive and divide channel count {c} (got {groups})"
     );
-    // opset-21 per-channel scale/bias: shape [C].
-    require!(
-        scale.shape.len() == 1 && scale.shape[0] == c,
-        "opset-21 scale must have shape [C]=[{c}] (got {:?})",
-        scale.shape
-    );
+    let affine_size = if node.since_version() >= 21 {
+        c
+    } else {
+        groups
+    };
+    for (name, affine) in [("scale", scale), ("bias", bias)] {
+        require!(
+            affine.shape.len() == 1
+                && (affine.shape[0] < 0 || affine_size < 0 || affine.shape[0] == affine_size),
+            "{name} must have shape [{affine_size}] (got {:?})",
+            affine.shape
+        );
+    }
+    if node.since_version() >= 21 {
+        require!(
+            matches!(node.int_attr("stash_type", 1), 1 | 10 | 11 | 16),
+            "stash_type must be float32, float16, float64, or bfloat16"
+        );
+    }
     Ok(())
 }
 
@@ -1070,13 +1094,14 @@ pub fn register_norm(registry: &mut OpRegistry) {
         },
         standard_norm_compile_shape_safety,
     );
-    shapeless(
+    shape_keyed(
         registry,
         "",
         "GroupNormalization",
-        K_ANY_OPSET,
+        18,
         group_norm_op,
         group_norm_claim,
+        "conservatively shape-keyed: group reshape depends on concrete batch, channel, and spatial extents",
     );
     shapeless(
         registry,

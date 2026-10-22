@@ -16,8 +16,10 @@ import sys
 
 import ml_dtypes
 import numpy as np
+import onnx
 import onnx_ir as ir
 import onnxruntime as ort
+from onnx.reference import ReferenceEvaluator
 import pytest
 
 import _models as m
@@ -77,17 +79,20 @@ def _strict_mlx_session(model):
     return session
 
 
-def _norm_reference(x, scale, axis, centered, *, stash=np.float32, bias=None, epsilon=1e-5):
+def _norm_reference(x, scale, axis, centered, *, stash=np.float32, bias=None, epsilon=1e-5,
+                    divide_stddev=False, moments_variance=False):
     axes = tuple(range(axis % x.ndim, x.ndim))
     accumulation = np.float64 if np.dtype(stash) == np.dtype(np.float64) else np.float32
     value = x.astype(stash)
     mean = value.astype(accumulation).mean(axis=axes, keepdims=True).astype(stash)
     values = (value - mean).astype(stash) if centered else value
-    squared = (values * values).astype(stash)
+    squared = (value * value if moments_variance else values * values).astype(stash)
     variance = squared.astype(accumulation).mean(axis=axes, keepdims=True).astype(stash)
+    if moments_variance:
+        variance = (variance - (mean * mean).astype(stash)).astype(stash)
     stddev = np.sqrt((variance + stash(np.float32(epsilon))).astype(stash)).astype(stash)
     inv = (stash(1) / stddev).astype(stash)
-    normalized = ((values * inv) if centered else (values / stddev)).astype(x.dtype)
+    normalized = ((values * inv) if centered and not divide_stddev else (values / stddev)).astype(x.dtype)
     output = normalized * scale
     if bias is not None:
         output = output + bias
@@ -459,6 +464,161 @@ def test_skip_layer_norm(dt):
 
 
 # --- GroupNormalization -----------------------------------------------------------------------
+def _group_norm_model(shape, version, groups, dt, stash):
+    affine = groups if version < 21 else shape[1]
+    payload_type = DT.BFLOAT16 if dt == ml_dtypes.bfloat16 else ir_of(dt)
+    boundary_type = DT.FLOAT if payload_type == DT.BFLOAT16 else payload_type
+    inputs = [m.tensor("x", boundary_type, shape), m.tensor("s", boundary_type, [affine]),
+              m.tensor("b", boundary_type, [affine])]
+    nodes, arguments = [], []
+    for value in inputs:
+        if boundary_type == payload_type:
+            arguments.append(value)
+        else:
+            converted = m.tensor(f"{value.name}_converted", payload_type, list(value.shape))
+            nodes.append(ir.node("Cast", [value], attributes={"to": int(payload_type)}, outputs=[converted]))
+            arguments.append(converted)
+    output = m.tensor("normalized", payload_type, shape)
+    attrs = {"num_groups": groups}
+    if version >= 21:
+        attrs["stash_type"] = int(stash)
+    nodes.append(ir.node("GroupNormalization", arguments, attributes=attrs, outputs=[output]))
+    if boundary_type != payload_type:
+        converted = m.tensor("out", boundary_type, shape)
+        nodes.append(ir.node("Cast", [output], attributes={"to": int(boundary_type)}, outputs=[converted]))
+        output = converted
+    graph = ir.Graph(inputs, [output], nodes=nodes, name="group_normalization", opset_imports={"": version})
+    return ir.to_proto(ir.Model(graph, ir_version=11)).SerializeToString()
+
+
+@pytest.mark.parametrize("version", [18, 21])
+@pytest.mark.parametrize("shape,groups", [([2, 6], 1), ([2, 6, 3], 2), ([1, 6, 2, 3, 2], 6)])
+@pytest.mark.parametrize("dt", [np.float32, np.float16, np.float64, ml_dtypes.bfloat16])
+@pytest.mark.parametrize("eager", [False, True])
+def test_group_norm_schema_forms(version, shape, groups, dt, eager, monkeypatch):
+    monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_COMPILE", "1" if eager else "0")
+    stash = DT.DOUBLE if dt == np.float64 else DT.FLOAT
+    model = _group_norm_model(shape, version, groups, dt, stash)
+    session = _strict_mlx_session(model)
+    rng = np.random.default_rng(121)
+    affine_size = groups if version < 21 else shape[1]
+    for _ in range(3):
+        x = rng.standard_normal(shape).astype(dt)
+        scale = rng.standard_normal(affine_size).astype(dt)
+        bias = rng.standard_normal(affine_size).astype(dt)
+        boundary = np.float32 if dt == ml_dtypes.bfloat16 else dt
+        actual = session.run(None, {"x": x.astype(boundary), "s": scale.astype(boundary),
+                                   "b": bias.astype(boundary)})[0]
+        grouped_shape = [shape[0], groups, int(np.prod(shape[1:])) // groups]
+        precision = dt if version < 21 else np.float64 if stash == DT.DOUBLE else np.float32
+        normalized, _, _ = _norm_reference(
+            x.reshape(grouped_shape), np.ones((), dt), 2, True, stash=precision,
+            divide_stddev=True, moments_variance=True,
+        )
+        if version < 21:
+            normalized = normalized * scale.reshape(1, groups, 1) + bias.reshape(1, groups, 1)
+            expected = normalized.reshape(shape)
+        else:
+            affine_shape = [1, shape[1]] + [1] * (len(shape) - 2)
+            expected = normalized.reshape(shape) * scale.reshape(affine_shape) + bias.reshape(affine_shape)
+        tolerance = dict(rtol=2e-2, atol=2e-2) if dt in [np.float16, ml_dtypes.bfloat16] else dict(rtol=1e-5, atol=1e-6)
+        np.testing.assert_allclose(actual, expected.astype(boundary), **tolerance)
+        if dt == np.float32:
+            cpu = ort.InferenceSession(model, providers=["CPUExecutionProvider"])
+            np.testing.assert_allclose(
+                actual, cpu.run(None, {"x": x, "s": scale, "b": bias})[0], **tolerance
+            )
+
+
+@pytest.mark.parametrize("stash,precision", [(DT.FLOAT16, np.float16), (DT.BFLOAT16, ml_dtypes.bfloat16),
+                                           (DT.DOUBLE, np.float64)])
+def test_group_norm_stash_precision(stash, precision):
+    shape, groups = [2, 4, 3], 2
+    model = _group_norm_model(shape, 21, groups, np.float32, stash)
+    feeds = {"x": randn(np.float32, *shape), "s": np.ones(4, np.float32), "b": np.zeros(4, np.float32)}
+    actual = _strict_mlx_session(model).run(None, feeds)[0]
+    expected, _, _ = _norm_reference(
+        feeds["x"].reshape(2, groups, 6), np.ones((), np.float32), 2, True, stash=precision,
+        divide_stddev=True, moments_variance=True,
+    )
+    np.testing.assert_allclose(actual, expected.reshape(shape), rtol=1e-6, atol=1e-6)
+
+
+@pytest.mark.parametrize("version", [18, 21])
+def test_group_norm_dynamic_channels_and_empty(version):
+    model = _group_norm_model(["N", "C", "S"], version, 2, np.float32, DT.FLOAT)
+    session = _strict_mlx_session(model)
+    for shape in ([2, 6, 3], [1, 8, 2], [0, 4, 3], [2, 6, 0], [2, 0, 3], [2, 6, 3]):
+        affine_size = 2 if version < 21 else shape[1]
+        feeds = {"x": randn(np.float32, *shape), "s": np.ones(affine_size, np.float32),
+                 "b": np.zeros(affine_size, np.float32)}
+        actual = session.run(None, feeds)[0]
+        assert actual.shape == tuple(shape)
+        if np.prod(shape):
+            expected, _, _ = _norm_reference(
+                feeds["x"].reshape(shape[0], 2, int(np.prod(shape[1:])) // 2),
+                np.ones((), np.float32), 2, True, divide_stddev=True, moments_variance=True,
+            )
+            np.testing.assert_allclose(actual, expected.reshape(shape), rtol=1e-5, atol=1e-6)
+
+
+def test_group_norm_double_statistics_exact():
+    model = build(
+        "GroupNormalization",
+        [m.tensor("x", DT.DOUBLE, [1, 2]), m.tensor("s", DT.DOUBLE, [2]),
+         m.tensor("b", DT.DOUBLE, [2])],
+        [m.tensor("out", DT.DOUBLE, [1, 2])],
+        attrs=[ir.AttrInt64("num_groups", 1), ir.AttrInt64("stash_type", int(DT.DOUBLE)),
+               ir.AttrFloat32("epsilon", 0)],
+    )
+    feeds = {"x": np.array([[1 + 2**-20, 1 - 2**-20]], np.float64),
+             "s": np.ones(2, np.float64), "b": np.zeros(2, np.float64)}
+    np.testing.assert_array_equal(_strict_mlx_session(model).run(None, feeds)[0], [[1, -1]])
+
+
+@pytest.mark.parametrize("version,stash,x", [(18, DT.FLOAT, [4096, 4097]), (21, DT.FLOAT16, [32, 33])])
+def test_group_norm_schema_function_variance(version, stash, x):
+    shape = [1, 2]
+    feeds = {"x": np.array([x], np.float32), "s": np.ones(2 if version == 21 else 1, np.float32),
+             "b": np.zeros(2 if version == 21 else 1, np.float32)}
+    model = _group_norm_model(shape, version, 1, np.float32, stash)
+    node = onnx.load_model_from_string(model).graph.node[0]
+    schema = onnx.defs.get_schema("GroupNormalization", version)
+    types = [
+        onnx.helper.make_tensor_type_proto(onnx.TensorProto.FLOAT, list(value.shape)).SerializeToString()
+        for value in feeds.values()
+    ]
+    function = onnx.FunctionProto.FromString(
+        schema.get_context_dependent_function(node.SerializeToString(), types)
+    )
+    reference = ReferenceEvaluator(function)
+    expected = reference.run(
+        None, dict(zip(function.input, feeds.values())),
+        attributes={attr.name: onnx.helper.get_attribute_value(attr) for attr in node.attribute},
+    )[0]
+    actual = _strict_mlx_session(model).run(None, feeds)[0]
+    np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-6)
+
+
+@pytest.mark.parametrize("malformed", ["channels", "scale", "bias"])
+def test_group_norm_invalid_dynamic_geometry_recovers(malformed):
+    session = _strict_mlx_session(
+        _group_norm_model(["N", "C", "S"], 21, 2, np.float32, DT.FLOAT)
+    )
+    feeds = {"x": randn(np.float32, 2, 6, 3), "s": np.ones(6, np.float32),
+             "b": np.zeros(6, np.float32)}
+    expected = session.run(None, feeds)[0]
+    bad = feeds.copy()
+    if malformed == "channels":
+        bad["x"] = randn(np.float32, 2, 7, 3)
+        bad["s"], bad["b"] = np.ones(7, np.float32), np.zeros(7, np.float32)
+    else:
+        bad["s" if malformed == "scale" else "b"] = np.ones(5, np.float32)
+    with pytest.raises(Exception, match="GroupNormalization.*(divide channel count|affine parameters)"):
+        session.run(None, bad)
+    np.testing.assert_array_equal(session.run(None, feeds)[0], expected)
+
+
 @pytest.mark.parametrize("dt", DTYPES)
 def test_group_norm(dt):
     rng = np.random.default_rng(5)

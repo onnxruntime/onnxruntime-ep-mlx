@@ -415,7 +415,11 @@ mod tests {
 
     #[test]
     fn float64_statistics_require_cpu_without_float64_tensor_slots() {
-        for op in ["RMSNormalization", "LayerNormalization"] {
+        for op in [
+            "RMSNormalization",
+            "LayerNormalization",
+            "GroupNormalization",
+        ] {
             let mut node = node_with_output(
                 ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
             );
