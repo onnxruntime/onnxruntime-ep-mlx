@@ -35,8 +35,8 @@ jobs:
     runs-on: macos-15
     env:
       ORT_VERSION: "1.31.0"
-      # Match ORT 1.31's ONNX dependency; newer fixtures can require unsupported schemas.
-      ONNX_VERSION: "1.22.0"
+      # Latest released ONNX; backend.prepare handles proven runtime/API capability limits.
+      ONNX_VERSION: "1.23.2"
       MLX_VERSION: "0.32.2"
       MLX_COMMIT: "1f8e74e3f12f31365464a6867c6579f0e9b29d85"
       MLXC_COMMIT: "c74db5307cc8ce122f48d97ef951b30578674e7f"

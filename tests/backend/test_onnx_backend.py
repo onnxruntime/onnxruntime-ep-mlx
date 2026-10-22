@@ -2,7 +2,8 @@
 
 Complements the property-based fuzzing conformance (``tests/conformance``) and
 the op-correctness suite (``tests/ops``) with ONNX's own **curated** per-node
-test data (``onnx/backend/test/data/node``). Each standard ``test_<op>_*`` case
+models and datasets generated in memory by ONNX's public backend loader.
+Each standard ``test_<op>_*`` case
 runs through the MLX execution provider (with CPU fallback available) and its
 outputs are compared against ONNX's reference expected outputs.
 
@@ -12,10 +13,12 @@ env var at ``rust/target/release/libonnxruntime_mlx_ep.dylib``.
 
 Notes
 -----
-* Only the **node** and small **operator/simple** model categories are exposed;
+* The **node**, **simple**, and **PyTorch operator/converted** categories are exposed;
   the heavy model-zoo / "real" tests (which download large models) are skipped.
 * Ops the EP does not claim run on the CPU fallback and still validate for
   correctness; claimed ops get genuine MLX validation against the ONNX data.
+* BF16 tensor I/O requires working public ORT NumPy conversions. Independent
+  CPU Shape/Constant probes establish missing conversions before such cases skip.
 * ``float64`` and other Apple-GPU-unsupported forms fall back to CPU and pass;
   genuinely-broken cases can be excluded in ``_EXCLUDE`` as discovered.
 """
@@ -26,13 +29,8 @@ import os
 import unittest
 from pathlib import Path
 
-import numpy as np
-import onnx
 import onnx.backend.test
 import pytest
-from onnx.backend.base import Backend, BackendRep
-
-EP_NAME = os.environ.get("MLX_EP_NAME", "MLXExecutionProvider")
 
 
 def _ep_lib() -> str | None:
@@ -47,75 +45,13 @@ if not (_LIB and Path(_LIB).is_file()):
         allow_module_level=True,
     )
 
-import onnxruntime as ort  # noqa: E402  (after the skip guard)
-
-_LIB = os.path.abspath(_LIB)
-_registered = False
+from _backend import MlxBackend, backend_test_cases  # noqa: E402
+from _attention_precision import ATTENTION_FP16_TEST_KWARGS  # noqa: E402
 
 
-def _ensure_registered() -> None:
-    global _registered
-    if _registered:
-        return
-    try:
-        ort.register_execution_provider_library(EP_NAME, _LIB)
-    except Exception as exc:  # a second registration in-process is benign
-        if "already registered" not in str(exc).lower():
-            raise
-    _registered = True
-
-
-class MlxBackendRep(BackendRep):
-    def __init__(self, sess: "ort.InferenceSession", inputs: list[str], outputs: list[str]):
-        self._sess = sess
-        self._inputs = inputs
-        self._outputs = outputs
-
-    def run(self, inputs, **kwargs):  # noqa: ANN001
-        # Sequence/optional inputs arrive as Python lists of arrays; ``np.asarray`` would
-        # collapse those into a single dense tensor and ORT would reject the feed
-        # ("expected sequence, received tensor"). Pass list-valued feeds through as a list
-        # of arrays so ORT builds a proper sequence OrtValue; wrap plain tensor inputs.
-        def _feed(val):
-            if val is None:
-                return None
-            if isinstance(val, (list, tuple)):
-                return [np.asarray(v) for v in val]
-            return np.asarray(val)
-
-        feeds = {name: _feed(val) for name, val in zip(self._inputs, inputs)}
-        return self._sess.run(self._outputs, feeds)
-
-
-class MlxBackend(Backend):
-    """ONNX backend that executes a model on the MLX EP (CPU fallback allowed)."""
-
-    @classmethod
-    def prepare(cls, model, device="CPU", **kwargs):  # noqa: ANN001
-        super().prepare(model, device, **kwargs)
-        _ensure_registered()
-        opts = ort.SessionOptions()
-        # Disable graph rewrites so the EP sees exactly the op under test.
-        opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
-        sess = ort.InferenceSession(
-            model.SerializeToString(),
-            sess_options=opts,
-            providers=[EP_NAME, "CPUExecutionProvider"],
-        )
-        return MlxBackendRep(
-            sess,
-            [i.name for i in sess.get_inputs()],
-            [o.name for o in sess.get_outputs()],
-        )
-
-    @classmethod
-    def supports_device(cls, device: str) -> bool:
-        # Apple unified memory: ORT tensors are CPU-addressable, so we advertise
-        # CPU (the node tests run on the "CPU" device).
-        return device == "CPU"
-
-
-_backend_test = onnx.backend.test.BackendTest(MlxBackend, __name__)
+_backend_test = onnx.backend.test.BackendTest(
+    MlxBackend, __name__, test_kwargs=ATTENTION_FP16_TEST_KWARGS
+)
 
 # Cases the EP fundamentally cannot serve even via CPU fallback, or that are
 # environment/model-zoo heavy. Extend as needed.
@@ -180,6 +116,10 @@ _EXCLUDE = [
     r"^test_bitshift_(left|right)_uint16_cpu$",
     r"^test_(max|min)_(u?int16)_cpu$",
     r"^test_top_k_uint64_cpu$",
+    # Pow(float32, uint64): MLX rejects the wider exponent to avoid lossy narrowing;
+    # ORT 1.31 CPU only supports int32/int64/float/double exponents (NOT_IMPLEMENTED).
+    # Keep float32/uint32 enabled: MLX serves it even though ORT CPU cannot.
+    r"^test_pow_types_float32_uint64_cpu$",
     # ImageDecoder(20): ORT 1.27 CPU has no kernel (NOT_IMPLEMENTED); needs image codec libs.
     r"^test_image_decoder_",
     # Range: the reference models are stamped opset 27 (ai.onnx official support in ORT 1.29 is
@@ -193,23 +133,31 @@ _EXCLUDE = [
     r"^test_operator_non_float_params_cpu$",
 ]
 for _pat in _EXCLUDE:
-    try:
-        _backend_test.exclude(_pat)
-    except Exception:
-        pass
+    _backend_test.exclude(_pat)
 
-# Expose ONLY the node + operator/simple model categories (skip the real /
+# Expose ONLY the node, simple, and PyTorch model categories (skip the real /
 # model-zoo tests that download large models). ``test_cases`` maps a category
 # class name -> unittest.TestCase subclass; pytest discovers them via globals().
-_WANTED = (
-    "OnnxBackendNodeModelTest",
-    "OnnxBackendSimpleModelTest",
-    "OnnxBackendPyTorchOperatorModelTest",
-    "OnnxBackendPyTorchConvertedModelTest",
-)
-for _name, _case in _backend_test.enable_report().test_cases.items():
-    if _name in _WANTED:
-        globals()[_name] = _case
+globals().update(backend_test_cases(_backend_test.enable_report()))
+
+
+def test_pow_exclusion_scope() -> None:
+    """Only the unsupported uint64 exponent may be excluded from Pow coverage."""
+    node_cases = globals()["OnnxBackendNodeModelTest"]
+    pow_cases = {
+        name: getattr(node_cases, name)
+        for name in dir(node_cases)
+        if name.startswith("test_pow") and name.endswith("_cpu")
+    }
+    assert {
+        "test_pow_cpu",
+        "test_pow_types_float32_uint32_cpu",
+        "test_pow_types_float32_int64_cpu",
+    } <= pow_cases.keys()
+    assert {
+        name for name, case in pow_cases.items()
+        if getattr(case, "__unittest_skip__", False)
+    } == {"test_pow_types_float32_uint64_cpu"}
 
 
 if __name__ == "__main__":

@@ -31,6 +31,47 @@ python -m pytest tests/ops -q
 Running `pytest` without `ONNXRUNTIME_MLX_EP_LIB` set **skips** the suite (rather than failing), so
 it is safe to include in any pytest invocation.
 
+`test_attention_semantics.py` uses small, locally built models and an independent float64 SDPA
+oracle rather than version-specific ONNX backend fixture names. It covers fully masked rows
+(including the combined causal/explicit mask), broadcast mask ranks, FP16/FP32, GQA and cached
+3D layouts, and preserves input NaNs/infinities in rows with attendable keys. Both fused and composed
+forms zero fully masked output rows even when Q or V is nonfinite; zero probabilities alone would
+still produce `0 * NaN` in the value contraction. The cached decode tests in
+`test_attention_ext.py` also require a compiled MISS/HIT replay as an empty mask becomes nonempty.
+An empty allowed key set must produce zero, not a uniform attention average or NaN; the guard is
+based on the additive mask, never a blanket NaN replacement.
+
+### Attention FP16 comparisons
+
+Two ONNX 1.23.2 cases, `test_attention_4d_causal_fp16` and its `_expanded` variant, have a
+case-specific backend comparison bound of `2 * finfo(float16).eps` (2^-9). The original models,
+inputs, expected arrays and absolute tolerance are unchanged. This is **not** an Attention-wide
+tolerance change: the GQA FP16 case and both fully masked robustness cases keep their original
+comparisons.
+
+The [released reference](https://github.com/onnx/onnx/blob/v1.23.2/onnx/reference/ops/op_attention.py)
+rounds scaled Q/K, logits, and the softmax exponential/sum/division to FP16. The expanded graph's
+Softmax has FP16 input/output, but does not require every internal arithmetic operation to round to
+FP16. MLX's precise softmax accumulates in FP32 before rounding its output; the composed Attention
+path uses the same accurate helper as standalone Softmax, while retaining `softmax_precision`'s
+input cast and the probability/output dtype boundaries. We do not add intermediate rounding to
+make a more accurate result reproduce the reference's rounding error.
+
+The [same-Mac pre-fix diagnostic](https://github.com/onnxruntime/onnxruntime-ep-mlx/actions/runs/39703543192)
+confirms that ORT CPU and MLX both return `0.3984375` at `[0,0,2,4]`, versus the fixture's
+`0.39794921875`; independent float64 SDPA gives `0.398295323199067`. For the expanded MLX graph,
+`[0,0,1,4]` is `0.468994140625` versus `0.469482421875`, with float64 value
+`0.469189668630952`. In both examples the native value is closer to float64 than the fixture, yet
+fails the fixture's 1e-3 relative comparison. Both discrepancies are exactly two FP16 ULPs.
+
+`tests/backend/test_attention_precision.py` therefore also runs the exact two public in-memory
+fixtures and requires **both** the expected data and native output to meet the **original**
+`rtol=0.001, atol=1e-7` against an independent float64 oracle, plus an exact two-ULP maximum
+distance from each other. Shape, dtype and finiteness are checked separately. Negative tests reject
+three-ULP drift, wrong masks/zero outputs, NaNs, wrong shapes/types, and forward-error violations
+even when fixture agreement is exact. The public runner's slightly wider relative bound alone is
+not the acceptance criterion.
+
 ## `tests/conformance` — ONNX-standard fuzz-conformance (opt-in)
 
 Bounded fuzz-conformance of the MLX EP against the ONNX standard via `cbourjau/onnx-tests`. Each op

@@ -137,6 +137,16 @@ fn apply_reduction(
         };
         return empty_reduce(ctx, x, axes, reduce_all, keepdims, ident);
     }
+    // Boolean max is logical OR (False < True), not a numeric max kernel.
+    if kind == Kind::Max && ctx.dtype_of(x) == mlx::mlx_dtype__MLX_BOOL {
+        return if reduce_all {
+            ctx.emit(|res, s| unsafe { mlx::mlx_any(res, x, keepdims, s) })
+        } else {
+            ctx.emit(|res, s| unsafe {
+                mlx::mlx_any_axes(res, x, axes.as_ptr(), axes.len(), keepdims, s)
+            })
+        };
+    }
     if reduce_all {
         match kind {
             Kind::Sum => ctx.emit(|res, s| unsafe { mlx::mlx_sum(res, x, keepdims, s) }),
@@ -182,7 +192,6 @@ fn reduce(
         PreOp::Square => ctx.emit(|res, s| unsafe { mlx::mlx_square(res, x, s) })?,
     };
 
-    let has_axes = has_axes_input(n) || n.int_arrays.contains_key("axes");
     let raw_axes = read_axes(ctx, n)?;
     let noop = n.ints.get("noop_with_empty_axes").copied().unwrap_or(0) != 0;
 
@@ -195,7 +204,7 @@ fn reduce(
             }
         };
 
-    if has_axes && raw_axes.is_empty() && noop {
+    if raw_axes.is_empty() && noop {
         let out = apply_post(ctx, body)?;
         ctx.bind(&n.outputs[0], out);
         return Ok(());
@@ -480,8 +489,11 @@ fn reduction_claim(node: &NodeView, float_only: bool) -> ClaimResult {
         (Some(x), Some(o)) => (x, o),
         _ => deny!("missing tensor type/shape info on input or output"),
     };
+    let bool_max = node.op_type() == "ReduceMax"
+        && node.since_version() >= 20
+        && x.dtype == ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL;
     require!(
-        !x.shape.is_empty(),
+        bool_max || !x.shape.is_empty(),
         "input must have rank >= 1 (got a scalar)"
     );
     require!(
@@ -506,8 +518,8 @@ fn reduction_claim(node: &NodeView, float_only: bool) -> ClaimResult {
         );
     } else {
         require!(
-            is_mlx_numeric(x.dtype) || is_float64(x.dtype),
-            "dtype must be an MLX-supported numeric type, got {}",
+            is_mlx_numeric(x.dtype) || is_float64(x.dtype) || bool_max,
+            "dtype must be an MLX-supported numeric type (or bool for ReduceMax opset >= 20), got {}",
             crate::registry::ort_dtype_name(x.dtype)
         );
     }

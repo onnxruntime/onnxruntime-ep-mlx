@@ -292,6 +292,8 @@ def test_attention_cached_decode_replays_dynamic_mask_and_kv_shapes() -> None:
         }
 
     first_feeds = feeds(empty, empty)
+    # The replay must handle an empty allowed set becoming nonempty as the cache grows.
+    first_feeds["M"][...] = False
     if not _cpu_supports(model, first_feeds):
         pytest.skip("ORT CPU EP has no native Attention kernel")
     cpu_session = ort.InferenceSession(model, providers=["CPUExecutionProvider"])

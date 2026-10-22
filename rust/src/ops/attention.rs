@@ -1135,8 +1135,28 @@ fn attention_softmax(
     output_dt: mlx::mlx_dtype,
 ) -> Result<mlx::mlx_array, MlxError> {
     let scores = ctx.astype(scores, precision)?;
-    let probs = ctx.emit(|res, st| unsafe { mlx::mlx_softmax_axis(res, scores, 3, false, st) })?;
+    let probs = ctx.softmax_axis(scores, 3)?;
     ctx.astype(probs, output_dt)
+}
+
+fn attention_zero_fully_masked_rows(
+    ctx: &mut TranslationContext,
+    values: mlx::mlx_array,
+    additive_mask: mlx::mlx_array,
+) -> Result<mlx::mlx_array, MlxError> {
+    let row_max = if ctx.shape_of(additive_mask).is_empty() {
+        additive_mask
+    } else {
+        ctx.emit(|res, st| unsafe { mlx::mlx_max_axis(res, additive_mask, -1, true, st) })?
+    };
+    let neg = ctx.scalar_f32(f32::NEG_INFINITY);
+    let neg = ctx.astype(neg, ctx.dtype_of(additive_mask))?;
+    let all_masked = ctx.binary(mlx::mlx_equal, row_max, neg)?;
+    let zero = ctx.scalar_f32(0.0);
+    let zero = ctx.astype(zero, ctx.dtype_of(values))?;
+    // Decide on the bias, not on possibly NaN logits/output. Select, rather than multiply,
+    // so empty rows become zero without clearing NaNs from rows with attendable keys.
+    ctx.where_(all_masked, zero, values)
 }
 
 fn attention_qk_output_op(
@@ -1178,16 +1198,6 @@ fn attention_qk_output_op(
         .map(|mask| attention_mask_to_score_shape(ctx, mask, b, qh, q_len, k_len, dt))
         .transpose()?;
     let overlay = attention_overlay_mask(ctx, n, b, q_len, k_len, past_len, dt, mask)?;
-    // The fully-masked-row guard reduces score axis 3, so materialize every schema-broadcastable
-    // mask rank (including [K], [Q,K], and [H,Q,K]) to the score's four-dimensional shape first.
-    let overlay = overlay
-        .map(|overlay| {
-            let shape = [b, qh, q_len, k_len];
-            ctx.emit(|res, st| unsafe {
-                mlx::mlx_broadcast_to(res, overlay, shape.as_ptr(), shape.len(), st)
-            })
-        })
-        .transpose()?;
     let biased = match overlay {
         Some(overlay) => add(ctx, capped, overlay)?,
         None => capped,
@@ -1195,14 +1205,7 @@ fn attention_qk_output_op(
     let precision = mlx_softmax_precision(n.ints.get("softmax_precision").copied()).unwrap_or(dt);
     let mut probs = attention_softmax(ctx, biased, precision, dt)?;
     if let Some(overlay) = overlay {
-        let row_max =
-            ctx.emit(|res, st| unsafe { mlx::mlx_max_axis(res, overlay, 3, true, st) })?;
-        let neg = ctx.scalar_f32(f32::NEG_INFINITY);
-        let neg = ctx.astype(neg, dt)?;
-        let all_masked = ctx.binary(mlx::mlx_equal, row_max, neg)?;
-        let zero = ctx.scalar_f32(0.0);
-        let zero = ctx.astype(zero, dt)?;
-        probs = ctx.where_(all_masked, zero, probs)?;
+        probs = attention_zero_fully_masked_rows(ctx, probs, overlay)?;
     }
 
     if n.outputs.len() > 3 && !n.outputs[3].name.is_empty() {
@@ -1218,7 +1221,12 @@ fn attention_qk_output_op(
     let v = gqa_repeat_heads_batched(ctx, v, b, kvh, groups, k_len, v_hd)?;
     let probs_for_v = ctx.astype(probs, ctx.dtype_of(v))?;
     let out = ctx.matmul(probs_for_v, v)?;
-    ctx.astype(out, dt)
+    let out = ctx.astype(out, dt)?;
+    match overlay {
+        // Zero probabilities alone do not guarantee zero Y when V contains NaN or infinity.
+        Some(overlay) => attention_zero_fully_masked_rows(ctx, out, overlay),
+        None => Ok(out),
+    }
 }
 
 // ---- Attention (ai.onnx) -----------------------------------------------------------------------
@@ -1286,14 +1294,20 @@ fn attention_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxErr
         attention_qk_output_op(
             ctx, n, qh4, present_k, present_v, b, qh, kvh, s, k_len, hd_q, hd_v, past_len, dt, mask,
         )?
-    } else if causal {
-        // ONNX `is_causal` uses upper-left alignment: the past keys (present K length minus the new
-        // K length) are always visible and the causal triangle covers the new-key region. MLX's
-        // built-in "causal" mode is lower-right aligned, so build the ONNX mask explicitly instead.
-        let cmask = combined_causal_mask(ctx, s, k_len, past_len, dt, mask)?;
-        sdpa(ctx, qh4, present_k, present_v, scale, b"array\0", cmask)?
     } else {
-        sdpa_dispatch(ctx, qh4, present_k, present_v, scale, false, mask, dt)?
+        let mask = if causal {
+            // MLX's built-in causal mode is lower-right aligned; ONNX aligns to the actual past.
+            Some(combined_causal_mask(ctx, s, k_len, past_len, dt, mask)?)
+        } else {
+            mask.map(|mask| mask_as_additive(ctx, mask, dt))
+                .transpose()?
+        };
+        let out = sdpa_dispatch(ctx, qh4, present_k, present_v, scale, false, mask, dt)?;
+        match mask {
+            // MLX SDPA does not implement ONNX's fully-masked-row zero-output contract.
+            Some(mask) => attention_zero_fully_masked_rows(ctx, out, mask)?,
+            None => out,
+        }
     };
 
     if is3d {
