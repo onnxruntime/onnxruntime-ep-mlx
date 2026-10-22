@@ -153,10 +153,13 @@ The **core Rust modules** register:
 | `misc.rs` / `image.rs` | Constants, losses, NonZero/Unique/Det, numeric TF-IDF, and image decoding |
 | `random.rs` / `signal.rs` / `recurrent.rs` / `vision.rs` / `controlflow.rs` | Random, signal/FFT/window, RNN/GRU/LSTM, vision/detection, and recursive control-flow translations |
 
-`ReduceMax` also claims Boolean tensors from opset 20 onward, including scalars.
-Boolean max lowers to MLX logical OR; empty reductions produce `False` with the
-same axes/`keepdims` output shape rules as numeric reductions. Other reduction
-operators retain their existing numeric/float-only dtype restrictions.
+Reductions accept scalar inputs. `ReduceMax` and `ReduceMin` also claim Boolean
+tensors from opset 20 onward, using logical OR and AND respectively. Empty
+extrema reductions use exact dtype identities: Boolean `False`/`True`, integer
+minimum/maximum, or floating-point negative/positive infinity. Live axes are
+read on each invocation, not frozen into a compiled closure; initializer axes
+remain compilable, and proven shape-derived axes use shape-keyed compilation.
+Other reduction operators retain their numeric/float-only dtype restrictions.
 
 Every claim is **conservative**: a handler claims only the ONNX forms it can translate correctly
 (dtype/shape/attr/opset checked in its `ClaimPredicate`); every other form falls back to ORT CPU.

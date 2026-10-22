@@ -165,12 +165,34 @@ def test_reduce_max_numeric_schemas(opset: int, keepdims: int) -> None:
     m.assert_matches_cpu(model, feeds, rtol=0, atol=0)
 
 
-def test_reduce_min_bool_still_declined() -> None:
+@pytest.mark.parametrize(
+    "shape,axes_form",
+    [
+        (shape, axes_form)
+        for shape in [(), (0,), (2, 3), (2, 0, 3)]
+        for axes_form in ["omitted", "empty", "last"]
+        if shape or axes_form != "last"
+    ],
+)
+@pytest.mark.parametrize("keepdims", [0, 1])
+@pytest.mark.parametrize("opset", [20, 23, 26])
+def test_reduce_min_bool(
+    shape: tuple[int, ...], keepdims: int, opset: int, axes_form: str
+) -> None:
+    x = np.asarray(np.arange(np.prod(shape), dtype=np.int64).reshape(shape) % 3 != 0)
+    axes = None if axes_form != "last" else (-1,)
+    expected = np.all(x, axis=axes, keepdims=bool(keepdims))
+    inputs = [m.tensor("x", DT.BOOL, list(shape))]
+    feeds = {"x": x}
+    if axes_form != "omitted":
+        values = np.asarray(axes or [], dtype=np.int64)
+        inputs.append(m.tensor("axes", DT.INT64, [len(values)]))
+        feeds["axes"] = values
     model = m.make_model(
         "ReduceMin",
-        [m.tensor("x", DT.BOOL, [2, 3])],
-        [m.tensor("out", DT.BOOL, [1, 1])],
-        opset=20,
+        inputs,
+        [m.tensor("out", DT.BOOL, list(expected.shape))],
+        attributes={"keepdims": keepdims},
+        opset=opset,
     )
-    feeds = {"x": np.array([[True, False, True], [True, True, True]])}
-    m.assert_op_declined(model, feeds, "ReduceMin")
+    _assert_mlx_result(model, feeds, expected)

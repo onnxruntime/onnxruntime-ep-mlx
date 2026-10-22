@@ -17,6 +17,129 @@ from onnx_ir import DataType as DT
 import _models as m
 
 
+_REDUCE_OPS = [
+    "ReduceSum", "ReduceMean", "ReduceMax", "ReduceMin", "ReduceProd",
+    "ReduceSumSquare", "ReduceL1", "ReduceL2", "ReduceLogSum", "ReduceLogSumExp",
+]
+
+
+@pytest.mark.parametrize("op", _REDUCE_OPS)
+@pytest.mark.parametrize("eager", [False, True], ids=["compiled-enabled", "eager"])
+@pytest.mark.parametrize("intermediate", [False, True], ids=["boundary-axes", "intermediate-axes"])
+def test_reduction_live_axes(op, eager, intermediate, monkeypatch):
+    monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_COMPILE", "1" if eager else "0")
+    x_value = m.tensor("x", DT.FLOAT, [2, 2])
+    axes = m.tensor("axes", DT.INT64, [1])
+    out = m.tensor("out", DT.FLOAT, [2])
+    nodes = []
+    reduce_axes = axes
+    if intermediate:
+        reduce_axes = m.tensor("reduce_axes", DT.INT64, [1])
+        nodes.append(ir.node("Identity", [axes], outputs=[reduce_axes]))
+    nodes.append(ir.node(op, [x_value, reduce_axes], attributes={"keepdims": 0}, outputs=[out]))
+    graph = ir.Graph(
+        [x_value, axes], [out], nodes=nodes,
+        name="live_reduction_axes", opset_imports={"": 23},
+    )
+    model = ir.to_proto(ir.Model(graph, ir_version=11)).SerializeToString()
+    options = ort.SessionOptions()
+    options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+    options.add_session_config_entry("session.disable_cpu_ep_fallback", "1")
+    session = ort.InferenceSession(model, options, providers=["MLXExecutionProvider"])
+    x = np.array([[1, 2], [4, 8]], np.float32)
+    for axis in [0, 1, -1, 0]:
+        feeds = {"x": x, "axes": np.array([axis], np.int64)}
+        actual = session.run(None, feeds)[0]
+        np.testing.assert_allclose(actual, m.run_cpu(model, feeds)[0], rtol=1e-5, atol=1e-6)
+
+
+def test_reduction_initializer_cache():
+    x = m.tensor("x", DT.FLOAT, [2, 2])
+    axes = _initializer("axes", np.array([1], np.int64))
+    out = m.tensor("out", DT.FLOAT, [2])
+    node = ir.node("ReduceSum", [x, axes], attributes={"keepdims": 0}, outputs=[out])
+    graph = ir.Graph(
+        [x], [out], nodes=[node], initializers=[axes],
+        name="constant_reduction_axes", opset_imports={"": 23},
+    )
+    model = ir.to_proto(ir.Model(graph, ir_version=11)).SerializeToString()
+    session = m._session(model, m.EP_PROVIDERS)
+    for offset in [0, 5, -2]:
+        data = np.arange(4, dtype=np.float32).reshape(2, 2) + offset
+        np.testing.assert_array_equal(session.run(None, {"x": data})[0], data.sum(axis=1))
+
+
+def test_reduction_axes_compile_routing(tmp_path):
+    trace = tmp_path / "reduction_axes.json"
+    subprocess.run(
+        [
+            sys.executable, "-m", "pytest", Path(__file__).name,
+            "-k", "(test_reduction_live_axes and compiled-enabled and ReduceSum and not ReduceSumSquare) or test_reduction_initializer_cache",
+            "-q", "-p", "no:cacheprovider",
+        ],
+        cwd=Path(__file__).parent,
+        env={
+            **os.environ,
+            "ONNXRUNTIME_EP_MLX_TRACE": str(trace),
+            "ONNXRUNTIME_EP_MLX_NO_COMPILE": "0",
+            "ONNXRUNTIME_EP_MLX_NO_GENERAL_COMPILE": "0",
+        },
+        check=True,
+        timeout=120,
+    )
+    events = [
+        e["args"] for e in json.loads(trace.read_text())
+        if e.get("cat") == "ep.path" and "ReduceSum" in e["args"].get("ops", "").split(",")
+    ]
+    assert [e["path"] for e in events] == ["eager"] * 8 + ["general"] * 3
+    assert [e["cache"] for e in events] == ["n/a"] * 8 + ["MISS", "HIT", "HIT"]
+
+
+@pytest.mark.parametrize("op", _REDUCE_OPS)
+@pytest.mark.parametrize("keepdims", [0, 1])
+@pytest.mark.parametrize("eager", [False, True], ids=["compiled", "eager"])
+def test_reduction_scalar_claim(op, keepdims, eager, monkeypatch):
+    monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_COMPILE", "1" if eager else "0")
+    model = m.make_model(
+        op, [m.tensor("x", DT.FLOAT, [])], [m.tensor("out", DT.FLOAT, [])],
+        attributes={"keepdims": keepdims},
+    )
+    feeds = {"x": np.array(2, np.float32)}
+    m.assert_mlx_claims(model, feeds)
+    m.assert_matches_cpu(model, feeds)
+
+
+@pytest.mark.parametrize("op", ["ReduceMax", "ReduceMin"])
+@pytest.mark.parametrize(
+    "dtype,np_dtype",
+    [
+        (DT.FLOAT16, np.float16), (DT.FLOAT, np.float32), (DT.DOUBLE, np.float64),
+        (DT.INT32, np.int32), (DT.INT64, np.int64),
+        (DT.UINT32, np.uint32), (DT.UINT64, np.uint64), (DT.BOOL, np.bool_),
+    ],
+)
+@pytest.mark.parametrize("keepdims", [0, 1])
+def test_empty_reduction_identity(op, dtype, np_dtype, keepdims):
+    shape = [2, 1, 3] if keepdims else [2, 3]
+    model = m.make_model(
+        op,
+        [m.tensor("x", dtype, [2, 0, 3]), m.tensor("axes", DT.INT64, [1])],
+        [m.tensor("out", dtype, shape)],
+        attributes={"keepdims": keepdims},
+    )
+    feeds = {"x": np.empty((2, 0, 3), np_dtype), "axes": np.array([1], np.int64)}
+    m.assert_mlx_claims(model, feeds)
+    if dtype == DT.BOOL:
+        identity = op == "ReduceMin"
+    elif np.issubdtype(np_dtype, np.integer):
+        limits = np.iinfo(np_dtype)
+        identity = limits.min if op == "ReduceMax" else limits.max
+    else:
+        identity = -np.inf if op == "ReduceMax" else np.inf
+    actual = m.run_mlx(model, feeds)[0]
+    np.testing.assert_array_equal(actual, np.full(shape, identity, np_dtype))
+
+
 def _initializer(name: str, value: np.ndarray) -> ir.Value:
     tensor = ir.tensor(value, name=name)
     return ir.Value(
