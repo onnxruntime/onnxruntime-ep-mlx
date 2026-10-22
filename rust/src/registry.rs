@@ -1551,8 +1551,18 @@ pub fn is_mlx_cpu_float(t: ort::ONNXTensorElementDataType) -> bool {
 /// Drives two things: the cluster-boundary rule in GetCapability (an fp64 node never merges with a
 /// non-fp64 node) and the CPU-stream selection for the resulting plan.
 pub fn node_uses_float64(node: &NodeView) -> bool {
-    (0..node.num_inputs()).any(|i| node.input_info(i).is_some_and(|s| is_float64(s.dtype)))
+    uses_float64_statistics(
+        &node.domain(),
+        &node.op_type(),
+        node.int_attr("stash_type", 1),
+    ) || (0..node.num_inputs()).any(|i| node.input_info(i).is_some_and(|s| is_float64(s.dtype)))
         || (0..node.num_outputs()).any(|i| node.output_info(i).is_some_and(|s| is_float64(s.dtype)))
+}
+
+pub(crate) fn uses_float64_statistics(domain: &str, op_type: &str, stash_type: i64) -> bool {
+    domain.is_empty()
+        && matches!(op_type, "RMSNormalization" | "LayerNormalization")
+        && stash_type == 11
 }
 
 pub fn is_signed_integer(t: ort::ONNXTensorElementDataType) -> bool {

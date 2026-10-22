@@ -138,7 +138,9 @@ pub(crate) unsafe fn get_capability(
             .collect();
         let float64: Vec<bool> = node_order
             .iter()
-            .map(|&node| snapshot_node_uses_float64(&snapshot, node))
+            .map(|&node| {
+                crate::registry::node_uses_float64(&NodeView::new(ort_api, raw_nodes_by_id[&node]))
+            })
             .collect();
         let attention_anchors = node_order
             .iter()
@@ -295,21 +297,6 @@ fn is_decoder_attention_anchor(node: &NodeMetadata) -> bool {
                 "GroupQueryAttention" | "MultiHeadAttention"
             ))
             || (node.domain.is_empty() && node.op_type == "Attention"))
-}
-
-fn snapshot_node_uses_float64(snapshot: &OrtGraphSnapshot, node: onnx_runtime_ir::NodeId) -> bool {
-    snapshot.nodes[&node]
-        .input_slots
-        .iter()
-        .chain(snapshot.nodes[&node].output_slots.iter())
-        .flatten()
-        .any(|value| {
-            snapshot.values[value]
-                .tensor
-                .as_ref()
-                .and_then(|tensor| tensor.dtype)
-                == Some(onnx_runtime_ir::DataType::Float64)
-        })
 }
 
 unsafe fn ep_fail_status(api: &ort::OrtApi, message: impl AsRef<str>) -> *mut ort::OrtStatus {

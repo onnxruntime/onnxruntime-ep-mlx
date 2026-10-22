@@ -414,6 +414,20 @@ mod tests {
     }
 
     #[test]
+    fn float64_statistics_require_cpu_without_float64_tensor_slots() {
+        for op in ["RMSNormalization", "LayerNormalization"] {
+            let mut node = node_with_output(
+                ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
+            );
+            node.op_type = op.to_string();
+            node.ints.insert("stash_type".to_string(), 11);
+            let plan = Plan::new(vec![node]);
+            assert!(plan.requires_cpu_stream);
+            assert!(!plan.dedicated_decode_stream);
+        }
+    }
+
+    #[test]
     fn stream_selection_preserves_float64_plan_lifetime_policy() {
         let cpu_plan = Plan::new(vec![node_with_output(
             ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_DOUBLE,
