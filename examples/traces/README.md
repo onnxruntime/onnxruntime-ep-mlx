@@ -9,7 +9,52 @@ model through the EP (the tracer is env-gated and off by default, near-zero cost
 when off). Events are stamped with the real process id, so an EP trace merges
 into onnx-genai's own timeline under the same process.
 
+## Record a trace
+
+Set the output path before starting your program. The JSON trace is written
+when the inference session is torn down:
+
+```sh
+ONNXRUNTIME_EP_MLX_TRACE=/tmp/mlx_trace.json python your_script.py
+```
+
+The trace shows fused subgraphs, compilation and copy phases, graph-build
+operations, and GPU memory/utilisation counters where available. `mlx.eval`
+measures CPU wall time around synchronous evaluation: it is GPU-inclusive
+subgraph time, **not per-kernel GPU timing**. Build-time op spans are not
+individual GPU kernel timings either.
+
+For diagnostics without a JSON trace:
+
+| Environment variable | Effect |
+|---|---|
+| `ONNXRUNTIME_EP_MLX_VERBOSE=1` | Print an end-of-run session summary to stderr. |
+| `ONNXRUNTIME_EP_MLX_CLAIM_DEBUG=1` | Print unclaimed nodes and reasons for fallback. |
+| `ONNXRUNTIME_EP_MLX_SIGNPOST=1` | Emit `os_signpost` intervals for Instruments correlation. |
+| `ONNXRUNTIME_EP_MLX_NO_STABLE_CROSS_CACHE=1` | Disable per-generation reuse of immutable MHA cross-attention K/V inputs for performance A/B. |
+
+### Per-kernel GPU detail in Xcode
+
+MLX owns the Metal command buffers inside `mlx_eval`. Capture a boundary eval
+to inspect its kernels in Xcode:
+
+```sh
+MTL_CAPTURE_ENABLED=1 \
+ONNXRUNTIME_EP_MLX_GPU_CAPTURE=/tmp/mlx.gputrace \
+ONNXRUNTIME_EP_MLX_GPU_CAPTURE_EVAL=5 \
+python your_script.py
+```
+
+Set `MTL_CAPTURE_ENABLED=1` before process start. The eval selector is zero-based
+and defaults to 0; choose a steady-state decode eval rather than prefill/warmup.
+Open the resulting `.gputrace` bundle in Xcode. The
+[Metal tracing design](../../docs/METAL_TRACING.md) contains architectural
+background and proposals, not a list of features all available through mlx-c.
+
 ## The traces
+
+These checked-in captures describe the builds and models used when recorded,
+not guaranteed coverage or speed for current releases.
 
 | File | What it is | What to look for |
 |------|-----------|------------------|
@@ -115,4 +160,3 @@ DYLD_LIBRARY_PATH=$ORT_LIB ONNX_GENAI_EP=metal \
   timing:  compile=370us (x22), copy=18us (x22), eval=37472us (x22)
 [rust-mlx-ep] ===================================
 ```
-

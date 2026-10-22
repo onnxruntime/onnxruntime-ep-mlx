@@ -4,13 +4,27 @@ The EP is MLX-native and written in Rust (`rust/`): an ONNX fused decoder subgra
 an MLX graph, with MLX as the sole compute path. The suites are **Python** (pytest); there is no
 longer any C++/CTest build.
 
-Build the EP first (see the repo `README.md`):
+Build the EP and configure its dependencies first (see [building](../docs/BUILDING.md)).
+Run these commands from the repository root:
 
 ```bash
-cd rust
-ORT_INCLUDE_DIR=<ort-include-dir> cargo build --release   # or set ORT_HOME=<ort-release-root>
+ORT_INCLUDE_DIR=<ort-include-dir> cargo build --manifest-path rust/Cargo.toml --release
 # => rust/target/release/libonnxruntime_mlx_ep.dylib
 ```
+
+Install the Python test dependencies used by CI:
+
+```sh
+python -m pip install "onnxruntime==1.31.0" "onnx==1.23.2" numpy onnx_ir pytest
+export ONNXRUNTIME_MLX_EP_LIB="$PWD/rust/target/release/libonnxruntime_mlx_ep.dylib"
+export DYLD_LIBRARY_PATH="$ORT_HOME/lib"
+cargo test --manifest-path rust/Cargo.toml --release --lib
+python -m pytest tests/ops -q
+python -m pytest tests/backend -q
+```
+
+Set `ORT_HOME` to the release root from the build guide, or point
+`DYLD_LIBRARY_PATH` at the corresponding ORT `lib/` directory.
 
 ## `tests/ops` — op-correctness (pytest)
 
@@ -71,6 +85,35 @@ distance from each other. Shape, dtype and finiteness are checked separately. Ne
 three-ULP drift, wrong masks/zero outputs, NaNs, wrong shapes/types, and forward-error violations
 even when fixture agreement is exact. The public runner's slightly wider relative bound alone is
 not the acceptance criterion.
+
+## `tests/backend` — official ONNX fixtures
+
+The public ONNX `BackendTest` runner loads node, simple, and PyTorch
+operator/converted cases. CI pins ONNX 1.23.2. Node models and input/expected
+datasets are obtained in memory via `load_model_tests(kind="node")`; packaged
+node fixture directories and the generate-data CLI are not needed. Collection
+fails if any intended category is empty.
+
+Models run unchanged with their original datasets and tolerances, except for
+the case-specific FP16 Attention comparisons described above. Explicit runtime
+IR/domain-opset limit rejections become version-reasoned skips. Attention-25
+window attributes added in ONNX 1.23 are skipped only when ORT rejects that exact
+official attribute on the matching valid model node; other invalid-graph errors
+fail.
+
+BF16 tensor inputs/outputs skip only when independent public ORT CPU probes
+demonstrate the required NumPy input/output conversion is unavailable. These
+Shape/Constant probes use no casts, preserve dtype/values when supported, and
+are cached per process. They do not rewrite real models or suppress
+internal-BF16-only models, malformed graphs, or unrelated runtime failures.
+Kernel errors and output mismatches still fail, with CPU fallback available
+for ops MLX does not claim.
+
+The loader/adapter regressions can run without Metal:
+
+```sh
+python -m pytest tests/backend/test_backend_adapter.py -q
+```
 
 ## `tests/conformance` — ONNX-standard fuzz-conformance (opt-in)
 
