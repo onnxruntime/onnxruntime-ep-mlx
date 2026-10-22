@@ -81,6 +81,7 @@ def _paged_ref(
     k_norm=None,
     norm_eps=1e-6,
     return_cache=False,
+    is_causal=True,
 ):
     batch = len(cum) - 1
     scale = 1.0 / math.sqrt(d)
@@ -128,7 +129,8 @@ def _paged_ref(
         scores = np.einsum("hqd,hkd->hqk", qh, kh) * scale
         col = np.arange(total)[None, :]
         row = (pastb + np.arange(nq))[:, None]
-        scores = np.where((col > row)[None], -np.inf, scores)
+        if is_causal:
+            scores = np.where((col > row)[None], -np.inf, scores)
         if head_sink is None:
             scores -= scores.max(-1, keepdims=True)
             e = np.exp(scores)

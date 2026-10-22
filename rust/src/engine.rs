@@ -52,6 +52,17 @@ pub struct TensorRef {
 }
 
 impl TensorRef {
+    pub(crate) fn cache_key(&self) -> String {
+        if self.source == Src::Initializer
+            && let Some(init) = &self.init
+            && init.owned.is_some()
+        {
+            format!("{}\0{:p}", self.name, init.data)
+        } else {
+            self.name.clone()
+        }
+    }
+
     pub fn absent() -> Self {
         TensorRef {
             name: String::new(),
@@ -1016,11 +1027,7 @@ impl<'a> TranslationContext<'a> {
                 // Body-local initializers may legally shadow an outer/other-branch name. Qualify
                 // copied body constants by their stable owned allocation so branch specialization
                 // cannot reuse a same-named constant from another scope.
-                let cache_key = if init.owned.is_some() {
-                    format!("{}\0{:p}", r.name, init.data)
-                } else {
-                    r.name.clone()
-                };
+                let cache_key = r.cache_key();
                 if let Some(a) = self.plan.cache.get(&cache_key) {
                     return Ok(a.as_raw());
                 }
@@ -2254,6 +2261,27 @@ pub(crate) fn copy_out_raw_delta(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn owned_initializer_cache_keys_preserve_storage_identity() {
+        let mut first = ctx_input("cos", 0);
+        let data = std::sync::Arc::new(vec![0u8; 4]);
+        first.source = Src::Initializer;
+        first.init = Some(InitData {
+            data: data.as_ptr().cast(),
+            shape: vec![1],
+            dtype: ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
+            count: 1,
+            owned: Some(data),
+        });
+        assert_eq!(first.cache_key(), first.clone().cache_key());
+        assert_ne!(first.cache_key(), ctx_input("cos", 0).cache_key());
+        let mut second = first.clone();
+        let data = std::sync::Arc::new(vec![0u8; 4]);
+        second.init.as_mut().unwrap().data = data.as_ptr().cast();
+        second.init.as_mut().unwrap().owned = Some(data);
+        assert_ne!(first.cache_key(), second.cache_key());
+    }
 
     fn input(name: &str) -> TensorRef {
         TensorRef {
