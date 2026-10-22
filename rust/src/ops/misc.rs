@@ -1,5 +1,5 @@
 //! Misc op handlers: Constant (scalar/list value forms), TfIdfVectorizer, OneHot, Trilu, Scatter
-//! (opset 9/10), Det, NonZero, Unique, OptionalHasElement/GetElement and the loss ops
+//! (opset 9/10), Det, NonZero, Unique, sequence consumers, OptionalHasElement/GetElement and the loss ops
 //! (NegativeLogLikelihoodLoss / SoftmaxCrossEntropyLoss). Faithful port of the C++ `ops/misc2.cc`
 //! (plus OneHot/Trilu from `math.cc` and Constant from `shape.cc`). Host-computed ops (Det /
 //! NonZero / Unique) materialise their input, compute on the host, and wrap the result back as a
@@ -12,9 +12,10 @@ use std::hash::Hash;
 use std::os::raw::c_void;
 
 use crate::engine::{MlxError, NodeDesc, Src, TensorRef, TranslationContext};
+use crate::mlx::VectorArray;
 use crate::registry::{
     ClaimPredicate, ClaimResult, K_ANY_OPSET, NodeView, OpHandler, OpRegistration, OpRegistry,
-    SlotInfo, ValueKind, is_mlx_float, is_mlx_supported, is_signed_integer,
+    SlotInfo, ValueKind, is_mlx_float, is_mlx_supported, is_movable, is_signed_integer,
 };
 use crate::sys::mlx;
 use crate::sys::ort;
@@ -1072,6 +1073,146 @@ fn optional_get_element_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result
     Ok(())
 }
 
+fn sequence_length_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
+    let count = i64::try_from(ctx.sequence_len(&n.inputs[0])?)
+        .map_err(|_| "MLX SequenceLength: count exceeds int64".to_string())?;
+    let result = ctx.scalar_i64(count);
+    ctx.bind(&n.outputs[0], result);
+    Ok(())
+}
+
+fn sequence_at_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
+    let count = i64::try_from(ctx.sequence_len(&n.inputs[0])?)
+        .map_err(|_| "MLX SequenceAt: count exceeds int64".to_string())?;
+    let position = ctx.resolve(&n.inputs[1])?;
+    if ctx.ndim(position) != 0 {
+        return Err("MLX SequenceAt: position must be a scalar".into());
+    }
+    let position = ctx.read_scalar_i64(position)?;
+    let index = if position < 0 {
+        position + count
+    } else {
+        position
+    };
+    if index < 0 || index >= count {
+        return Err(format!(
+            "MLX SequenceAt: position {position} is out of range for {count} tensors"
+        ));
+    }
+    let result = ctx.sequence_element(&n.inputs[0], index as usize, n.outputs[0].otype)?;
+    ctx.bind(&n.outputs[0], result);
+    Ok(())
+}
+
+fn concat_from_sequence_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
+    let count = ctx.sequence_len(&n.inputs[0])?;
+    if count == 0 {
+        return Err("MLX ConcatFromSequence: input sequence must not be empty".into());
+    }
+    let new_axis = n.ints.get("new_axis").copied().unwrap_or(0);
+    if !matches!(new_axis, 0 | 1) {
+        return Err("MLX ConcatFromSequence: new_axis must be 0 or 1".into());
+    }
+    let axis = *n
+        .ints
+        .get("axis")
+        .ok_or_else(|| "MLX ConcatFromSequence: axis is required".to_string())?;
+    let first = ctx.sequence_element(&n.inputs[0], 0, n.outputs[0].otype)?;
+    let first_shape = ctx.shape_of(first);
+    let rank = first_shape.len() as i64 + new_axis;
+    if axis < -rank || axis >= rank {
+        return Err(format!(
+            "MLX ConcatFromSequence: axis {axis} is invalid for rank {rank}"
+        ));
+    }
+    let axis = if axis < 0 { axis + rank } else { axis } as usize;
+    if new_axis == 1 {
+        crate::engine::dim_i32(
+            i64::try_from(count)
+                .map_err(|_| "MLX ConcatFromSequence: sequence is too long".to_string())?,
+        )?;
+    }
+    let mut arrays = VectorArray::new();
+    let mut extent = 0i64;
+    for index in 0..count {
+        let array = if index == 0 {
+            first
+        } else {
+            ctx.sequence_element(&n.inputs[0], index, n.outputs[0].otype)?
+        };
+        let mut shape = ctx.shape_of(array);
+        if shape.len() != first_shape.len()
+            || shape
+                .iter()
+                .zip(&first_shape)
+                .enumerate()
+                .any(|(i, (a, b))| a != b && (new_axis == 1 || i != axis))
+        {
+            return Err("MLX ConcatFromSequence: incompatible element shapes".into());
+        }
+        let array = if new_axis == 1 {
+            shape.insert(axis, 1);
+            ctx.reshape(array, &shape)?
+        } else {
+            extent = extent
+                .checked_add(i64::from(shape[axis]))
+                .ok_or_else(|| "MLX ConcatFromSequence: axis extent overflow".to_string())?;
+            crate::engine::dim_i32(extent)?;
+            array
+        };
+        arrays.append(array);
+    }
+    let result = ctx.emit(|res, stream| unsafe {
+        mlx::mlx_concatenate_axis(res, arrays.as_raw(), axis as i32, stream)
+    })?;
+    ctx.bind(&n.outputs[0], result);
+    Ok(())
+}
+
+fn sequence_claim(node: &NodeView) -> ClaimResult {
+    let op = node.op_type();
+    let inputs = if op == "SequenceAt" { 2 } else { 1 };
+    require!(
+        node.num_inputs() == inputs && node.num_outputs() == 1,
+        "sequence operator has invalid input/output arity"
+    );
+    let element = match node.input_kind(0) {
+        Some(ValueKind::Sequence(inner)) => match *inner {
+            ValueKind::Tensor(info) => info,
+            _ => deny!("only sequences of tensors are supported"),
+        },
+        _ => deny!("input must be a tensor sequence"),
+    };
+    let output = node
+        .output_info(0)
+        .ok_or_else(|| "output must be a tensor".to_string())?;
+    if op == "SequenceLength" {
+        require!(output.dtype == T_INT64, "length output must be int64");
+    } else {
+        require!(
+            is_movable(element.dtype) && element.dtype == output.dtype,
+            "sequence elements and output must share an MLX-supported dtype"
+        );
+    }
+    if op == "SequenceAt" {
+        let position = node
+            .input_info(1)
+            .ok_or_else(|| "position must be an integer tensor".to_string())?;
+        require!(
+            is_int_index(position.dtype),
+            "position must be int32 or int64"
+        );
+        require!(position.shape.is_empty(), "position must be a scalar");
+    } else if op == "ConcatFromSequence" {
+        require!(
+            matches!(node.int_attr("new_axis", 0), 0 | 1),
+            "new_axis must be 0 or 1"
+        );
+        require!(node.has_attr("axis"), "axis is required");
+    }
+    Ok(())
+}
+
 fn optional_get_element_claim(node: &NodeView) -> ClaimResult {
     require!(
         node.num_inputs() == 1 && node.num_outputs() == 1 && node.input_present(0),
@@ -1325,6 +1466,33 @@ fn eager(
 }
 
 pub fn register(registry: &mut OpRegistry) {
+    eager(
+        registry,
+        "SequenceLength",
+        11,
+        K_ANY_OPSET,
+        sequence_length_op,
+        sequence_claim,
+        "conservatively reads live sequence metadata from the ORT kernel context",
+    );
+    eager(
+        registry,
+        "SequenceAt",
+        11,
+        K_ANY_OPSET,
+        sequence_at_op,
+        sequence_claim,
+        "conservatively copies live sequence elements from the ORT kernel context",
+    );
+    eager(
+        registry,
+        "ConcatFromSequence",
+        11,
+        K_ANY_OPSET,
+        concat_from_sequence_op,
+        sequence_claim,
+        "conservatively copies live sequence elements from the ORT kernel context",
+    );
     shapeless(
         registry,
         "Constant",

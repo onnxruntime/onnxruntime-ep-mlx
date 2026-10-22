@@ -127,9 +127,23 @@ cannot materialize their results:
 
 | Category | Ops |
 |---|---|
-| Sequence type (opaque list-of-tensors) | ConcatFromSequence, SequenceAt/Construct/Empty/Erase/Insert/Length/Map, SplitToSequence |
+| Sequence-valued outputs | SequenceConstruct/Empty/Erase/Insert/Map, SplitToSequence |
 | String tensors | RegexFullMatch, StringConcat, StringNormalizer, StringSplit |
 | Optional value | Optional |
+
+Sequence **inputs** are supported by `SequenceLength`, `SequenceAt`, and
+`ConcatFromSequence` from opset 11 onward. These handlers execute eagerly and
+re-read the live ORT sequence on every invocation. Element copies own their MLX
+storage before temporary ORT values are released. `SequenceLength` reads only the
+container count, including string-tensor sequences, and returns a scalar int64.
+`SequenceAt` accepts scalar int32/int64 positions, including negative indices.
+Element access is bounded by ORT's signed 32-bit `GetValue` index API.
+`ConcatFromSequence` supports concatenation or stacking (`new_axis=0/1`), negative
+axes, and empty tensor dimensions; empty sequences, incompatible shapes, and
+invalid indices/axes report errors. Payload outputs support the native movable
+numeric/Boolean types, including precise float64 on MLX CPU, but not strings or
+complex tensors. Sequence-producing nodes remain on CPU; their tensor-sequence
+outputs can feed these MLX consumers across the ORT boundary.
 
 Metal has no float64 kernels; supported float64 forms run through MLX CPU, while
 other forms fall back to ORT CPU. Empty/dynamic support is per-handler, not a
@@ -150,7 +164,7 @@ The **core Rust modules** register:
 | `quant.rs` | MatMulNBits, GatherBlockQuantized, Quantize/Dequantize/DynamicQuantize, MatMulInteger, ConvInteger, QLinearMatMul, QLinearConv |
 | `ssm.rs` | TensorScatter (opset 24), CausalConvWithState, LinearAttention (linear/gated/delta/gated_delta, GQA) |
 | `selective_scan.rs` | Mamba-1 selective scan: recognises the `Scan` body and replaces the per-timestep unroll with one custom Metal kernel (state kept in registers) |
-| `misc.rs` / `image.rs` | Constants, losses, NonZero/Unique/Det, numeric TF-IDF, and image decoding |
+| `misc.rs` / `image.rs` | Constants, losses, NonZero/Unique/Det, sequence-to-tensor consumers, numeric TF-IDF, and image decoding |
 | `random.rs` / `signal.rs` / `recurrent.rs` / `vision.rs` / `controlflow.rs` | Random, signal/FFT/window, RNN/GRU/LSTM, vision/detection, and recursive control-flow translations |
 
 Reductions accept scalar inputs. `ReduceMax` and `ReduceMin` also claim Boolean
