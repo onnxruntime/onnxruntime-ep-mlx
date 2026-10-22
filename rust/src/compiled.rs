@@ -122,6 +122,7 @@ fn host_parameter_indices(n: &NodeDesc) -> &'static [usize] {
         "HannWindow" | "HammingWindow" | "BlackmanWindow" => &[0],
         "MelWeightMatrix" => &[0, 1, 2, 3, 4],
         "MaxUnpool" => &[1, 2],
+        "Col2Im" => &[1, 2],
         "CumSum" | "CumProd" => &[1],
         "RNN" | "GRU" | "LSTM" => &[4],
         "TopK" => &[1],
@@ -1584,6 +1585,33 @@ mod shape_inference_tests {
             input("x", Src::CtxInput),
             input("indices", Src::Initializer),
             input("shape", Src::Initializer),
+        ];
+        assert!(!reads_unguarded_parameter(&node, true));
+        for index in [1, 2] {
+            for source in [Src::CtxInput, Src::Intermediate] {
+                node.inputs[index].source = source;
+                assert!(reads_unguarded_parameter(&node, true));
+                assert!(reads_data_dependent_parameter(&node));
+            }
+
+            node.inputs[index].source = Src::Initializer;
+        }
+    }
+
+    #[test]
+    fn col2im_host_geometry_requires_constant_controls() {
+        let mut node = NodeDesc::new(
+            "Col2Im".to_string(),
+            String::new(),
+            18,
+            CompileShapeSafety::ShapeKeyedOnly {
+                reason: "host-read image and block shapes",
+            },
+        );
+        node.inputs = vec![
+            input("x", Src::CtxInput),
+            input("image", Src::Initializer),
+            input("block", Src::Initializer),
         ];
         assert!(!reads_unguarded_parameter(&node, true));
         for index in [1, 2] {

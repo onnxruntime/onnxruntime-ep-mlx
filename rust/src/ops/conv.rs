@@ -6,7 +6,7 @@
 //! path expect NHWC (channels-last). Every handler therefore transposes the input to channels-last
 //! (`to_channels_last`), runs the MLX op, and transposes the result back (`from_channels_last`);
 //! conv weights are repacked from ONNX `[O, I/g, k...]` to MLX `[O, k..., I/g]`. Conv and
-//! ConvTranspose support 1-3 spatial dimensions (MLX restricts groups to 1D/2D). Transpose
+//! ConvTranspose support 1-3 spatial dimensions (3D groups compose group-1 kernels). Transpose
 //! convolution uses an uncropped convolution followed by output cropping, supporting asymmetric
 //! pads without slicing the undilated input. Window pooling uses dilated strided views for
 //! 1-3 spatial dimensions, including ceil-mode tails and original-coordinate MaxPool indices.
@@ -96,6 +96,78 @@ fn present(n: &NodeDesc, i: usize) -> bool {
     i < n.inputs.len() && n.inputs[i].source != Src::Absent
 }
 
+#[allow(clippy::too_many_arguments)]
+fn conv_general(
+    ctx: &mut TranslationContext,
+    x: mlx::mlx_array,
+    weight: mlx::mlx_array,
+    strides: &[i32],
+    low: &[i32],
+    high: &[i32],
+    kernel_dilation: &[i32],
+    input_dilation: &[i32],
+    group: i32,
+    flip: bool,
+) -> Result<mlx::mlx_array, MlxError> {
+    if strides.len() == 3 && group > 1 {
+        let xs = ctx.shape_of(x);
+        let ws = ctx.shape_of(weight);
+        let mut output = None;
+        for g in 0..group {
+            let mut begin = vec![0; xs.len()];
+            let mut end = xs.clone();
+            begin[4] = g * (xs[4] / group);
+            end[4] = (g + 1) * (xs[4] / group);
+            let input = ctx.slice(x, &begin, &end)?;
+            let input = ctx.contiguous(input)?;
+            begin.fill(0);
+            end = ws.clone();
+            begin[0] = g * (ws[0] / group);
+            end[0] = (g + 1) * (ws[0] / group);
+            let w = ctx.slice(weight, &begin, &end)?;
+            let w = ctx.contiguous(w)?;
+            let part = conv_general(
+                ctx,
+                input,
+                w,
+                strides,
+                low,
+                high,
+                kernel_dilation,
+                input_dilation,
+                1,
+                flip,
+            )?;
+            output = Some(match output {
+                Some(previous) => ctx.concat2(previous, part, 4)?,
+                None => part,
+            });
+        }
+        return output.ok_or_else(|| "Conv: group must be positive".into());
+    }
+    let rank = strides.len();
+    ctx.emit(|res, s| unsafe {
+        mlx::mlx_conv_general(
+            res,
+            x,
+            weight,
+            strides.as_ptr(),
+            rank,
+            low.as_ptr(),
+            rank,
+            high.as_ptr(),
+            rank,
+            kernel_dilation.as_ptr(),
+            rank,
+            input_dilation.as_ptr(),
+            rank,
+            group,
+            flip,
+            s,
+        )
+    })
+}
+
 // ---- Conv ---------------------------------------------------------------------------------------
 
 fn conv_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
@@ -167,26 +239,9 @@ fn conv_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
         let pad_hi: Vec<i32> = (0..sr).map(|i| pads[i + sr] as i32).collect();
         let dil_i: Vec<i32> = dilations.iter().map(|&v| v as i32).collect();
         let input_dil: Vec<i32> = vec![1; sr];
-        ctx.emit(|res, s| unsafe {
-            mlx::mlx_conv_general(
-                res,
-                x,
-                weight,
-                stride_i.as_ptr(),
-                stride_i.len(),
-                pad_lo.as_ptr(),
-                pad_lo.len(),
-                pad_hi.as_ptr(),
-                pad_hi.len(),
-                dil_i.as_ptr(),
-                dil_i.len(),
-                input_dil.as_ptr(),
-                input_dil.len(),
-                group,
-                false,
-                s,
-            )
-        })?
+        conv_general(
+            ctx, x, weight, &stride_i, &pad_lo, &pad_hi, &dil_i, &input_dil, group, false,
+        )?
     };
 
     if present(n, 2) {
@@ -199,6 +254,111 @@ fn conv_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
 }
 
 // ---- DeformConv (2D) ---------------------------------------------------------------------------
+
+#[allow(clippy::too_many_arguments)]
+fn deform_geometry(
+    x: &[i64],
+    w: &[i64],
+    strides: &[i64],
+    dilations: &[i64],
+    pads: &[i64],
+    group: i64,
+    offset_group: i64,
+) -> Result<(Vec<i64>, Vec<i64>), MlxError> {
+    if x.len() != 4
+        || w.len() != 4
+        || strides.len() != 2
+        || dilations.len() != 2
+        || pads.len() != 4
+        || strides
+            .iter()
+            .chain(dilations)
+            .any(|&v| v <= 0 || v > i32::MAX as i64)
+        || pads.iter().any(|&v| v < 0 || v > i32::MAX as i64)
+        || x.iter().chain(w).any(|&v| v > i32::MAX as i64)
+        || x[1..].contains(&0)
+        || w.contains(&0)
+        || group <= 0
+        || group > i32::MAX as i64
+        || offset_group <= 0
+        || offset_group > i32::MAX as i64
+    {
+        return Err("DeformConv: invalid rank, dimensions, group or offset_group".into());
+    }
+    if (x[1] > 0 && (x[1] % group != 0 || x[1] % offset_group != 0))
+        || (w[0] > 0 && w[0] % group != 0)
+        || (x[1] > 0 && w[1] > 0 && x[1] / group != w[1])
+    {
+        return Err("DeformConv: inconsistent input/weight channels, group or offset_group".into());
+    }
+    let kernel_size = if w[2..].iter().all(|&v| v > 0) {
+        w[2].checked_mul(w[3])
+            .ok_or("DeformConv: kernel size overflow")?
+    } else {
+        -1
+    };
+    let offset_channels = if kernel_size > 0 {
+        kernel_size
+            .checked_mul(offset_group)
+            .and_then(|v| v.checked_mul(2))
+            .filter(|&v| v <= i32::MAX as i64)
+            .ok_or("DeformConv: offset channels exceed int32")?
+    } else {
+        -1
+    };
+    let mut output = vec![x[0], w[0]];
+    for i in 0..2 {
+        let extent = if x[i + 2] > 0 && w[i + 2] > 0 {
+            let effective = dilations[i] * (w[i + 2] - 1) + 1;
+            let padded = x[i + 2] + pads[i] + pads[i + 2];
+            if padded < effective {
+                return Err("DeformConv: padded input is smaller than effective kernel".into());
+            }
+            let extent = (padded - effective) / strides[i] + 1;
+            if extent > i32::MAX as i64 {
+                return Err("DeformConv: output extent exceeds int32".into());
+            }
+            extent
+        } else {
+            -1
+        };
+        output.push(extent);
+    }
+    let offset = vec![x[0], offset_channels, output[2], output[3]];
+    // Gather indices and flattened matmul/column dimensions are signed int32.
+    for shape in [
+        x,
+        w,
+        &x[1..],
+        &output[2..],
+        output.as_slice(),
+        offset.as_slice(),
+    ] {
+        if shape.iter().all(|&v| v >= 0)
+            && shape
+                .iter()
+                .try_fold(1i64, |p, &v| p.checked_mul(v))
+                .is_none_or(|v| v > i32::MAX as i64)
+        {
+            return Err("DeformConv: flattened tensor size exceeds int32".into());
+        }
+    }
+    if kernel_size > 0 && x[1] > 0 {
+        let columns = [x[0], x[1], kernel_size, output[2], output[3]];
+        if columns.iter().all(|&v| v >= 0)
+            && columns
+                .iter()
+                .try_fold(1i64, |p, &v| p.checked_mul(v))
+                .is_none_or(|v| v > i32::MAX as i64)
+        {
+            return Err("DeformConv: sampled column size exceeds int32".into());
+        }
+        if x[1] / group * kernel_size > i32::MAX as i64 {
+            return Err("DeformConv: flattened kernel channels exceed int32".into());
+        }
+    }
+    Ok((output, offset))
+}
 
 fn deform_take(
     ctx: &mut TranslationContext,
@@ -224,12 +384,18 @@ fn deform_take(
     let valid_y = ctx.binary(mlx::mlx_logical_and, ge_y, le_y)?;
     let valid_x = ctx.binary(mlx::mlx_logical_and, ge_x, le_x)?;
     let valid = ctx.binary(mlx::mlx_logical_and, valid_y, valid_x)?;
-    let valid = ctx.astype(valid, dt)?;
-
-    let clipped_y = ctx.emit(|res, s| unsafe { mlx::mlx_clip(res, y, zero, max_y, s) })?;
-    let clipped_x = ctx.emit(|res, s| unsafe { mlx::mlx_clip(res, x_coord, zero, max_x, s) })?;
-    let yi = ctx.astype(clipped_y, mlx::mlx_dtype__MLX_INT32)?;
-    let xi = ctx.astype(clipped_x, mlx::mlx_dtype__MLX_INT32)?;
+    // Select safe coordinates before integer conversion, including for nonfinite live offsets.
+    let clipped_y = ctx.emit(|res, s| unsafe { mlx::mlx_where(res, valid_y, y, zero, s) })?;
+    let clipped_x = ctx.emit(|res, s| unsafe { mlx::mlx_where(res, valid_x, x_coord, zero, s) })?;
+    let yi = ctx.astype(clipped_y, mlx::mlx_dtype__MLX_INT64)?;
+    let xi = ctx.astype(clipped_x, mlx::mlx_dtype__MLX_INT64)?;
+    // A large int32 extent can round upward in fp32; clamp in integer space before narrowing.
+    let last_y = ctx.scalar_i64(i64::from(height - 1));
+    let last_x = ctx.scalar_i64(i64::from(width - 1));
+    let yi = ctx.binary(mlx::mlx_minimum, yi, last_y)?;
+    let xi = ctx.binary(mlx::mlx_minimum, xi, last_x)?;
+    let yi = ctx.astype(yi, mlx::mlx_dtype__MLX_INT32)?;
+    let xi = ctx.astype(xi, mlx::mlx_dtype__MLX_INT32)?;
     let width_scalar = ctx.scalar_i32(width);
     let row = ctx.mul(yi, width_scalar)?;
     let spatial = ctx.add(row, xi)?;
@@ -259,7 +425,7 @@ fn deform_take(
             s,
         )
     })?;
-    ctx.mul(gathered, valid)
+    ctx.emit(|res, s| unsafe { mlx::mlx_where(res, valid, gathered, zero, s) })
 }
 
 fn deform_bilinear_sample(
@@ -314,15 +480,77 @@ fn deform_conv_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxE
     let x_shape = ctx.shape_of(x);
     let w_shape = ctx.shape_of(weight);
     let offset_shape = ctx.shape_of(offset);
+    let group = n.ints.get("group").copied().unwrap_or(1);
+    let offset_group = n.ints.get("offset_group").copied().unwrap_or(1);
+    let strides = attr_or(n, "strides", 2, 1);
+    let pads = attr_or(n, "pads", 4, 0);
+    let dilations = attr_or(n, "dilations", 2, 1);
+    let (expected, expected_offset) = deform_geometry(
+        &x_shape.iter().map(|&v| i64::from(v)).collect::<Vec<_>>(),
+        &w_shape.iter().map(|&v| i64::from(v)).collect::<Vec<_>>(),
+        &strides,
+        &dilations,
+        &pads,
+        group,
+        offset_group,
+    )?;
+    if offset_shape
+        .iter()
+        .map(|&v| i64::from(v))
+        .collect::<Vec<_>>()
+        != expected_offset
+    {
+        return Err(format!(
+            "DeformConv: offset shape must be {expected_offset:?}, got {offset_shape:?}"
+        ));
+    }
+    if let Some(kernel) = n.int_arrays.get("kernel_shape")
+        && kernel.as_slice()
+            != &w_shape[2..]
+                .iter()
+                .map(|&v| i64::from(v))
+                .collect::<Vec<_>>()
+    {
+        return Err("DeformConv: kernel_shape must match W spatial dimensions".into());
+    }
+    if present(n, 3) {
+        let bias = ctx.resolve(&n.inputs[3])?;
+        if ctx.shape_of(bias) != [w_shape[0]] {
+            return Err("DeformConv: bias shape must match output channels".into());
+        }
+    }
+    if present(n, 4) {
+        let mask = ctx.resolve(&n.inputs[4])?;
+        let shape = vec![
+            expected[0],
+            expected_offset[1] / 2,
+            expected[2],
+            expected[3],
+        ];
+        if ctx
+            .shape_of(mask)
+            .iter()
+            .map(|&v| i64::from(v))
+            .collect::<Vec<_>>()
+            != shape
+        {
+            return Err(format!("DeformConv: mask shape must be {shape:?}"));
+        }
+    }
+    if x_shape[0] == 0 {
+        let shape: Vec<i32> = expected.iter().map(|&v| v as i32).collect();
+        let output = ctx.emit(|res, s| unsafe {
+            mlx::mlx_zeros(res, shape.as_ptr(), shape.len(), output_dtype, s)
+        })?;
+        ctx.bind(&n.outputs[0], output);
+        return Ok(());
+    }
     let (batch, channels, out_h, out_w) =
         (x_shape[0], x_shape[1], offset_shape[2], offset_shape[3]);
     let (out_channels, kernel_h, kernel_w) = (w_shape[0], w_shape[2], w_shape[3]);
     let kernel_size = kernel_h * kernel_w;
-    let group = n.ints.get("group").copied().unwrap_or(1) as i32;
-    let offset_group = n.ints.get("offset_group").copied().unwrap_or(1) as i32;
-    let strides = attr_or(n, "strides", 2, 1);
-    let pads = attr_or(n, "pads", 4, 0);
-    let dilations = attr_or(n, "dilations", 2, 1);
+    let group = group as i32;
+    let offset_group = offset_group as i32;
     let dt = ctx.dtype_of(x);
 
     let mut base_h = Vec::with_capacity((out_h * out_w) as usize);
@@ -524,6 +752,16 @@ fn conv_transpose_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), M
         n.int_arrays.get("output_shape").map(Vec::as_slice),
         &attr_or(n, "pads", 2 * rank, 0),
     )?;
+    for i in 0..rank {
+        let uncropped = strides[i] * (i64::from(xs[i + 2]) - 1)
+            + output_padding[i]
+            + dilations[i] * (i64::from(ws[i + 2]) - 1)
+            + 1;
+        let extent = uncropped - pads[i] - pads[i + rank];
+        if uncropped > i32::MAX as i64 || extent <= 0 || extent > i32::MAX as i64 {
+            return Err("ConvTranspose: derived output extent must be positive int32".into());
+        }
+    }
     let mut grouped_shape = vec![group, ws[0] / group, ws[1]];
     grouped_shape.extend_from_slice(&ws[2..]);
     let w = ctx.reshape(w0, &grouped_shape)?;
@@ -548,26 +786,18 @@ fn conv_transpose_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), M
     let kernel_dilation: Vec<i32> = dilations.iter().map(|&v| v as i32).collect();
     let input_dilation: Vec<i32> = strides.iter().map(|&v| v as i32).collect();
     let unit = vec![1; rank];
-    let mut out = ctx.emit(|res, s| unsafe {
-        mlx::mlx_conv_general(
-            res,
-            x,
-            weight,
-            unit.as_ptr(),
-            rank,
-            low.as_ptr(),
-            rank,
-            high.as_ptr(),
-            rank,
-            kernel_dilation.as_ptr(),
-            rank,
-            input_dilation.as_ptr(),
-            rank,
-            group,
-            true,
-            s,
-        )
-    })?;
+    let mut out = conv_general(
+        ctx,
+        x,
+        weight,
+        &unit,
+        &low,
+        &high,
+        &kernel_dilation,
+        &input_dilation,
+        group,
+        true,
+    )?;
     let mut start = vec![0; rank + 2];
     let mut stop = ctx.shape_of(out);
     for i in 0..rank {
@@ -1342,10 +1572,6 @@ fn conv_claim(node: &NodeView) -> ClaimResult {
         group > 0 && group <= i32::MAX as i64,
         "group must be positive and fit int32 (got {group})"
     );
-    require!(
-        spatial_rank != 3 || group == 1,
-        "MLX Conv3D does not support groups"
-    );
     let Some(channels) = w.shape[1].checked_mul(group) else {
         deny!("W channels times group overflows int64");
     };
@@ -1421,23 +1647,17 @@ fn deform_conv_claim(node: &NodeView) -> ClaimResult {
         crate::registry::ort_dtype_name(out.dtype)
     );
     require!(
-        static_positive_shape(&x.shape, 4),
-        "DeformConv requires static positive rank-4 NCHW X (shape {:?})",
-        x.shape
+        x.shape.len() == 4 && w.shape.len() == 4,
+        "DeformConv requires rank-4 X and W"
     );
     require!(
-        static_positive_shape(&w.shape, 4),
-        "DeformConv requires static positive rank-4 W (shape {:?})",
-        w.shape
-    );
-    require!(
-        static_positive_shape(&offset.shape, 4),
-        "DeformConv requires static positive rank-4 offset (shape {:?})",
+        offset.shape.len() == 4,
+        "DeformConv requires rank-4 offset (shape {:?})",
         offset.shape
     );
     require!(
-        static_positive_shape(&out.shape, 4),
-        "DeformConv requires static positive rank-4 output (shape {:?})",
+        out.shape.len() == 4,
+        "DeformConv requires rank-4 output (shape {:?})",
         out.shape
     );
     let kernel = match read_spatial_attribute(node, "kernel_shape", 2, 0) {
@@ -1446,7 +1666,7 @@ fn deform_conv_claim(node: &NodeView) -> ClaimResult {
         None => deny!("kernel_shape must contain 2 positive values"),
     };
     require!(
-        kernel == w.shape[2..],
+        same_known_shape(&kernel, &w.shape[2..]),
         "kernel_shape {:?} must match W spatial shape {:?}",
         kernel,
         &w.shape[2..]
@@ -1465,49 +1685,27 @@ fn deform_conv_claim(node: &NodeView) -> ClaimResult {
     };
     let group = node.int_attr("group", 1);
     let offset_group = node.int_attr("offset_group", 1);
-    require!(group > 0, "group must be positive (got {group})");
-    require!(
-        offset_group > 0,
-        "offset_group must be positive (got {offset_group})"
-    );
-    let channels = x.shape[1];
     let out_channels = w.shape[0];
+    let (expected_output, expected_offset) = match deform_geometry(
+        &x.shape,
+        &w.shape,
+        &strides,
+        &dilations,
+        &pads,
+        group,
+        offset_group,
+    ) {
+        Ok(geometry) => geometry,
+        Err(reason) => deny!("{reason}"),
+    };
     require!(
-        channels % group == 0 && out_channels % group == 0,
-        "group {group} must divide input channels {channels} and output channels {out_channels}"
-    );
-    require!(
-        w.shape[1] == channels / group,
-        "W input-channel dim must equal X channels/group (got {} vs {}/{})",
-        w.shape[1],
-        channels,
-        group
-    );
-    require!(
-        channels % offset_group == 0,
-        "offset_group {offset_group} must divide input channels {channels}"
-    );
-    let effective_h = dilations[0] * (kernel[0] - 1) + 1;
-    let effective_w = dilations[1] * (kernel[1] - 1) + 1;
-    let padded_h = x.shape[2] + pads[0] + pads[2];
-    let padded_w = x.shape[3] + pads[1] + pads[3];
-    require!(
-        padded_h >= effective_h && padded_w >= effective_w,
-        "padded input [{padded_h}, {padded_w}] is smaller than effective kernel [{effective_h}, {effective_w}]"
-    );
-    let out_h = (padded_h - effective_h) / strides[0] + 1;
-    let out_w = (padded_w - effective_w) / strides[1] + 1;
-    let kernel_size = kernel[0] * kernel[1];
-    let expected_offset = vec![x.shape[0], offset_group * kernel_size * 2, out_h, out_w];
-    require!(
-        offset.shape == expected_offset,
+        same_known_shape(&offset.shape, &expected_offset),
         "offset shape {:?} must be {:?}",
         offset.shape,
         expected_offset
     );
-    let expected_output = vec![x.shape[0], out_channels, out_h, out_w];
     require!(
-        out.shape == expected_output,
+        same_known_shape(&out.shape, &expected_output),
         "output shape {:?} must be {:?}",
         out.shape,
         expected_output
@@ -1518,7 +1716,7 @@ fn deform_conv_claim(node: &NodeView) -> ClaimResult {
             None => deny!("missing tensor type/shape info on bias"),
         };
         require!(
-            bias.dtype == x.dtype && bias.shape == vec![out_channels],
+            bias.dtype == x.dtype && same_known_shape(&bias.shape, &[out_channels]),
             "bias must have dtype {} and shape [{}]",
             crate::registry::ort_dtype_name(x.dtype),
             out_channels
@@ -1529,9 +1727,18 @@ fn deform_conv_claim(node: &NodeView) -> ClaimResult {
             Some(info) => info,
             None => deny!("missing tensor type/shape info on mask"),
         };
-        let expected_mask = vec![x.shape[0], offset_group * kernel_size, out_h, out_w];
+        let expected_mask = vec![
+            x.shape[0],
+            if expected_offset[1] < 0 {
+                -1
+            } else {
+                expected_offset[1] / 2
+            },
+            expected_output[2],
+            expected_output[3],
+        ];
         require!(
-            mask.dtype == x.dtype && mask.shape == expected_mask,
+            mask.dtype == x.dtype && same_known_shape(&mask.shape, &expected_mask),
             "mask must have dtype {} and shape {:?}",
             crate::registry::ort_dtype_name(x.dtype),
             expected_mask
@@ -1585,11 +1792,8 @@ fn conv_transpose_claim(node: &NodeView) -> ClaimResult {
     );
     let group = node.int_attr("group", 1);
     require!(
-        group > 0
-            && group <= i32::MAX as i64
-            && w.shape[0] % group == 0
-            && (rank != 3 || group == 1),
-        "group must divide W input channels; MLX ConvTranspose3D requires group=1"
+        group > 0 && group <= i32::MAX as i64 && w.shape[0] % group == 0,
+        "group must divide W input channels"
     );
     require!(
         x.shape[1] < 0 || w.shape[0] == x.shape[1],
@@ -1977,7 +2181,27 @@ fn shape_keyed(
 }
 
 pub fn register_conv(registry: &mut OpRegistry) {
-    shapeless(registry, "Conv", conv_op, conv_claim);
+    registry.register_shape_classified(
+        OpRegistration {
+            domain: "",
+            op_type: "Conv",
+            min_opset: K_ANY_OPSET,
+            max_opset: K_ANY_OPSET,
+            handler: conv_op,
+            claim: conv_claim,
+        },
+        |node| {
+            if node.int_attr("group", 1) > 1
+                && node.input_info(0).is_some_and(|info| info.shape.len() == 5)
+            {
+                crate::registry::CompileShapeSafety::ShapeKeyedOnly {
+                    reason: crate::registry::MLX_SLICE_SHAPE_REASON,
+                }
+            } else {
+                crate::registry::CompileShapeSafety::Shapeless
+            }
+        },
+    );
     registry.register_shape_keyed(
         OpRegistration {
             domain: "",
@@ -2039,7 +2263,32 @@ pub fn register_conv(registry: &mut OpRegistry) {
 
 #[cfg(test)]
 mod pooling_tests {
-    use super::PoolGeometry;
+    use super::{PoolGeometry, deform_geometry};
+
+    #[test]
+    fn deform_geometry_checks_known_and_symbolic_shapes() {
+        let geometry = |x: &[i64], w: &[i64], group, offsets| {
+            deform_geometry(x, w, &[1, 2], &[2, 1], &[1, 0, 0, 1], group, offsets)
+        };
+        let (output, offset) = geometry(&[2, 4, 5, 6], &[6, 2, 2, 2], 2, 4).unwrap();
+        assert_eq!(output, [2, 6, 4, 3]);
+        assert_eq!(offset, [2, 32, 4, 3]);
+        let (output, offset) = geometry(&[-1, -1, -1, -1], &[-1, -1, -1, -1], 2, 4).unwrap();
+        assert_eq!(output, [-1; 4]);
+        assert_eq!(offset, [-1; 4]);
+        assert!(geometry(&[0, 4, 5, 6], &[6, 2, 2, 2], 2, 4).is_ok());
+        for (x, w, group, offsets) in [
+            ([1, 3, 5, 6], [6, 2, 2, 2], 2, 1),
+            ([1, 4, 5, 6], [6, 2, 2, 2], 2, 3),
+            ([1, 4, 0, 6], [6, 2, 2, 2], 2, 1),
+            ([1, 4, 5, 6], [6, 2, 0, 2], 2, 1),
+            ([1, 4, 5, 6], [6, 2, 2, 2], 0, 1),
+            ([1, 4, 5, 6], [6, 2, i32::MAX as i64, 2], 2, 1),
+            ([1, 4, i32::MAX as i64, 6], [6, 2, 2, 2], 2, 1),
+        ] {
+            assert!(geometry(&x, &w, group, offsets).is_err());
+        }
+    }
 
     #[test]
     fn ceil_tail_and_last_window_correction() {
