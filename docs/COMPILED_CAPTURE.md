@@ -241,17 +241,30 @@ Final timings have tracing, ORT profiling, verbose/claim logs, captures, and com
 | MLX main `57a0d2e` | 7.312 | 7.786 | 6.029 / 1.257 |
 | MLX coverage fixes `605f11e` | 5.862 | 5.932 | 5.435 / 0.399 |
 | MLX coverage fixes + current main, `5a52393` | 5.849 | 5.996 | 5.421 / 0.400 |
-| MLX plus value-guarded boundary specialization | 2.912 | 3.178 | 2.414 / 0.464 |
+| MLX plus reviewed value-guarded boundary specialization | 2.671 | 2.748 | 2.254 / 0.391 |
 
-Run order was CPU, main, coverage fixes, specialization; a later confirmation ran updated coverage
-fixes, specialization, CPU and measured medians 5.849s, 2.809s, 8.062s respectively. Confirmation
-p95s were 5.996s, 3.552s, 8.222s. These are sequential local observations, not confidence intervals.
+Run order was CPU, main, coverage fixes, specialization; the initial specialization candidate measured
+2.912s median / 3.178s p95. A later confirmation ran updated coverage fixes, specialization, CPU and
+measured medians 5.849s, 2.809s, 8.062s respectively; p95s were 5.996s, 3.552s, 8.222s. After review,
+the boundary exemption was explicitly restricted to general capture, preserving prefill's stricter
+guard. The rebuilt/revalidated final source produced the 2.671s result above in another fresh
+three-warmup/ten-timed process. These are sequential local observations, not confidence intervals.
 The machine already had about 4.76 GiB swap in use; free-memory percentage was 54–56%, with no
 recorded thermal/performance warnings. Existing swap and other host activity limit precision.
 
+The reviewed provider's SHA256 is
+`4860d51c27093afe1946e1d16753500cad8d4ab2040ec739334e7d6a06b0f60f`; the loaded ORT dylib's is
+`83973572676032b4ba9418afed0b51f45599d35bb4e4628ca8ae1954c8362e31`. Separate loader diagnostics
+verified the intended provider/ORT/MLX/MLX-C libraries, not just the requested environment variable.
+Final first-chunk median was 34.93ms, steady chunk median/p95 35.76/39.02ms, final audio chunk
+35.25ms, and flush-chunk median 34.53ms. Compute/audio RTF was 0.0668.
+
 All warmup/timed utterances produced the same 131 token IDs and transcript as CPU, with 75 encoder
 and 656 decoder calls. Maximum emitted-token logprob difference was `1.15e-5` for coverage fixes
-and `7.63e-6` with specialization. Model weights, audio, transcripts, and raw profiles remain local.
+and `7.63e-6` with specialization. All encoder outputs/caches on identical first/steady/final feeds
+also agreed with CPU at `rtol=1e-4, atol=1e-4`; integer lengths were exact. Maximum absolute errors
+were `8.05e-7` for encoded features, `3.91e-6` for channel cache, and `1.26e-4` for convolution cache.
+Model weights, audio, transcripts, and raw profiles remain local.
 
 Attribution used separate diagnostic runs, never their timings as final performance results:
 

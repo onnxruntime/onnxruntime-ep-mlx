@@ -175,12 +175,17 @@ fn boundary_shape_specialization_key(
 }
 
 /// Shape-keyed MLX caches do not observe input values. Only initializers, proven shape-constant
-/// intermediates, or explicitly value-guarded Reshape/Expand/Slice boundary parameters are safe.
+/// intermediates, or explicitly value-guarded general-route boundary parameters are safe.
 fn reads_data_dependent_parameter(n: &NodeDesc) -> bool {
-    if n.subgraphs
-        .iter()
-        .any(|sg| sg.nodes.iter().any(reads_data_dependent_parameter))
-    {
+    reads_unguarded_parameter(n, false)
+}
+
+fn reads_unguarded_parameter(n: &NodeDesc, guard_boundary_values: bool) -> bool {
+    if n.subgraphs.iter().any(|sg| {
+        sg.nodes
+            .iter()
+            .any(|n| reads_unguarded_parameter(n, guard_boundary_values))
+    }) {
         return true;
     }
     host_parameter_indices(n).iter().any(|&i| {
@@ -188,7 +193,7 @@ fn reads_data_dependent_parameter(n: &NodeDesc) -> bool {
             !matches!(tr.source, Src::Initializer | Src::Absent)
                 && !tr.constant
                 && !tr.shape_const
-                && !guarded_boundary_parameter(n, tr)
+                && !(guard_boundary_values && guarded_boundary_parameter(n, tr))
         })
     })
 }
@@ -206,7 +211,7 @@ pub fn general_enabled(has_control_flow: bool, nodes: &[NodeDesc]) -> bool {
     }
     !nodes
         .iter()
-        .any(|n| is_general_compile_unsafe(n) || reads_data_dependent_parameter(n))
+        .any(|n| is_general_compile_unsafe(n) || reads_unguarded_parameter(n, true))
         && compile_shape_mode_supported(nodes, false)
 }
 
@@ -1468,7 +1473,8 @@ mod shape_inference_tests {
             CompileShapeSafety::Shapeless,
         );
         reshape.inputs = vec![input("data", Src::CtxInput), input("shape", Src::CtxInput)];
-        assert!(!reads_data_dependent_parameter(&reshape));
+        assert!(reads_data_dependent_parameter(&reshape));
+        assert!(!reads_unguarded_parameter(&reshape, true));
         assert_eq!(
             boundary_shape_inputs(std::slice::from_ref(&reshape)),
             vec![0]
@@ -1481,5 +1487,31 @@ mod shape_inference_tests {
             !reads_data_dependent_parameter(&reshape),
             "Shape/Size-derived parameters change with the shape-keyed cache key"
         );
+    }
+
+    #[test]
+    fn prefill_does_not_exempt_general_route_boundary_guards() {
+        for op in ["Reshape", "Expand", "Slice"] {
+            let mut parameterized = NodeDesc::new(
+                op.to_string(),
+                String::new(),
+                14,
+                CompileShapeSafety::Shapeless,
+            );
+            parameterized.inputs = vec![
+                input("data", Src::CtxInput),
+                input("parameter", Src::CtxInput),
+                input("end", Src::CtxInput),
+            ];
+            assert!(reads_data_dependent_parameter(&parameterized));
+            assert!(!reads_unguarded_parameter(&parameterized, true));
+            let gqa = NodeDesc::new(
+                "GroupQueryAttention".to_string(),
+                "com.microsoft".to_string(),
+                1,
+                CompileShapeSafety::Shapeless,
+            );
+            assert!(!prefill_enabled(false, &[gqa, parameterized]));
+        }
     }
 }
