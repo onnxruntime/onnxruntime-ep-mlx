@@ -10,7 +10,7 @@
 use crate::engine::{MlxError, NodeDesc, Src, TranslationContext};
 use crate::registry::{
     ClaimResult, CompileShapeSafety, K_ANY_OPSET, NodeView, OpRegistration, OpRegistry, is_float64,
-    is_mlx_cpu_float, is_mlx_float, is_mlx_numeric, is_signed_integer,
+    is_mlx_cpu_float, is_mlx_float, is_mlx_numeric,
 };
 use crate::sys::mlx;
 use crate::sys::ort;
@@ -40,11 +40,15 @@ enum PostOp {
     Sqrt,
 }
 
-fn is_mlx_signed_integer_dtype(dtype: mlx::mlx_dtype) -> bool {
+fn is_mlx_integer_dtype(dtype: mlx::mlx_dtype) -> bool {
     dtype == mlx::mlx_dtype__MLX_INT8
         || dtype == mlx::mlx_dtype__MLX_INT16
         || dtype == mlx::mlx_dtype__MLX_INT32
         || dtype == mlx::mlx_dtype__MLX_INT64
+        || dtype == mlx::mlx_dtype__MLX_UINT8
+        || dtype == mlx::mlx_dtype__MLX_UINT16
+        || dtype == mlx::mlx_dtype__MLX_UINT32
+        || dtype == mlx::mlx_dtype__MLX_UINT64
 }
 
 fn has_axes_input(n: &NodeDesc) -> bool {
@@ -453,21 +457,42 @@ fn hardmax_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError
 fn topk_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
     let x = ctx.resolve(&n.inputs[0])?;
     let shape = ctx.shape_of(x);
-    let mut axis = n.ints.get("axis").copied().unwrap_or(-1) as i32;
+    let mut axis = n.ints.get("axis").copied().unwrap_or(-1);
     if axis < 0 {
-        axis += shape.len() as i32;
+        axis += shape.len() as i64;
     }
     if axis < 0 || axis as usize >= shape.len() {
         return Err("MLX TopK axis is out of range".to_string());
     }
-    let k64 = read_scalar_int(ctx, &n.inputs[1])?;
+    let axis = axis as i32;
+    let k64 = if n.since_version < 10 {
+        n.ints
+            .get("k")
+            .copied()
+            .ok_or("TopK: missing k attribute")?
+    } else {
+        let values = ctx.read_ints_eval(&n.inputs[1])?;
+        if values.len() != 1 {
+            return Err("TopK: K must contain exactly one value".to_string());
+        }
+        values[0]
+    };
     if k64 <= 0 || k64 > shape[axis as usize] as i64 {
         return Err("MLX TopK K is out of range".to_string());
     }
     let k = k64 as i32;
     let largest = n.ints.get("largest").copied().unwrap_or(1) != 0;
+    if ctx.size_of(x) == 0 {
+        let mut output_shape = shape;
+        output_shape[axis as usize] = k;
+        let values = ctx.zeros(&output_shape, ctx.dtype_of(x))?;
+        let indices = ctx.zeros(&output_shape, mlx::mlx_dtype__MLX_INT64)?;
+        ctx.bind(&n.outputs[0], values);
+        ctx.bind(&n.outputs[1], indices);
+        return Ok(());
+    }
 
-    let sort_input = if largest && is_mlx_signed_integer_dtype(ctx.dtype_of(x)) {
+    let sort_input = if largest && is_mlx_integer_dtype(ctx.dtype_of(x)) {
         // Integer negation makes MIN sort as the largest value. Bitwise inversion
         // reverses the total signed and unsigned integer order without overflow.
         ctx.unary(mlx::mlx_bitwise_invert, x)?
@@ -865,19 +890,16 @@ fn hardmax_claim(node: &NodeView) -> ClaimResult {
 }
 
 fn topk_claim(node: &NodeView) -> ClaimResult {
+    let legacy = node.since_version() < 10;
     require!(
-        node.num_inputs() == 2 && node.num_outputs() == 2,
-        "expects 2 inputs and 2 outputs, got {}in/{}out",
+        node.num_inputs() == if legacy { 1 } else { 2 } && node.num_outputs() == 2,
+        "invalid TopK input/output count: {}in/{}out",
         node.num_inputs(),
         node.num_outputs()
     );
-    let (x, k, values, indices) = match (
-        node.input_info(0),
-        node.input_info(1),
-        node.output_info(0),
-        node.output_info(1),
-    ) {
-        (Some(x), Some(k), Some(v), Some(i)) => (x, k, v, i),
+    let (x, values, indices) = match (node.input_info(0), node.output_info(0), node.output_info(1))
+    {
+        (Some(x), Some(v), Some(i)) => (x, v, i),
         _ => deny!("missing tensor type/shape info on X, K, values, or indices"),
     };
     require!(
@@ -885,30 +907,28 @@ fn topk_claim(node: &NodeView) -> ClaimResult {
         "input must have rank >= 1 (got a scalar)"
     );
     require!(
-        (is_mlx_cpu_float(x.dtype) || is_signed_integer(x.dtype)) && values.dtype == x.dtype,
-        "X/values must share fp32/fp16/bf16/fp64 or a signed integer dtype; unsigned, float8, and sub-byte TopK forms stay on CPU because ORT 1.29 has no kernel registration for their output path, got {} -> {}",
+        (is_mlx_numeric(x.dtype) || is_float64(x.dtype)) && values.dtype == x.dtype,
+        "X/values must share a supported floating or integer dtype, got {} -> {}",
         crate::registry::ort_dtype_name(x.dtype),
         crate::registry::ort_dtype_name(values.dtype)
-    );
-    require!(
-        k.dtype == ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64,
-        "K must be an int64 scalar read at translation time, got {}",
-        crate::registry::ort_dtype_name(k.dtype)
     );
     require!(
         indices.dtype == ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64,
         "indices output must be int64, got {}",
         crate::registry::ort_dtype_name(indices.dtype)
     );
-    require!(
-        k.shape.len() == 1 && k.shape[0] == 1,
-        "K must be a shape [1] tensor as required by ONNX TopK, got shape {:?}",
-        k.shape
-    );
-    require!(
-        node.is_const_int64(1),
-        "K must be a constant int64 initializer; runtime K stays on CPU"
-    );
+    if !legacy {
+        let k = match node.input_info(1) {
+            Some(k) => k,
+            None => deny!("missing K tensor"),
+        };
+        require!(
+            k.dtype == ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64
+                && k.shape.len() == 1
+                && (k.shape[0] == 1 || k.shape[0] < 0),
+            "K must be an int64 tensor of shape [1]"
+        );
+    }
     let mut axis = node.int_attr("axis", -1);
     let raw_axis = axis;
     if axis < 0 {
@@ -926,21 +946,36 @@ fn topk_claim(node: &NodeView) -> ClaimResult {
         "largest must be 0 or 1 (got {largest})"
     );
     require!(
-        sorted == 1,
-        "only sorted=1 is supported (got {sorted}); K is read at translation time and must be within the selected axis"
+        sorted == 0 || sorted == 1,
+        "sorted must be 0 or 1 (got {sorted})"
     );
-    let k_value = node
-        .read_const_int64(1)
-        .expect("is_const_int64 validated immediately above");
-    require!(
-        k_value.len() == 1
-            && x.shape[axis as usize] > 0
-            && (1..=x.shape[axis as usize]).contains(&k_value[0]),
-        "K initializer must contain one value in 1..={} for axis {raw_axis}, got {:?}",
-        x.shape[axis as usize],
-        k_value
-    );
+    let known_k = if legacy {
+        Some(vec![node.int_attr("k", 0)])
+    } else {
+        node.read_const_int64(1)
+    };
+    if let Some(k) = known_k {
+        let extent = x.shape[axis as usize];
+        require!(
+            k.len() == 1 && k[0] > 0 && (extent < 0 || k[0] <= extent),
+            "K must be positive and not exceed axis extent {extent}, got {k:?}"
+        );
+    }
     Ok(())
+}
+
+fn topk_compile_shape_safety(node: &NodeView) -> CompileShapeSafety {
+    if (node.since_version() < 10 || node.is_const_int64(1))
+        && node
+            .input_info(0)
+            .is_some_and(|x| x.shape.iter().all(|&d| d > 0))
+    {
+        CompileShapeSafety::Shapeless
+    } else {
+        CompileShapeSafety::ShapeKeyedOnly {
+            reason: "conservatively shape-keyed: live K and empty/dynamic extents affect TopK output shapes",
+        }
+    }
 }
 
 fn shapeless(
@@ -1045,7 +1080,17 @@ pub fn register(registry: &mut OpRegistry) {
         crate::registry::MLX_SCAN_SHAPE_REASON,
     );
     shapeless(registry, "Hardmax", K_ANY_OPSET, hardmax_op, hardmax_claim);
-    shapeless(registry, "TopK", 10, topk_op, topk_claim);
+    registry.register_shape_classified(
+        OpRegistration {
+            domain: "",
+            op_type: "TopK",
+            min_opset: 1,
+            max_opset: K_ANY_OPSET,
+            handler: topk_op,
+            claim: topk_claim,
+        },
+        topk_compile_shape_safety,
+    );
 }
 
 #[cfg(test)]

@@ -9,6 +9,8 @@ import subprocess
 import sys
 
 import numpy as np
+import ml_dtypes
+import onnx
 import onnx_ir as ir
 import onnxruntime as ort
 import pytest
@@ -1003,3 +1005,235 @@ def test_topk_ties_choose_lowest_indices_first() -> None:
         "k": np.array([3], dtype=np.int64),
     }
     m.assert_matches_cpu(model, feeds, rtol=0, atol=0)
+
+
+_TOPK_TYPES = [
+    (DT.FLOAT16, np.float16), (DT.FLOAT, np.float32), (DT.DOUBLE, np.float64),
+    (DT.INT8, np.int8), (DT.INT16, np.int16), (DT.INT32, np.int32), (DT.INT64, np.int64),
+    (DT.UINT8, np.uint8), (DT.UINT16, np.uint16), (DT.UINT32, np.uint32), (DT.UINT64, np.uint64),
+]
+
+
+def _topk_model(dtype, shape, *, axis=-1, k=2, form="constant", largest=1, sorted=1, opset=24):
+    x = m.tensor("x", dtype, shape)
+    inputs, initializers, nodes, arguments = [x], [], [], [x]
+    attrs = {"axis": axis}
+    if opset >= 11:
+        attrs.update(largest=largest, sorted=sorted)
+    if form == "attribute":
+        attrs["k"] = k
+    elif form == "constant":
+        k_value = _initializer("k", np.array([k], np.int64))
+        initializers.append(k_value)
+        arguments.append(k_value)
+    elif form == "shape":
+        k_value = m.tensor("derived_k", DT.INT64, [1])
+        normalized_axis = axis % len(shape)
+        nodes.append(ir.node("Shape", [x], attributes={"start": normalized_axis, "end": normalized_axis + 1},
+                             outputs=[k_value]))
+        arguments.append(k_value)
+    else:
+        k_value = m.tensor("k", DT.INT64, [1])
+        inputs.append(k_value)
+        if form == "intermediate":
+            intermediate = m.tensor("derived_k", DT.INT64, [1])
+            cumsum_axis = _initializer("cumsum_axis", np.array(0, np.int64))
+            initializers.append(cumsum_axis)
+            nodes.append(ir.node("CumSum", [k_value, cumsum_axis], outputs=[intermediate]))
+            k_value = intermediate
+        arguments.append(k_value)
+    output_shape = list(shape)
+    output_shape[axis % len(shape)] = k if form in ["attribute", "constant"] else "selected"
+    values, indices = m.tensor("values", dtype, output_shape), m.tensor("indices", DT.INT64, output_shape)
+    nodes.append(ir.node("TopK", arguments, attributes=attrs, outputs=[values, indices]))
+    graph = ir.Graph(inputs, [values, indices], nodes=nodes, initializers=initializers,
+                     name="topk_forms", opset_imports={"": opset})
+    return ir.to_proto(ir.Model(graph, ir_version=11)).SerializeToString()
+
+
+def _topk_session(model):
+    options = ort.SessionOptions()
+    options.log_severity_level = 3
+    options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+    options.add_session_config_entry("session.disable_cpu_ep_fallback", "1")
+    session = ort.InferenceSession(model, options, providers=["MLXExecutionProvider"])
+    session.disable_fallback()
+    return session
+
+
+def _topk_reference(x, k, axis, largest):
+    moved = np.moveaxis(x, axis, -1)
+    indices = np.array([
+        sorted(range(len(row)), key=lambda i: (-row[i].item() if largest else row[i].item(), i))[:k]
+        for row in moved.reshape(-1, moved.shape[-1])
+    ], np.int64).reshape(*moved.shape[:-1], k)
+    indices = np.moveaxis(indices, -1, axis)
+    return np.take_along_axis(x, indices, axis=axis), indices
+
+
+def _assert_topk(actual, expected, axis, sorted_output):
+    actual_values, actual_indices = actual
+    expected_values, expected_indices = expected
+    if not sorted_output:
+        order = np.argsort(actual_indices, axis=axis)
+        actual_values = np.take_along_axis(actual_values, order, axis=axis)
+        actual_indices = np.take_along_axis(actual_indices, order, axis=axis)
+        order = np.argsort(expected_indices, axis=axis)
+        expected_values = np.take_along_axis(expected_values, order, axis=axis)
+        expected_indices = np.take_along_axis(expected_indices, order, axis=axis)
+    np.testing.assert_array_equal(actual_indices, expected_indices)
+    assert actual_indices.dtype == np.int64
+    assert actual_values.dtype == expected_values.dtype
+    assert actual_values.tobytes() == expected_values.tobytes()
+
+
+@pytest.mark.parametrize("dtype,numpy_dtype", _TOPK_TYPES)
+@pytest.mark.parametrize("axis", [-2, -1, 0, 1])
+@pytest.mark.parametrize("largest,sorted_output", [(0, 0), (0, 1), (1, 0), (1, 1)])
+@pytest.mark.parametrize("eager", [False, True])
+def test_topk_exact_type_axis_forms(dtype, numpy_dtype, axis, largest, sorted_output, eager, monkeypatch):
+    monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_COMPILE", "1" if eager else "0")
+    model = _topk_model(dtype, [3, 4], axis=axis, largest=largest, sorted=sorted_output)
+    data = np.arange(12, dtype=numpy_dtype).reshape(3, 4)
+    if np.issubdtype(numpy_dtype, np.integer):
+        limits = np.iinfo(numpy_dtype)
+        data.flat[:6] = [limits.min, limits.max, limits.max - 1, limits.min + 1, 0, 1]
+    else:
+        epsilon = np.finfo(numpy_dtype).eps
+        data.flat[:6] = [np.inf, -np.inf, -0.0, 0.0, 1 + epsilon, 1 + 2 * epsilon]
+    session = _topk_session(model)
+    for value in [data, np.flip(data, axis=axis).copy(), data]:
+        _assert_topk(session.run(None, {"x": value}), _topk_reference(value, 2, axis, largest),
+                     axis, sorted_output)
+
+
+@pytest.mark.parametrize("opset", [1, 9, 10, 11, 24])
+@pytest.mark.parametrize("axis", [-1, 0])
+def test_topk_schema_versions(opset, axis):
+    model = _topk_model(DT.FLOAT, [3, 4], axis=axis, form="attribute" if opset < 10 else "constant",
+                        opset=opset)
+    data = np.array([[1, 3, 5, 5], [4, 8, 7, 7], [2, 2, 9, 0]], np.float32)
+    actual = _topk_session(model).run(None, {"x": data})
+    _assert_topk(actual, _topk_reference(data, 2, axis, 1), axis, True)
+    expected = m.run_cpu(model, {"x": data})
+    _assert_topk(actual, expected, axis, True)
+
+
+@pytest.mark.parametrize("form", ["boundary", "intermediate", "shape"])
+@pytest.mark.parametrize("eager", [False, True])
+def test_topk_live_parameters(form, eager, monkeypatch):
+    monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_COMPILE", "1" if eager else "0")
+    model = _topk_model(DT.FLOAT, ["B", "D"], form=form)
+    session = _topk_session(model)
+    for width, k in [(4, 1), (4, 3), (6, 2), (4, 1)]:
+        data = np.arange(2 * width, dtype=np.float32).reshape(2, width)
+        feeds = {"x": data}
+        if form == "shape":
+            k = width
+        else:
+            feeds["k"] = np.array([k], np.int64)
+        _assert_topk(session.run(None, feeds), _topk_reference(data, k, -1, 1), -1, True)
+    if form != "shape":
+        for invalid in [0, -1, 5, 2**32 + 1]:
+            with pytest.raises(Exception, match="TopK K is out of range"):
+                session.run(None, {**feeds, "k": np.array([invalid], np.int64)})
+        _assert_topk(session.run(None, feeds), _topk_reference(data, k, -1, 1), -1, True)
+
+
+@pytest.mark.parametrize("dtype,numpy_dtype", [(DT.FLOAT, np.float32), (DT.INT64, np.int64),
+                                           (DT.UINT64, np.uint64), (DT.DOUBLE, np.float64)])
+def test_topk_empty_outer_dimension(dtype, numpy_dtype):
+    model = _topk_model(dtype, ["B", 4])
+    session = _topk_session(model)
+    for rows in [0, 2, 0, 2]:
+        x = np.arange(rows * 4, dtype=numpy_dtype).reshape(rows, 4)
+        values, indices = session.run(None, {"x": x})
+        assert values.shape == indices.shape == (rows, 2)
+        if rows:
+            _assert_topk([values, indices], _topk_reference(x, 2, -1, 1), -1, True)
+
+
+@pytest.mark.parametrize("numpy_dtype,dtype", [(np.float32, DT.FLOAT), (np.int64, DT.INT64),
+                                           (np.uint64, DT.UINT64), (np.float64, DT.DOUBLE)])
+@pytest.mark.parametrize("size", [257, 2049])
+def test_topk_large_stable_ties(numpy_dtype, dtype, size):
+    x = np.ones((1, size), dtype=numpy_dtype)
+    x[:, ::3] = 2
+    model = _topk_model(dtype, [1, size], k=17)
+    _assert_topk(_topk_session(model).run(None, {"x": x}), _topk_reference(x, 17, -1, 1), -1, True)
+
+
+@pytest.mark.parametrize("shape,axis", [([5], 0), ([2, 3, 4], 1), ([2, 3, 4], -1)])
+def test_topk_rank_boundaries(shape, axis):
+    data = np.arange(np.prod(shape), dtype=np.float32).reshape(shape)
+    model = _topk_model(DT.FLOAT, shape, axis=axis)
+    _assert_topk(_topk_session(model).run(None, {"x": data}), _topk_reference(data, 2, axis, 1), axis, True)
+
+
+@pytest.mark.parametrize("largest", [0, 1])
+def test_topk_bfloat16_interior(largest):
+    proto = onnx.load_model_from_string(_topk_model(DT.FLOAT, [2, 4], largest=largest))
+    node = proto.graph.node[0]
+    node.input[0] = "x_bf"
+    node.output[0] = "values_bf"
+    nodes = [
+        onnx.helper.make_node("Cast", ["x"], ["x_bf"], to=onnx.TensorProto.BFLOAT16), node,
+        onnx.helper.make_node("Cast", ["values_bf"], ["values"], to=onnx.TensorProto.FLOAT),
+    ]
+    del proto.graph.node[:]
+    proto.graph.node.extend(nodes)
+    data = np.array([[1, 1.003, 1.01, 2], [-2, -1.01, -1.003, -1]], np.float32)
+    rounded = data.astype(ml_dtypes.bfloat16).astype(np.float32)
+    _assert_topk(_topk_session(proto.SerializeToString()).run(None, {"x": data}),
+                 _topk_reference(rounded, 2, -1, largest), -1, True)
+
+
+def test_topk_unknown_k_extent_and_error_recovery():
+    proto = onnx.load_model_from_string(_topk_model(DT.FLOAT, [2, 4], form="boundary"))
+    dim = proto.graph.input[1].type.tensor_type.shape.dim[0]
+    dim.ClearField("dim_value")
+    dim.dim_param = "K_length"
+    session = _topk_session(proto.SerializeToString())
+    feeds = {"x": np.arange(8, dtype=np.float32).reshape(2, 4), "k": np.array([2], np.int64)}
+    expected = session.run(None, feeds)
+    for invalid in [np.array([], np.int64), np.array([1, 2], np.int64)]:
+        with pytest.raises(Exception, match="K must contain exactly one value"):
+            session.run(None, {**feeds, "k": invalid})
+    _assert_topk(session.run(None, feeds), expected, -1, True)
+
+
+@pytest.mark.parametrize("form", ["boundary", "intermediate", "shape", "budget"])
+def test_topk_cache_replays(form):
+    session = _topk_session(_topk_model(DT.FLOAT, ["B", "D"],
+                                      form="boundary" if form == "budget" else form))
+    cases = [(4, 1), (4, 3), (6, 2), (4, 1)]
+    if form == "budget":
+        cases = [(20, k) for k in [*range(1, 18), 1]]
+    for width, k in cases:
+        data = np.arange(2 * width, dtype=np.float32).reshape(2, width)
+        feeds = {"x": data}
+        if form == "shape":
+            k = width
+        else:
+            feeds["k"] = np.array([k], np.int64)
+        _assert_topk(session.run(None, feeds), _topk_reference(data, k, -1, 1), -1, True)
+
+
+def test_topk_compile_routes(tmp_path):
+    trace = tmp_path / "topk.json"
+    subprocess.run(
+        [sys.executable, "-m", "pytest", Path(__file__).name, "-k", "test_topk_cache_replays",
+         "-q", "-p", "no:cacheprovider"],
+        cwd=Path(__file__).parent,
+        env={**os.environ, "ONNXRUNTIME_EP_MLX_TRACE": str(trace),
+             "ONNXRUNTIME_EP_MLX_NO_COMPILE": "0", "ONNXRUNTIME_EP_MLX_NO_GENERAL_COMPILE": "0"},
+        check=True, timeout=120,
+    )
+    paths = [e["args"] for e in json.loads(trace.read_text())
+             if e.get("cat") == "ep.path" and "TopK" in e["args"].get("ops", "").split(",")]
+    assert [e["path"] for e in paths] == ["general"] * 4 + ["eager"] * 4 + ["general"] * 20 + ["eager", "general"]
+    assert [e["cache"] for e in paths] == (
+        ["MISS", "RETRACE", "RETRACE", "HIT"] + ["n/a"] * 4
+        + ["MISS", "HIT", "RETRACE", "HIT"]
+        + ["MISS"] + ["RETRACE"] * 15 + ["n/a", "HIT"]
+    )
