@@ -635,7 +635,6 @@ fn expand_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError>
     let in_shape = ctx.shape_of(data);
     let out_rank = in_shape.len().max(target.len());
     let mut result = vec![0i32; out_rank];
-    let mut incompatible = false;
     for i in 0..out_rank {
         let d_in = if i + in_shape.len() < out_rank {
             1i64
@@ -647,24 +646,25 @@ fn expand_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError>
         } else {
             target[i - (out_rank - target.len())]
         };
+        if !(0..=i32::MAX as i64).contains(&d_t) {
+            return Err(format!(
+                "Expand: target dimension {d_t} must be in [0, i32::MAX]"
+            ));
+        }
         let d_out = if d_in == 1 {
             d_t
         } else if d_t == 1 || d_in == d_t {
             d_in
         } else {
-            incompatible = true;
-            d_in.max(d_t)
+            return Err(format!(
+                "Expand: input dimension {d_in} cannot broadcast to target dimension {d_t}"
+            ));
         };
         result[i] = dim_i32(d_out)?;
     }
-    let dt = ctx.dtype_of(data);
-    let r = if incompatible {
-        ctx.zeros(&result, dt)?
-    } else {
-        ctx.emit(|res, s| unsafe {
-            mlx::mlx_broadcast_to(res, data, result.as_ptr(), result.len(), s)
-        })?
-    };
+    let r = ctx.emit(|res, s| unsafe {
+        mlx::mlx_broadcast_to(res, data, result.as_ptr(), result.len(), s)
+    })?;
     // Broadcast is a zero-copy stride-0 view; contiguous is deferred to the output boundary.
     ctx.bind(&n.outputs[0], r);
     Ok(())
@@ -1111,7 +1111,17 @@ fn shape_interval(rank: i64, start: i64, end: i64) -> (i64, i64) {
 
 fn constant_of_shape_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
     let shape_i64 = read_ints(ctx, n, 0)?;
-    let s: Vec<i32> = shape_i64.iter().map(|&x| x as i32).collect();
+    let s: Vec<i32> = shape_i64
+        .iter()
+        .map(|&dimension| {
+            if !(0..=i32::MAX as i64).contains(&dimension) {
+                return Err(format!(
+                    "ConstantOfShape: dimension {dimension} must be in [0, i32::MAX]"
+                ));
+            }
+            dim_i32(dimension)
+        })
+        .collect::<Result<_, _>>()?;
     let out_type = n.outputs[0].otype;
     let mlx_type = crate::engine::mlx_dtype_from_onnx(out_type);
 
@@ -1121,7 +1131,14 @@ fn constant_of_shape_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<()
     let fill = n
         .tensors
         .get("value")
-        .and_then(|t| t.single_element_bytes().map(|b| (b.to_vec(), t.dtype)));
+        .map(|t| {
+            t.single_element_bytes()
+                .map(|b| (b.to_vec(), t.dtype))
+                .ok_or_else(|| {
+                    "ConstantOfShape: value must contain exactly one element".to_string()
+                })
+        })
+        .transpose()?;
     let r = match fill {
         Some((bytes, value_dtype)) => {
             // ONNX takes the output dtype from `value`, so build the scalar in that dtype and let
@@ -1136,20 +1153,7 @@ fn constant_of_shape_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<()
                 mlx::mlx_full(res, s.as_ptr(), s.len(), scalar, mlx_type, st)
             })?
         }
-        None if out_type == ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64 => {
-            let value = ctx.scalar_i64(-1);
-            ctx.emit(|res, st| unsafe {
-                mlx::mlx_full(
-                    res,
-                    s.as_ptr(),
-                    s.len(),
-                    value,
-                    mlx::mlx_dtype__MLX_INT64,
-                    st,
-                )
-            })?
-        }
-        None => ctx.zeros(&s, mlx::mlx_dtype__MLX_FLOAT32)?,
+        None => ctx.zeros(&s, mlx_type)?,
     };
     ctx.bind(&n.outputs[0], r);
     Ok(())
@@ -2396,6 +2400,16 @@ fn constant_of_shape_claim(node: &NodeView) -> ClaimResult {
     Ok(())
 }
 
+fn constant_of_shape_compile_shape_safety(node: &NodeView) -> crate::registry::CompileShapeSafety {
+    if node.is_constant_initializer(0) {
+        crate::registry::CompileShapeSafety::Shapeless
+    } else {
+        crate::registry::CompileShapeSafety::ShapeKeyedOnly {
+            reason: "runtime fill shape requires shape/value guards, not shapeless replay",
+        }
+    }
+}
+
 // The per-axis claim guards below index parallel arrays (input.shape/output.shape/sizes/scales) by
 // axis and use the axis index in their decline messages — an iterator form would be less clear.
 #[allow(clippy::needless_range_loop)]
@@ -2794,11 +2808,16 @@ pub fn register(registry: &mut OpRegistry) {
     shapeless(registry, "Range", range_op, range_claim);
     shapeless(registry, "Shape", shape_op, shape_claim);
     shapeless(registry, "Size", size_op, size_claim);
-    shapeless(
-        registry,
-        "ConstantOfShape",
-        constant_of_shape_op,
-        constant_of_shape_claim,
+    registry.register_shape_classified(
+        OpRegistration {
+            domain: "",
+            op_type: "ConstantOfShape",
+            min_opset: K_ANY_OPSET,
+            max_opset: K_ANY_OPSET,
+            handler: constant_of_shape_op,
+            claim: constant_of_shape_claim,
+        },
+        constant_of_shape_compile_shape_safety,
     );
     shapeless(registry, "Where", where_handler, where_claim);
     shapeless(registry, "Resize", resize_op, resize_claim);

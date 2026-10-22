@@ -161,6 +161,14 @@ read on each invocation, not frozen into a compiled closure; initializer axes
 remain compilable, and proven shape-derived axes use shape-keyed compilation.
 Other reduction operators retain their numeric/float-only dtype restrictions.
 
+`ConstantOfShape` preserves exact fill values, scalar output for an empty shape
+vector, and zero dimensions. When compilation is supported, live boundary shapes
+use bounded value specialization; float64 and data-dependent intermediate shapes
+execute eagerly, and proven
+shape-derived shapes use shape-keyed compilation. Invalid dimensions are rejected
+before narrowing to MLX extents. `Expand` reports incompatible broadcasts instead
+of returning an invented zero tensor.
+
 Every claim is **conservative**: a handler claims only the ONNX forms it can translate correctly
 (dtype/shape/attr/opset checked in its `ClaimPredicate`); every other form falls back to ORT CPU.
 The op suite passes **1215 tests** with 62 ORT/dtype skips; the ONNX backend suite passes 1607 tests
