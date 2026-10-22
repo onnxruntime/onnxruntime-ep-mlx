@@ -137,13 +137,15 @@ def test_gather_block_quantized_asymmetric():
 @pytest.mark.parametrize(
     "dtype,np_dtype", [(DT.FLOAT, np.float32), (DT.FLOAT16, np.float16)]
 )
-def test_gather_block_quantized_default_block_size(dtype, np_dtype):
+@pytest.mark.parametrize("asymmetric", [False, True])
+def test_gather_block_quantized_default_block_size(dtype, np_dtype, asymmetric):
     model = build(
         "GatherBlockQuantized",
         [
             m.tensor("data", DT.UINT8, [2, 128]),
             m.tensor("indices", DT.INT64, [2]),
             m.tensor("scales", dtype, [2, 2]),
+            *([m.tensor("zero_points", DT.UINT8, [2, 1])] if asymmetric else []),
         ],
         [m.tensor("out", dtype, [2, 256])],
         domain="com.microsoft",
@@ -159,6 +161,8 @@ def test_gather_block_quantized_default_block_size(dtype, np_dtype):
         "indices": np.array([-2, 1], dtype=np.int64),
         "scales": scales,
     }
+    if asymmetric:
+        feeds["zero_points"] = np.full((2, 1), 0x88, dtype=np.uint8)
     expected = (
         np.tile(np.array([0.0, 1.0], dtype=np_dtype), 128)
         * np.repeat(scales, 128, axis=1)

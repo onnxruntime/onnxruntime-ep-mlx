@@ -1952,7 +1952,7 @@ fn gather_block_quantized_compile_shape_safety(node: &NodeView) -> CompileShapeS
     gather_block_quantized_compile_shape_safety_for(
         packed_data,
         packed_zero_points,
-        node.int_attr("block_size", 32),
+        node.int_attr("block_size", 128),
         node.input_present(3),
     )
 }
@@ -3057,10 +3057,12 @@ pub fn register(registry: &mut OpRegistry) {
 mod compile_shape_safety_tests {
     use super::{
         block_quantized_compile_shape_safety, block_shape_ok, claim_quant_axis,
+        gather_block_quantized_compile_shape_safety,
         gather_block_quantized_compile_shape_safety_for, matmulnbits_compile_shape_safety_for,
         quant_axis, quant_param_shape_ok,
     };
-    use crate::registry::CompileShapeSafety;
+    use crate::registry::{CompileShapeSafety, NodeView};
+    use crate::sys::ort;
 
     #[test]
     fn block_quantized_matmul_is_shapeless_only_without_trim_slice() {
@@ -3097,6 +3099,116 @@ mod compile_shape_safety_tests {
         assert!(
             !gather_block_quantized_compile_shape_safety_for(192, 2, 128, true).allows_shapeless()
         );
+    }
+
+    #[test]
+    fn gather_block_quantized_omitted_block_size_keeps_asymmetric_form_shapeless() {
+        static DATA_SHAPE: [i64; 2] = [2, 128];
+        static ZERO_POINTS_SHAPE: [i64; 2] = [2, 1];
+
+        // Shape arrays stand in for opaque ORT handles; these callbacks only read their dimensions.
+        unsafe extern "C" fn num_inputs(
+            _: *const ort::OrtNode,
+            out: *mut usize,
+        ) -> *mut ort::OrtStatus {
+            unsafe { *out = 4 };
+            std::ptr::null_mut()
+        }
+
+        unsafe extern "C" fn inputs(
+            _: *const ort::OrtNode,
+            out: *mut *const ort::OrtValueInfo,
+            _: usize,
+        ) -> *mut ort::OrtStatus {
+            unsafe {
+                *out = DATA_SHAPE.as_ptr().cast();
+                *out.add(1) = std::ptr::null();
+                *out.add(2) = std::ptr::null();
+                *out.add(3) = ZERO_POINTS_SHAPE.as_ptr().cast();
+            }
+            std::ptr::null_mut()
+        }
+
+        unsafe extern "C" fn type_info(
+            value: *const ort::OrtValueInfo,
+            out: *mut *const ort::OrtTypeInfo,
+        ) -> *mut ort::OrtStatus {
+            unsafe { *out = value.cast() };
+            std::ptr::null_mut()
+        }
+
+        unsafe extern "C" fn onnx_type(
+            _: *const ort::OrtTypeInfo,
+            out: *mut ort::ONNXType,
+        ) -> *mut ort::OrtStatus {
+            unsafe { *out = ort::ONNXType_ONNX_TYPE_TENSOR };
+            std::ptr::null_mut()
+        }
+
+        unsafe extern "C" fn tensor_info(
+            info: *const ort::OrtTypeInfo,
+            out: *mut *const ort::OrtTensorTypeAndShapeInfo,
+        ) -> *mut ort::OrtStatus {
+            unsafe { *out = info.cast() };
+            std::ptr::null_mut()
+        }
+
+        unsafe extern "C" fn element_type(
+            _: *const ort::OrtTensorTypeAndShapeInfo,
+            out: *mut ort::ONNXTensorElementDataType,
+        ) -> *mut ort::OrtStatus {
+            unsafe { *out = ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8 };
+            std::ptr::null_mut()
+        }
+
+        unsafe extern "C" fn rank(
+            _: *const ort::OrtTensorTypeAndShapeInfo,
+            out: *mut usize,
+        ) -> *mut ort::OrtStatus {
+            unsafe { *out = 2 };
+            std::ptr::null_mut()
+        }
+
+        unsafe extern "C" fn dimensions(
+            info: *const ort::OrtTensorTypeAndShapeInfo,
+            out: *mut i64,
+            count: usize,
+        ) -> *mut ort::OrtStatus {
+            unsafe { std::ptr::copy_nonoverlapping(info.cast::<i64>(), out, count) };
+            std::ptr::null_mut()
+        }
+
+        unsafe extern "C" fn absent_attribute(
+            _: *const ort::OrtNode,
+            _: *const std::ffi::c_char,
+            out: *mut *const ort::OrtOpAttr,
+        ) -> *mut ort::OrtStatus {
+            unsafe { *out = std::ptr::null() };
+            std::ptr::null_mut()
+        }
+
+        unsafe extern "C" fn input_name(
+            _: *const ort::OrtValueInfo,
+            out: *mut *const std::ffi::c_char,
+        ) -> *mut ort::OrtStatus {
+            unsafe { *out = c"zero_points".as_ptr() };
+            std::ptr::null_mut()
+        }
+
+        let mut api: ort::OrtApi = unsafe { std::mem::zeroed() };
+        api.Node_GetNumInputs = Some(num_inputs);
+        api.Node_GetInputs = Some(inputs);
+        api.GetValueInfoTypeInfo = Some(type_info);
+        api.GetOnnxTypeFromTypeInfo = Some(onnx_type);
+        api.CastTypeInfoToTensorInfo = Some(tensor_info);
+        api.GetTensorElementType = Some(element_type);
+        api.GetDimensionsCount = Some(rank);
+        api.GetDimensions = Some(dimensions);
+        api.Node_GetAttributeByName = Some(absent_attribute);
+        api.GetValueInfoName = Some(input_name);
+        let node = NodeView::new(&api, std::ptr::null());
+
+        assert!(gather_block_quantized_compile_shape_safety(&node).allows_shapeless());
     }
 
     #[test]
