@@ -13,7 +13,7 @@ from test_attention_ext import _t, assert_mlx_claims, build_model
 from test_paged_attention import _inputs, _model, _paged_ref
 
 
-@pytest.mark.parametrize("opset", [23, 24, 25])
+@pytest.mark.parametrize("opset", [23, 24, 25, 26])
 @pytest.mark.parametrize("shape", [[1], [2, 1], [1, 1, 2, 1]])
 @pytest.mark.parametrize("boolean", [False, True])
 @pytest.mark.parametrize("composed", [False, True])
