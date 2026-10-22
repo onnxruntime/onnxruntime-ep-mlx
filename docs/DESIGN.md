@@ -176,6 +176,23 @@ Both in-op and standalone `RotaryEmbedding` consume the supplied cos/sin values 
 scaled/nonlinear caches and one-row caches. Offset, explicit-position and per-position-cache forms
 use the same rotation semantics; no cache-frequency reconstruction is assumed.
 
+Contrib GQA score composition uses FP32 accumulation: scale QK, apply `softcap`, then
+add bias and visibility masks. `qk_output=1` returns capped, biased scores with invisible
+columns zeroed; mode 2 returns key probabilities after softmax, including any sink in the
+denominator. Both have shape `[B,Hq,S,total_sequence_length]`; ragged tail columns are
+zero-filled. Sliding-cache QK diagnostics remain unsupported because the absolute-position
+output contract is distinct from resident-cache geometry. `smooth_softmax=1` supplies a
+zero sink logit unless an explicit per-head `head_sink` overrides it, including when the
+flag is zero. Sinks never contribute values.
+
+`PagedAttention` supports SEPARATE packed QKV as contiguous Q, K and V sections in input 0
+with inputs 1/2 absent. LATENT retains its separate key contract. Its `softcap` precedes
+masking and sinks, using FP32 accumulation and activation-dtype output/cache storage.
+Positive `local_window_size=W` keeps keys at positions `key >= query-W+1`; causal mode
+also imposes `key <= query`, while bidirectional mode has no right bound. The pinned
+ORT v1.31.0 CUDA implementation passes `W-1` to FlashAttention; this is not a symmetric
+window. These composed forms remain eager and do not change ordinary compiled GQA.
+
 ### 3.2 Constant and initializer caching
 
 The compiled plan caches immutable or effectively constant data instead of rebuilding it every token:

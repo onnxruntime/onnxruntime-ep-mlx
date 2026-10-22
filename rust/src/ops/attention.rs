@@ -2,7 +2,7 @@
 //! primitive. Faithful port of the C++ `ops/attention.cc` + `ops/attention_ext.cc`:
 //!
 //!   * GroupQueryAttention (com.microsoft) — separate Q/K/V, in-op RoPE + KV-cache append + causal
-//!     SDPA. Multi-output (attn, present_key, present_value). Decode-critical.
+//!     SDPA, softcap/sinks and optional before/after-softmax diagnostics. Decode-critical.
 //!   * Attention (ai.onnx opset 23-28) — MHA / GQA / MQA, 3D (B,S,H*hd) or 4D (B,H,S,hd),
 //!     optional attn_mask, nonpad lengths, causal/window masks, logit soft-cap, QK outputs, and
 //!     in-op past/present KV concat.
@@ -58,6 +58,54 @@ fn sub(
     b: mlx::mlx_array,
 ) -> Result<mlx::mlx_array, MlxError> {
     ctx.binary(mlx::mlx_subtract, a, b)
+}
+
+fn capped_attention_logits(
+    ctx: &mut TranslationContext,
+    q: mlx::mlx_array,
+    k: mlx::mlx_array,
+    scale: f32,
+    softcap: f32,
+) -> Result<mlx::mlx_array, MlxError> {
+    let kt = ctx.transpose(k, &[0, 1, 3, 2])?;
+    let scores = ctx.matmul(q, kt)?;
+    let scale = ctx.scalar_f32(scale);
+    let scores = ctx.mul(scores, scale)?;
+    if softcap <= 0.0 {
+        return Ok(scores);
+    }
+    let cap = ctx.scalar_f32(softcap);
+    let scores = ctx.binary(mlx::mlx_divide, scores, cap)?;
+    let scores = ctx.unary(mlx::mlx_tanh, scores)?;
+    ctx.mul(scores, cap)
+}
+
+/// A sink contributes only to the denominator, never to the returned key probabilities.
+fn attention_probs_with_sink(
+    ctx: &mut TranslationContext,
+    scores: mlx::mlx_array,
+    sink: Option<mlx::mlx_array>,
+) -> Result<mlx::mlx_array, MlxError> {
+    let Some(sink) = sink else {
+        return ctx.softmax_axis(scores, 3);
+    };
+    let shape = ctx.shape_of(scores);
+    let sink = ctx.astype(sink, ctx.dtype_of(scores))?;
+    let sink = ctx.reshape(sink, &[1, shape[1], 1, 1])?;
+    let target = [shape[0], shape[1], shape[2], 1];
+    let sink = ctx.emit(|res, st| unsafe {
+        mlx::mlx_broadcast_to(res, sink, target.as_ptr(), target.len(), st)
+    })?;
+    let logits = concat2(ctx, scores, sink, 3)?;
+    let probs = ctx.softmax_axis(logits, 3)?;
+    slice(ctx, probs, &[0, 0, 0, 0], &shape)
+}
+
+fn gqa_composed(n: &NodeDesc) -> bool {
+    n.floats.get("softcap").copied().unwrap_or(0.0) > 0.0
+        || attr_int(n, "qk_output", 0) != 0
+        || attr_int(n, "smooth_softmax", 0) == 1
+        || present(n, 11)
 }
 
 /// A row-major slice [start, stop) with unit stride over all axes.
@@ -225,6 +273,9 @@ fn causal_window_mask(
         1.0,
         i32t,
     )?;
+    // Right-padded GQA query rows use the last live key as their window endpoint.
+    let last_lower = ctx.scalar_i32(k_len - window);
+    let lower_pos = ctx.binary(mlx::mlx_minimum, lower_pos, last_lower)?;
     let lower_pos = ctx.reshape(lower_pos, &[q_len, 1])?;
     let lower = ctx.less_equal(lower_pos, key_pos)?;
     let allow = ctx.binary(mlx::mlx_logical_and, upper, lower)?;
@@ -438,13 +489,27 @@ fn gqa_batched(
         None
     };
     let bias = if present(n, 10) {
-        Some(ctx.resolve(&n.inputs[10])?)
+        let bias = ctx.resolve(&n.inputs[10])?;
+        let bs = ctx.shape_of(bias);
+        if bs.len() != 4
+            || (bs[0] != 1 && bs[0] != batch)
+            || (bs[1] != 1 && bs[1] != heads)
+            || bs[2] != seq
+            || bs[3] != total[0] as i32
+        {
+            return Err(
+                "GroupQueryAttention: attention_bias must broadcast to [batch,heads,sequence,total]"
+                    .to_string(),
+            );
+        }
+        Some(bias)
     } else {
         None
     };
     let mut outputs = VectorArray::new();
     let mut keys = VectorArray::new();
     let mut values = VectorArray::new();
+    let mut diagnostics = VectorArray::new();
     for b in 0..batch {
         let length = lengths[b as usize] as i32 + 1;
         let past = (length - seq).max(0);
@@ -480,13 +545,70 @@ fn gqa_batched(
         } else {
             ctx.zeros(&[seq, length], dt)?
         };
+        let visibility = mask;
+        let mut logits = if gqa_composed(n) {
+            let q32 = ctx.astype(qb, mlx::mlx_dtype__MLX_FLOAT32)?;
+            let k32 = ctx.astype(ak, mlx::mlx_dtype__MLX_FLOAT32)?;
+            let k32 = gqa_repeat_heads(ctx, k32, kv_heads, heads / kv_heads, length, head)?;
+            Some(capped_attention_logits(
+                ctx,
+                q32,
+                k32,
+                scale,
+                n.floats.get("softcap").copied().unwrap_or(0.0),
+            )?)
+        } else {
+            None
+        };
         if let Some(bias) = bias {
             let bs = ctx.shape_of(bias);
             let bi = if bs[0] == 1 { 0 } else { b };
             let bias = slice(ctx, bias, &[bi, 0, 0, 0], &[bi + 1, bs[1], seq, length])?;
-            mask = add(ctx, mask, bias)?;
+            if let Some(scores) = logits {
+                let bias = ctx.astype(bias, mlx::mlx_dtype__MLX_FLOAT32)?;
+                logits = Some(add(ctx, scores, bias)?);
+            } else {
+                mask = add(ctx, mask, bias)?;
+            }
         }
-        let out = sdpa(ctx, qb, ak, av, scale, b"array\0", mask)?;
+        let out = if let Some(logits) = logits {
+            let mask = ctx.astype(visibility, mlx::mlx_dtype__MLX_FLOAT32)?;
+            let zero = ctx.scalar_f32(0.0);
+            let visible = ctx.binary(mlx::mlx_equal, mask, zero)?;
+            let neg = ctx.scalar_f32(f32::NEG_INFINITY);
+            let scores = ctx.where_(visible, logits, neg)?;
+            let sink = if present(n, 11) {
+                Some(ctx.resolve(&n.inputs[11])?)
+            } else if attr_int(n, "smooth_softmax", 0) == 1 {
+                Some(ctx.zeros(&[heads], mlx::mlx_dtype__MLX_FLOAT32)?)
+            } else {
+                None
+            };
+            let probs = attention_probs_with_sink(ctx, scores, sink)?;
+            let mode = attr_int(n, "qk_output", 0);
+            if mode != 0 {
+                let diagnostic = if mode == 1 {
+                    ctx.where_(visible, logits, zero)?
+                } else {
+                    probs
+                };
+                let diagnostic = ctx.astype(diagnostic, dt)?;
+                let padding = total[0] as i32 - length;
+                let diagnostic = if padding > 0 {
+                    let zero = ctx.zeros(&[1, heads, seq, padding], dt)?;
+                    concat2(ctx, diagnostic, zero, 3)?
+                } else {
+                    diagnostic
+                };
+                diagnostics.append(diagnostic);
+            }
+            let v32 = ctx.astype(av, mlx::mlx_dtype__MLX_FLOAT32)?;
+            let v32 = gqa_repeat_heads(ctx, v32, kv_heads, heads / kv_heads, length, head)?;
+            let out = ctx.matmul(probs, v32)?;
+            ctx.astype(out, dt)?
+        } else {
+            sdpa(ctx, qb, ak, av, scale, b"array\0", mask)?
+        };
         outputs.append(out);
         let tail_len = capacity - length;
         let tail_k = if length < cap {
@@ -517,6 +639,12 @@ fn gqa_batched(
     let out = ctx.transpose(out, &[0, 2, 1, 3])?;
     let out = ctx.reshape(out, &[batch, seq, heads * head])?;
     ctx.bind(&n.outputs[0], out);
+    if attr_int(n, "qk_output", 0) != 0 {
+        let out = ctx.emit(|res, st| unsafe {
+            mlx::mlx_concatenate_axis(res, diagnostics.as_raw(), 0, st)
+        })?;
+        ctx.bind(&n.outputs[3], out);
+    }
     for (index, arrays) in [(1, keys), (2, values)] {
         if n.outputs.get(index).is_some_and(|o| !o.name.is_empty()) {
             let out = ctx.emit(|res, st| unsafe {
@@ -739,7 +867,12 @@ fn group_query_attention_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Resul
         kh = ctx.emit(|res, st| unsafe { mlx::mlx_fast_rms_norm(res, kh, k_weight, eps, st) })?;
     }
 
-    if !sliding && (b != 1 || !present(n, 3) || attr_int(n, "causal", 1) == 0 || local_window >= 0)
+    if !sliding
+        && (b != 1
+            || !present(n, 3)
+            || attr_int(n, "causal", 1) == 0
+            || local_window >= 0
+            || gqa_composed(n))
     {
         return gqa_batched(ctx, n, qh, kh, vh, past_k, past_v, scale);
     }
@@ -895,7 +1028,35 @@ fn group_query_attention_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Resul
             let mask =
                 causal_window_mask(ctx, s, k_len, seed_rows, local_window, ctx.dtype_of(qb))?;
             let mask = ctx.reshape(mask, &[1, 1, s, k_len])?;
-            let ab = sdpa(ctx, qb, work_k, work_v, scale, b"array\0", mask)?;
+            let ab = if gqa_composed(n) {
+                let sink = if present(n, 11) {
+                    Some(ctx.resolve(&n.inputs[11])?)
+                } else if attr_int(n, "smooth_softmax", 0) == 1 {
+                    Some(ctx.zeros(&[num_heads], mlx::mlx_dtype__MLX_FLOAT32)?)
+                } else {
+                    None
+                };
+                let dt = ctx.dtype_of(qb);
+                let qb = ctx.astype(qb, mlx::mlx_dtype__MLX_FLOAT32)?;
+                let k32 = ctx.astype(work_k, mlx::mlx_dtype__MLX_FLOAT32)?;
+                let v32 = ctx.astype(work_v, mlx::mlx_dtype__MLX_FLOAT32)?;
+                let k32 = gqa_repeat_heads(ctx, k32, kv_heads, num_heads / kv_heads, k_len, head)?;
+                let v32 = gqa_repeat_heads(ctx, v32, kv_heads, num_heads / kv_heads, k_len, head)?;
+                let mask = ctx.astype(mask, mlx::mlx_dtype__MLX_FLOAT32)?;
+                let out = paged_sdpa(
+                    ctx,
+                    qb,
+                    k32,
+                    v32,
+                    scale,
+                    mask,
+                    sink,
+                    n.floats.get("softcap").copied().unwrap_or(0.0),
+                )?;
+                ctx.astype(out, dt)?
+            } else {
+                sdpa(ctx, qb, work_k, work_v, scale, b"array\0", mask)?
+            };
 
             let write_start = if use_staging { seed_offset } else { 0 };
             let write_k = slice(
@@ -1901,7 +2062,14 @@ fn is_int32(t: ort::ONNXTensorElementDataType) -> bool {
 ///     and an additive `attention_bias` mask (input 10). `position_ids` (input 9) is ignored.
 ///     All floating inputs/outputs share one dtype; seqlens_k / total_sequence_length are int32.
 fn group_query_attention_claim(node: &NodeView) -> ClaimResult {
-    require!(node.num_outputs() > 0, "requires at least 1 output");
+    require!(
+        (1..=4).contains(&node.num_outputs()),
+        "requires 1 to 4 outputs"
+    );
+    require!(
+        node.output_present(1) == node.output_present(2),
+        "present_key and present_value must both be provided or both omitted"
+    );
     let sliding = node.int_attr("sliding_window_cache", 0) != 0;
     require!(
         matches!(node.int_attr("causal", 1), 0 | 1),
@@ -2072,6 +2240,18 @@ fn group_query_attention_claim(node: &NodeView) -> ClaimResult {
         "query hidden size must match head count"
     );
     let head = q.shape[2] / total_heads;
+    if has_bias {
+        let bias = node.input_info(10).unwrap();
+        require!(
+            (bias.shape[0] < 0
+                || bias.shape[0] == 1
+                || q.shape[0] < 0
+                || bias.shape[0] == q.shape[0])
+                && (bias.shape[1] < 0 || bias.shape[1] == 1 || bias.shape[1] == nh)
+                && (bias.shape[2] < 0 || q.shape[1] < 0 || bias.shape[2] == q.shape[1]),
+            "attention_bias must broadcast to [batch,num_heads,sequence_length,total_sequence_length]"
+        );
+    }
     if !packed_qkv {
         for idx in [1, 2] {
             let kv = node.input_info(idx).unwrap();
@@ -2145,10 +2325,13 @@ fn group_query_attention_claim(node: &NodeView) -> ClaimResult {
         !node.input_present(9) || !do_rotary,
         "custom position_ids with in-op rotary are unsupported"
     );
-    require!(
-        !node.input_present(11),
-        "head_sink/smooth softmax is unsupported"
-    );
+    if node.input_present(11) {
+        require!(
+            node.input_info(11)
+                .is_some_and(|v| v.dtype == out_type && v.shape == [nh]),
+            "head_sink must be [num_heads] in activation dtype"
+        );
+    }
     require!(
         !node.input_present(12) && !node.input_present(13),
         "quantized KV cache scales are unsupported"
@@ -2184,16 +2367,31 @@ fn group_query_attention_claim(node: &NodeView) -> ClaimResult {
         }
     }
     require!(
-        node.int_attr("smooth_softmax", 0) != 1,
-        "smooth_softmax=1 is unsupported"
+        matches!(node.int_attr("smooth_softmax", 0), -1..=1),
+        "smooth_softmax must be -1 (schema default), 0 or 1"
+    );
+    let qk = node.int_attr("qk_output", 0);
+    require!(
+        matches!(qk, 0..=2) && (qk != 0) == node.output_present(3),
+        "qk_output must be 0, 1 or 2 and enabled exactly when output_qk is present"
     );
     require!(
-        node.int_attr("qk_output", 0) == 0,
-        "qk_output is unsupported"
+        !sliding || qk == 0,
+        "sliding_window_cache with QK diagnostics is unsupported"
     );
+    if qk != 0 {
+        require!(
+            node.output_info(3).is_some_and(|v| v.dtype == out_type
+                && v.shape.len() == 4
+                && (v.shape[0] < 0 || q.shape[0] < 0 || v.shape[0] == q.shape[0])
+                && (v.shape[1] < 0 || v.shape[1] == nh)
+                && (v.shape[2] < 0 || q.shape[1] < 0 || v.shape[2] == q.shape[1])),
+            "output_qk must be [batch,num_heads,sequence_length,total_sequence_length] in activation dtype"
+        );
+    }
     require!(
-        node.float_attr("softcap", 0.0) == 0.0,
-        "softcap is unsupported"
+        node.float_attr("softcap", 0.0).is_finite() && node.float_attr("softcap", 0.0) >= 0.0,
+        "softcap must be finite and non-negative"
     );
     Ok(())
 }
@@ -2230,6 +2428,15 @@ fn group_query_attention_compile_shape_safety_for(
 }
 
 fn group_query_attention_compile_shape_safety(node: &NodeView) -> CompileShapeSafety {
+    if node.float_attr("softcap", 0.0) > 0.0
+        || node.int_attr("qk_output", 0) != 0
+        || node.int_attr("smooth_softmax", 0) == 1
+        || node.input_present(11)
+    {
+        return CompileShapeSafety::EagerOnly {
+            reason: "composed GQA logits, diagnostics and sinks use live eager geometry",
+        };
+    }
     if node
         .input_info(0)
         .is_none_or(|q| q.shape.first() != Some(&1))
@@ -3107,7 +3314,7 @@ fn shape_keyed(
 // (block_table) are runtime INT32 tensors, read host-side each forward. For each sequence we gather
 // its cached K/V from the scattered physical blocks, append the new (optionally RoPE'd) K/V, run a
 // GQA SDPA in fp32, and pack the outputs back. Causality is optional; RoPE uses exact cache rows.
-// Packed-QKV input, softcap and sliding windows remain unsupported.
+// SEPARATE packed QKV, softcap, and left windows compose on this eager path.
 
 /// Read an integer input tensor (int32 or int64) to a host `Vec<i64>`, normalizing dtype through
 /// MLX (astype + eval) — unlike `read_ints`, which reinterprets the raw bytes as i64 and so mangles
@@ -3161,6 +3368,7 @@ fn gqa_repeat_heads(
     ctx.reshape(b, &[1, kv * g, s, hd])
 }
 
+#[allow(clippy::too_many_arguments)]
 fn paged_sdpa(
     ctx: &mut TranslationContext,
     q: mlx::mlx_array,
@@ -3169,27 +3377,15 @@ fn paged_sdpa(
     scale: f32,
     mask: mlx::mlx_array,
     head_sink: Option<mlx::mlx_array>,
+    softcap: f32,
 ) -> Result<mlx::mlx_array, MlxError> {
-    let Some(sink) = head_sink else {
+    if head_sink.is_none() && softcap == 0.0 {
         return sdpa(ctx, q, k, v, scale, b"array\0", mask);
-    };
-    let kt = ctx.transpose(k, &[0, 1, 3, 2])?;
-    let mut scores = ctx.binary(mlx::mlx_matmul, q, kt)?;
-    let scale = ctx.scalar_f32(scale);
-    scores = ctx.mul(scores, scale)?;
-    scores = ctx.add(scores, mask)?;
-    let heads = ctx.shape_of(q)[1];
-    let sink = ctx.reshape(sink, &[1, heads, 1, 1])?;
-    let target = [1, heads, ctx.shape_of(q)[2], 1];
-    let sink = ctx.emit(|res, st| unsafe {
-        mlx::mlx_broadcast_to(res, sink, target.as_ptr(), target.len(), st)
-    })?;
-    scores = concat2(ctx, scores, sink, 3)?;
-    let probs = ctx.emit(|res, st| unsafe { mlx::mlx_softmax_axis(res, scores, 3, true, st) })?;
-    let vshape = ctx.shape_of(v);
-    let zero = ctx.zeros(&[1, vshape[1], 1, vshape[3]], ctx.dtype_of(v))?;
-    let v = concat2(ctx, v, zero, 2)?;
-    ctx.binary(mlx::mlx_matmul, probs, v)
+    }
+    let scores = capped_attention_logits(ctx, q, k, scale, softcap)?;
+    let scores = ctx.add(scores, mask)?;
+    let probs = attention_probs_with_sink(ctx, scores, head_sink)?;
+    ctx.matmul(probs, v)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3254,7 +3450,29 @@ fn paged_attention_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), 
     }
     let f32t = mlx::mlx_dtype__MLX_FLOAT32;
 
-    let q = ctx.resolve(&n.inputs[0])?;
+    let input_q = ctx.resolve(&n.inputs[0])?;
+    let packed = !present(n, 1) && !present(n, 2);
+    let input_shape = ctx.shape_of(input_q);
+    let packed_head = input_shape[1] / (num_heads + 2 * kv_heads);
+    let (q, key, value) = if packed {
+        let q_end = num_heads * packed_head;
+        let k_end = q_end + kv_heads * packed_head;
+        (
+            slice(ctx, input_q, &[0, 0], &[input_shape[0], q_end])?,
+            slice(ctx, input_q, &[0, q_end], &[input_shape[0], k_end])?,
+            Some(slice(ctx, input_q, &[0, k_end], &input_shape)?),
+        )
+    } else {
+        (
+            input_q,
+            ctx.resolve(&n.inputs[1])?,
+            if latent {
+                None
+            } else {
+                Some(ctx.resolve(&n.inputs[2])?)
+            },
+        )
+    };
     let out_dt = ctx.dtype_of(q);
     let qs = ctx.shape_of(q); // [num_tokens, hidden]
     let hidden = qs[1];
@@ -3269,12 +3487,6 @@ fn paged_attention_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), 
     let scale = attr_scale(n, head);
     let g = num_heads / kv_heads;
 
-    let key = ctx.resolve(&n.inputs[1])?;
-    let value = if latent {
-        None
-    } else {
-        Some(ctx.resolve(&n.inputs[2])?)
-    };
     let mut kcache = ctx.resolve(&n.inputs[3])?;
     let mut vcache = if latent {
         None
@@ -3493,13 +3705,37 @@ fn paged_attention_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), 
         let qh = ctx.astype(qh, f32t)?;
         let kh = ctx.astype(kh, f32t)?;
         let vh = ctx.astype(vh, f32t)?;
-        let mask = if attr_int(n, "is_causal", 1) != 0 {
+        let mut mask = if attr_int(n, "is_causal", 1) != 0 {
             causal_mask_topleft(ctx, nq, total, pastb, f32t)?
         } else {
             ctx.zeros(&[nq, total], f32t)?
         };
+        let window = attr_int(n, "local_window_size", -1) as i32;
+        if window > 0 {
+            let key_pos = ctx.arange(0.0, total as f64, 1.0, mlx::mlx_dtype__MLX_INT32)?;
+            let key_pos = ctx.reshape(key_pos, &[1, total])?;
+            let left = ctx.arange(
+                (pastb - window + 1) as f64,
+                (pastb + nq - window + 1) as f64,
+                1.0,
+                mlx::mlx_dtype__MLX_INT32,
+            )?;
+            let left = ctx.reshape(left, &[nq, 1])?;
+            let allowed = ctx.less_equal(left, key_pos)?;
+            let neg = ctx.scalar_f32(f32::NEG_INFINITY);
+            mask = ctx.where_(allowed, mask, neg)?;
+        }
         let mask = ctx.reshape(mask, &[1, 1, nq, total])?;
-        let o = paged_sdpa(ctx, qh, kh, vh, scale, mask, head_sink)?; // [1,H,nq,head]
+        let o = paged_sdpa(
+            ctx,
+            qh,
+            kh,
+            vh,
+            scale,
+            mask,
+            head_sink,
+            n.floats.get("softcap").copied().unwrap_or(0.0),
+        )?; // [1,H,nq,head]
         let o = ctx.transpose(o, &[0, 2, 1, 3])?; // [1,nq,H,head]
         let o = ctx.reshape(o, &[nq, out_hidden])?;
         outs.push(ctx.astype(o, out_dt)?);
@@ -3587,7 +3823,12 @@ fn paged_attention_claim(node: &NodeView) -> ClaimResult {
         "kv_cache_layout must be SEPARATE or LATENT"
     );
     let latent = layout == "LATENT";
-    for idx in [0usize, 1, 3] {
+    let packed = !latent && !node.input_present(1) && !node.input_present(2);
+    for idx in if packed {
+        vec![0usize, 3]
+    } else {
+        vec![0usize, 1, 3]
+    } {
         match dtype_of(node, idx) {
             Some(dt) => require!(
                 dt == out_dt,
@@ -3606,7 +3847,11 @@ fn paged_attention_claim(node: &NodeView) -> ClaimResult {
             "LATENT layout aliases value to key and requires absent value/value_cache"
         );
     } else {
-        for idx in [2usize, 4] {
+        for idx in if packed {
+            vec![4usize]
+        } else {
+            vec![2usize, 4]
+        } {
             require!(
                 dtype_of(node, idx) == Some(out_dt),
                 "input {idx} must be present and share the output float dtype"
@@ -3631,26 +3876,39 @@ fn paged_attention_claim(node: &NodeView) -> ClaimResult {
         "LATENT layout requires kv_num_heads=1"
     );
     let query = node.input_info(0).unwrap();
+    let query_heads = if packed {
+        num_heads + 2 * kv_heads
+    } else {
+        num_heads
+    };
     require!(
-        query.shape.len() == 2 && query.shape[1] > 0 && query.shape[1] % num_heads == 0,
-        "query must be [num_tokens,num_heads*head_size]"
+        query.shape.len() == 2 && query.shape[1] > 0 && query.shape[1] % query_heads == 0,
+        "query must have rank 2 and a hidden size divisible by its separate or packed head count"
     );
-    let head = query.shape[1] / num_heads;
+    let head = query.shape[1] / query_heads;
     let v_head = match node.int_attr("v_head_size", 0) {
         0 => head,
         value => value,
     };
     require!(v_head > 0, "effective v_head_size must be positive");
-    require!(
-        node.input_info(1)
-            .is_some_and(|v| v.shape.len() == 2 && v.shape[1] == kv_heads * head),
-        "key must be [num_tokens,kv_num_heads*head_size]"
-    );
+    if !packed {
+        require!(
+            node.input_info(1)
+                .is_some_and(|v| v.shape.len() == 2 && v.shape[1] == kv_heads * head),
+            "key must be [num_tokens,kv_num_heads*head_size]"
+        );
+        if !latent {
+            require!(
+                node.input_info(2)
+                    .is_some_and(|v| v.shape.len() == 2 && v.shape[1] == kv_heads * v_head),
+                "value must be [num_tokens,kv_num_heads*v_head_size]"
+            );
+        }
+    }
     if !latent {
         require!(
-            node.input_info(2)
-                .is_some_and(|v| v.shape.len() == 2 && v.shape[1] == kv_heads * v_head),
-            "value must be [num_tokens,kv_num_heads*v_head_size]"
+            v_head == head,
+            "SEPARATE layout requires equal key and value head sizes"
         );
     } else {
         require!(
@@ -3685,12 +3943,12 @@ fn paged_attention_claim(node: &NodeView) -> ClaimResult {
         "output must be [num_tokens,num_heads*v_head_size]"
     );
     require!(
-        node.int_attr("local_window_size", -1) == -1,
-        "sliding-window attention (local_window_size) is not supported"
+        node.int_attr("local_window_size", -1) == -1 || node.int_attr("local_window_size", -1) > 0,
+        "local_window_size must be -1 or positive"
     );
     require!(
-        node.float_attr("softcap", 0.0) == 0.0,
-        "attention softcap is not supported"
+        node.float_attr("softcap", 0.0).is_finite() && node.float_attr("softcap", 0.0) >= 0.0,
+        "softcap must be finite and non-negative"
     );
     // do_rotary=1 needs the cos/sin caches present (inputs 8, 9).
     if node.int_attr("do_rotary", 0) != 0 {
