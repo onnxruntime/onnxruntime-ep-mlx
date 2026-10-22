@@ -4,8 +4,8 @@
 
 use crate::engine::{MlxError, NodeDesc, TranslationContext, mlx_dtype_from_onnx};
 use crate::registry::{
-    ClaimResult, K_ANY_OPSET, NodeView, OpRegistration, OpRegistry, is_float64, is_int_index,
-    is_mlx_cpu_float, is_mlx_float, is_mlx_numeric, is_mlx_supported, is_movable,
+    ClaimResult, CompileShapeSafety, K_ANY_OPSET, NodeView, OpRegistration, OpRegistry, is_float64,
+    is_int_index, is_mlx_cpu_float, is_mlx_float, is_mlx_numeric, is_mlx_supported, is_movable,
     is_signed_integer, is_unsigned_integer, scalar_or_suffix_broadcast,
 };
 use crate::sys::mlx;
@@ -412,6 +412,27 @@ fn softmax_claim(node: &NodeView) -> ClaimResult {
         "axis {axis} is out of range for rank {rank}"
     );
     Ok(())
+}
+
+fn softmax_shape_safety(since_version: i32, axis: i64, rank: i64) -> CompileShapeSafety {
+    let axis = if axis < 0 { axis + rank } else { axis };
+    if since_version < 13 && axis != rank - 1 {
+        CompileShapeSafety::ShapeKeyedOnly {
+            reason: "legacy suffix Softmax lowering depends on singleton dimension extents",
+        }
+    } else {
+        CompileShapeSafety::Shapeless
+    }
+}
+
+fn softmax_compile_shape_safety(node: &NodeView) -> CompileShapeSafety {
+    let default_axis = if node.since_version() >= 13 { -1 } else { 1 };
+    let rank = node.input_info(0).map_or(0, |info| info.shape.len()) as i64;
+    softmax_shape_safety(
+        node.since_version(),
+        node.int_attr("axis", default_axis),
+        rank,
+    )
 }
 
 fn cast_pair_claimable(
@@ -965,14 +986,17 @@ pub fn register(registry: &mut OpRegistry) {
         handler: sigmoid_op,
         claim: sigmoid_claim,
     });
-    registry.register_shapeless(OpRegistration {
-        domain: "",
-        op_type: "Softmax",
-        min_opset: K_ANY_OPSET,
-        max_opset: K_ANY_OPSET,
-        handler: softmax_op,
-        claim: softmax_claim,
-    });
+    registry.register_shape_classified(
+        OpRegistration {
+            domain: "",
+            op_type: "Softmax",
+            min_opset: K_ANY_OPSET,
+            max_opset: K_ANY_OPSET,
+            handler: softmax_op,
+            claim: softmax_claim,
+        },
+        softmax_compile_shape_safety,
+    );
     registry.register_shapeless(OpRegistration {
         domain: "",
         op_type: "Cast",
@@ -1063,4 +1087,26 @@ pub fn register(registry: &mut OpRegistry) {
     // Misc elementwise.
     shapeless_since(registry, "Mod", 10, mod_op, mod_claim);
     shapeless_since(registry, "BitShift", 11, bitshift_op, bitshift_claim);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_suffix_softmax_never_enters_shapeless_replay() {
+        for version in [1, 11] {
+            for axis in [0, 1, -2, -3] {
+                let safety = softmax_shape_safety(version, axis, 3);
+                assert!(!safety.allows_shapeless());
+                assert!(safety.allows_shape_keyed());
+            }
+            for axis in [2, -1] {
+                assert!(softmax_shape_safety(version, axis, 3).allows_shapeless());
+            }
+        }
+        for axis in [0, 1, 2, -1, -2, -3] {
+            assert!(softmax_shape_safety(13, axis, 3).allows_shapeless());
+        }
+    }
 }

@@ -1819,6 +1819,10 @@ mod tests {
             compile_shape_rule("com.microsoft", "GroupQueryAttention", 1),
             CompileShapeRule::Classified(_)
         ));
+        assert!(matches!(
+            compile_shape_rule("", "Softmax", 11),
+            CompileShapeRule::Classified(_)
+        ));
     }
 
     #[test]

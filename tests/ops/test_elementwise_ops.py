@@ -59,7 +59,7 @@ def test_softmax_symbolic_suffix(opset, eager, monkeypatch):
     )
     session = m._session(model, m.EP_PROVIDERS)
     rng = np.random.default_rng(42)
-    for length in [3, 5, 0, 3]:
+    for length in [1, 5, 0, 1]:
         x = rng.normal(size=(2, length, 4)).astype(np.float32)
         actual = session.run(None, {"x": x})[0]
         np.testing.assert_allclose(actual, m.run_cpu(model, {"x": x})[0], rtol=1e-5, atol=1e-6)
