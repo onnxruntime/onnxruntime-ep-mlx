@@ -64,7 +64,7 @@ The following table is the current support contract. Do not broaden claims witho
 | **GroupQueryAttention** | `com.microsoft` | 9-input separate-QKV form; matching `fp32`/`fp16`/`bf16` Q/K/V/past_k/past_v/cos/sin; `int32` `seqlens_k` and `total_seq`; RoPE applied in-op | `mlx_fast_scaled_dot_product_attention` + `mlx_fast_rope` | Writes present K/V back to the same ORT ctx outputs in `[B, kv_heads, total_seq, head]` native-float layout. This keeps prefill→decode KV handoff layout- and position-continuous. |
 | **RMSNormalization** | `ai.onnx` | Any valid suffix axis; broadcast scale; independent floating X/scale types | Fused last-axis vector form or composed statistics/affine | Live scale remains a dependency. Default epsilon is `1e-5`; explicit stash precision is honored. |
 | **LayerNormalization** | `ai.onnx` | Any valid suffix axis; broadcast scale/optional bias; optional mean/inverse-standard-deviation outputs | Fused last-axis vector Y-only form or composed statistics/affine | Statistics retain stash dtype. Float64 tensors or internal statistics use an isolated MLX CPU stream. |
-| **SkipSimplifiedLayerNormalization** | `com.microsoft` | `fp32`/`fp16`/`bf16` input/skip/gamma | skip-add + `mlx_fast_rms_norm` | Implements residual add followed by RMS normalization. Dtype-generic. |
+| **SkipSimplifiedLayerNormalization** | `com.microsoft` | `fp32`/`fp16`/`bf16` input/skip/gamma, optional bias, inverse statistic and residual output | skip-add + fused RMS normalization or composed saved statistics | Float32 accumulation; live RMS mean output remains unclaimed because its semantics are undefined upstream. |
 | **GatherBlockQuantized** | `com.microsoft` | int4 embedding, symmetric (3-input, `zp=8`) **and** asymmetric (4-input `zero_points`) | gather + int4 dequant | Symmetric: `w=(q-8)·scale`. Asymmetric: `w=(q-zp)·scale`. |
 | **Softmax** | `ai.onnx` | any valid axis; `fp32`/`fp16`/`bf16` | `mlx_softmax_axis` / `mlx_softmax_axes` | Opset <13 normalizes the complete suffix starting at `axis` (default 1); opset >=13 normalizes one axis (default -1). Legacy multi-axis suffixes use shape-keyed compilation because MLX selects the lowering using singleton extents; single-axis forms retain shapeless compilation. |
 | **MatMul** | `ai.onnx` | rank >=1 floating operands, including vector-vector, vector-matrix and batched vector forms | `mlx_matmul` | ONNX vector promotion/squeezing and batch broadcasting are native MLX semantics. Empty contraction dimensions, empty batches and symbolic extents are supported. Float64 uses the isolated MLX CPU stream; integer MatMul stays on ORT CPU. |
@@ -307,10 +307,19 @@ bias, broadcast skip inputs, and the residual sum at fixed output slot 3.
 Both use their schema's default epsilon of `1e-12`. Narrow inputs accumulate the
 residual and normalization in float32 before casting output tensors back.
 Empty extents are supported; dynamic forms use shape-keyed compilation.
-Training diagnostic outputs at slots 1 and 2 are not implemented and are
-declined when consumed or exported; declared-but-unused diagnostics remain
-accepted. This is an inference-only contract, not a claim that those training
-statistics are mathematically impossible.
+`SkipLayerNormalization` supplies float32 mean and inverse-standard-deviation
+outputs at slots 1 and 2, including independent output holes. The RMS variant
+supplies its inverse-root-mean-square statistic at slot 2. Saved statistics have
+shape `input.shape[:-1] + [1]` and describe the float32 residual before its
+optional cast back to the input dtype. Statistics use shape-keyed composition;
+ordinary inference retains the fused normalization paths.
+
+Only the RMS variant's live mean output at slot 1 remains declined when consumed
+or exported. Its upstream schema does not define which RMS statistic it denotes,
+and the [portable reference](https://github.com/onnxruntime/mobius/blob/main/src/mobius/functions/skip_layer_normalization.py)
+emits unused placeholders, not an observable value contract. Declared-but-unused
+RMS mean outputs remain accepted. This is a semantic specification gap, not a
+backend limitation.
 
 ### 3.4 Quantized embedding gather
 
