@@ -62,7 +62,8 @@ The following table is the current support contract. Do not broaden claims witho
 |---|---|---|---|---|
 | **MatMulNBits** | `com.microsoft` | int4 block quantized weights, `bits=4`, `block_size=32` | `mlx_quantized_matmul` | Packed uint8 int4 weights are repacked once to MLX affine-quant format and cached persistently on the compiled plan. |
 | **GroupQueryAttention** | `com.microsoft` | 9-input separate-QKV form; matching `fp32`/`fp16`/`bf16` Q/K/V/past_k/past_v/cos/sin; `int32` `seqlens_k` and `total_seq`; RoPE applied in-op | `mlx_fast_scaled_dot_product_attention` + `mlx_fast_rope` | Writes present K/V back to the same ORT ctx outputs in `[B, kv_heads, total_seq, head]` native-float layout. This keeps prefill→decode KV handoff layout- and position-continuous. |
-| **RMSNormalization** | `ai.onnx` | `axis=-1`; `fp32`/`fp16`/`bf16` | `mlx_fast_rms_norm` | Gamma is cached from live context data on first run. Dtype-generic. |
+| **RMSNormalization** | `ai.onnx` | Any valid suffix axis; broadcast scale; independent floating X/scale types | Fused last-axis vector form or composed statistics/affine | Live scale remains a dependency. Default epsilon is `1e-5`; explicit stash precision is honored. |
+| **LayerNormalization** | `ai.onnx` | Any valid suffix axis; broadcast scale/optional bias; optional mean/inverse-standard-deviation outputs | Fused last-axis vector Y-only form or composed statistics/affine | Statistics retain stash dtype. Float64 tensors or internal statistics use an isolated MLX CPU stream. |
 | **SkipSimplifiedLayerNormalization** | `com.microsoft` | `fp32`/`fp16`/`bf16` input/skip/gamma | skip-add + `mlx_fast_rms_norm` | Implements residual add followed by RMS normalization. Dtype-generic. |
 | **GatherBlockQuantized** | `com.microsoft` | int4 embedding, symmetric (3-input, `zp=8`) **and** asymmetric (4-input `zero_points`) | gather + int4 dequant | Symmetric: `w=(q-8)·scale`. Asymmetric: `w=(q-zp)·scale`. |
 | **Softmax** | `ai.onnx` | any valid axis; `fp32`/`fp16`/`bf16` | `mlx_softmax_axis` / `mlx_softmax_axes` | Opset <13 normalizes the complete suffix starting at `axis` (default 1); opset >=13 normalizes one axis (default -1). Legacy multi-axis suffixes use shape-keyed compilation because MLX selects the lowering using singleton extents; single-axis forms retain shapeless compilation. |
@@ -105,26 +106,24 @@ kernel. The retained SVM path is compute-bound enough to benefit from Metal; a 1
 regression case with 256 support vectors measured about **10.9×** faster than ORT CPU on the
 development machine.
 
-### 2.2 Coverage status (2026-08-18) — every numeric/bool tensor ai.onnx operator covered
+### 2.2 Coverage and form restrictions
 
-Coverage spans the full Mobius-emitted op set plus **188 of 202 non-deprecated ai.onnx ops**,
-verified against ONNX 1.22/opset 27. The remaining 14 operators all require sequence, string, or
-optional values that cannot cross the EP's MLX-array-only boundary. Every numeric/bool tensor
-operator now has an MLX or host-computed implementation, including Mish, CumProd, Hardmax, DeformConv,
-NonMaxSuppression, numeric TfIdfVectorizer, and ImageDecoder.
+Registrations cover numeric/Boolean tensor operators and selected contrib operators,
+but registration alone does not mean every schema version, attribute combination,
+dtype, optional input/output, rank, or dynamic/empty shape is supported. The
+per-node claim predicate and compile policy define the implemented subset.
 
-Every op claims the **most relaxed dtype set** its translation supports
-(`is_mlx_supported_type`: bool/int/uint 8-64/fp16/bf16/fp32; **float64 excepted** — Apple GPUs have no
-double precision). Coverage includes elementwise/math/trig/activations,
+The MLX array boundary carries bool/int/uint 8-64/fp16/bf16/fp32, with selective
+float64 support on isolated MLX CPU streams. Coverage includes elementwise/math/trig/activations,
 logical/bitwise, all reductions, shape/data-movement, normalizations, attention, MatMul/Gemm,
-conv/pooling, **all quantization (Quantize/Dequantize/DynamicQuantize/MatMulInteger/ConvInteger/
-QLinearMatMul/QLinearConv)**, random, signal/FFT (DFT/STFT/windows/MelWeightMatrix — audio),
+conv/pooling, quantization (Quantize/Dequantize/DynamicQuantize/MatMulInteger/ConvInteger/
+QLinearMatMul/QLinearConv), random, signal/FFT (DFT/STFT/windows/MelWeightMatrix — audio),
 vision/detection, **recurrent (RNN/GRU/LSTM and
 com.microsoft LinearAttention via static unrolling)**, **control flow (If/Scan/Loop via recursive
 subgraph-body translation)**, and host-computed data-dependent operators.
 
-**The 14 operators that remain on ORT CPU** require value kinds the current EP boundary cannot
-materialize:
+These value-kind forms remain on ORT CPU because the current array-only EP boundary
+cannot materialize their results:
 
 | Category | Ops |
 |---|---|
@@ -132,9 +131,10 @@ materialize:
 | String tensors | RegexFullMatch, StringConcat, StringNormalizer, StringSplit |
 | Optional value | Optional |
 
-Float64 everywhere falls back to ORT CPU (Metal hardware limit). Zero-size/empty tensors are
-**handled on MLX** (not rejected). Control-flow BODIES still offload to MLX even when a rare CF form
-runs on CPU. See §2.2 for the registry and the add-an-op recipe.
+Metal has no float64 kernels; supported float64 forms run through MLX CPU, while
+other forms fall back to ORT CPU. Empty/dynamic support is per-handler, not a
+blanket guarantee. Claimed control-flow nodes translate supported tensor bodies;
+other control-flow forms remain on CPU.
 
 The **core Rust modules** register:
 
@@ -169,19 +169,12 @@ shape-derived shapes use shape-keyed compilation. Invalid dimensions are rejecte
 before narrowing to MLX extents. `Expand` reports incompatible broadcasts instead
 of returning an invented zero tensor.
 
-Every claim is **conservative**: a handler claims only the ONNX forms it can translate correctly
-(dtype/shape/attr/opset checked in its `ClaimPredicate`); every other form falls back to ORT CPU.
-The op suite passes **1215 tests** with 62 ORT/dtype skips; the ONNX backend suite passes 1607 tests
-with unsupported/environment-specific cases skipped.
-
-**Within the Mobius-emitted subset**, the ops left on ORT CPU (each needs engine-level support the flat plan does not provide) are:
-
-| Op | Reason |
-|---|---|
-| `MoE` | Data-dependent router top-k gather/scatter — cannot lower to a static MLX graph. |
-| `PackedMultiHeadAttention` | Ragged packed layout needs runtime cumulative-seqlen, unavailable at claim time. |
-
-Plus conservative per-op form exclusions (e.g. `Resize` cubic/roi/antialias, Conv 3D/SAME/asymmetric-pad, MHA padding-mask/KV-cache) that also fall back to correct ORT CPU.
+Each registration supplies a claim predicate and compilation policy. A declined
+form falls back to ORT CPU. Regression tests cover selected schema partitions and
+interaction boundaries; they are not proof of arbitrary Cartesian combinations.
+Examples of remaining form exclusions include some `Resize` interpolation options,
+ConvTranspose geometries, and attention mask/layout combinations. Such exclusions
+are implementation restrictions, not necessarily mathematical/backend impossibilities.
 
 **Engine fix (landed):** ORT returns a **null** `OrtValueInfo` for an omitted *interior* optional input (e.g. `Resize` `roi`, `Clip` `min`); the Rust clustering pass now null-guards input names before constructing dataflow edges, so interior-optional-gap ops are safe. Earlier interior-gap claim guards in attention/SSM modules can now be relaxed as a follow-up.
 
@@ -286,7 +279,14 @@ The backend writes present K/V to the same ORT context outputs in `[B, kv_heads,
 
 ### 3.3 Normalization
 
-`RMSNormalization` maps to `mlx_fast_rms_norm` for `axis=-1`, in `fp32`/`fp16`/`bf16`.
+Standard `RMSNormalization` and `LayerNormalization` normalize any valid suffix
+of dimensions and accept unidirectional broadcast affine parameters. The ordinary
+last-axis, vector-affine, Y-only forms retain MLX fast kernels. Other forms compose
+the schema's arithmetic, honor `stash_type`, and cast normalized values back before
+the affine stage. Narrow statistics accumulate in float32 and round back to stash
+precision; float64 statistics stay on an isolated MLX CPU stream even when all
+boundary tensors are float32. LayerNormalization also produces optional mean and
+inverse-standard-deviation outputs, including omitted output slots.
 
 `SkipSimplifiedLayerNormalization` is translated as skip-add followed by `mlx_fast_rms_norm` for `fp32`/`fp16`/`bf16` input/skip/gamma.
 

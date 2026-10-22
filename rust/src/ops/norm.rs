@@ -1,7 +1,7 @@
 //! Normalization op handlers. Faithful port of the C++ `ops/norm.cc` + `ops/norm_ext.cc`:
 //!
-//!   * RMSNormalization (ai.onnx opset 23+)             — mlx_fast_rms_norm
-//!   * LayerNormalization (ai.onnx opset 17+)           — mlx_fast_layer_norm
+//!   * RMSNormalization (ai.onnx opset 23+)             — fused or composed suffix normalization
+//!   * LayerNormalization (ai.onnx opset 17+)           — fused or composed, optional statistics
 //!   * SimplifiedLayerNormalization (com.microsoft)     — mlx_fast_rms_norm
 //!   * SkipLayerNormalization (com.microsoft)           — residual add + mlx_fast_layer_norm
 //!   * SkipSimplifiedLayerNormalization (com.microsoft) — residual add + mlx_fast_rms_norm
@@ -11,13 +11,13 @@
 //!   * BatchNormalization (ai.onnx, inference form)     — composed per-channel affine
 //!   * LRN (ai.onnx, across-channel)                    — composed square/window-sum/power/divide
 //!
-//! Every handler honors the resolved input dtype (fp32/fp16/bf16) with no per-dtype branching:
-//! the MLX fast norms run in whatever float dtype the input carries, and the composed paths keep a
-//! matching-dtype epsilon scalar so no unwanted upcast occurs.
+//! Standard norms honor stash precision and broadcast affine parameters. Their ordinary last-axis
+//! vector-affine forms retain the fused kernels; float64 tensors/statistics use an isolated CPU stream.
 
 use crate::engine::{MlxError, NodeDesc, Src, TranslationContext};
 use crate::registry::{
-    ClaimResult, K_ANY_OPSET, NodeView, OpRegistration, OpRegistry, is_mlx_float,
+    ClaimResult, CompileShapeSafety, K_ANY_OPSET, NodeView, OpRegistration, OpRegistry,
+    is_mlx_cpu_float, is_mlx_float,
 };
 use crate::sys::mlx;
 use crate::sys::ort;
@@ -160,15 +160,8 @@ fn instance_norm_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), Ml
     Ok(())
 }
 
-/// RMSNormalization (ai.onnx opset 23+): out = rms_norm(x) * scale over the last axis.
 fn rms_norm_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
-    let x = ctx.resolve(&n.inputs[0])?;
-    let g = ctx.resolve(&n.inputs[1])?;
-    let eps = epsilon(n, 1e-6);
-    let r = ctx.emit(|res, s| unsafe { mlx::mlx_fast_rms_norm(res, x, g, eps, s) })?;
-    ctx.mark_fast("mlx_fast_rms_norm");
-    ctx.bind(&n.outputs[0], r);
-    Ok(())
+    standard_norm_op(ctx, n, false)
 }
 
 /// SimplifiedLayerNormalization (com.microsoft): Y = rms_norm(X) * scale over the last axis.
@@ -182,20 +175,139 @@ fn simplified_layer_norm_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Resul
     Ok(())
 }
 
-/// LayerNormalization (ai.onnx opset 17+, last-axis form): Y = layer_norm(X, scale, bias, eps).
-/// Only the single-output (Y) form is claimed; Mean/InvStdDev extra outputs are left to CPU.
 fn layer_norm_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
+    standard_norm_op(ctx, n, true)
+}
+
+fn affine_broadcasts_to(x: &[i64], affine: &[i64]) -> bool {
+    affine.len() <= x.len()
+        && x.iter()
+            .rev()
+            .zip(affine.iter().rev())
+            .all(|(&x, &a)| a == 1 || a == x || a < 0 || x < 0)
+}
+
+fn norm_mean_axes(
+    ctx: &mut TranslationContext,
+    input: mlx::mlx_array,
+    axes: &[i32],
+    dtype: mlx::mlx_dtype,
+) -> Result<mlx::mlx_array, MlxError> {
+    // Avoid narrow-type accumulation error, but round each statistic to the requested precision.
+    let accumulation_dtype = if dtype == mlx::mlx_dtype__MLX_FLOAT64 {
+        dtype
+    } else {
+        mlx::mlx_dtype__MLX_FLOAT32
+    };
+    let input = ctx.astype(input, accumulation_dtype)?;
+    let mean = ctx.emit(|res, stream| unsafe {
+        mlx::mlx_mean_axes(res, input, axes.as_ptr(), axes.len(), true, stream)
+    })?;
+    ctx.astype(mean, dtype)
+}
+
+fn standard_norm_op(
+    ctx: &mut TranslationContext,
+    n: &NodeDesc,
+    centered: bool,
+) -> Result<(), MlxError> {
     let x = ctx.resolve(&n.inputs[0])?;
     let scale = ctx.resolve(&n.inputs[1])?;
-    let bias = if present(n, 2) {
-        ctx.resolve(&n.inputs[2])?
+    let bias = if centered && present(n, 2) {
+        Some(ctx.resolve(&n.inputs[2])?)
     } else {
-        empty_array()
+        None
     };
+    let shape = ctx.shape_of(x);
+    let rank = shape.len() as i64;
+    let axis = n.ints.get("axis").copied().unwrap_or(-1);
+    if rank == 0 || axis < -rank || axis >= rank {
+        return Err(format!(
+            "{}: axis {axis} is invalid for rank {rank}",
+            n.op_type
+        ));
+    }
+    let axis = if axis < 0 { axis + rank } else { axis } as i32;
+    let input_shape: Vec<i64> = shape.iter().map(|&d| i64::from(d)).collect();
+    for affine in [Some(scale), bias].into_iter().flatten() {
+        let affine_shape: Vec<i64> = ctx.shape_of(affine).iter().map(|&d| i64::from(d)).collect();
+        if !affine_broadcasts_to(&input_shape, &affine_shape) {
+            return Err(format!(
+                "{}: affine shape {affine_shape:?} cannot broadcast to {shape:?}",
+                n.op_type
+            ));
+        }
+    }
+    let stash = n.ints.get("stash_type").copied().unwrap_or(1);
+    let input_dtype = ctx.dtype_of(x);
     let eps = epsilon(n, 1e-5);
-    let r = ctx.emit(|res, s| unsafe { mlx::mlx_fast_layer_norm(res, x, scale, bias, eps, s) })?;
-    ctx.mark_fast("mlx_fast_layer_norm");
-    ctx.bind(&n.outputs[0], r);
+    let vector_shape = [shape[shape.len() - 1]];
+    if axis == rank as i32 - 1
+        && stash == 1
+        && n.outputs.len() == 1
+        && ctx.size_of(x) != 0
+        && input_dtype != mlx::mlx_dtype__MLX_FLOAT64
+        && ctx.dtype_of(scale) == input_dtype
+        && ctx.shape_of(scale) == vector_shape
+        && bias.is_none_or(|b| ctx.dtype_of(b) == input_dtype && ctx.shape_of(b) == vector_shape)
+    {
+        let r = if centered {
+            ctx.mark_fast("mlx_fast_layer_norm");
+            ctx.emit(|res, s| unsafe {
+                mlx::mlx_fast_layer_norm(res, x, scale, bias.unwrap_or_else(empty_array), eps, s)
+            })?
+        } else {
+            ctx.mark_fast("mlx_fast_rms_norm");
+            ctx.emit(|res, s| unsafe { mlx::mlx_fast_rms_norm(res, x, scale, eps, s) })?
+        };
+        ctx.bind(&n.outputs[0], r);
+        return Ok(());
+    }
+    let stash_dtype = crate::engine::mlx_dtype_from_onnx(stash as ort::ONNXTensorElementDataType);
+    let compute = ctx.astype(x, stash_dtype)?;
+    let axes: Vec<i32> = (axis..rank as i32).collect();
+    let mean = if centered {
+        Some(norm_mean_axes(ctx, compute, &axes, stash_dtype)?)
+    } else {
+        None
+    };
+    let values = match mean {
+        Some(mean) => sub(ctx, compute, mean)?,
+        None => compute,
+    };
+    let squared = mul(ctx, values, values)?;
+    let variance = norm_mean_axes(ctx, squared, &axes, stash_dtype)?;
+    let epsilon = scalar_like(ctx, eps, stash_dtype)?;
+    let denominator = add(ctx, variance, epsilon)?;
+    let stddev = sqrt(ctx, denominator)?;
+    let inv_std = ctx.unary(mlx::mlx_reciprocal, stddev)?;
+    let normalized = if centered {
+        mul(ctx, values, inv_std)?
+    } else {
+        divide(ctx, values, stddev)?
+    };
+    let normalized = ctx.astype(normalized, input_dtype)?;
+    let scaled = mul(ctx, normalized, scale)?;
+    let output = match bias {
+        Some(bias) => add(ctx, scaled, bias)?,
+        None => scaled,
+    };
+    let output = ctx.astype(
+        output,
+        crate::engine::mlx_dtype_from_onnx(n.outputs[0].otype),
+    )?;
+    ctx.bind(&n.outputs[0], output);
+    if centered {
+        if let Some(mean) = mean
+            && n.outputs.get(1).is_some_and(|o| !o.name.is_empty())
+        {
+            ctx.bind(&n.outputs[1], mean);
+        }
+        if n.outputs.get(2).is_some_and(|o| !o.name.is_empty()) {
+            ctx.bind(&n.outputs[2], inv_std);
+        }
+    }
+    ctx.mark_composed("normalization with explicit stash precision and broadcast affine");
     Ok(())
 }
 
@@ -459,30 +571,7 @@ fn tensor_dtype(node: &NodeView, i: usize) -> Option<ort::ONNXTensorElementDataT
 
 /// RMSNormalization (ai.onnx): X, scale, axis == -1. fp32/fp16/bf16 (mlx_fast_rms_norm is generic).
 fn rms_norm_claim(node: &NodeView) -> ClaimResult {
-    require!(
-        node.num_inputs() == 2 && node.num_outputs() > 0,
-        "expects 2 inputs and at least 1 output, got {}in/{}out",
-        node.num_inputs(),
-        node.num_outputs()
-    );
-    let (x, g, out) = match (
-        node.input_info(0),
-        tensor_dtype(node, 1),
-        node.output_info(0),
-    ) {
-        (Some(x), Some(g), Some(o)) => (x, g, o),
-        _ => deny!("missing tensor type/shape info on an input or the first output"),
-    };
-    require!(
-        is_mlx_float(x.dtype) && g == x.dtype && out.dtype == x.dtype,
-        "X, scale, and output must share one float dtype (fp32/fp16/bf16), got {}, {} -> {}",
-        crate::registry::ort_dtype_name(x.dtype),
-        crate::registry::ort_dtype_name(g),
-        crate::registry::ort_dtype_name(out.dtype)
-    );
-    let axis = node.int_attr("axis", -1);
-    require!(axis == -1, "only axis=-1 is supported (got {axis})");
-    Ok(())
+    standard_norm_claim(node, false)
 }
 
 /// SimplifiedLayerNormalization (com.microsoft): X + scale, last-axis, single output.
@@ -521,50 +610,100 @@ fn simplified_layer_norm_claim(node: &NodeView) -> ClaimResult {
     Ok(())
 }
 
-/// LayerNormalization: fp32/fp16/bf16 X + scale (+ optional bias), last-axis, single output (Y).
 fn layer_norm_claim(node: &NodeView) -> ClaimResult {
+    standard_norm_claim(node, true)
+}
+
+fn standard_norm_claim(node: &NodeView, centered: bool) -> ClaimResult {
     let nin = node.num_inputs();
     require!(
-        (2..=3).contains(&nin) && node.num_outputs() == 1,
-        "expects 2-3 inputs and 1 output, got {}in/{}out",
+        (2..=if centered { 3 } else { 2 }).contains(&nin)
+            && (1..=if centered { 3 } else { 1 }).contains(&node.num_outputs()),
+        "invalid normalization input/output count: {}in/{}out",
         nin,
         node.num_outputs()
     );
-    let (x, scale, out) = match (
-        node.input_info(0),
-        tensor_dtype(node, 1),
-        node.output_info(0),
-    ) {
+    let (x, scale, out) = match (node.input_info(0), node.input_info(1), node.output_info(0)) {
         (Some(x), Some(scale), Some(o)) => (x, scale, o),
         _ => deny!("missing tensor type/shape info on X, scale, or output"),
     };
     require!(
-        is_mlx_float(x.dtype) && scale == x.dtype && out.dtype == x.dtype,
-        "X, scale, and output must share one float dtype (fp32/fp16/bf16), got {}, {} -> {}",
-        crate::registry::ort_dtype_name(x.dtype),
-        crate::registry::ort_dtype_name(scale),
-        crate::registry::ort_dtype_name(out.dtype)
+        is_mlx_cpu_float(x.dtype)
+            && is_mlx_cpu_float(scale.dtype)
+            && out.dtype == scale.dtype
+            && (!centered || scale.dtype == x.dtype),
+        "normalization requires supported floating-point inputs and matching affine/output types"
+    );
+    require!(
+        affine_broadcasts_to(&x.shape, &scale.shape),
+        "scale shape {:?} cannot broadcast to input {:?}",
+        scale.shape,
+        x.shape
     );
     if nin == 3 && node.input_present(2) {
-        let bias = match tensor_dtype(node, 2) {
+        let bias = match node.input_info(2) {
             Some(bias) => bias,
             None => deny!("missing tensor type/shape info on bias"),
         };
         require!(
-            bias == x.dtype,
+            bias.dtype == x.dtype && affine_broadcasts_to(&x.shape, &bias.shape),
             "bias must match X dtype {}, got {}",
             crate::registry::ort_dtype_name(x.dtype),
-            crate::registry::ort_dtype_name(bias)
+            crate::registry::ort_dtype_name(bias.dtype)
         );
     }
     let rank = x.shape.len() as i64;
     require!(rank > 0, "input must have rank >= 1 (got a scalar)");
     let axis = node.int_attr("axis", -1);
     require!(
-        axis == -1 || axis == rank - 1,
-        "only the last axis is supported (got axis={axis} for rank {rank})"
+        axis >= -rank && axis < rank,
+        "axis {axis} is out of range for rank {rank}"
     );
+    let stash = node.int_attr("stash_type", 1);
+    require!(
+        matches!(stash, 1 | 10 | 11 | 16),
+        "stash_type must be float32, float16, float64, or bfloat16"
+    );
+    for i in 1..node.num_outputs() {
+        if node.output_present(i) {
+            require!(
+                node.output_info(i)
+                    .is_some_and(|o| i64::from(o.dtype) == stash),
+                "statistic output {i} must match stash_type {stash}"
+            );
+        }
+    }
     Ok(())
+}
+
+fn standard_norm_compile_shape_safety(node: &NodeView) -> CompileShapeSafety {
+    let fast_geometry = (|| {
+        let x = node.input_info(0)?;
+        let scale = node.input_info(1)?;
+        let dim = *x.shape.last()?;
+        let axis = node.int_attr("axis", -1);
+        Some(
+            dim > 0
+                && (axis == -1 || axis == x.shape.len() as i64 - 1)
+                && node.int_attr("stash_type", 1) == 1
+                && node.num_outputs() == 1
+                && is_mlx_float(x.dtype)
+                && scale.dtype == x.dtype
+                && scale.shape == [dim]
+                && (!node.input_present(2)
+                    || node
+                        .input_info(2)
+                        .is_some_and(|b| b.dtype == x.dtype && b.shape == [dim])),
+        )
+    })()
+    .unwrap_or(false);
+    if fast_geometry {
+        CompileShapeSafety::Shapeless
+    } else {
+        CompileShapeSafety::ShapeKeyedOnly {
+            reason: "conservatively shape-keyed: composed normalization axes and affine dispatch depend on concrete shapes",
+        }
+    }
 }
 
 /// SkipSimplifiedLayerNormalization (com.microsoft): input, skip, gamma. fp32/fp16/bf16. 3-input.
@@ -908,22 +1047,28 @@ pub fn register_norm(registry: &mut OpRegistry) {
         instance_norm_claim,
     );
     // RMSNormalization entered ai.onnx at opset 23.
-    shapeless(
-        registry,
-        "",
-        "RMSNormalization",
-        23,
-        rms_norm_op,
-        rms_norm_claim,
+    registry.register_shape_classified(
+        OpRegistration {
+            domain: "",
+            op_type: "RMSNormalization",
+            min_opset: 23,
+            max_opset: K_ANY_OPSET,
+            handler: rms_norm_op,
+            claim: rms_norm_claim,
+        },
+        standard_norm_compile_shape_safety,
     );
     // LayerNormalization entered ai.onnx at opset 17.
-    shapeless(
-        registry,
-        "",
-        "LayerNormalization",
-        17,
-        layer_norm_op,
-        layer_norm_claim,
+    registry.register_shape_classified(
+        OpRegistration {
+            domain: "",
+            op_type: "LayerNormalization",
+            min_opset: 17,
+            max_opset: K_ANY_OPSET,
+            handler: layer_norm_op,
+            claim: layer_norm_claim,
+        },
+        standard_norm_compile_shape_safety,
     );
     shapeless(
         registry,
