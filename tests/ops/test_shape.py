@@ -588,6 +588,109 @@ def test_identity(dt):
 
 
 # --- ConstantOfShape --------------------------------------------------------------------------
+@pytest.mark.parametrize("intermediate", [False, True])
+@pytest.mark.parametrize("eager", [False, True], ids=["compiled-enabled", "eager"])
+@pytest.mark.parametrize(
+    "dtype,np_dtype,fill",
+    [
+        (DT.FLOAT, np.float32, None),
+        (DT.INT64, np.int64, 2**53 + 7),
+        (DT.UINT64, np.uint64, 2**63 + 5),
+        (DT.DOUBLE, np.float64, 1e-300),
+        (DT.BOOL, np.bool_, True),
+    ],
+)
+def test_constant_of_shape_live_values(intermediate, eager, dtype, np_dtype, fill, monkeypatch):
+    monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_COMPILE", "1" if eager else "0")
+    shape = m.tensor("shape", DT.INT64, [2])
+    out = m.tensor("out", dtype, ["A", "B"])
+    nodes = []
+    parameter = shape
+    if intermediate:
+        parameter = m.tensor("parameter", DT.INT64, [2])
+        nodes.append(ir.node("Identity", [shape], outputs=[parameter]))
+    attributes = {} if fill is None else {
+        "value": ir.AttrTensor("value", ir.tensor(np.array([fill], np_dtype)))
+    }
+    nodes.append(ir.node("ConstantOfShape", [parameter], attributes=attributes, outputs=[out]))
+    graph = ir.Graph(
+        [shape], [out], nodes=nodes, name="live_fill_shape", opset_imports={"": 23}
+    )
+    model = ir.to_proto(ir.Model(graph, ir_version=11)).SerializeToString()
+    options = ort.SessionOptions()
+    options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+    options.add_session_config_entry("session.disable_cpu_ep_fallback", "1")
+    session = ort.InferenceSession(model, options, providers=["MLXExecutionProvider"])
+    for dims in [(2, 3), (3, 2), (0, 4), (2, 3)]:
+        actual = session.run(None, {"shape": np.asarray(dims, np.int64)})[0]
+        np.testing.assert_array_equal(actual, np.full(dims, 0 if fill is None else fill, np_dtype))
+
+
+@pytest.mark.parametrize("dimension", [-1, 2**31, 2**32 + 1])
+def test_constant_of_shape_rejects_narrowed_dimension(dimension):
+    model = build(
+        "ConstantOfShape", [m.tensor("shape", DT.INT64, [1])],
+        [m.tensor("out", DT.FLOAT, ["N"])],
+    )
+    session = m._session(model, m.EP_PROVIDERS)
+    session.disable_fallback()
+    with pytest.raises(ort.capi.onnxruntime_pybind11_state.EPFail, match="ConstantOfShape.*i32"):
+        session.run(None, {"shape": np.array([dimension], np.int64)})
+
+
+def test_expand_rejects_incompatible_dimensions():
+    model = build(
+        "Expand", [m.tensor("x", DT.FLOAT, [2, 2]), m.tensor("shape", DT.INT64, [2])],
+        [m.tensor("out", DT.FLOAT, ["A", "B"])],
+    )
+    session = m._session(model, m.EP_PROVIDERS)
+    session.disable_fallback()
+    with pytest.raises(ort.capi.onnxruntime_pybind11_state.EPFail, match="Expand.*cannot broadcast"):
+        session.run(None, {"x": np.ones((2, 2), np.float32), "shape": np.array([2, 3], np.int64)})
+
+
+def test_constant_of_shape_empty_shape_is_scalar():
+    model = build(
+        "ConstantOfShape", [m.tensor("shape", DT.INT64, [0])],
+        [m.tensor("out", DT.FLOAT, [])],
+    )
+    feeds = {"shape": np.array([], np.int64)}
+    m.assert_mlx_claims(model, feeds)
+    np.testing.assert_array_equal(m.run_mlx(model, feeds)[0], np.array(0, np.float32))
+
+
+def test_constant_of_shape_value_guard_replay(tmp_path):
+    trace = tmp_path / "fill_shape.json"
+    subprocess.run(
+        [
+            sys.executable, "-m", "pytest", Path(__file__).name,
+            "-k", "test_constant_of_shape_live_values and compiled-enabled",
+            "-q", "-p", "no:cacheprovider",
+        ],
+        cwd=Path(__file__).parent,
+        env={
+            **os.environ,
+            "ONNXRUNTIME_EP_MLX_TRACE": str(trace),
+            "ONNXRUNTIME_EP_MLX_NO_COMPILE": "0",
+            "ONNXRUNTIME_EP_MLX_NO_GENERAL_COMPILE": "0",
+        },
+        check=True,
+        timeout=120,
+    )
+    events = [
+        e["args"] for e in json.loads(trace.read_text())
+        if e.get("cat") == "ep.path" and "ConstantOfShape" in e["args"].get("ops", "").split(",")
+    ]
+    paths, caches = [], []
+    for compiled in [True, True, True, False, True]:
+        paths.extend(["general" if compiled else "eager"] * 4 + ["eager"] * 4)
+        caches.extend(
+            (["MISS", "RETRACE", "RETRACE", "HIT"] if compiled else ["n/a"] * 4) + ["n/a"] * 4
+        )
+    assert [e["path"] for e in events] == paths
+    assert [e["cache"] for e in events] == caches
+
+
 def _assert_matches_cpu_noopt(model: bytes, feeds: dict, *, rtol: float, atol: float) -> None:
     """Like ``m.assert_matches_cpu`` but with graph optimization disabled.
 
