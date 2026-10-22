@@ -14,7 +14,7 @@
 //! `delta_copyout` / `contiguous_outputs` features). The strategies are just configurations:
 //!   * **decode**  = `{ Shapeless,  kv_alias, rope_as_data, delta_copyout }` — shapeless so a growing
 //!     KV length never retraces; RoPE position + valid-past fed as DATA; delta KV copy-out.
-//!   * **general** = `{ ShapeKeyed, contiguous_outputs }` — retraces on a shape change; no attention.
+//!   * **general** = `{ ShapeKeyed, contiguous_outputs }` — retraces on a shape change; no KV aliasing.
 //!   * **prefill** = `{ ShapeKeyed, kv_alias, rope_as_data, delta_copyout }` (Phase 2) — the SAME
 //!     decoder subgraph as decode but with a variable query length S>1, so it is shape-keyed.
 //!
@@ -76,13 +76,24 @@ pub fn decode_enabled(has_control_flow: bool, nodes: &[NodeDesc]) -> bool {
 
 /// Op types whose subgraphs keep their existing (eager / compiled-decode) routes because they are
 /// incompatible with a single static-shape fused trace:
-///   * attention ops carry KV-cache aliasing + delta copy-out semantics not modelled by the general
-///     config (they take the decode/prefill configs instead);
+///   * cached attention ops carry KV-cache aliasing + delta copy-out semantics not modelled by the
+///     general config (they take the decode/prefill configs instead); cache-free standard Attention
+///     can use ordinary shape-keyed capture;
 ///   * host-computed ops GPU-eval their DYNAMIC input DATA mid-translate (`contiguous_eval`) and/or
 ///     emit a data-dependent output shape — both illegal inside an `mlx_compile` trace (the
 ///     placeholder has no data), so a subgraph containing one is never general-compiled.
 fn is_general_compile_unsafe(n: &NodeDesc) -> bool {
-    is_separate_qkv_attention(n)
+    let cache_free_attention = n.domain.is_empty()
+        && n.op_type == "Attention"
+        && n.inputs
+            .iter()
+            .skip(4)
+            .all(|input| input.source == Src::Absent)
+        && n.outputs
+            .iter()
+            .skip(1)
+            .all(|output| output.name.is_empty());
+    (is_separate_qkv_attention(n) && !cache_free_attention)
         || matches!(
             n.op_type.as_str(),
             "GroupQueryAttention"
@@ -1396,6 +1407,56 @@ mod shape_inference_tests {
         );
         node.inputs = vec![input("data", Src::CtxInput), input("axis", axis_source)];
         node
+    }
+
+    #[test]
+    fn general_capture_allows_only_cache_free_standard_attention() {
+        let mut node = NodeDesc::new(
+            "Attention".to_string(),
+            String::new(),
+            23,
+            CompileShapeSafety::Shapeless,
+        );
+        node.inputs = ["q", "k", "v", "mask"]
+            .into_iter()
+            .map(|name| input(name, Src::CtxInput))
+            .collect();
+        assert!(!is_general_compile_unsafe(&node));
+        node.inputs.push(input("", Src::Absent));
+        node.inputs.push(input("", Src::Absent));
+        assert!(!is_general_compile_unsafe(&node));
+        node.inputs[4] = input("past_key", Src::CtxInput);
+        assert!(is_general_compile_unsafe(&node));
+        node.inputs[4] = input("", Src::Absent);
+        node.inputs[5] = input("past_value", Src::CtxInput);
+        assert!(is_general_compile_unsafe(&node));
+        node.inputs[5] = input("", Src::Absent);
+        node.outputs = vec![
+            OutRef {
+                name: "output".to_string(),
+                external: true,
+                ctx_index: 0,
+                otype: ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
+            },
+            OutRef {
+                name: "present_key".to_string(),
+                external: true,
+                ctx_index: 1,
+                otype: ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
+            },
+        ];
+        assert!(is_general_compile_unsafe(&node));
+        node.outputs.pop();
+        assert!(!is_general_compile_unsafe(&node));
+        node.op_type = "MultiHeadAttention".to_string();
+        node.domain = "com.microsoft".to_string();
+        assert!(is_general_compile_unsafe(&node));
+        node.op_type = "Attention".to_string();
+        node.domain.clear();
+        node.compile_shape_safety = CompileShapeSafety::EagerOnly {
+            reason: "composed attention form",
+        };
+        assert!(!compile_shape_mode_supported(&[node], false));
     }
 
     #[test]

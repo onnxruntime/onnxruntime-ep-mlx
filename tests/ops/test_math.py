@@ -79,38 +79,50 @@ def test_div(dtype: DT, np_dtype, tol: float) -> None:
 
 @pytest.mark.parametrize("scalar", [False, True], ids=["suffix", "scalar"])
 @pytest.mark.parametrize("eager", [False, True], ids=["compiled", "eager"])
-def test_div_int32(scalar: bool, eager: bool, monkeypatch) -> None:
+@pytest.mark.parametrize("np_dtype,dt", [(np.int32, DT.INT32), (np.int64, DT.INT64)])
+def test_div_signed_integer(scalar: bool, eager: bool, np_dtype, dt, monkeypatch) -> None:
     monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_COMPILE", "1" if eager else "0")
     monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_GENERAL_COMPILE", "0")
+    low, high = np.iinfo(np_dtype).min, np.iinfo(np_dtype).max
+    inexact_float = 2**24 + 1 if np_dtype == np.int32 else 2**53 + 1
     a = np.array(
         [
-            [-7, 7, -7, 7, 0, 1, -1, 2147483647],
-            [-2147483648, -2147483648, 16777217, -16777217, 8, -8, 2, -2],
-            [-2147483648, 2147483647, -2147483648, 2147483647, -6, 6, -6, 6],
-            [2147483647, -2147483648, 0, -1, -2147483647, -2147483648, 2147483647, -2147483648],
+            [-7, 7, -7, 7, 0, 1, -1, high],
+            [low, low, inexact_float, -inexact_float, 8, -8, 2, -2],
+            [low, high, low, high, -6, 6, -6, 6],
+            [high, low, 0, -1, -high, low, high, low],
         ],
-        dtype=np.int32,
+        dtype=np_dtype,
     )
-    b = np.array(-3 if scalar else [3, -3, -3, 3, -1, 1, 2, 1], dtype=np.int32)
+    b = np.array(-3 if scalar else [3, -3, -3, 3, -1, 1, 2, 1], dtype=np_dtype)
     model = m.make_model(
         "Div",
-        [m.tensor("a", DT.INT32, list(a.shape)), m.tensor("b", DT.INT32, list(b.shape))],
-        [m.tensor("out", DT.INT32, list(a.shape))],
+        [m.tensor("a", dt, list(a.shape)), m.tensor("b", dt, list(b.shape))],
+        [m.tensor("out", dt, list(a.shape))],
     )
     m.assert_mlx_claims(model, {"a": a, "b": b})
     session = m._session(model, m.EP_PROVIDERS)
-    for values in [a, np.flip(a, axis=0).copy(), a]:
-        feeds = {"a": values, "b": b}
-        numerators, divisors = np.broadcast_arrays(values, b)
+    cases = [(a, b), (np.flip(a, axis=0).copy(), b)]
+    if np_dtype == np.int64:
+        large_divisors = np.array(
+            low if scalar else [low, low + 1, -(2**53 + 1), -(2**31 + 1),
+                                2**31 + 1, 2**53 + 1, high, 1],
+            dtype=np_dtype,
+        )
+        cases.append((a, large_divisors))
+    cases.append((a, b))
+    for values, divisor in cases:
+        feeds = {"a": values, "b": divisor}
+        numerators, divisors = np.broadcast_arrays(values, divisor)
         expected = np.array(
             [
                 (abs(int(x)) // abs(int(y))) * (-1 if (x < 0) != (y < 0) else 1)
                 for x, y in zip(numerators.flat, divisors.flat, strict=True)
             ],
-            dtype=np.int32,
+            dtype=np_dtype,
         ).reshape(values.shape)
         actual = session.run(None, feeds)[0]
-        assert actual.dtype == np.int32
+        assert actual.dtype == np_dtype
         np.testing.assert_array_equal(actual, expected)
         np.testing.assert_array_equal(actual, m.run_cpu(model, feeds)[0])
 

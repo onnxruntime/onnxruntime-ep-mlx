@@ -33,7 +33,7 @@ _CHILD_ENV = "ONNXRUNTIME_EP_MLX_CLAIM_TEST_CHILD"
 
 
 def _declined_ms_model() -> bytes:
-    """A `com.microsoft.MatMulNBits` the EP declines (2-bit is unsupported)."""
+    """A `com.microsoft.MatMulNBits` the EP declines (CUDA-prepacked layout)."""
     return m.make_model(
         "MatMulNBits",
         [
@@ -43,7 +43,7 @@ def _declined_ms_model() -> bytes:
         ],
         [m.tensor("out", DataType.FLOAT, [1, 4, 8])],
         domain="com.microsoft",
-        attributes={"K": 32, "N": 8, "bits": 2, "block_size": 32},
+        attributes={"K": 32, "N": 8, "bits": 2, "block_size": 32, "weight_prepacked": 1},
     )
 
 
