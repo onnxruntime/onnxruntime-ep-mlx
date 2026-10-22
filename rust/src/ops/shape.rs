@@ -520,11 +520,12 @@ fn reshape_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError
     let data = ctx.resolve(&n.inputs[0])?;
     let shape = read_ints(ctx, n, 1)?;
     let in_shape = ctx.shape_of(data);
+    let allowzero = int_attr(n, "allowzero", 0) != 0;
     let target: Vec<i32> = shape
         .iter()
         .enumerate()
         .map(|(i, &d)| {
-            if d == 0 && i < in_shape.len() {
+            if d == 0 && !allowzero && i < in_shape.len() {
                 Ok(in_shape[i]) // allowzero=0: copy the input dim
             } else {
                 dim_i32(d) // preserves -1 (infer); errors on >i32 dims
@@ -1795,10 +1796,6 @@ fn reshape_claim(node: &NodeView) -> ClaimResult {
         node.input_info(1).map(|i| i.dtype)
             == Some(ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64),
         "Reshape `shape` input must be int64 (runtime shape-derived values resolve at trace time; a data-dependent shape falls back to eager, and a cyclic partition is dropped to CPU)"
-    );
-    require!(
-        node.int_attr("allowzero", 0) == 0,
-        "Reshape: allowzero=1 is unsupported (only the default copy-input-dim-on-zero behavior is claimed)"
     );
     Ok(())
 }

@@ -180,6 +180,35 @@ def test_reshape_zero_and_infer():
     m.assert_matches_cpu(model, {"d": data}, **tol(np.float32))
 
 
+def test_reshape_allowzero_without_zeros():
+    # dynamo exporter sets allowzero=1 on every Reshape; with no 0 in the target it is a plain reshape.
+    data = sample(np.float32, [2, 3, 4])
+    shape = np.array([2, -1, 4], np.int64)
+    model = build(
+        "Reshape",
+        [m.tensor("d", DT.FLOAT, [2, 3, 4]), initz("s", shape)],
+        [m.tensor("o", DT.FLOAT, [2, 3, 4])],
+        inits=(initz("s", shape),),
+        attrs=[ir.AttrInt64("allowzero", 1)],
+    )
+    m.assert_op_claimed(model, {"d": data}, "Reshape", **tol(np.float32))
+
+
+def test_reshape_allowzero_literal_zero():
+    # allowzero=1: a 0 is a real zero-size dim, not a copy of the input dim ([0, 4] -> [4, 0]).
+    data = np.zeros((0, 4), np.float32)
+    shape = np.array([4, 0], np.int64)
+    model = build(
+        "Reshape",
+        [m.tensor("d", DT.FLOAT, [0, 4]), initz("s", shape)],
+        [m.tensor("o", DT.FLOAT, [4, 0])],
+        inits=(initz("s", shape),),
+        attrs=[ir.AttrInt64("allowzero", 1)],
+    )
+    m.assert_op_claimed(model, {"d": data}, "Reshape", **tol(np.float32))
+    assert m.run_mlx(model, {"d": data})[0].shape == (4, 0)
+
+
 # --- Transpose --------------------------------------------------------------------------------
 @pytest.mark.parametrize("dt", MOVE_DTYPES)
 def test_transpose_perm(dt):
