@@ -681,6 +681,13 @@ unsafe fn collect_attributes(api: &ort::OrtApi, node: *const ort::OrtNode, desc:
             if let Some(value) = unsafe { read_string(api, attr, ty) } {
                 desc.strings.insert(name, value);
             }
+        } else if ty == ort::OrtOpAttrType_ORT_OP_ATTR_STRINGS {
+            if let Some(value) = unsafe { read_string(api, attr, ty) } {
+                desc.string_arrays.insert(
+                    name,
+                    value.split_terminator('\0').map(str::to_owned).collect(),
+                );
+            }
         } else if ty == ort::OrtOpAttrType_ORT_OP_ATTR_TENSOR {
             if let Some(value) = unsafe { read_tensor_attr(api, attr) } {
                 desc.tensors.insert(name, value);

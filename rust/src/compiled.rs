@@ -111,6 +111,7 @@ fn host_parameter_indices(n: &NodeDesc) -> &'static [usize] {
         "HannWindow" | "HammingWindow" | "BlackmanWindow" => &[0],
         "MelWeightMatrix" => &[0, 1, 2, 3, 4],
         "CumSum" | "CumProd" => &[1],
+        "RNN" | "GRU" | "LSTM" => &[4],
         "ReduceSum" | "ReduceMean" | "ReduceMax" | "ReduceMin" | "ReduceProd"
         | "ReduceSumSquare" | "ReduceL1" | "ReduceL2" | "ReduceLogSum" | "ReduceLogSumExp" => &[1],
         _ => &[],
@@ -129,6 +130,9 @@ fn guarded_boundary_parameter(n: &NodeDesc, r: &crate::engine::TensorRef) -> boo
             | "HannWindow"
             | "HammingWindow"
             | "BlackmanWindow"
+            | "RNN"
+            | "GRU"
+            | "LSTM"
     ) && r.source == Src::CtxInput
 }
 
@@ -1654,6 +1658,30 @@ mod shape_inference_tests {
                 CompileShapeSafety::Shapeless,
             );
             assert!(!prefill_enabled(false, &[gqa, parameterized]));
+        }
+    }
+
+    #[test]
+    fn recurrent_lengths_require_value_guards_for_validation() {
+        for op in ["RNN", "GRU", "LSTM"] {
+            let mut node = NodeDesc::new(
+                op.to_string(),
+                String::new(),
+                22,
+                CompileShapeSafety::ShapeKeyedOnly {
+                    reason: crate::registry::MLX_SLICE_SHAPE_REASON,
+                },
+            );
+            node.inputs = vec![crate::engine::TensorRef::absent(); 5];
+            node.inputs[4] = input("lengths", Src::CtxInput);
+            node.inputs[4].ctx_index = 4;
+            assert!(reads_data_dependent_parameter(&node));
+            assert!(!reads_unguarded_parameter(&node, true));
+            assert_eq!(boundary_shape_inputs(std::slice::from_ref(&node)), vec![4]);
+            node.inputs[4].source = Src::Intermediate;
+            assert!(reads_unguarded_parameter(&node, true));
+            node.inputs[4].shape_const = true;
+            assert!(!reads_unguarded_parameter(&node, true));
         }
     }
 }
