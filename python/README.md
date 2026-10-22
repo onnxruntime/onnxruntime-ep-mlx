@@ -6,7 +6,7 @@
 MLX-native ONNX Runtime execution provider for Apple Silicon. It is an
 out-of-tree plugin EP for ONNX Runtime 1.31 or newer and requires no ONNX Runtime fork.
 
-The wheel bundles the MLX runtime. Supported parts of your model run on the GPU;
+The wheel bundles the MLX runtime. Supported parts of your model run in MLX;
 unsupported operators stay on ONNX Runtime's CPU provider, where a matching
 CPU kernel is available. Coverage depends on operator attributes, dtypes, and shapes.
 
