@@ -193,7 +193,7 @@ struct Summary {
     /// The set of shape keys seen per compiled path and concrete partition. A shape-keyed HIT whose
     /// key is in the set is genuine cache reuse; a new key with an already-compiled slot is a real
     /// RETRACE. Partition scoping prevents unrelated general partitions from classifying each
-    /// other's cache events.
+    /// other's cache events. Entries are removed when the owning plan is dropped.
     seen_shape_keys: HashMap<String, std::collections::HashSet<String>>,
     // ---- Memory view ----
     managed_wrap_count: u64,
@@ -211,6 +211,18 @@ struct Summary {
 }
 
 impl Summary {
+    fn forget_partition(&mut self, partition_id: usize) {
+        for path in [
+            ComputePath::Decode,
+            ComputePath::Prefill,
+            ComputePath::General,
+            ComputePath::Eager,
+        ] {
+            self.seen_shape_keys
+                .remove(&format!("{}:{partition_id:x}", path.as_str()));
+        }
+    }
+
     fn classify_cache(
         &mut self,
         cache_scope: &str,
@@ -252,6 +264,19 @@ static TRACER: OnceLock<MlxTracer> = OnceLock::new();
 /// The shared tracer. First access reads the environment and wires everything up.
 pub fn tracer() -> &'static MlxTracer {
     TRACER.get_or_init(MlxTracer::new)
+}
+
+pub(crate) fn forget_partition(nodes: &[NodeDesc]) {
+    // Teardown must not initialize tracing if the plan was never executed.
+    if let Some(tracer) = TRACER.get()
+        && tracer.active()
+    {
+        let mut summary = match tracer.summary.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        summary.forget_partition(nodes.as_ptr() as usize);
+    }
 }
 
 thread_local! {
@@ -1813,7 +1838,32 @@ mod ioreport {
 
 #[cfg(test)]
 mod tests {
-    use super::{CacheState, Summary};
+    use super::{CacheState, ComputePath, Summary};
+
+    #[test]
+    fn partition_teardown_clears_history_even_without_a_later_miss() {
+        let mut summary = Summary::default();
+        for path in [ComputePath::General, ComputePath::Prefill] {
+            let scope = format!("{}:1234", path.as_str());
+            summary.classify_cache(&scope, CacheState::Miss, "shape=8");
+        }
+        summary.classify_cache("general:5678", CacheState::Miss, "shape=8");
+
+        summary.forget_partition(0x1234);
+
+        // An initial empty input can build the replacement closure but run eagerly,
+        // so its first successful compiled call reports HIT without a preceding MISS.
+        for scope in ["general:1234", "prefill:1234"] {
+            assert_eq!(
+                summary.classify_cache(scope, CacheState::Hit, "shape=8"),
+                CacheState::Retrace
+            );
+        }
+        assert_eq!(
+            summary.classify_cache("general:5678", CacheState::Hit, "shape=8"),
+            CacheState::Hit
+        );
+    }
 
     #[test]
     fn cache_history_preserves_shape_and_value_specialization_reuse() {
