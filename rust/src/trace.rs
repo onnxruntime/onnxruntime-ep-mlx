@@ -210,6 +210,40 @@ struct Summary {
     phase_us: std::collections::BTreeMap<&'static str, (u64, u64)>,
 }
 
+impl Summary {
+    fn classify_cache(
+        &mut self,
+        cache_scope: &str,
+        cache: CacheState,
+        shape_key: &str,
+    ) -> CacheState {
+        if cache == CacheState::Miss {
+            self.seen_shape_keys.remove(cache_scope);
+        }
+        let resolved = match cache {
+            CacheState::Hit if !shape_key.is_empty() => {
+                let seen = self
+                    .seen_shape_keys
+                    .get(cache_scope)
+                    .is_some_and(|set| set.contains(shape_key));
+                if seen {
+                    CacheState::Hit
+                } else {
+                    CacheState::Retrace
+                }
+            }
+            other => other,
+        };
+        if !shape_key.is_empty() {
+            self.seen_shape_keys
+                .entry(cache_scope.to_string())
+                .or_default()
+                .insert(shape_key.to_string());
+        }
+        resolved
+    }
+}
+
 /// Process-wide tracer singleton. All subgraphs/sessions share one timeline and one
 /// output file, stamped with the real `pid` so the events merge into onnx-genai's
 /// Perfetto timeline under the same process, on their own tracks.
@@ -502,31 +536,8 @@ impl MlxTracer {
             };
             s.path_counts[idx] += 1;
             // Classify the cache state. A caller reports MISS only when it actually (re)traced
-            // this call; HIT means it replayed. For a shape-keyed HIT whose shape key differs
-            // from the last one seen, MLX retraced under the hood → RETRACE.
-            let resolved = match cache {
-                CacheState::Hit if !shape_key.is_empty() => {
-                    // Genuine reuse iff this exact key was already seen for this path tag; the slot
-                    // is compiled (pre_valid) but a NEW key means a real under-the-hood retrace.
-                    let seen = s
-                        .seen_shape_keys
-                        .get(&cache_scope)
-                        .map(|set| set.contains(shape_key))
-                        .unwrap_or(false);
-                    if seen {
-                        CacheState::Hit
-                    } else {
-                        CacheState::Retrace
-                    }
-                }
-                other => other,
-            };
-            if !shape_key.is_empty() {
-                s.seen_shape_keys
-                    .entry(cache_scope)
-                    .or_default()
-                    .insert(shape_key.to_string());
-            }
+            // this call. Reset history on MISS because a new plan can reuse an old nodes address.
+            let resolved = s.classify_cache(&cache_scope, cache, shape_key);
             match resolved {
                 CacheState::Hit => s.cache_hit += 1,
                 CacheState::Miss => s.cache_miss += 1,
@@ -1796,5 +1807,34 @@ mod ioreport {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CacheState, Summary};
+
+    #[test]
+    fn cache_miss_resets_shape_history_for_reused_partition_address() {
+        let mut summary = Summary::default();
+        let scope = "general:reused-address";
+
+        assert_eq!(
+            summary.classify_cache(scope, CacheState::Miss, "end=8"),
+            CacheState::Miss
+        );
+        assert_eq!(
+            summary.classify_cache(scope, CacheState::Hit, "end=10"),
+            CacheState::Retrace
+        );
+
+        assert_eq!(
+            summary.classify_cache(scope, CacheState::Miss, "end=8"),
+            CacheState::Miss
+        );
+        assert_eq!(
+            summary.classify_cache(scope, CacheState::Hit, "end=10"),
+            CacheState::Retrace
+        );
     }
 }
