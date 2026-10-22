@@ -68,12 +68,16 @@ def test_attention_fully_masked_rows(opset, dtype, mask_type, causal, mask_rank)
 
 @pytest.mark.parametrize("special_form", [False, True])
 @pytest.mark.parametrize("invalid_score", [np.nan, np.inf])
-def test_attention_mask_guard_is_not_nan_to_num(special_form, invalid_score):
+@pytest.mark.parametrize("invalid_input", ["Q", "V"])
+def test_attention_mask_guard_is_not_nan_to_num(special_form, invalid_score, invalid_input):
     q = np.ones((1, 2, 3, 8), dtype=np.float32)
-    q[:, :, 0] = invalid_score
-    q[:, :, 1] = np.nan
     k = np.ones_like(q)
     v = np.ones_like(q)
+    if invalid_input == "Q":
+        q[:, :, 0] = invalid_score
+        q[:, :, 1] = np.nan
+    else:
+        v[:, :, 0] = invalid_score
     mask = np.array([[False, False, False], [True, True, True], [True, True, True]])
     attributes = {"softmax_precision": int(DT.FLOAT)} if special_form else {}
     model = build_model(
@@ -87,8 +91,13 @@ def test_attention_mask_guard_is_not_nan_to_num(special_form, invalid_score):
     assert_mlx_claims(model, feeds)
     actual = m.run_mlx(model, feeds)[0]
     np.testing.assert_array_equal(actual[:, :, 0], 0)
-    assert np.isnan(actual[:, :, 1]).all(), "An attended input NaN must not be cleared"
-    np.testing.assert_array_equal(actual[:, :, 2], 1)
+    if invalid_input == "Q":
+        assert np.isnan(actual[:, :, 1]).all(), "An attended input NaN must not be cleared"
+        np.testing.assert_array_equal(actual[:, :, 2], 1)
+    elif np.isnan(invalid_score):
+        assert np.isnan(actual[:, :, 1:]).all(), "An attended V NaN must not be cleared"
+    else:
+        assert np.isposinf(actual[:, :, 1:]).all(), "An attended V infinity must not be cleared"
 
 
 def test_attention_fp16_external_cache_softmax_accuracy():
@@ -146,3 +155,39 @@ def test_attention_3d_cached_fully_masked_rows(dtype):
     np.testing.assert_array_equal(actual[:, 0], 0)
     np.testing.assert_array_equal(actual_k, present_k)
     np.testing.assert_array_equal(actual_v, present_v)
+
+
+@pytest.mark.parametrize("mode", [0, 1, 2, 3])
+@pytest.mark.parametrize("invalid_value", [np.nan, np.inf])
+def test_attention_empty_output_guard_preserves_qk_diagnostics(mode, invalid_value):
+    q = np.ones((1, 2, 2, 8), dtype=np.float32)
+    k = np.ones_like(q)
+    v = np.full_like(q, invalid_value)
+    mask = np.array([[False, False], [True, True]])
+    model = build_model(
+        "Attention",
+        [_t("Q", list(q.shape)), _t("K", list(k.shape)), _t("V", list(v.shape)),
+         _t("M", list(mask.shape), DT.BOOL)],
+        [_t("Y", list(q.shape)), _t("PK", list(k.shape)), _t("PV", list(v.shape)),
+         _t("QK", [1, 2, 2, 2])],
+        attributes={"softcap": 2.0, "qk_matmul_output_mode": mode},
+    )
+    feeds = {"Q": q, "K": k, "V": v, "M": mask}
+    assert_mlx_claims(model, feeds)
+    actual, present_k, present_v, qk = m.run_mlx(model, feeds)
+    np.testing.assert_array_equal(actual[:, :, 0], 0)
+    if np.isnan(invalid_value):
+        assert np.isnan(actual[:, :, 1]).all()
+    else:
+        assert np.isposinf(actual[:, :, 1]).all()
+    np.testing.assert_array_equal(present_k, k)
+    np.testing.assert_array_equal(present_v, v)
+    raw = np.sqrt(8.0)
+    capped = 2.0 * np.tanh(raw / 2.0)
+    expected = np.full((1, 2, 2, 2), raw if mode == 0 else capped)
+    if mode == 2:
+        expected[:, :, 0] = -np.inf
+    elif mode == 3:
+        expected[:, :, 0] = 0
+        expected[:, :, 1] = 0.5
+    np.testing.assert_allclose(qk, expected, rtol=1e-6, atol=1e-7)

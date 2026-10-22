@@ -1221,7 +1221,12 @@ fn attention_qk_output_op(
     let v = gqa_repeat_heads_batched(ctx, v, b, kvh, groups, k_len, v_hd)?;
     let probs_for_v = ctx.astype(probs, ctx.dtype_of(v))?;
     let out = ctx.matmul(probs_for_v, v)?;
-    ctx.astype(out, dt)
+    let out = ctx.astype(out, dt)?;
+    match overlay {
+        // Zero probabilities alone do not guarantee zero Y when V contains NaN or infinity.
+        Some(overlay) => attention_zero_fully_masked_rows(ctx, out, overlay),
+        None => Ok(out),
+    }
 }
 
 // ---- Attention (ai.onnx) -----------------------------------------------------------------------

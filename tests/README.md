@@ -34,7 +34,9 @@ it is safe to include in any pytest invocation.
 `test_attention_semantics.py` uses small, locally built models and an independent float64 SDPA
 oracle rather than version-specific ONNX backend fixture names. It covers fully masked rows
 (including the combined causal/explicit mask), broadcast mask ranks, FP16/FP32, GQA and cached
-3D layouts, and preserves input NaNs in rows with attendable keys. The cached decode tests in
+3D layouts, and preserves input NaNs/infinities in rows with attendable keys. Both fused and composed
+forms zero fully masked output rows even when Q or V is nonfinite; zero probabilities alone would
+still produce `0 * NaN` in the value contraction. The cached decode tests in
 `test_attention_ext.py` also require a compiled MISS/HIT replay as an empty mask becomes nonempty.
 An empty allowed key set must produce zero, not a uniform attention average or NaN; the guard is
 based on the additive mask, never a blanket NaN replacement.
