@@ -24,6 +24,47 @@ import _models as m
 FLOAT_CASES = [(DT.FLOAT, np.float32, 1e-5), (DT.FLOAT16, np.float16, 3e-3)]
 
 
+@pytest.mark.parametrize("opset", [1, 11, 13])
+@pytest.mark.parametrize("axis", [None, 0, 1, 2, -1, -2])
+@pytest.mark.parametrize("shape", [[2, 3, 4], [2, 0, 4], [0, 3, 4]])
+@pytest.mark.parametrize("eager", [False, True], ids=["compiled", "eager"])
+def test_softmax_schema_axes(opset, axis, shape, eager, monkeypatch):
+    monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_COMPILE", "1" if eager else "0")
+    model = m.make_model(
+        "Softmax",
+        [m.tensor("x", DT.FLOAT, shape)],
+        [m.tensor("out", DT.FLOAT, shape)],
+        attributes={} if axis is None else {"axis": axis},
+        opset=opset,
+    )
+    x = np.arange(np.prod(shape), dtype=np.float32).reshape(shape) / 7
+    m.assert_mlx_claims(model, {"x": x})
+    session = m._session(model, m.EP_PROVIDERS)
+    for live in [x, -x, np.flip(x, axis=1).copy()]:
+        actual = session.run(None, {"x": live})[0]
+        expected = m.run_cpu(model, {"x": live})[0]
+        np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.parametrize("opset", [11, 13])
+@pytest.mark.parametrize("eager", [False, True], ids=["compiled", "eager"])
+def test_softmax_symbolic_suffix(opset, eager, monkeypatch):
+    monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_COMPILE", "1" if eager else "0")
+    model = m.make_model(
+        "Softmax",
+        [m.tensor("x", DT.FLOAT, [2, "N", 4])],
+        [m.tensor("out", DT.FLOAT, [2, "N", 4])],
+        attributes={"axis": 1},
+        opset=opset,
+    )
+    session = m._session(model, m.EP_PROVIDERS)
+    rng = np.random.default_rng(42)
+    for length in [1, 5, 0, 1]:
+        x = rng.normal(size=(2, length, 4)).astype(np.float32)
+        actual = session.run(None, {"x": x})[0]
+        np.testing.assert_allclose(actual, m.run_cpu(model, {"x": x})[0], rtol=1e-5, atol=1e-6)
+
+
 # --- claim helpers ------------------------------------------------------------------------------
 def assert_mlx_claims(model: bytes, feeds: dict[str, np.ndarray]) -> None:
     """Assert the MLX EP actually claims (executes) at least one node of ``model``."""

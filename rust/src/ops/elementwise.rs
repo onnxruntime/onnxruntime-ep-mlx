@@ -4,8 +4,8 @@
 
 use crate::engine::{MlxError, NodeDesc, TranslationContext, mlx_dtype_from_onnx};
 use crate::registry::{
-    ClaimResult, K_ANY_OPSET, NodeView, OpRegistration, OpRegistry, is_float64, is_int_index,
-    is_mlx_cpu_float, is_mlx_float, is_mlx_numeric, is_mlx_supported, is_movable,
+    ClaimResult, CompileShapeSafety, K_ANY_OPSET, NodeView, OpRegistration, OpRegistry, is_float64,
+    is_int_index, is_mlx_cpu_float, is_mlx_float, is_mlx_numeric, is_mlx_supported, is_movable,
     is_signed_integer, is_unsigned_integer, scalar_or_suffix_broadcast,
 };
 use crate::sys::mlx;
@@ -47,16 +47,23 @@ fn sigmoid_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError
 
 fn softmax_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
     let x = ctx.resolve(&n.inputs[0])?;
-    // ONNX opset>=13 `axis` = the (per-axis) softmax axis; negative counts from the end. The claim
-    // only accepts non-last axes for opset>=13, so the simple per-axis meaning always applies here.
     let rank = ctx.ndim(x) as i64;
-    let axis_attr = n.ints.get("axis").copied().unwrap_or(-1);
+    let default_axis = if n.since_version >= 13 { -1 } else { 1 };
+    let axis_attr = n.ints.get("axis").copied().unwrap_or(default_axis);
     let axis = if axis_attr < 0 {
         axis_attr + rank
     } else {
         axis_attr
     } as i32;
-    let r = ctx.softmax_axis(x, axis)?;
+    let r = if n.since_version >= 13 || axis == rank as i32 - 1 {
+        ctx.softmax_axis(x, axis)?
+    } else {
+        // Before opset 13, the suffix starting at axis is one softmax dimension.
+        let axes: Vec<i32> = (axis..rank as i32).collect();
+        ctx.emit(|res, s| unsafe {
+            mlx::mlx_softmax_axes(res, x, axes.as_ptr(), axes.len(), true, s)
+        })?
+    };
     ctx.bind(&n.outputs[0], r);
     Ok(())
 }
@@ -377,7 +384,7 @@ fn sigmoid_claim(node: &NodeView) -> ClaimResult {
     float_unary_claim_inner(node, false)
 }
 
-/// Softmax over the last axis (axis == -1 or rank-1), fp32/fp16/bf16.
+/// Softmax over one axis (opset >= 13) or the trailing suffix (earlier schemas).
 fn softmax_claim(node: &NodeView) -> ClaimResult {
     require!(
         node.num_inputs() == 1 && node.num_outputs() >= 1,
@@ -397,21 +404,35 @@ fn softmax_claim(node: &NodeView) -> ClaimResult {
     );
     let rank = i.shape.len() as i64;
     require!(rank > 0, "input must have rank >= 1 (got a scalar)");
-    let axis = node.int_attr("axis", -1);
+    let default_axis = if node.since_version() >= 13 { -1 } else { 1 };
+    let axis = node.int_attr("axis", default_axis);
     let norm = if axis < 0 { axis + rank } else { axis };
     require!(
         norm >= 0 && norm < rank,
         "axis {axis} is out of range for rank {rank}"
     );
-    // Last-axis softmax is correct for every opset. A non-last axis only carries the simple
-    // per-axis meaning from opset 13 onward; before that `axis` coerces the tensor to 2D (softmax
-    // over ALL trailing axes), which we don't implement — leave those to CPU.
-    require!(
-        norm == rank - 1 || node.since_version() >= 13,
-        "opset<13 with a non-last axis={axis} coerces to 2D (reduces over ALL trailing axes), \
-         which is unimplemented — re-export at opset>=13 for per-axis softmax"
-    );
     Ok(())
+}
+
+fn softmax_shape_safety(since_version: i32, axis: i64, rank: i64) -> CompileShapeSafety {
+    let axis = if axis < 0 { axis + rank } else { axis };
+    if since_version < 13 && axis != rank - 1 {
+        CompileShapeSafety::ShapeKeyedOnly {
+            reason: "legacy suffix Softmax lowering depends on singleton dimension extents",
+        }
+    } else {
+        CompileShapeSafety::Shapeless
+    }
+}
+
+fn softmax_compile_shape_safety(node: &NodeView) -> CompileShapeSafety {
+    let default_axis = if node.since_version() >= 13 { -1 } else { 1 };
+    let rank = node.input_info(0).map_or(0, |info| info.shape.len()) as i64;
+    softmax_shape_safety(
+        node.since_version(),
+        node.int_attr("axis", default_axis),
+        rank,
+    )
 }
 
 fn cast_pair_claimable(
@@ -965,14 +986,17 @@ pub fn register(registry: &mut OpRegistry) {
         handler: sigmoid_op,
         claim: sigmoid_claim,
     });
-    registry.register_shapeless(OpRegistration {
-        domain: "",
-        op_type: "Softmax",
-        min_opset: K_ANY_OPSET,
-        max_opset: K_ANY_OPSET,
-        handler: softmax_op,
-        claim: softmax_claim,
-    });
+    registry.register_shape_classified(
+        OpRegistration {
+            domain: "",
+            op_type: "Softmax",
+            min_opset: K_ANY_OPSET,
+            max_opset: K_ANY_OPSET,
+            handler: softmax_op,
+            claim: softmax_claim,
+        },
+        softmax_compile_shape_safety,
+    );
     registry.register_shapeless(OpRegistration {
         domain: "",
         op_type: "Cast",
@@ -1063,4 +1087,26 @@ pub fn register(registry: &mut OpRegistry) {
     // Misc elementwise.
     shapeless_since(registry, "Mod", 10, mod_op, mod_claim);
     shapeless_since(registry, "BitShift", 11, bitshift_op, bitshift_claim);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_suffix_softmax_never_enters_shapeless_replay() {
+        for version in [1, 11] {
+            for axis in [0, 1, -2, -3] {
+                let safety = softmax_shape_safety(version, axis, 3);
+                assert!(!safety.allows_shapeless());
+                assert!(safety.allows_shape_keyed());
+            }
+            for axis in [2, -1] {
+                assert!(softmax_shape_safety(version, axis, 3).allows_shapeless());
+            }
+        }
+        for axis in [0, 1, 2, -1, -2, -3] {
+            assert!(softmax_shape_safety(13, axis, 3).allows_shapeless());
+        }
+    }
 }

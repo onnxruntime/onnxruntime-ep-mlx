@@ -15,6 +15,9 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
+import subprocess
+import sys
 
 import numpy as np
 import onnxruntime as ort
@@ -84,6 +87,96 @@ MATMUL_CASES = [
     ("batched-4d", [2, 3, 8, 16], [2, 3, 16, 12]),
     ("broadcast-4d", [2, 3, 8, 16], [16, 12]),
 ]
+
+
+@pytest.mark.parametrize(
+    "ashape,bshape",
+    [
+        ([5], [5]),
+        ([5], [5, 3]),
+        ([2, 5], [5]),
+        ([5], [2, 5, 3]),
+        ([2, 3, 5], [5]),
+        ([0], [0]),
+        ([0], [0, 3]),
+        ([2, 0], [0]),
+        ([5], [0, 5, 3]),
+    ],
+)
+@pytest.mark.parametrize(
+    "dtype,np_dtype",
+    [(DT.FLOAT, np.float32), (DT.FLOAT16, np.float16), (DT.DOUBLE, np.float64)],
+)
+@pytest.mark.parametrize("eager", [False, True], ids=["compiled", "eager"])
+def test_matmul_vector_forms(ashape, bshape, dtype, np_dtype, eager, monkeypatch):
+    monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_COMPILE", "1" if eager else "0")
+    rng = np.random.default_rng(42)
+    a = rng.normal(size=ashape).astype(np_dtype)
+    b = rng.normal(size=bshape).astype(np_dtype)
+    expected = np.matmul(a, b)
+    model = m.make_model(
+        "MatMul",
+        [m.tensor("a", dtype, ashape), m.tensor("b", dtype, bshape)],
+        [m.tensor("out", dtype, expected.shape)],
+    )
+    feeds = {"a": a, "b": b}
+    m.assert_mlx_claims(model, feeds)
+    session = m._session(model, m.EP_PROVIDERS)
+    for live_b in [b, -b, b]:
+        actual = session.run(None, {"a": a, "b": live_b})[0]
+        assert actual.dtype == np_dtype
+        np.testing.assert_allclose(actual, np.matmul(a, live_b), rtol=3e-3, atol=3e-3)
+
+
+@pytest.mark.parametrize("eager", [False, True], ids=["compiled", "eager"])
+def test_matmul_vector_symbolic(eager, monkeypatch):
+    monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_COMPILE", "1" if eager else "0")
+    model = m.make_model(
+        "MatMul",
+        [m.tensor("a", DT.FLOAT, ["K"]), m.tensor("b", DT.FLOAT, ["B", "K", 3])],
+        [m.tensor("out", DT.FLOAT, ["B", 3])],
+    )
+    session = m._session(model, m.EP_PROVIDERS)
+    rng = np.random.default_rng(42)
+    for batch, width in [(2, 5), (3, 7), (2, 0), (0, 5), (2, 5)]:
+        a = rng.normal(size=width).astype(np.float32)
+        b = rng.normal(size=(batch, width, 3)).astype(np.float32)
+        actual = session.run(None, {"a": a, "b": b})[0]
+        np.testing.assert_allclose(actual, np.matmul(a, b), rtol=1e-5, atol=1e-6)
+
+
+def test_vector_and_suffix_use_general_compile(tmp_path):
+    trace = tmp_path / "vector-suffix.json"
+    subprocess.run(
+        [
+            sys.executable, "-m", "pytest",
+            "test_gaps_compute.py", "test_elementwise_ops.py",
+            "-k", "(test_matmul_vector_symbolic or test_softmax_symbolic_suffix) and compiled",
+            "-q", "-p", "no:cacheprovider",
+        ],
+        cwd=Path(__file__).parent,
+        env={
+            **os.environ,
+            "ONNXRUNTIME_EP_MLX_TRACE": str(trace),
+            "ONNXRUNTIME_EP_MLX_NO_COMPILE": "0",
+            "ONNXRUNTIME_EP_MLX_NO_GENERAL_COMPILE": "0",
+        },
+        check=True,
+        timeout=120,
+    )
+    paths = [e for e in json.loads(trace.read_text()) if e.get("cat") == "ep.path"]
+    assert len(paths) == 13
+    # Empty dynamic inputs deliberately bypass mlx_compile's zero-size abort.
+    assert [e["args"]["path"] for e in paths] == [
+        "general", "general", "eager", "eager", "general",
+        "general", "general", "eager", "general",
+        "general", "general", "eager", "general",
+    ]
+    assert [e["args"]["cache"] for e in paths] == [
+        "MISS", "RETRACE", "n/a", "n/a", "HIT",
+        "MISS", "RETRACE", "n/a", "HIT",
+        "MISS", "RETRACE", "n/a", "HIT",
+    ]
 
 
 @pytest.mark.parametrize("case", MATMUL_CASES, ids=[c[0] for c in MATMUL_CASES])

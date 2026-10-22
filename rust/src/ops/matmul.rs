@@ -100,8 +100,8 @@ fn matmul_claim(node: &NodeView) -> ClaimResult {
         crate::registry::ort_dtype_name(out.dtype)
     );
     require!(
-        a.shape.len() >= 2 && b.shape.len() >= 2,
-        "both inputs must have rank >= 2 (got ranks {} and {})",
+        !a.shape.is_empty() && !b.shape.is_empty(),
+        "both inputs must have rank >= 1 (got ranks {} and {})",
         a.shape.len(),
         b.shape.len()
     );
