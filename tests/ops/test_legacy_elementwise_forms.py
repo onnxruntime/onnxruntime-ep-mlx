@@ -87,7 +87,7 @@ def mode(request, monkeypatch):
 def test_legacy_elementwise_forms(mode, op, attributes, dtype, numpy_dtype, shape):
     session = _session(_model(op, dtype, shape, attributes))
     for offset in (-0.75, 0.25):
-        data = (np.arange(math.prod(shape)).reshape(shape) * 0.125 + offset).astype(numpy_dtype)
+        data = np.asarray(np.arange(math.prod(shape)).reshape(shape) * 0.125 + offset, dtype=numpy_dtype)
         before = data.tobytes()
         (actual,) = session.run(None, {"x": data})
         _assert_result(actual, _reference(op, data, attributes))
@@ -99,7 +99,7 @@ def test_legacy_elementwise_forms(mode, op, attributes, dtype, numpy_dtype, shap
 def test_legacy_unknown_rank_replay(mode, op, attributes, dtype, numpy_dtype):
     session = _session(_model(op, dtype, None, attributes))
     for shape in [(2, 3), (0, 5), (), (3,), (2, 3)]:
-        data = (np.arange(math.prod(shape)).reshape(shape) * 0.25 - 0.5).astype(numpy_dtype)
+        data = np.asarray(np.arange(math.prod(shape)).reshape(shape) * 0.25 - 0.5, dtype=numpy_dtype)
         before = data.tobytes()
         (actual,) = session.run(None, {"x": data})
         _assert_result(actual, _reference(op, data, attributes))
