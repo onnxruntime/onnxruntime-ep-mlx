@@ -1,24 +1,29 @@
 //! State-space / KV-cache "misc" op handlers. Faithful port of the C++ `ops/ssm_misc.cc`:
-//!   * TensorScatter (ai.onnx) — static-KV-cache scatter ("linear" mode) via slice_update /
-//!     slice_update_dynamic.
-//!   * CausalConvWithState (com.microsoft) — fused causal depthwise conv1d with carry state.
-//!   * LinearAttention (com.microsoft) — chunked/recurrent linear attention (4 update rules,
-//!     GQA) via static-length unrolling over the time axis T.
+//!   * TensorScatter (ai.onnx) — typed per-batch linear/circular KV-cache updates.
+//!   * CausalConvWithState — dilated causal depthwise conv1d, channel layouts, and carry windows.
+//!   * LinearAttention — stable recurrent linear attention (4 update rules, GQA), with a
+//!     column-parallel Metal prefill scan and an unrolled fallback.
 //!     Only statically translatable, MLX-supported forms are claimed; the rest fall to ORT CPU.
+//!
+//! Live TensorScatter offsets are validated on every eager application; initializer/no-index
+//! updates can compile shape-keyed. Causal convolution supports ndim=1 with static channel/kernel
+//! geometry. Linear attention always uses the recurrence: neither decay strength nor normalized
+//! keys follows from shape alone, so the chunk_size tuning hint cannot justify a WY fast path.
+//! GPU prefill with d_k <= 256 uses a typed SIMD-column scan; wider/CPU forms retain the unroll.
+//! `ONNXRUNTIME_EP_MLX_NO_LINEAR_ATTENTION_SCAN=1` selects the unroll for numerical/perf A/B.
 
 use crate::engine::{MlxError, NodeDesc, Src, TranslationContext, mlx_dtype_from_onnx};
 use crate::registry::{
     ClaimPredicate, ClaimResult, K_ANY_OPSET, NodeView, OpHandler, OpRegistration, OpRegistry,
-    is_mlx_float,
+    is_mlx_float, is_movable,
 };
 use crate::sys::mlx;
 use crate::sys::ort;
 use crate::{deny, require};
-use std::os::raw::c_char;
+use std::ffi::CString;
 
 const T_INT64: ort::ONNXTensorElementDataType =
     ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64;
-const I32: mlx::mlx_dtype = mlx::mlx_dtype__MLX_INT32;
 
 // ---- shared helpers -----------------------------------------------------------------------------
 
@@ -38,26 +43,12 @@ fn norm_axis(axis: i64, rank: i32) -> i32 {
     a as i32
 }
 
-/// True when an optional input is omitted in the MIDDLE of the input list (an interior gap), which
-/// the shared clustering pass cannot represent; such forms are left to ORT CPU.
-fn has_interior_gap(node: &NodeView) -> bool {
-    let n = node.num_inputs();
-    let mut last_present = 0usize;
-    let mut seen = false;
-    for i in 0..n {
-        if node.input_present(i) {
-            last_present = i;
-            seen = true;
-        }
-    }
-    if !seen {
-        return false;
-    }
-    (0..last_present).any(|i| !node.input_present(i))
+fn compatible_shape(a: &[i64], b: &[i64]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(&a, &b)| a < 0 || b < 0 || a == b)
 }
 
 // =============================================================================================
-// TensorScatter (ai.onnx) — write `update` into `past_cache` along `axis` at write_indices[0]/0.
+// TensorScatter (ai.onnx) — per-batch linear/circular cache writes, with exact native copies.
 // =============================================================================================
 fn tensor_scatter_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
     let past = ctx.resolve(&n.inputs[0])?;
@@ -65,79 +56,78 @@ fn tensor_scatter_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), M
     let rank = ctx.ndim(past) as i32;
     let axis = norm_axis(n.ints.get("axis").copied().unwrap_or(-2), rank);
 
-    let mode = str_attr(n, "mode", "linear");
-    let present_arr = if mode == "circular" && present(n, 2) {
-        // Circular writes need a statically known split point. Dynamic indices are deliberately
-        // declined: MLX has no data-dependent split primitive that preserves the cache shape.
-        let start = ctx
-            .read_ints_eval(&n.inputs[2])?
-            .first()
-            .copied()
-            .ok_or_else(|| "TensorScatter: write_indices cannot be empty".to_string())?
-            as i32;
-        let cache_len = ctx.dim(past, axis);
-        let update_len = ctx.dim(update, axis);
-        let first_len = (cache_len - start).min(update_len);
-        let mut start0 = vec![0i32; rank as usize];
-        let mut stop0 = ctx.shape_of(past);
-        start0[axis as usize] = start;
-        stop0[axis as usize] = start + first_len;
-        let first_update = if first_len == update_len {
-            update
+    let shape = ctx.shape_of(past);
+    let update_shape = ctx.shape_of(update);
+    if shape.len() < 2
+        || axis <= 0
+        || axis >= rank
+        || update_shape.len() != shape.len()
+        || shape
+            .iter()
+            .zip(&update_shape)
+            .enumerate()
+            .any(|(i, (a, b))| i != axis as usize && a != b)
+        || update_shape[axis as usize] > shape[axis as usize]
+    {
+        return Err("TensorScatter: incompatible cache/update geometry".to_string());
+    }
+    let capacity = i64::from(shape[axis as usize]);
+    let length = i64::from(update_shape[axis as usize]);
+    let circular = str_attr(n, "mode", "linear") == "circular";
+    if !present(n, 2) {
+        let output = if length == 0 {
+            past
         } else {
-            let update_shape = ctx.shape_of(update);
-            let update_start = vec![0i32; rank as usize];
-            let mut update_stop = update_shape;
-            update_stop[axis as usize] = first_len;
-            ctx.slice(update, &update_start, &update_stop)?
+            ctx.slice_update(past, update, &vec![0; shape.len()], &update_shape)?
         };
-        let first = ctx.slice_update(past, first_update, &start0, &stop0)?;
-        if first_len == update_len {
-            first
+        let output = ctx.contiguous(output)?;
+        ctx.bind(&n.outputs[0], output);
+        return Ok(());
+    }
+    let wi = ctx.resolve(&n.inputs[2])?;
+    if ctx.shape_of(wi) != [shape[0]] {
+        return Err("TensorScatter: write_indices must have one entry per batch".to_string());
+    }
+    let indices = ctx.read_ints_eval(&n.inputs[2])?;
+    if circular && capacity == 0 && length > 0 {
+        return Err("TensorScatter: circular cache capacity must be positive".to_string());
+    }
+    let mut output = past;
+    for (batch, &index) in indices.iter().enumerate() {
+        if !circular && (index < 0 || index > capacity - length) {
+            return Err(
+                "TensorScatter: linear write index plus update length must fit in cache"
+                    .to_string(),
+            );
+        }
+        if length == 0 {
+            continue;
+        }
+        // Normalize before adding length, so even INT64_MIN/MAX cannot overflow.
+        let start = if circular {
+            index.rem_euclid(capacity)
         } else {
-            let update_shape = ctx.shape_of(update);
-            let mut update_start = vec![0i32; rank as usize];
-            let update_stop = update_shape;
-            update_start[axis as usize] = first_len;
-            let tail = ctx.slice(update, &update_start, &update_stop)?;
-            let start1 = vec![0i32; rank as usize];
-            let mut stop1 = ctx.shape_of(past);
-            stop1[axis as usize] = update_len - first_len;
-            ctx.slice_update(first, tail, &start1, &stop1)?
+            index
+        };
+        let first = length.min(capacity - start);
+        for (source, destination, count) in [(0, start, first), (first, 0, length - first)] {
+            if count == 0 {
+                continue;
+            }
+            let mut lo = vec![0; shape.len()];
+            let mut hi = update_shape.clone();
+            lo[0] = batch as i32;
+            hi[0] = batch as i32 + 1;
+            lo[axis as usize] = source as i32;
+            hi[axis as usize] = (source + count) as i32;
+            let slab = ctx.slice(update, &lo, &hi)?;
+            lo[axis as usize] = destination as i32;
+            hi[axis as usize] = (destination + count) as i32;
+            output = ctx.slice_update(output, slab, &lo, &hi)?;
         }
-    } else if present(n, 2) {
-        // Decode form: dynamic offset from write_indices along `axis` (batch_size == 1 per claim).
-        let wi = ctx.resolve(&n.inputs[2])?;
-        let wi = ctx.astype(wi, I32)?;
-        let axes = [axis];
-        ctx.emit(|res, s| unsafe {
-            mlx::mlx_slice_update_dynamic(res, past, update, wi, axes.as_ptr(), axes.len(), s)
-        })?
-    } else {
-        // Prefill form: write the update block at offset 0 along `axis` for every batch.
-        let start = vec![0i32; rank as usize];
-        let mut stop = vec![0i32; rank as usize];
-        for i in 0..rank {
-            stop[i as usize] = ctx.dim(past, i);
-        }
-        stop[axis as usize] = ctx.dim(update, axis);
-        let strides = vec![1i32; rank as usize];
-        ctx.emit(|res, s| unsafe {
-            mlx::mlx_slice_update(
-                res,
-                past,
-                update,
-                start.as_ptr(),
-                start.len(),
-                stop.as_ptr(),
-                stop.len(),
-                strides.as_ptr(),
-                strides.len(),
-                s,
-            )
-        })?
-    };
-    let cont = ctx.contiguous(present_arr)?;
+    }
+
+    let cont = ctx.contiguous(output)?;
     ctx.bind(&n.outputs[0], cont);
     Ok(())
 }
@@ -160,20 +150,22 @@ fn tensor_scatter_claim(node: &NodeView) -> ClaimResult {
         _ => deny!("missing tensor type/shape info on an input or the output"),
     };
     require!(
-        is_mlx_float(past.dtype) && update.dtype == past.dtype && out.dtype == past.dtype,
-        "past/update/output must share one float dtype, got {} / {} -> {}",
+        is_movable(past.dtype) && update.dtype == past.dtype && out.dtype == past.dtype,
+        "past/update/output must share one MLX copy dtype, got {} / {} -> {}",
         crate::registry::ort_dtype_name(past.dtype),
         crate::registry::ort_dtype_name(update.dtype),
         crate::registry::ort_dtype_name(out.dtype)
     );
     require!(
-        past.shape.len() >= 2 && update.shape.len() == past.shape.len() && out.shape == past.shape,
+        past.shape.len() >= 2
+            && update.shape.len() == past.shape.len()
+            && compatible_shape(&out.shape, &past.shape),
         "past_cache/output must have the same rank >=2 and shape; update must have the same rank"
     );
     let rank = past.shape.len() as i64;
     let axis = node.int_attr("axis", -2);
     require!(
-        axis >= -rank && axis < rank && axis != 0,
+        axis > -rank && axis < rank && axis != 0,
         "axis must name a non-batch dimension in [-{rank}, {}], got {axis}",
         rank - 1
     );
@@ -206,32 +198,17 @@ fn tensor_scatter_claim(node: &NodeView) -> ClaimResult {
             None => deny!("missing tensor type/shape info on write_indices"),
         };
         require!(
-            wi.shape.len() == 1 && wi.shape[0] == past.shape[0],
+            wi.shape.len() == 1 && compatible_shape(&wi.shape, &past.shape[..1]),
             "write_indices must be rank-1 with one entry per batch"
         );
-        // Only batch_size == 1 is expressible as one dynamic slice.
-        require!(
-            !past.shape.is_empty() && past.shape[0] == 1,
-            "dynamic TensorScatter requires past_cache batch size 1, got shape {:?}",
-            past.shape
-        );
-        if mode == "circular" {
-            let indices = match node.read_const_int64(2) {
-                Some(indices) => indices,
-                None => deny!(
-                    "circular TensorScatter requires constant write_indices because MLX cannot split an update at a dynamic wrap point"
-                ),
-            };
+        if mode == "linear"
+            && let Some(indices) = node.read_const_int64(2)
+        {
             require!(
-                indices.len() == 1 && indices[0] >= 0 && indices[0] < past.shape[axis],
-                "circular TensorScatter write index must be in [0, {})",
-                past.shape[axis]
-            );
-        } else if let Some(indices) = node.read_const_int64(2) {
-            require!(
-                indices.len() == 1
-                    && indices[0] >= 0
-                    && indices[0] + update.shape[axis] <= past.shape[axis],
+                indices.iter().all(|&index| index >= 0
+                    && (past.shape[axis] < 0
+                        || update.shape[axis] < 0
+                        || index <= past.shape[axis] - update.shape[axis])),
                 "linear TensorScatter write index plus update length must fit in the cache"
             );
         }
@@ -242,80 +219,146 @@ fn tensor_scatter_claim(node: &NodeView) -> ClaimResult {
 // =============================================================================================
 // CausalConvWithState (com.microsoft) — stateful causal depthwise conv1d.
 // =============================================================================================
+fn causal_channels_first(
+    ctx: &mut TranslationContext,
+    array: mlx::mlx_array,
+    channels: i32,
+    window: bool,
+) -> Result<mlx::mlx_array, MlxError> {
+    let shape = ctx.shape_of(array);
+    if window {
+        let flat = ctx.reshape(array, &[shape[0], shape[1], shape[2], channels])?;
+        ctx.transpose(flat, &[0, 1, 3, 2])
+    } else {
+        let flat = ctx.reshape(array, &[shape[0], shape[1], channels])?;
+        ctx.transpose(flat, &[0, 2, 1])
+    }
+}
+
+fn causal_channels_last(
+    ctx: &mut TranslationContext,
+    array: mlx::mlx_array,
+    shape: &[i32],
+    window: bool,
+) -> Result<mlx::mlx_array, MlxError> {
+    let transposed = ctx.transpose(array, if window { &[0, 1, 3, 2] } else { &[0, 2, 1] })?;
+    ctx.reshape(transposed, shape)
+}
+
 fn causal_conv_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
-    let x = ctx.resolve(&n.inputs[0])?; // (B, C, L)
+    let mut x = ctx.resolve(&n.inputs[0])?;
+    let input_shape = ctx.shape_of(x);
     let weight = ctx.resolve(&n.inputs[1])?; // (C, 1, k)
+    let channels_last = n.ints.get("channels_last").copied().unwrap_or(0) == 1;
+    let c = ctx.dim(weight, 0);
+    if channels_last {
+        x = causal_channels_first(ctx, x, c, false)?;
+    }
     let dt = ctx.dtype_of(x);
     let b = ctx.dim(x, 0);
-    let c = ctx.dim(x, 1);
     let l = ctx.dim(x, 2);
     let k = ctx.dim(weight, 2);
+    let dilation = n.ints.get("dilation").copied().unwrap_or(1) as i32;
+    let carry = (k - 1)
+        .checked_mul(dilation)
+        .filter(|&v| v >= 0)
+        .ok_or("CausalConvWithState: invalid receptive field")?;
+    if c <= 0 || k <= 0 || ctx.dim(x, 1) != c || ctx.dim(weight, 1) != 1 {
+        return Err("CausalConvWithState: incompatible input/weight geometry".to_string());
+    }
     let state_window = *n.ints.get("state_window").unwrap_or(&0) as i32;
 
     let has_bias = present(n, 2);
     let has_state = present(n, 3);
+    let mut state_shape = input_shape.clone();
+    state_shape[if channels_last { 1 } else { 2 }] = carry;
+    if state_window > 0 {
+        state_shape.insert(0, state_window);
+    }
+    let past = if has_state {
+        let past = ctx.resolve(&n.inputs[3])?;
+        if ctx.shape_of(past) != state_shape {
+            return Err("CausalConvWithState: incompatible past_state geometry".to_string());
+        }
+        Some(if channels_last {
+            causal_channels_first(ctx, past, c, state_window > 0)?
+        } else {
+            past
+        })
+    } else {
+        None
+    };
+    if has_bias {
+        let bias = ctx.resolve(&n.inputs[2])?;
+        if ctx.shape_of(bias) != [c] {
+            return Err("CausalConvWithState: bias must have shape [channels]".to_string());
+        }
+    }
 
-    // Left context: past_state (B, C, k-1) or k-1 zeros. For k == 1 there is no carry state.
+    // Carry is the full dilated receptive field, not just the number of preceding taps.
     let mut x_pad = x;
-    if k > 1 {
-        let state = if has_state {
-            let state = ctx.resolve(&n.inputs[3])?;
+    if carry > 0 {
+        let state = if let Some(state) = past {
             if state_window > 0 {
                 let state = ctx.slice(
                     state,
                     &[state_window - 1, 0, 0, 0],
-                    &[state_window, b, c, k - 1],
+                    &[state_window, b, c, carry],
                 )?;
-                ctx.reshape(state, &[b, c, k - 1])?
+                ctx.reshape(state, &[b, c, carry])?
             } else {
                 state
             }
         } else {
-            ctx.zeros(&[b, c, k - 1], dt)?
+            ctx.zeros(&[b, c, carry], dt)?
         };
-        x_pad = ctx.concat2(state, x, 2)?; // (B, C, k-1+L)
+        x_pad = ctx.concat2(state, x, 2)?;
     }
 
-    // present_state = last k-1 columns of x_pad (boundary output -> contiguous).
     if n.outputs.len() >= 2 && !n.outputs[1].name.is_empty() {
-        if state_window > 0 {
-            if k > 1 && l > 0 {
+        let ps = if state_window > 0 {
+            if carry > 0 && l > 0 {
                 let kept = l.min(state_window);
                 let leading = state_window - kept;
                 let mut window = if leading > 0 {
-                    Some(ctx.zeros(&[leading, b, c, k - 1], dt)?)
+                    Some(ctx.zeros(&[leading, b, c, carry], dt)?)
                 } else {
                     None
                 };
                 for token in (l - kept)..l {
-                    let carry = ctx.slice(x_pad, &[0, 0, token + 1], &[b, c, token + k])?;
-                    let carry = ctx.expand_dims(carry, 0)?;
+                    let step = ctx.slice(x_pad, &[0, 0, token + 1], &[b, c, token + 1 + carry])?;
+                    let step = ctx.expand_dims(step, 0)?;
                     window = Some(match window {
-                        Some(previous) => ctx.concat2(previous, carry, 0)?,
-                        None => carry,
+                        Some(previous) => ctx.concat2(previous, step, 0)?,
+                        None => step,
                     });
                 }
-                let ps = window
-                    .ok_or_else(|| "MLX CausalConv state_window produced no states".to_string())?;
-                let ps = ctx.contiguous(ps)?;
-                ctx.bind(&n.outputs[1], ps);
-            } else if has_state && l == 0 {
-                let ps = ctx.resolve(&n.inputs[3])?;
-                let ps = ctx.contiguous(ps)?;
-                ctx.bind(&n.outputs[1], ps);
+                window.ok_or("MLX CausalConv state_window produced no states")?
+            } else if l == 0
+                && let Some(past) = past
+            {
+                past
             } else {
-                let z = ctx.zeros(&[state_window, b, c, k - 1], dt)?;
-                ctx.bind(&n.outputs[1], z);
+                ctx.zeros(&[state_window, b, c, carry], dt)?
             }
-        } else if k > 1 {
+        } else if carry > 0 {
             let padded = ctx.dim(x_pad, 2);
-            let ps = ctx.slice(x_pad, &[0, 0, padded - (k - 1)], &[b, c, padded])?;
-            let ps = ctx.contiguous(ps)?;
-            ctx.bind(&n.outputs[1], ps);
+            ctx.slice(x_pad, &[0, 0, padded - carry], &[b, c, padded])?
         } else {
-            let z = ctx.zeros(&[b, c, 0], dt)?;
-            ctx.bind(&n.outputs[1], z);
-        }
+            ctx.zeros(&[b, c, 0], dt)?
+        };
+        let ps = if channels_last {
+            causal_channels_last(ctx, ps, &state_shape, state_window > 0)?
+        } else {
+            ps
+        };
+        let ps = ctx.contiguous(ps)?;
+        ctx.bind(&n.outputs[1], ps);
+    }
+    if l == 0 || b == 0 {
+        let y = ctx.zeros(&input_shape, dt)?;
+        ctx.bind(&n.outputs[0], y);
+        return Ok(());
     }
 
     // Depthwise conv1d: MLX uses NLC data and (C_out, kernel, C_in/groups) weights.
@@ -323,7 +366,8 @@ fn causal_conv_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxE
     let x_nlc = ctx.contiguous(x_t)?; // (B, k-1+L, C)
     let w_t = ctx.transpose(weight, &[0, 2, 1])?;
     let w_ckc = ctx.contiguous(w_t)?; // (C, k, 1)
-    let y_nlc = ctx.emit(|res, s| unsafe { mlx::mlx_conv1d(res, x_nlc, w_ckc, 1, 0, 1, c, s) })?;
+    let y_nlc =
+        ctx.emit(|res, s| unsafe { mlx::mlx_conv1d(res, x_nlc, w_ckc, 1, 0, dilation, c, s) })?;
     let y_t = ctx.transpose(y_nlc, &[0, 2, 1])?;
     let mut y = ctx.contiguous(y_t)?; // (B, C, L)
 
@@ -338,6 +382,10 @@ fn causal_conv_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxE
         let sig = ctx.emit(|res, s| unsafe { mlx::mlx_sigmoid(res, y, s) })?;
         y = ctx.mul(y, sig)?;
     }
+    if channels_last {
+        y = causal_channels_last(ctx, y, &input_shape, false)?;
+    }
+    let y = ctx.contiguous(y)?;
     ctx.bind(&n.outputs[0], y);
     Ok(())
 }
@@ -346,10 +394,27 @@ fn causal_conv_claim(node: &NodeView) -> ClaimResult {
     let ni = node.num_inputs();
     require!((2..=4).contains(&ni), "expects 2-4 inputs, got {ni}");
     let no = node.num_outputs();
-    require!((1..=2).contains(&no), "expects 1-2 outputs, got {no}");
+    require!(no == 2, "expects two outputs, got {no}");
+    let standard = node.domain().is_empty();
+    let ndim = node.int_attr("ndim", 1);
+    let channels_last = node.int_attr("channels_last", 0);
+    let dilation = node.int_attr("dilation", 1);
+    let state_window = node.int_attr("state_window", 0);
     require!(
-        !has_interior_gap(node),
-        "optional inputs may only be omitted from the trailing end"
+        ndim == 1,
+        "only one-dimensional causal convolution is supported"
+    );
+    require!(
+        (0..=1).contains(&channels_last),
+        "channels_last must be 0 or 1"
+    );
+    require!(
+        dilation > 0 && dilation <= i32::MAX as i64,
+        "dilation must be a positive int32"
+    );
+    require!(
+        !standard || (channels_last == 0 && dilation == 1 && state_window == 0),
+        "standard CausalConvWithState does not define contrib layout/dilation/window attributes"
     );
     let (input, weight) = match (node.input_info(0), node.input_info(1)) {
         (Some(a), Some(b)) => (a, b),
@@ -362,40 +427,64 @@ fn causal_conv_claim(node: &NodeView) -> ClaimResult {
         crate::registry::ort_dtype_name(weight.dtype)
     );
     require!(
-        input.shape.len() == 3 && weight.shape.len() == 3,
-        "input and weight must both be rank 3, got ranks {} and {}",
+        (if channels_last == 1 {
+            input.shape.len() >= 3
+        } else {
+            input.shape.len() == 3
+        }) && weight.shape.len() == 3,
+        "input layout and weight rank must match one-dimensional convolution, got ranks {} and {}",
         input.shape.len(),
         weight.shape.len()
     );
-    let state_window = node.int_attr("state_window", 0);
+    let channels = if channels_last == 1 {
+        input.shape[2..]
+            .iter()
+            .try_fold(1i64, |a, &b| if b > 0 { a.checked_mul(b) } else { None })
+    } else {
+        Some(input.shape[1])
+    };
+    require!(
+        channels.is_some_and(|c| c > 0 && c <= i32::MAX as i64 && weight.shape[0] == c)
+            && weight.shape[1] == 1
+            && weight.shape[2] > 0,
+        "positive static channel/kernel geometry and weight [channels,1,kernel] required"
+    );
+    let carry = (weight.shape[2] - 1).checked_mul(dilation);
+    require!(
+        carry.is_some_and(|c| c < i32::MAX as i64),
+        "receptive field exceeds int32 geometry"
+    );
+    let carry = carry.unwrap();
     require!(
         (0..=8).contains(&state_window),
         "state_window must be in [0,8], got {state_window}"
     );
-    let expected_state_shape = if state_window > 0 {
-        vec![
-            state_window,
-            input.shape[0],
-            input.shape[1],
-            weight.shape[2] - 1,
-        ]
-    } else {
-        vec![input.shape[0], input.shape[1], weight.shape[2] - 1]
-    };
+    let mut expected_state_shape = input.shape.clone();
+    expected_state_shape[if channels_last == 1 { 1 } else { 2 }] = carry;
+    if state_window > 0 {
+        expected_state_shape.insert(0, state_window);
+    }
+    require!(
+        matches!(node.output_info(0), Some(out) if out.dtype == input.dtype && compatible_shape(&out.shape, &input.shape)),
+        "output must have input shape and dtype"
+    );
     if node.input_present(2) {
         match node.input_info(2) {
-            Some(b) if b.dtype == input.dtype => {}
+            Some(b) if b.dtype == input.dtype && b.shape == [channels.unwrap()] => {}
             Some(b) => deny!(
-                "bias dtype must match input dtype {}, got {}",
+                "bias must have input dtype {} and shape [{}], got {} {:?}",
                 crate::registry::ort_dtype_name(input.dtype),
-                crate::registry::ort_dtype_name(b.dtype)
+                channels.unwrap(),
+                crate::registry::ort_dtype_name(b.dtype),
+                b.shape
             ),
             None => deny!("missing tensor type/shape info on bias"),
         }
     }
     if node.input_present(3) {
         match node.input_info(3) {
-            Some(p) if p.dtype == input.dtype && p.shape == expected_state_shape => {}
+            Some(p)
+                if p.dtype == input.dtype && compatible_shape(&p.shape, &expected_state_shape) => {}
             Some(p) => deny!(
                 "past_state must have dtype {} and shape {:?}, got {} {:?}",
                 crate::registry::ort_dtype_name(input.dtype),
@@ -408,7 +497,7 @@ fn causal_conv_claim(node: &NodeView) -> ClaimResult {
     }
     if let Some(present) = node.output_info(1) {
         require!(
-            present.dtype == input.dtype && present.shape == expected_state_shape,
+            present.dtype == input.dtype && compatible_shape(&present.shape, &expected_state_shape),
             "present_state must have input dtype and shape {:?}",
             expected_state_shape
         );
@@ -422,7 +511,7 @@ fn causal_conv_claim(node: &NodeView) -> ClaimResult {
 }
 
 // =============================================================================================
-// LinearAttention (com.microsoft) — delta-rule linear attention, static-length unroll over T.
+// LinearAttention (com.microsoft) — stable delta-rule recurrence and fused prefill.
 // =============================================================================================
 fn rule_uses_decay(rule: &str) -> bool {
     rule == "gated" || rule == "gated_delta"
@@ -484,239 +573,223 @@ fn repeat_axis(
     ctx.emit(|res, s| unsafe { mlx::mlx_repeat_axis(res, a, repeats, axis, s) })
 }
 
-// ---- chunked gated-delta helpers ----------------------------------------------------------------
-
-const CHUNK_SIZE: i32 = 64;
-
-/// Zero-pad `a` at the END of `axis` by `high` elements, then force contiguous (chunk reshapes and
-/// the batched matmuls below all require a dense buffer). `high == 0` still returns a contiguous
-/// copy so a subsequent `reshape` never sees a strided view.
-fn pad_axis_end(
-    ctx: &mut TranslationContext,
-    a: mlx::mlx_array,
-    axis: i32,
-    high: i32,
-    dt: mlx::mlx_dtype,
-) -> Result<mlx::mlx_array, MlxError> {
-    if high == 0 {
-        return ctx.contiguous(a);
+// Each SIMD group owns one state column. Time remains sequential, avoiding the unstable WY
+// inversion, but state lives in registers and independent columns/heads run in parallel.
+const LINEAR_ATTENTION_SCAN_SRC: &str = r#"
+    size_t column = thread_position_in_grid.x / 32;
+    if (column >= size_t(B) * H * DV) { return; }
+    uint lane = thread_position_in_grid.x % 32;
+    uint vi = column % DV;
+    size_t bh = column / DV;
+    uint bi = bh / H;
+    uint hi = bh % H;
+    S state[(DK + 31) / 32];
+    for (uint j = 0; j < (DK + 31) / 32; ++j) {
+        uint ki = lane + j * 32;
+        if (ki < DK) {
+            state[j] = initial[(bh * DK + ki) * DV + vi];
+            for (int w = 0; w < WINDOW - TIME; ++w) {
+                present[((size_t(w) * B * H + bh) * DK + ki) * DV + vi] = S(0);
+            }
+        }
     }
-    let zero = la_scalar(ctx, 0.0, dt)?;
-    let axes = [axis];
-    let lo = [0i32];
-    let hi = [high];
-    let mode = b"constant\0";
-    let out = ctx.emit(|res, s| unsafe {
-        mlx::mlx_pad(
-            res,
-            a,
-            axes.as_ptr(),
-            1,
-            lo.as_ptr(),
-            1,
-            hi.as_ptr(),
-            1,
-            zero,
-            mode.as_ptr() as *const c_char,
-            s,
-        )
-    })?;
-    ctx.contiguous(out)
-}
+    for (uint t = 0; t < TIME; ++t) {
+        size_t kt = (bh * TIME + t) * DK;
+        float retrieval = 0.0f;
+        for (uint j = 0; j < (DK + 31) / 32; ++j) {
+            uint ki = lane + j * 32;
+            if (ki < DK) {
+                if (DECAY) {
+                    size_t gi = SCALAR_DECAY ? bh * TIME + t : kt + ki;
+                    S gate = S(precise::exp(float(decay[gi])));
+                    state[j] = S(float(state[j]) * float(gate));
+                }
+                retrieval += float(key[kt + ki]) * float(state[j]);
+            }
+        }
+        S delta = value[(bh * TIME + t) * DV + vi];
+        if (BETA) {
+            S retrieved = S(simd_sum(retrieval));
+            S difference = S(float(delta) - float(retrieved));
+            delta = S(float(beta[bh * TIME + t]) * float(difference));
+        }
+        for (uint j = 0; j < (DK + 31) / 32; ++j) {
+            uint ki = lane + j * 32;
+            if (ki < DK) {
+                S outer = S(float(key[kt + ki]) * float(delta));
+                state[j] = S(float(state[j]) + float(outer));
+                int w = int(t) - (TIME - WINDOW);
+                if (WINDOW > 0 && w >= 0) {
+                    present[((size_t(w) * B * H + bh) * DK + ki) * DV + vi] = state[j];
+                }
+            }
+        }
+        for (uint q = 0; q < HQ / H; ++q) {
+            uint qh = hi * (HQ / H) + q;
+            size_t qt = ((size_t(bi) * HQ + qh) * TIME + t) * DK;
+            float readout = 0.0f;
+            for (uint j = 0; j < (DK + 31) / 32; ++j) {
+                uint ki = lane + j * 32;
+                if (ki < DK) {
+                    readout += float(query[qt + ki]) * float(state[j]);
+                }
+            }
+            S result = S(simd_sum(readout));
+            if (lane == 0) {
+                output[((size_t(bi) * TIME + t) * HQ + qh) * DV + vi] = result;
+            }
+        }
+    }
+    if (WINDOW == 0) {
+        for (uint j = 0; j < (DK + 31) / 32; ++j) {
+            uint ki = lane + j * 32;
+            if (ki < DK) {
+                present[(bh * DK + ki) * DV + vi] = state[j];
+            }
+        }
+    }
+"#;
 
-fn tril(
-    ctx: &mut TranslationContext,
-    a: mlx::mlx_array,
-    k: i32,
-) -> Result<mlx::mlx_array, MlxError> {
-    ctx.emit(|res, s| unsafe { mlx::mlx_tril(res, a, k, s) })
-}
-
-fn exp_arr(ctx: &mut TranslationContext, a: mlx::mlx_array) -> Result<mlx::mlx_array, MlxError> {
-    ctx.emit(|res, s| unsafe { mlx::mlx_exp(res, a, s) })
-}
-
-/// Transpose the last two axes of a rank-N array (N in {4,5}).
-fn transpose_last2(
-    ctx: &mut TranslationContext,
-    a: mlx::mlx_array,
-    rank: i32,
-) -> Result<mlx::mlx_array, MlxError> {
-    let mut axes: Vec<i32> = (0..rank).collect();
-    axes.swap((rank - 1) as usize, (rank - 2) as usize);
-    ctx.transpose(a, &axes)
-}
-
-/// Select chunk `i` along axis 2 of a rank-5 `[B,H,nc,C,X]` tensor, returning `[B,H,C,X]`.
-fn chunk5(
-    ctx: &mut TranslationContext,
-    a: mlx::mlx_array,
-    i: i32,
-    b: i32,
-    h: i32,
-    c: i32,
-    x: i32,
-) -> Result<mlx::mlx_array, MlxError> {
-    let s = ctx.slice(a, &[0, 0, i, 0, 0], &[b, h, i + 1, c, x])?;
-    ctx.reshape(s, &[b, h, c, x])
-}
-
-/// Select chunk `i` along axis 2 of a rank-4 `[B,H,nc,C]` tensor, returning `[B,H,C]`.
-fn chunk4(
-    ctx: &mut TranslationContext,
-    a: mlx::mlx_array,
-    i: i32,
-    b: i32,
-    h: i32,
-    c: i32,
-) -> Result<mlx::mlx_array, MlxError> {
-    let s = ctx.slice(a, &[0, 0, i, 0], &[b, h, i + 1, c])?;
-    ctx.reshape(s, &[b, h, c])
-}
-
-/// Chunked gated-delta / delta linear attention (chunk_size = 64). A faithful MLX port of HF
-/// Qwen3.5's `torch_chunk_gated_delta_rule`; numerically identical to the recurrent unroll (the
-/// ground-truth handler), but expressed as batched matmuls so PREFILL fills the GPU. All ops are
-/// static-shape (the C-axis forward-substitution is a fixed 64-iteration loop), so the whole thing
-/// is captured inside `mlx_compile`.
-///
-/// Inputs are already in `[B,H,T,·]` head layout with GQA tiling applied and the query pre-scaled.
-/// `g_bht` is the per-head SCALAR decay `[B,H,T]` (zeros for the `delta` rule); `beta_bht` is
-/// `[B,H,T]`. `state` is the initial `[B,H,d_k,d_v]` recurrent state.
 #[allow(clippy::too_many_arguments)]
-fn linear_attention_chunked(
+fn linear_attention_scan(
     ctx: &mut TranslationContext,
-    n: &NodeDesc,
-    q4: mlx::mlx_array,
-    k4: mlx::mlx_array,
-    v4: mlx::mlx_array,
-    g_bht: mlx::mlx_array,
-    beta_bht: mlx::mlx_array,
-    mut state: mlx::mlx_array,
-    b: i32,
-    h: i32,
-    d_k: i32,
-    d_v: i32,
-    t_len: i32,
-    dt: mlx::mlx_dtype,
-) -> Result<(), MlxError> {
-    let c = CHUNK_SIZE;
-    let pad = (c - t_len % c) % c;
-    let tp = t_len + pad;
-    let nc = tp / c;
-
-    // Pad time to a chunk multiple (query/key/value with zeros; beta/g with zeros too).
-    let q = pad_axis_end(ctx, q4, 2, pad, dt)?; // [B,H,tp,d_k]
-    let k = pad_axis_end(ctx, k4, 2, pad, dt)?; // [B,H,tp,d_k]
-    let v = pad_axis_end(ctx, v4, 2, pad, dt)?; // [B,H,tp,d_v]
-    let beta = pad_axis_end(ctx, beta_bht, 2, pad, dt)?; // [B,H,tp]
-    let g = pad_axis_end(ctx, g_bht, 2, pad, dt)?; // [B,H,tp]
-
-    // v_beta / k_beta on the flat (unchunked) tensors, then reshape everything into chunks.
-    let beta_col = ctx.expand_dims(beta, 3)?; // [B,H,tp,1]
-    let v_beta = ctx.mul(v, beta_col)?; // [B,H,tp,d_v]
-    let k_beta = ctx.mul(k, beta_col)?; // [B,H,tp,d_k]
-
-    let q_c = ctx.reshape(q, &[b, h, nc, c, d_k])?;
-    let k_c = ctx.reshape(k, &[b, h, nc, c, d_k])?;
-    let k_beta_c = ctx.reshape(k_beta, &[b, h, nc, c, d_k])?;
-    let v_beta_c = ctx.reshape(v_beta, &[b, h, nc, c, d_v])?;
-    let g_c = ctx.reshape(g, &[b, h, nc, c])?; // [B,H,nc,C]
-
-    // Cumulative decay within each chunk and the pairwise decay matrix.
-    let g_cum = ctx.cumsum(g_c, 3, false, true)?; // [B,H,nc,C]
-    let gi = ctx.expand_dims(g_cum, 4)?; // [B,H,nc,C,1]
-    let gj = ctx.expand_dims(g_cum, 3)?; // [B,H,nc,1,C]
-    let diff = ctx.sub(gi, gj)?; // [B,H,nc,C,C]
-    let low = tril(ctx, diff, 0)?;
-    let dexp = exp_arr(ctx, low)?;
-    let decay_mask = tril(ctx, dexp, 0)?; // [B,H,nc,C,C]
-
-    // Upper-triangular (incl. diagonal) boolean mask, broadcast over batch/chunk.
-    let ones_cc = ctx.emit(|res, s| unsafe {
-        mlx::mlx_ones(res, [c, c].as_ptr(), 2, mlx::mlx_dtype__MLX_BOOL, s)
-    })?;
-    let mask = ctx.emit(|res, s| unsafe { mlx::mlx_triu(res, ones_cc, 0, s) })?;
-    let zero = la_scalar(ctx, 0.0, dt)?;
-
-    // attn = -((k_beta @ key^T) * decay_mask) with the upper triangle (incl. diagonal) zeroed.
-    let k_t = transpose_last2(ctx, k_c, 5)?; // [B,H,nc,d_k,C]
-    let kk = ctx.matmul(k_beta_c, k_t)?; // [B,H,nc,C,C]
-    let kk = ctx.mul(kk, decay_mask)?;
-    let neg = ctx.emit(|res, s| unsafe { mlx::mlx_negative(res, kk, s) })?;
-    let mut attn = ctx.where_(mask, zero, neg)?; // [B,H,nc,C,C]
-
-    // Forward substitution: build (I - A)^-1 in place (fixed C-iteration loop, static shapes).
-    for i in 1..c {
-        let row = ctx.slice(attn, &[0, 0, 0, i, 0], &[b, h, nc, i + 1, i])?; // [B,H,nc,1,i]
-        let sub = ctx.slice(attn, &[0, 0, 0, 0, 0], &[b, h, nc, i, i])?; // [B,H,nc,i,i]
-        let prod = ctx.matmul(row, sub)?; // [B,H,nc,1,i]
-        let new_row = ctx.add(row, prod)?;
-        attn = ctx.slice_update(attn, new_row, &[0, 0, 0, i, 0], &[b, h, nc, i + 1, i])?;
+    state: mlx::mlx_array,
+    query: mlx::mlx_array,
+    key: mlx::mlx_array,
+    value: mlx::mlx_array,
+    decay: Option<mlx::mlx_array>,
+    beta: Option<mlx::mlx_array>,
+    scalar_decay: bool,
+    window: i32,
+) -> Result<Option<(mlx::mlx_array, mlx::mlx_array)>, MlxError> {
+    let disabled = std::env::var_os("ONNXRUNTIME_EP_MLX_NO_LINEAR_ATTENTION_SCAN")
+        .is_some_and(|value| value != "0" && !value.is_empty());
+    let shape = ctx.shape_of(value);
+    let (b, h, time, dv) = (shape[0], shape[1], shape[2], shape[3]);
+    let qshape = ctx.shape_of(query);
+    let (hq, dk) = (qshape[1], qshape[3]);
+    // Bound per-lane register state, not legal operator inputs. Wider shapes retain the unroll.
+    if disabled || time <= 1 || b <= 0 || dk <= 0 || dk > 256 {
+        return Ok(None);
     }
-    let eye = ctx.emit(|res, s| unsafe { mlx::mlx_eye(res, c, c, 0, dt, s) })?;
-    let attn = ctx.add(attn, eye)?; // [B,H,nc,C,C]
-
-    let u_val = ctx.matmul(attn, v_beta_c)?; // [B,H,nc,C,d_v] ("pseudo-values")
-    let g_exp = exp_arr(ctx, g_cum)?; // [B,H,nc,C]
-    let g_exp_col = ctx.expand_dims(g_exp, 4)?; // [B,H,nc,C,1]
-    let k_scaled = ctx.mul(k_beta_c, g_exp_col)?; // [B,H,nc,C,d_k]
-    let k_cumdecay = ctx.matmul(attn, k_scaled)?; // [B,H,nc,C,d_k]
-
-    // Sequential scan over chunks; each step is a handful of batched matmuls over [B,H,C,·].
-    let mut out_chunks: Vec<mlx::mlx_array> = Vec::with_capacity(nc as usize);
-    for i in 0..nc {
-        let q_i = chunk5(ctx, q_c, i, b, h, c, d_k)?; // [B,H,C,d_k]
-        let k_i = chunk5(ctx, k_c, i, b, h, c, d_k)?; // [B,H,C,d_k]
-        let v_i = chunk5(ctx, u_val, i, b, h, c, d_v)?; // [B,H,C,d_v]
-        let dm_i = chunk5(ctx, decay_mask, i, b, h, c, c)?; // [B,H,C,C]
-        let gc_i = chunk4(ctx, g_cum, i, b, h, c)?; // [B,H,C]
-        let kcd_i = chunk5(ctx, k_cumdecay, i, b, h, c, d_k)?; // [B,H,C,d_k]
-
-        let k_i_t = transpose_last2(ctx, k_i, 4)?; // [B,H,d_k,C]
-        let attn_i = ctx.matmul(q_i, k_i_t)?; // [B,H,C,C]
-        let attn_i = ctx.mul(attn_i, dm_i)?;
-
-        let v_prime = ctx.matmul(kcd_i, state)?; // [B,H,C,d_v]
-        let v_new = ctx.sub(v_i, v_prime)?; // [B,H,C,d_v]
-
-        let gc_i_exp = exp_arr(ctx, gc_i)?; // [B,H,C]
-        let gc_i_col = ctx.expand_dims(gc_i_exp, 3)?; // [B,H,C,1]
-        let q_dec = ctx.mul(q_i, gc_i_col)?; // [B,H,C,d_k]
-        let attn_inter = ctx.matmul(q_dec, state)?; // [B,H,C,d_v]
-        let intra = ctx.matmul(attn_i, v_new)?; // [B,H,C,d_v]
-        let out_i = ctx.add(attn_inter, intra)?; // [B,H,C,d_v]
-        out_chunks.push(out_i);
-
-        // State update: decay carried state and add the chunk's key/value outer product.
-        let g_last = ctx.slice(gc_i, &[0, 0, c - 1], &[b, h, c])?; // [B,H,1]
-        let g_last_exp = exp_arr(ctx, g_last)?; // [B,H,1]
-        let g_last_e = ctx.expand_dims(g_last_exp, 3)?; // [B,H,1,1]
-        let decayed = ctx.mul(state, g_last_e)?; // [B,H,d_k,d_v]
-
-        let w = ctx.sub(g_last, gc_i)?; // [B,H,C]  (g_last - g_cum)
-        let w_exp = exp_arr(ctx, w)?;
-        let w_col = ctx.expand_dims(w_exp, 3)?; // [B,H,C,1]
-        let kw = ctx.mul(k_i, w_col)?; // [B,H,C,d_k]
-        let kw_t = transpose_last2(ctx, kw, 4)?; // [B,H,d_k,C]
-        let upd = ctx.matmul(kw_t, v_new)?; // [B,H,d_k,d_v]
-        state = ctx.add(decayed, upd)?;
+    let Some(threads) = b
+        .checked_mul(h)
+        .and_then(|x| x.checked_mul(dv))
+        .and_then(|x| x.checked_mul(32))
+    else {
+        return Ok(None);
+    };
+    let mut device = unsafe { mlx::mlx_device_new() };
+    let mut device_type = mlx::mlx_device_type__MLX_CPU;
+    let mut rc = unsafe { mlx::mlx_stream_get_device(&mut device, ctx.stream()) };
+    if rc == 0 {
+        rc = unsafe { mlx::mlx_device_get_type(&mut device_type, device) };
+    }
+    unsafe { mlx::mlx_device_free(device) };
+    if rc != 0 {
+        return Err("LinearAttention: failed to inspect recurrence stream".to_string());
+    }
+    if device_type != mlx::mlx_device_type__MLX_GPU {
+        return Ok(None);
     }
 
-    if !n.outputs.is_empty() && !n.outputs[0].name.is_empty() {
-        let out5 = ctx.stack(&out_chunks, 2)?; // [B,H,nc,C,d_v]
-        let out_flat = ctx.reshape(out5, &[b, h, tp, d_v])?;
-        let out = ctx.slice(out_flat, &[0, 0, 0, 0], &[b, h, t_len, d_v])?; // drop padding
-        let out = ctx.transpose(out, &[0, 2, 1, 3])?; // [B,T,H,d_v]
-        let out = ctx.reshape(out, &[b, t_len, h * d_v])?;
-        let out = ctx.contiguous(out)?;
-        ctx.bind(&n.outputs[0], out);
+    let inputs = super::selective_scan::VecString::new(&[
+        "initial", "query", "key", "value", "decay", "beta",
+    ])?;
+    let outputs = super::selective_scan::VecString::new(&["output", "present"])?;
+    let source = CString::new(LINEAR_ATTENTION_SCAN_SRC).unwrap();
+    let kernel = unsafe {
+        mlx::mlx_fast_metal_kernel_new(
+            c"onnxrt_mlx_linear_attention_scan".as_ptr(),
+            inputs.as_raw(),
+            outputs.as_raw(),
+            source.as_ptr(),
+            c"".as_ptr(),
+            true,
+            false,
+        )
+    };
+    if kernel.ctx.is_null() {
+        return Err("LinearAttention: failed to construct fused recurrence".to_string());
     }
-    if n.outputs.len() >= 2 && !n.outputs[1].name.is_empty() {
-        let ps = ctx.contiguous(state)?;
-        ctx.bind(&n.outputs[1], ps);
+    let config = unsafe { mlx::mlx_fast_metal_kernel_config_new() };
+    let dtype = ctx.dtype_of(state);
+    rc = unsafe {
+        mlx::mlx_fast_metal_kernel_config_add_template_arg_dtype(config, c"S".as_ptr(), dtype)
+    };
+    for (name, number) in [
+        ("B", b),
+        ("H", h),
+        ("HQ", hq),
+        ("TIME", time),
+        ("DK", dk),
+        ("DV", dv),
+        ("WINDOW", window),
+        ("DECAY", decay.is_some() as i32),
+        ("BETA", beta.is_some() as i32),
+        ("SCALAR_DECAY", scalar_decay as i32),
+    ] {
+        let name = CString::new(name).unwrap();
+        rc |= unsafe {
+            mlx::mlx_fast_metal_kernel_config_add_template_arg_int(config, name.as_ptr(), number)
+        };
     }
-    Ok(())
+    let output_shape = [b, time, hq * dv];
+    let mut state_shape = vec![b, h, dk, dv];
+    if window > 0 {
+        state_shape.insert(0, window);
+    }
+    rc |= unsafe {
+        mlx::mlx_fast_metal_kernel_config_add_output_arg(
+            config,
+            output_shape.as_ptr(),
+            output_shape.len(),
+            dtype,
+        )
+    };
+    rc |= unsafe {
+        mlx::mlx_fast_metal_kernel_config_add_output_arg(
+            config,
+            state_shape.as_ptr(),
+            state_shape.len(),
+            dtype,
+        )
+    };
+    rc |= unsafe { mlx::mlx_fast_metal_kernel_config_set_grid(config, threads, 1, 1) };
+    rc |= unsafe {
+        mlx::mlx_fast_metal_kernel_config_set_thread_group(config, threads.min(128), 1, 1)
+    };
+    let mut arguments = crate::mlx::VectorArray::new();
+    for array in [
+        state,
+        query,
+        key,
+        value,
+        decay.unwrap_or(state),
+        beta.unwrap_or(state),
+    ] {
+        arguments.append(array);
+    }
+    let mut results = crate::mlx::VectorArray::new();
+    if rc == 0 {
+        rc = unsafe {
+            mlx::mlx_fast_metal_kernel_apply(
+                results.as_mut_ptr(),
+                kernel,
+                arguments.as_raw(),
+                config,
+                ctx.stream(),
+            )
+        };
+    }
+    unsafe {
+        mlx::mlx_fast_metal_kernel_config_free(config);
+        mlx::mlx_fast_metal_kernel_free(kernel);
+    }
+    if rc != 0 || results.size() != 2 {
+        return Err("LinearAttention: fused recurrence kernel failed".to_string());
+    }
+    Ok(Some((ctx.keep(results.get(0)), ctx.keep(results.get(1)))))
 }
 
 fn linear_attention_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
@@ -747,11 +820,24 @@ fn linear_attention_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(),
     };
 
     let qsh = ctx.shape_of(query);
+    let ksh = ctx.shape_of(key);
     let vsh = ctx.shape_of(value);
+    if qsh.len() != 3
+        || ksh.len() != 3
+        || vsh.len() != 3
+        || qsh[..2] != ksh[..2]
+        || qsh[..2] != vsh[..2]
+        || qsh[2] <= 0
+        || qsh[2] % hq != 0
+        || vsh[2] <= 0
+        || vsh[2] % h != 0
+    {
+        return Err("LinearAttention: incompatible query/key/value geometry".to_string());
+    }
     let b = qsh[0];
     let t_len = qsh[1];
     // A dynamic (symbolic) time extent only survives into a SHAPELESS trace; the static-length
-    // unroll below needs a concrete T. Fail the trace so the plan falls back to the eager translator
+    // recurrence needs a concrete T. Fail the trace so the plan falls back to the eager translator
     // (or the shape-keyed general trace), where `shape_of` reports the real extent. The claim admits
     // dynamic-time nodes precisely because this guard keeps them correct.
     if t_len < 0 {
@@ -762,11 +848,32 @@ fn linear_attention_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(),
     }
     let d_k = qsh[2] / hq;
     let d_v = vsh[2] / h;
-    let n_k_heads = ctx.shape_of(key)[2] / d_k;
-    if n_k_heads <= 0 || h % n_k_heads != 0 {
+    let n_k_heads = ksh[2] / d_k;
+    if ksh[2] % d_k != 0 || n_k_heads <= 0 || h % n_k_heads != 0 {
         return Err("MLX LinearAttention: kv_num_heads must be divisible by key heads".to_string());
     }
     let output_heads = hq.max(h);
+    let mut expected_state = vec![b, h, d_k, d_v];
+    if state_window > 0 {
+        expected_state.insert(0, state_window);
+    }
+    if present(n, 3) {
+        let past = ctx.resolve(&n.inputs[3])?;
+        if ctx.shape_of(past) != expected_state {
+            return Err("LinearAttention: incompatible past_state geometry".to_string());
+        }
+    }
+    for (index, widths) in [(4, [h, h * d_k]), (5, [1, h])] {
+        if present(n, index) {
+            let a = ctx.resolve(&n.inputs[index])?;
+            let shape = ctx.shape_of(a);
+            if shape.len() != 3 || shape[..2] != qsh[..2] || !widths.contains(&shape[2]) {
+                return Err(format!(
+                    "LinearAttention: incompatible input {index} geometry"
+                ));
+            }
+        }
+    }
 
     let scale_attr = n.floats.get("scale").copied().unwrap_or(0.0);
     let scale = if scale_attr != 0.0 {
@@ -871,29 +978,34 @@ fn linear_attention_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(),
         None
     };
 
-    // Prefill fast path: the CHUNKED gated-delta algorithm (chunk_size = 64) is numerically
-    // identical (in exact arithmetic) to the recurrent unroll but expressed as batched matmuls, so
-    // it fills the GPU on long sequences. It is used ONLY for `gated_delta` with a per-head SCALAR
-    // decay layout (the Qwen3.5 GatedDeltaNet form). The `delta` rule is deliberately excluded: with
-    // no decay to bound it, the `(I - A)^-1` forward substitution amplifies fp32 rounding and
-    // diverges from ORT CPU (verified: ~1e-1..1e1 abs error at T>=128), so it stays on the stable
-    // recurrent path — as do `linear` / `gated` (no delta correction) and the per-key-dim decay
-    // layout. Decode / small T (t_len <= chunk_size) also stay recurrent (best for T == 1).
-    let use_chunked = rule == "gated_delta"
-        && decay_per_head_scalar
-        && t_len > CHUNK_SIZE
-        && hq == h
-        && n_k_heads == h
-        && state_dt == dt
-        && state_window == 0;
-    if use_chunked {
-        let g_bht = decay4.expect("gated_delta carries decay"); // [B,H,T] scalar decay
-        let beta_bht = beta3.expect("gated_delta carries beta"); // [B,H,T]
-        return linear_attention_chunked(
-            ctx, n, q4, k4, v4, g_bht, beta_bht, state, b, h, d_k, d_v, t_len, dt,
+    if t_len > 1 {
+        if let Some((output, present)) = linear_attention_scan(
+            ctx,
+            state,
+            q4,
+            k4,
+            v4,
+            decay4,
+            beta3,
+            decay_per_head_scalar,
+            state_window,
+        )? {
+            if !n.outputs[0].name.is_empty() {
+                let output = ctx.astype(output, dt)?;
+                ctx.bind(&n.outputs[0], output);
+            }
+            if !n.outputs[1].name.is_empty() {
+                ctx.bind(&n.outputs[1], present);
+            }
+            ctx.mark_fast("mlx_linear_attention_scan");
+            return Ok(());
+        }
+        ctx.mark_composed(
+            "stable unroll: scan disabled, CPU/empty geometry, d_k > 256, or grid limit",
         );
     }
 
+    // Zero/weak decay and unnormalized keys remain legal on every route.
     let mut outs: Vec<mlx::mlx_array> = Vec::with_capacity(t_len as usize);
     let mut state_history: Vec<mlx::mlx_array> = if state_window > 0 {
         Vec::with_capacity(state_window as usize)
@@ -993,8 +1105,8 @@ fn linear_attention_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(),
 
 fn linear_attention_common_claim(node: &NodeView, allow_mixed_state: bool) -> ClaimResult {
     require!(
-        node.num_inputs() >= 3 && node.num_outputs() >= 1,
-        "expects at least 3 inputs and 1 output, got {}in/{}out",
+        (3..=6).contains(&node.num_inputs()) && node.num_outputs() == 2,
+        "expects 3-6 inputs and two outputs, got {}in/{}out",
         node.num_inputs(),
         node.num_outputs()
     );
@@ -1008,7 +1120,11 @@ fn linear_attention_common_claim(node: &NodeView, allow_mixed_state: bool) -> Cl
     let hq = node.int_attr("q_num_heads", 0);
     let h = node.int_attr("kv_num_heads", 0);
     require!(
-        hq > 0 && h > 0 && (hq % h == 0 || h % hq == 0),
+        hq > 0
+            && h > 0
+            && hq <= i32::MAX as i64
+            && h <= i32::MAX as i64
+            && (hq % h == 0 || h % hq == 0),
         "q_num_heads and kv_num_heads must be positive and one must divide the other, got q={hq}, kv={h}"
     );
     let (q, k, v) = match (node.input_info(0), node.input_info(1), node.input_info(2)) {
@@ -1044,6 +1160,15 @@ fn linear_attention_common_claim(node: &NodeView, allow_mixed_state: bool) -> Cl
         "value hidden size must be a positive multiple of kv_num_heads"
     );
     let d_v = v.shape[2] / h;
+    require!(
+        compatible_shape(&q.shape[..2], &k.shape[..2])
+            && compatible_shape(&q.shape[..2], &v.shape[..2]),
+        "query/key/value batch and time dimensions must match"
+    );
+    require!(
+        matches!(node.output_info(0), Some(out) if out.dtype == q.dtype && compatible_shape(&out.shape, &[q.shape[0], q.shape[1], hq.max(h) * d_v])),
+        "output must have query dtype and shape [B,T,max(q_num_heads,kv_num_heads)*d_v]"
+    );
     let expected_state_shape = if state_window > 0 {
         vec![state_window, q.shape[0], h, d_k, d_v]
     } else {
@@ -1051,7 +1176,7 @@ fn linear_attention_common_claim(node: &NodeView, allow_mixed_state: bool) -> Cl
     };
     if let Some(past) = node.input_info(3) {
         require!(
-            past.shape == expected_state_shape,
+            compatible_shape(&past.shape, &expected_state_shape),
             "past_state shape {:?} must be {:?}",
             past.shape,
             expected_state_shape
@@ -1059,7 +1184,12 @@ fn linear_attention_common_claim(node: &NodeView, allow_mixed_state: bool) -> Cl
     }
     if let Some(present_state) = node.output_info(1) {
         require!(
-            present_state.shape == expected_state_shape,
+            compatible_shape(&present_state.shape, &expected_state_shape)
+                && (if allow_mixed_state {
+                    is_mlx_float(present_state.dtype)
+                } else {
+                    present_state.dtype == q.dtype
+                }),
             "present_state shape {:?} must be {:?}",
             present_state.shape,
             expected_state_shape
@@ -1067,7 +1197,7 @@ fn linear_attention_common_claim(node: &NodeView, allow_mixed_state: bool) -> Cl
     }
     // The time dimension may be DYNAMIC (symbolic `[-1]`, as in real Qwen3.5/Qwen3-Next decoder
     // exports): the shape-keyed general trace resolves the concrete extent at trace time, and the
-    // handler unrolls over it (with a guard that falls back to eager if it is ever traced shapeless).
+    // handler specializes the recurrence (falling back to eager if it is ever traced shapeless).
     let float_ok = |i: usize| -> bool {
         if !node.input_present(i) {
             return true;
@@ -1106,12 +1236,19 @@ fn linear_attention_common_claim(node: &NodeView, allow_mixed_state: bool) -> Cl
         !rule_uses_beta(&rule) || node.input_present(5),
         "update_rule {rule:?} requires the beta input"
     );
+    if let Some(decay) = node.input_info(4) {
+        require!(
+            decay.shape.len() == 3
+                && compatible_shape(&decay.shape[..2], &q.shape[..2])
+                && (decay.shape[2] == h || decay.shape[2] == h * d_k),
+            "decay must have shape [B,T,kv_num_heads] or [B,T,kv_num_heads*d_k]"
+        );
+    }
     if node.input_present(5) {
         let beta = node.input_info(5).unwrap();
         require!(
             beta.shape.len() == 3
-                && beta.shape[0] == q.shape[0]
-                && beta.shape[1] == q.shape[1]
+                && compatible_shape(&beta.shape[..2], &q.shape[..2])
                 && (beta.shape[2] == 1 || beta.shape[2] == h),
             "beta must have shape [B,T,1] or [B,T,kv_num_heads]"
         );
@@ -1125,6 +1262,10 @@ fn linear_attention_claim(node: &NodeView) -> ClaimResult {
 
 fn linear_attention_standard_claim(node: &NodeView) -> ClaimResult {
     linear_attention_common_claim(node, true)?;
+    require!(
+        node.int_attr("state_window", 0) == 0,
+        "standard LinearAttention does not define state_window"
+    );
     let q = node.input_info(0).unwrap();
     let k = node.input_info(1).unwrap();
     let v = node.input_info(2).unwrap();
@@ -1212,19 +1353,26 @@ fn gated_add_claim(node: &NodeView) -> ClaimResult {
 
 fn linear_attention_gate_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
     let a = ctx.resolve(&n.inputs[0])?;
+    let shape = ctx.shape_of(a);
     let out_dt = ctx.dtype_of(a);
     let a32 = ctx.astype(a, mlx::mlx_dtype__MLX_FLOAT32)?;
     let bias = ctx.resolve(&n.inputs[1])?;
+    let scale = ctx.resolve(&n.inputs[2])?;
+    if shape.len() != 3 || ctx.shape_of(bias) != [shape[2]] || ctx.shape_of(scale) != [shape[2]] {
+        return Err("LinearAttentionGate: parameters must have shape [H]".to_string());
+    }
     let shifted = ctx.add(a32, bias)?;
     let zero = ctx.zeros_like(shifted)?;
     let softplus = ctx.binary(mlx::mlx_logaddexp, zero, shifted)?;
-    let scale = ctx.resolve(&n.inputs[2])?;
     let decay32 = ctx.mul(softplus, scale)?;
     let decay = ctx.astype(decay32, out_dt)?;
     ctx.bind(&n.outputs[0], decay);
 
     if n.outputs.len() > 1 && !n.outputs[1].name.is_empty() {
         let b = ctx.resolve(&n.inputs[3])?;
+        if ctx.shape_of(b) != shape {
+            return Err("LinearAttentionGate: b must have the same shape as a".to_string());
+        }
         let b32 = ctx.astype(b, mlx::mlx_dtype__MLX_FLOAT32)?;
         let beta32 = ctx.unary(mlx::mlx_sigmoid, b32)?;
         let beta = ctx.astype(beta32, out_dt)?;
@@ -1235,18 +1383,15 @@ fn linear_attention_gate_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Resul
 
 fn linear_attention_gate_claim(node: &NodeView) -> ClaimResult {
     require!(
-        node.num_inputs() == 4 && (1..=2).contains(&node.num_outputs()),
-        "LinearAttentionGate expects 4 input slots and 1-2 outputs"
+        (3..=4).contains(&node.num_inputs()) && (1..=2).contains(&node.num_outputs()),
+        "LinearAttentionGate expects 3-4 input slots and 1-2 outputs"
     );
     let a = match node.input_info(0) {
         Some(a) if is_mlx_float(a.dtype) => a,
         Some(_) => deny!("a must have an MLX float dtype"),
         None => deny!("a lacks tensor type/shape info"),
     };
-    require!(
-        a.shape.len() == 3 && a.shape.iter().all(|&d| d >= 0),
-        "a must be a static rank-3 [B,T,H] tensor"
-    );
+    require!(a.shape.len() == 3, "a must be a rank-3 [B,T,H] tensor");
     for idx in [1usize, 2] {
         let param = match node.input_info(idx) {
             Some(param) => param,
@@ -1254,7 +1399,7 @@ fn linear_attention_gate_claim(node: &NodeView) -> ClaimResult {
         };
         require!(
             param.dtype == ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT
-                && param.shape == [a.shape[2]],
+                && compatible_shape(&param.shape, &[a.shape[2]]),
             "dt_bias and decay_scale must be float32 [H]"
         );
     }
@@ -1263,7 +1408,7 @@ fn linear_attention_gate_claim(node: &NodeView) -> ClaimResult {
         None => deny!("decay output lacks tensor type/shape info"),
     };
     require!(
-        decay.dtype == a.dtype && decay.shape == a.shape,
+        decay.dtype == a.dtype && compatible_shape(&decay.shape, &a.shape),
         "decay output must match a"
     );
     if node.output_present(1) {
@@ -1281,9 +1426,9 @@ fn linear_attention_gate_claim(node: &NodeView) -> ClaimResult {
         };
         require!(
             b.dtype == a.dtype
-                && b.shape == a.shape
+                && compatible_shape(&b.shape, &a.shape)
                 && beta.dtype == a.dtype
-                && beta.shape == a.shape,
+                && compatible_shape(&beta.shape, &a.shape),
             "b and beta must match a"
         );
     }
@@ -1375,14 +1520,17 @@ fn gated_rms_norm_claim(node: &NodeView) -> ClaimResult {
 // ---- registration -------------------------------------------------------------------------------
 
 pub fn register(registry: &mut OpRegistry) {
-    registry.register_shapeless(OpRegistration {
-        domain: "",
-        op_type: "TensorScatter",
-        min_opset: 24,
-        max_opset: K_ANY_OPSET,
-        handler: tensor_scatter_op as OpHandler,
-        claim: tensor_scatter_claim as ClaimPredicate,
-    });
+    registry.register_shape_keyed(
+        OpRegistration {
+            domain: "",
+            op_type: "TensorScatter",
+            min_opset: 24,
+            max_opset: K_ANY_OPSET,
+            handler: tensor_scatter_op as OpHandler,
+            claim: tensor_scatter_claim as ClaimPredicate,
+        },
+        crate::registry::MLX_SLICE_SHAPE_REASON,
+    );
     registry.register_shape_keyed(
         OpRegistration {
             domain: "com.microsoft",
@@ -1414,7 +1562,7 @@ pub fn register(registry: &mut OpRegistry) {
             handler: linear_attention_op as OpHandler,
             claim: linear_attention_claim as ClaimPredicate,
         },
-        "emits MLX Slice, Pad, and Scan, which lack Primitive::output_shapes in MLX 0.32.2",
+        "emits MLX Slice or CustomKernel without Primitive::output_shapes",
     );
     registry.register_shape_keyed(
         OpRegistration {
@@ -1425,18 +1573,24 @@ pub fn register(registry: &mut OpRegistry) {
             handler: linear_attention_op as OpHandler,
             claim: linear_attention_standard_claim as ClaimPredicate,
         },
-        "emits MLX Slice, Pad, and Scan, which lack Primitive::output_shapes in MLX 0.32.2",
+        "emits MLX Slice or CustomKernel without Primitive::output_shapes",
+    );
+    registry.register_shape_keyed(
+        OpRegistration {
+            domain: "com.microsoft",
+            op_type: "LinearAttentionGate",
+            min_opset: K_ANY_OPSET,
+            max_opset: K_ANY_OPSET,
+            handler: linear_attention_gate_op as OpHandler,
+            claim: linear_attention_gate_claim as ClaimPredicate,
+        },
+        "conservatively validates concrete gate/parameter geometry",
     );
     for (op_type, handler, claim) in [
         (
             "GatedAdd",
             gated_add_op as OpHandler,
             gated_add_claim as ClaimPredicate,
-        ),
-        (
-            "LinearAttentionGate",
-            linear_attention_gate_op as OpHandler,
-            linear_attention_gate_claim as ClaimPredicate,
         ),
         (
             "GatedRMSNorm",
@@ -1452,5 +1606,37 @@ pub fn register(registry: &mut OpRegistry) {
             handler,
             claim,
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{engine::Plan, mlx::Stream};
+
+    #[test]
+    fn linear_attention_scan_declines_cpu_stream() {
+        let stream = Stream::new_default_cpu();
+        let mut plan = Plan::new(Vec::new());
+        let mut ctx = TranslationContext::new(
+            &mut plan,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            stream.as_raw(),
+        );
+        let state = ctx
+            .zeros(&[1, 1, 3, 2], mlx::mlx_dtype__MLX_FLOAT32)
+            .unwrap();
+        let query = ctx
+            .zeros(&[1, 1, 5, 3], mlx::mlx_dtype__MLX_FLOAT32)
+            .unwrap();
+        let value = ctx
+            .zeros(&[1, 1, 5, 2], mlx::mlx_dtype__MLX_FLOAT32)
+            .unwrap();
+        assert!(
+            linear_attention_scan(&mut ctx, state, query, query, value, None, None, true, 0)
+                .unwrap()
+                .is_none()
+        );
     }
 }

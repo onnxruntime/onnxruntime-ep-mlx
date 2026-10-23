@@ -475,17 +475,13 @@ def _causal_conv_model(
     return model, feeds
 
 
-# NOTE: com.microsoft.CausalConvWithState orders inputs (input, weight, bias?, past_state?), so a
-# bias-less-but-stateful node necessarily leaves an INTERIOR optional gap. ORT models such a gap as
-# a null ValueInfo, which the shared EP clustering in ep.cc dereferences unconditionally — an
-# engine-level limitation (like Scan's subgraph). That form is therefore not exercised here; the
-# claim additionally rejects interior gaps so any such node falls back to ORT CPU.
 @pytest.mark.parametrize(
     "with_bias,with_state,activation",
     [
         (False, False, "none"),
         (True, False, "none"),
         (True, True, "none"),
+        (False, True, "none"),
         (False, False, "silu"),
         (True, True, "swish"),
     ],
@@ -496,6 +492,7 @@ def test_causal_conv_with_state(with_bias, with_state, activation):
     )
     if not _cpu_supports(model, feeds):
         pytest.skip("ORT CPU lacks com.microsoft.CausalConvWithState in this build")
+    m.assert_mlx_claims(model, feeds)
     m.assert_matches_cpu(model, feeds, rtol=1e-4, atol=1e-5)
 
 
@@ -862,12 +859,6 @@ def test_linear_attention_zero_size(B: int, T: int) -> None:
     m.assert_matches_cpu(model, feeds, rtol=1e-3, atol=1e-3)
 
 
-# Dynamic (symbolic) T is left to ORT CPU — the unroll needs a static step count.
-@pytest.mark.skip(reason="dynamic (symbolic) T is left to ORT CPU — the unroll needs a static T")
-def test_linear_attention_dynamic_t_left_to_cpu() -> None:
-    ...
-
-
 # Qwen3.5 / Qwen3-Next GatedDeltaNet form: more value heads than query heads, a per-head SCALAR
 # decay gate [B,T,H], and a DYNAMIC (symbolic) time dim — the shape real decoder exports carry.
 @pytest.mark.parametrize("with_past", [False, True])
@@ -883,8 +874,8 @@ def test_linear_attention_qwen35_scalar_decay(with_past: bool, dyn_time: bool) -
 
 
 # Real Qwen3.5-0.8B GatedDeltaNet dims: 16 query/value heads, d_k == d_v == 128, per-head SCALAR
-# decay. The `gated_delta` rule at T > chunk_size (64) takes the CHUNKED prefill path (batched
-# matmuls); every other rule and the T == 1 decode step stay on the recurrent unroll.
+# decay. All four rules use the recurrence, including prefill: a shape-only WY dispatch cannot
+# assume stabilizing decay or normalized keys.
 #
 # DECODE (T == 1) covers all four rules — the recurrent state is bounded for a single step, so all
 # match ORT CPU to ~1e-7.
@@ -900,16 +891,8 @@ def test_linear_attention_qwen35_real_decode(rule: str, dyn_time: bool) -> None:
     m.assert_matches_cpu(model, feeds, rtol=2e-3, atol=2e-3)
 
 
-# PREFILL (T == 128: two full chunks; T == 200: non-multiple of the 64-wide chunk, exercising the
-# zero padding, plus a carried past_state). `gated_delta` here is the deliverable: the chunked path.
-# `gated` / `linear` stay on the recurrent path (bounded state) and guard against regressions.
-#
-# The `delta` rule is intentionally excluded from the large-T prefill cases: it applies NO decay, so
-# its recurrent state grows without bound (outputs reach magnitude ~1e5 at T=128 and ~1e6 at T=200
-# with these random inputs). ORT CPU evaluates the contrib kernel with a different internal
-# (chunked) summation order than any recurrent unroll, and at that magnitude fp32 rounding alone
-# exceeds a 2e-3 gate — so the comparison is not physically meaningful for `delta` at large T. Its
-# correctness is covered by the bounded T == 1 decode case above and the small-dim op tests.
+# PREFILL: long static/dynamic sequences, including a carried past_state. Ungated large-key cases
+# have dedicated FP64 recurrence and delta-equivalence checks in test_ssm_contracts.py.
 @pytest.mark.parametrize("rule", ["linear", "gated", "gated_delta"])
 @pytest.mark.parametrize(
     "T,with_past",
@@ -927,7 +910,6 @@ def test_linear_attention_qwen35_real_prefill(
     if not _cpu_supports(model, feeds):
         pytest.skip("ORT CPU lacks com.microsoft.LinearAttention (per-head-scalar decay) in this build")
     if rule == "gated_delta" and T == 128 and not with_past and not dyn_time:
-        # This exact case takes `linear_attention_chunked`, whose internal cumulative decay uses
-        # TranslationContext::cumsum. Prove the shape-safety registration did not unclaim the op.
+        # Prove that replacing WY chunking with the recurrence did not unclaim long prefill.
         m.assert_mlx_claims(model, feeds)
     m.assert_matches_cpu(model, feeds, rtol=2e-3, atol=2e-3)
