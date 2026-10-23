@@ -1935,6 +1935,7 @@ mod tests {
             ("Swish", 23, 24),
             ("SwiGLU", 27, 28),
             ("DeformConv", 18, 19),
+            ("GridSample", 15, 16),
         ] {
             assert!(
                 registry.find_entry("", op, before).is_none(),

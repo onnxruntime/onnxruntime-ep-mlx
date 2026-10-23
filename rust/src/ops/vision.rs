@@ -7,8 +7,9 @@
 //! accept symbolic extents; host-read MaxUnpool/Col2Im controls stay eager unless constant.
 //! Col2Im preserves integer/bool payloads with an inverse gather map and same-dtype add/OR;
 //! float64 uses that map on the existing MLX CPU-stream route without narrowing.
-//! Unsupported forms (cubic GridSample, 5-D volumetric, adaptive RoiAlign `sampling_ratio==0`,
-//! non-float payloads outside Col2Im) are left to CPU.
+//! GridSample uses tensor-product gathers for small ranks and separable interpolation for larger
+//! ranks. Nearest sampling preserves numeric/bool payloads without floating-point conversion.
+//! Adaptive RoiAlign `sampling_ratio==0` and non-float interpolation are left to CPU.
 //! NonMaxSuppression is host-computed because MLX has no data-dependent compacting primitive.
 
 use std::cmp::Ordering;
@@ -18,7 +19,7 @@ use crate::engine::{MlxError, NodeDesc, TensorRef, TranslationContext, mlx_dtype
 use crate::mlx::{Array, VectorArray};
 use crate::registry::{
     ClaimResult, K_ANY_OPSET, NodeView, OpRegistration, OpRegistry, is_int_index, is_mlx_cpu_float,
-    is_mlx_float,
+    is_mlx_float, is_movable,
 };
 use crate::sys::mlx;
 use crate::sys::ort;
@@ -303,131 +304,572 @@ fn out_dtype(n: &NodeDesc) -> mlx::mlx_dtype {
 }
 
 // =================================================================================================
-// GridSample (2D)
+// GridSample
 // =================================================================================================
 
-#[allow(clippy::too_many_arguments)]
-fn gs_sample(
-    ctx: &mut TranslationContext,
-    xf: mlx::mlx_array,
-    xf_coord: mlx::mlx_array,
-    yf_coord: mlx::mlx_array,
-    w: mlx::mlx_array,
-    zeros_pad: bool,
-    dims: (i32, i32, i32, i32, i32), // N, C, P, W, H
-) -> Result<mlx::mlx_array, MlxError> {
-    let (n, c, p, w_dim, h_dim) = dims;
-    let mut weight = w;
-    if zeros_pad {
-        let mx = in_range_mask(ctx, xf_coord, 0.0, w_dim as f32 - 1.0)?;
-        weight = mul(ctx, weight, mx)?;
-        let my = in_range_mask(ctx, yf_coord, 0.0, h_dim as f32 - 1.0)?;
-        weight = mul(ctx, weight, my)?;
+fn gs_product(dims: &[i32]) -> Result<i32, MlxError> {
+    dims.iter().try_fold(1i32, |a, &b| {
+        if b < 0 {
+            return Err("GridSample: dimensions must be nonnegative".into());
+        }
+        a.checked_mul(b)
+            .ok_or_else(|| "GridSample: element count exceeds int32 indexing".into())
+    })
+}
+
+fn gs_shape(x: &[i32], grid: &[i32]) -> Result<Vec<i32>, MlxError> {
+    if x.len() < 3 || grid.len() != x.len() || grid.last() != Some(&((x.len() - 2) as i32)) {
+        return Err(
+            "GridSample: expected X[N,C,spatial...] and grid[N,output...,spatial_rank]".into(),
+        );
     }
-    let xc = clip(ctx, xf_coord, 0.0, w_dim as f32 - 1.0)?;
-    let xi = astype(ctx, xc, mlx::mlx_dtype__MLX_INT32)?;
-    let yc = clip(ctx, yf_coord, 0.0, h_dim as f32 - 1.0)?;
-    let yi = astype(ctx, yc, mlx::mlx_dtype__MLX_INT32)?;
-    let wsc = scalar_i(ctx, w_dim);
-    let ymul = mul(ctx, yi, wsc)?;
-    let flat = add(ctx, ymul, xi)?; // [N,P] int32
-    let flat3 = reshape(ctx, flat, &[n, 1, p])?;
-    let idx = broadcast_to(ctx, flat3, &[n, c, p])?;
-    let g = take_along_axis(ctx, xf, idx, 2)?; // [N,C,P]
-    let w3 = reshape(ctx, weight, &[n, 1, p])?;
-    mul(ctx, g, w3)
+    if x[0] != grid[0] {
+        return Err("GridSample: grid and input batch sizes must match".into());
+    }
+    if x[2..].iter().any(|&d| d <= 0) {
+        return Err("GridSample: input spatial dimensions must be positive".into());
+    }
+    gs_product(x)?;
+    gs_product(grid)?;
+    let mut out = vec![x[0], x[1]];
+    out.extend_from_slice(&grid[1..grid.len() - 1]);
+    gs_product(&out)?;
+    Ok(out)
+}
+
+fn gs_scalar(ctx: &mut TranslationContext, value: f64, double: bool) -> mlx::mlx_array {
+    if double {
+        ctx.scalar_f64(value)
+    } else {
+        ctx.scalar_f32(value as f32)
+    }
+}
+
+fn gs_clip(
+    ctx: &mut TranslationContext,
+    x: mlx::mlx_array,
+    lo: f64,
+    hi: f64,
+    double: bool,
+) -> Result<mlx::mlx_array, MlxError> {
+    let lo = gs_scalar(ctx, lo, double);
+    let hi = gs_scalar(ctx, hi, double);
+    ctx.emit(|res, s| unsafe { mlx::mlx_clip(res, x, lo, hi, s) })
+}
+
+fn gs_reflect(
+    ctx: &mut TranslationContext,
+    x: mlx::mlx_array,
+    dim: i32,
+    align: bool,
+    double: bool,
+) -> Result<mlx::mlx_array, MlxError> {
+    if dim == 1 {
+        let zero = gs_scalar(ctx, 0.0, double);
+        return mul(ctx, x, zero);
+    }
+    let lo = gs_scalar(ctx, if align { 0.0 } else { -0.5 }, double);
+    let span = gs_scalar(ctx, f64::from(if align { dim - 1 } else { dim }), double);
+    let two_span = gs_scalar(
+        ctx,
+        2.0 * f64::from(if align { dim - 1 } else { dim }),
+        double,
+    );
+    // Reduce before adding the half-pixel border: at large magnitudes x + 0.5 can round back
+    // to x, changing which reflected integer pixel is selected.
+    let reduced = if align {
+        x
+    } else {
+        ctx.binary(mlx::mlx_remainder, x, two_span)?
+    };
+    let shifted = sub(ctx, reduced, lo)?;
+    // A floating remainder avoids an overflowing integer quotient for far-away grids.
+    let phase = ctx.binary(mlx::mlx_remainder, shifted, two_span)?;
+    let dist = sub(ctx, phase, span)?;
+    let dist = abs_(ctx, dist)?;
+    let reflected = sub(ctx, span, dist)?;
+    add(ctx, reflected, lo)
+}
+
+struct GsTap {
+    index: mlx::mlx_array,
+    weight: mlx::mlx_array,
+    valid: mlx::mlx_array,
+}
+
+fn gs_cubic_weight(
+    ctx: &mut TranslationContext,
+    distance: mlx::mlx_array,
+    outer: bool,
+    double: bool,
+) -> Result<mlx::mlx_array, MlxError> {
+    let coefficients = if outer {
+        [-0.75, 3.75, -6.0, 3.0]
+    } else {
+        [1.25, -2.25, 0.0, 1.0]
+    };
+    let mut weight = gs_scalar(ctx, coefficients[0], double);
+    for coefficient in &coefficients[1..] {
+        weight = mul(ctx, weight, distance)?;
+        let coefficient = gs_scalar(ctx, *coefficient, double);
+        weight = add(ctx, weight, coefficient)?;
+    }
+    Ok(weight)
+}
+
+/// Float32 cannot represent every pixel in a long axis. Decode its exact binary rational so
+/// index rounding and bounds stay integer operations; only interpolation weights narrow to f32.
+fn gs_large_axis_taps(
+    ctx: &mut TranslationContext,
+    coord: mlx::mlx_array,
+    dim: i32,
+    mode: &str,
+    padding: &str,
+    align: bool,
+) -> Result<Vec<GsTap>, MlxError> {
+    let bits =
+        ctx.emit(|res, s| unsafe { mlx::mlx_view(res, coord, mlx::mlx_dtype__MLX_UINT32, s) })?;
+    let bits = astype(ctx, bits, mlx::mlx_dtype__MLX_INT64)?;
+    let zero = ctx.scalar_i64(0);
+    let one = ctx.scalar_i64(1);
+    let magnitude_mask = ctx.scalar_i64(0x7fff_ffff);
+    let magnitude = ctx.binary(mlx::mlx_bitwise_and, bits, magnitude_mask)?;
+    let infinity = ctx.scalar_i64(0x7f80_0000);
+    let nonfinite = ctx.binary(mlx::mlx_greater_equal, magnitude, infinity)?;
+    let minus_one = ctx.scalar_i64(0xbf80_0000);
+    let bits = where_(ctx, nonfinite, minus_one, bits)?;
+    let bits = if padding == "reflection" {
+        bits
+    } else {
+        let magnitude = ctx.binary(mlx::mlx_bitwise_and, bits, magnitude_mask)?;
+        let eight = ctx.scalar_i64(0x4100_0000);
+        let magnitude = ctx.binary(mlx::mlx_minimum, magnitude, eight)?;
+        let sign_mask = ctx.scalar_i64(0x8000_0000);
+        let sign = ctx.binary(mlx::mlx_bitwise_and, bits, sign_mask)?;
+        ctx.binary(mlx::mlx_bitwise_or, magnitude, sign)?
+    };
+    let shift = ctx.scalar_i64(23);
+    let exponent = ctx.binary(mlx::mlx_right_shift, bits, shift)?;
+    let mask = ctx.scalar_i64(255);
+    let exponent = ctx.binary(mlx::mlx_bitwise_and, exponent, mask)?;
+    let normal = ctx.binary(mlx::mlx_not_equal, exponent, zero)?;
+    let hidden = ctx.scalar_i64(1 << 23);
+    let hidden = where_(ctx, normal, hidden, zero)?;
+    let mask = ctx.scalar_i64((1 << 23) - 1);
+    let mantissa = ctx.binary(mlx::mlx_bitwise_and, bits, mask)?;
+    let mantissa = add(ctx, mantissa, hidden)?;
+    let shift = ctx.scalar_i64(31);
+    let sign = ctx.binary(mlx::mlx_right_shift, bits, shift)?;
+    let negative = ctx.binary(mlx::mlx_not_equal, sign, zero)?;
+    let negated = sub(ctx, zero, mantissa)?;
+    let mantissa = where_(ctx, negative, negated, mantissa)?;
+    let bias = ctx.scalar_i64(150);
+    let power = sub(ctx, bias, exponent)?;
+    let subnormal_power = ctx.scalar_i64(149);
+    let power = where_(ctx, normal, power, subnormal_power)?;
+    let (mantissa, power) = if padding == "reflection" {
+        // Reduce the rational modulo four without a floating operation: Metal's denormal
+        // flushing must not erase the sign of a subnormal grid next to a nearest half-tie.
+        let four_exponent = ctx.scalar_i64(129);
+        let far = ctx.binary(mlx::mlx_greater_equal, exponent, four_exponent)?;
+        let nonnegative_power = ctx.binary(mlx::mlx_maximum, power, zero)?;
+        let cap = ctx.scalar_i64(21);
+        let capped_power = ctx.binary(mlx::mlx_minimum, nonnegative_power, cap)?;
+        let four = ctx.scalar_i64(4);
+        let period = ctx.binary(mlx::mlx_left_shift, four, capped_power)?;
+        let negative_power = sub(ctx, zero, power)?;
+        let shift = ctx.binary(mlx::mlx_maximum, negative_power, zero)?;
+        let shift = ctx.binary(mlx::mlx_minimum, shift, one)?;
+        let magnitude = abs_(ctx, mantissa)?;
+        let shifted = ctx.binary(mlx::mlx_left_shift, magnitude, shift)?;
+        let reduced = ctx.binary(mlx::mlx_remainder, shifted, period)?;
+        let too_large = ctx.scalar_i64(152);
+        let too_large = ctx.binary(mlx::mlx_greater_equal, exponent, too_large)?;
+        let reduced = where_(ctx, too_large, zero, reduced)?;
+        // Restore the sign after magnitude reduction.
+        let negated = sub(ctx, zero, reduced)?;
+        let reduced = where_(ctx, negative, negated, reduced)?;
+        (
+            where_(ctx, far, reduced, mantissa)?,
+            where_(ctx, far, nonnegative_power, power)?,
+        )
+    } else {
+        (mantissa, power)
+    };
+    let scale = ctx.scalar_i64(i64::from(if align { dim - 1 } else { dim }));
+    let product = mul(ctx, mantissa, scale)?;
+    let limit = ctx.scalar_i64(55);
+    let tiny = ctx.binary(mlx::mlx_greater, power, limit)?;
+    let capped = ctx.binary(mlx::mlx_minimum, power, limit)?;
+    let half_denominator = ctx.binary(mlx::mlx_left_shift, one, capped)?;
+    let denominator = add(ctx, half_denominator, half_denominator)?;
+    let center = i64::from(dim - 1) / 2;
+    let center_array = ctx.scalar_i64(center);
+    let numerator = if (dim - 1) % 2 != 0 {
+        add(ctx, product, half_denominator)?
+    } else {
+        product
+    };
+    let quotient = ctx.binary(mlx::mlx_floor_divide, numerator, denominator)?;
+    let multiple = mul(ctx, quotient, denominator)?;
+    let remainder = sub(ctx, numerator, multiple)?;
+    let base = add(ctx, center_array, quotient)?;
+    let greater_half = ctx.binary(mlx::mlx_greater, remainder, half_denominator)?;
+    let equal_half = ctx.binary(mlx::mlx_equal, remainder, half_denominator)?;
+    let odd = ctx.binary(mlx::mlx_bitwise_and, base, one)?;
+    let odd = ctx.binary(mlx::mlx_not_equal, odd, zero)?;
+    let odd_tie = ctx.binary(mlx::mlx_logical_and, equal_half, odd)?;
+    let increment = ctx.binary(mlx::mlx_logical_or, greater_half, odd_tie)?;
+    let increment = astype(ctx, increment, mlx::mlx_dtype__MLX_INT64)?;
+    let nearest = add(ctx, base, increment)?;
+    let remainder_f = astype(ctx, remainder, mlx::mlx_dtype__MLX_FLOAT32)?;
+    let denominator_f = astype(ctx, denominator, mlx::mlx_dtype__MLX_FLOAT32)?;
+    let fraction = div(ctx, remainder_f, denominator_f)?;
+
+    // For very small grids the rational denominator need not fit int64. The perturbation
+    // is strictly less than half a pixel; its sign still decides a half-center nearest tie.
+    let product_negative = ctx.binary(mlx::mlx_less, product, zero)?;
+    let product_positive = ctx.binary(mlx::mlx_greater, product, zero)?;
+    let product_zero = ctx.binary(mlx::mlx_equal, product, zero)?;
+    let tiny_floor_offset = if (dim - 1) % 2 == 0 {
+        astype(ctx, product_negative, mlx::mlx_dtype__MLX_INT64)?
+    } else {
+        zero
+    };
+    let tiny_base = sub(ctx, center_array, tiny_floor_offset)?;
+    let tiny_increment = if (dim - 1) % 2 != 0 {
+        let tie = if center % 2 != 0 {
+            product_zero
+        } else {
+            ctx.scalar_bool(false)
+        };
+        let increment = ctx.binary(mlx::mlx_logical_or, product_positive, tie)?;
+        astype(ctx, increment, mlx::mlx_dtype__MLX_INT64)?
+    } else {
+        zero
+    };
+    let tiny_nearest = add(ctx, center_array, tiny_increment)?;
+    let scale_f = ctx.scalar_f32(if align { (dim - 1) as f32 } else { dim as f32 } * 0.5);
+    let delta = mul(ctx, coord, scale_f)?;
+    let half_center = ctx.scalar_f32(if (dim - 1) % 2 != 0 { 0.5 } else { 0.0 });
+    let tiny_fraction = add(ctx, delta, half_center)?;
+    let floor_offset_f = astype(ctx, tiny_floor_offset, mlx::mlx_dtype__MLX_FLOAT32)?;
+    let tiny_fraction = add(ctx, tiny_fraction, floor_offset_f)?;
+    let base = where_(ctx, tiny, tiny_base, base)?;
+    let nearest = where_(ctx, tiny, tiny_nearest, nearest)?;
+    let fraction = where_(ctx, tiny, tiny_fraction, fraction)?;
+    let base = if mode == "nearest" { nearest } else { base };
+    let count = if mode == "nearest" {
+        1
+    } else if mode == "cubic" {
+        4
+    } else {
+        2
+    };
+    let last = ctx.scalar_i64(i64::from(dim - 1));
+    let period = ctx.scalar_i64(2 * i64::from(if align { dim - 1 } else { dim }));
+    let reflected_last =
+        ctx.scalar_i64(2 * i64::from(if align { dim - 1 } else { dim }) - i64::from(!align));
+    let mut taps = Vec::with_capacity(count);
+    for tap in 0..count {
+        let offset = tap as i64 - i64::from(count == 4);
+        let offset_i = ctx.scalar_i64(offset);
+        let position = add(ctx, base, offset_i)?;
+        let ge = ctx.binary(mlx::mlx_greater_equal, position, zero)?;
+        let le = ctx.binary(mlx::mlx_less_equal, position, last)?;
+        let valid = ctx.binary(mlx::mlx_logical_and, ge, le)?;
+        let index = if padding == "reflection" {
+            let phase = ctx.binary(mlx::mlx_remainder, position, period)?;
+            let other = sub(ctx, reflected_last, phase)?;
+            ctx.binary(mlx::mlx_minimum, phase, other)?
+        } else {
+            position
+        };
+        let index = ctx.binary(mlx::mlx_maximum, index, zero)?;
+        let index = ctx.binary(mlx::mlx_minimum, index, last)?;
+        let index = astype(ctx, index, mlx::mlx_dtype__MLX_INT32)?;
+        let offset_f = ctx.scalar_f32(offset as f32);
+        let distance = sub(ctx, fraction, offset_f)?;
+        let distance = abs_(ctx, distance)?;
+        let one_f = ctx.scalar_f32(1.0);
+        let weight = match count {
+            1 => one_f,
+            4 => gs_cubic_weight(ctx, distance, tap == 0 || tap == 3, false)?,
+            _ => sub(ctx, one_f, distance)?,
+        };
+        taps.push(GsTap {
+            index,
+            weight,
+            valid,
+        });
+    }
+    Ok(taps)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn gs_taps(
+    ctx: &mut TranslationContext,
+    coord: mlx::mlx_array,
+    dim: i32,
+    mode: &str,
+    padding: &str,
+    align: bool,
+    double: bool,
+) -> Result<Vec<GsTap>, MlxError> {
+    if !double && dim > (1 << 24) {
+        return gs_large_axis_taps(ctx, coord, dim, mode, padding, align);
+    }
+    let finite = ctx.unary(mlx::mlx_isfinite, coord)?;
+    let minus_one = gs_scalar(ctx, -1.0, double);
+    let coord = where_(ctx, finite, coord, minus_one)?;
+    let coord = if padding == "reflection" {
+        // Signed reduction preserves small negative nearest-threshold coordinates exactly.
+        // The period is four for either alignment, independent of the input spatial extent.
+        let magnitude = abs_(ctx, coord)?;
+        let period = gs_scalar(ctx, 4.0, double);
+        let reduced = ctx.binary(mlx::mlx_remainder, magnitude, period)?;
+        let sign = sign(ctx, coord)?;
+        mul(ctx, reduced, sign)?
+    } else {
+        // Outside this normalized interval every cubic/linear/nearest tap is outside the image
+        // (except aligned singleton axes, which always map to zero). This preserves padding
+        // while avoiding overflow in denormalization, even for the largest finite grid value.
+        gs_clip(ctx, coord, -8.0, 8.0, double)?
+    };
+    let one = gs_scalar(ctx, 1.0, double);
+    let shifted = add(ctx, coord, one)?;
+    let scale = gs_scalar(ctx, f64::from(if align { dim - 1 } else { dim }), double);
+    let scaled = mul(ctx, shifted, scale)?;
+    let scaled = if align {
+        scaled
+    } else {
+        sub(ctx, scaled, one)?
+    };
+    let half = gs_scalar(ctx, 0.5, double);
+    let coord = mul(ctx, scaled, half)?;
+    // For interpolation, reducing the continuous coordinate is equivalent to padding every tap,
+    // and keeps the unit offsets representable even when a finite grid is very far outside.
+    let coord = if mode != "nearest" && padding == "reflection" {
+        gs_reflect(ctx, coord, dim, align, double)?
+    } else if padding == "border" {
+        // Cubic can overshoot near the edge: only collapse coordinates whose entire support
+        // lies outside. Clamping to the image itself would silently turn it into edge replication.
+        gs_clip(ctx, coord, -2.0, f64::from(dim) + 1.0, double)?
+    } else {
+        coord
+    };
+    let base = if mode == "nearest" {
+        round0(ctx, coord)?
+    } else {
+        floor(ctx, coord)?
+    };
+    let fraction = sub(ctx, coord, base)?;
+    let count = if mode == "nearest" {
+        1
+    } else if mode == "cubic" {
+        4
+    } else {
+        2
+    };
+    let mut taps = Vec::with_capacity(count);
+    for tap in 0..count {
+        let offset = gs_scalar(ctx, tap as f64 - if count == 4 { 1.0 } else { 0.0 }, double);
+        let position = add(ctx, base, offset)?;
+        let weight = if count == 1 {
+            one
+        } else {
+            let distance = sub(ctx, fraction, offset)?;
+            let distance = abs_(ctx, distance)?;
+            if count == 4 {
+                gs_cubic_weight(ctx, distance, tap == 0 || tap == 3, double)?
+            } else {
+                sub(ctx, one, distance)?
+            }
+        };
+        let zero = gs_scalar(ctx, 0.0, double);
+        let last = gs_scalar(ctx, f64::from(dim - 1), double);
+        let ge = ctx.binary(mlx::mlx_greater_equal, position, zero)?;
+        let le = ctx.binary(mlx::mlx_less_equal, position, last)?;
+        let valid = ctx.binary(mlx::mlx_logical_and, ge, le)?;
+        let position = if padding == "reflection" {
+            gs_reflect(ctx, position, dim, align, double)?
+        } else {
+            position
+        };
+        let position = gs_clip(ctx, position, 0.0, f64::from(dim - 1), double)?;
+        let index = astype(ctx, position, mlx::mlx_dtype__MLX_INT32)?;
+        taps.push(GsTap {
+            index,
+            weight,
+            valid,
+        });
+    }
+    Ok(taps)
+}
+
+fn gs_gather(
+    ctx: &mut TranslationContext,
+    x: mlx::mlx_array,
+    indices: mlx::mlx_array,
+    valid: mlx::mlx_array,
+    zeros: bool,
+    shape: &[i32],
+    axis: i32,
+) -> Result<mlx::mlx_array, MlxError> {
+    let indices = broadcast_to(ctx, indices, shape)?;
+    let value = take_along_axis(ctx, x, indices, axis)?;
+    if zeros {
+        let zero = scalar_i(ctx, 0);
+        let dtype = ctx.dtype_of(x);
+        let zero = astype(ctx, zero, dtype)?;
+        where_(ctx, valid, value, zero)
+    } else {
+        Ok(value)
+    }
 }
 
 fn grid_sample_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
-    let x0 = ctx.resolve(&n.inputs[0])?;
-    let xc = contiguous(ctx, x0)?;
-    let x = astype(ctx, xc, mlx::mlx_dtype__MLX_FLOAT32)?;
+    let x = ctx.resolve(&n.inputs[0])?;
+    let grid = ctx.resolve(&n.inputs[1])?;
     let xs = ctx.shape_of(x);
-    let (nn, cc, hh, ww) = (xs[0], xs[1], xs[2], xs[3]);
-
-    let g0 = ctx.resolve(&n.inputs[1])?;
-    let grid = astype(ctx, g0, mlx::mlx_dtype__MLX_FLOAT32)?;
     let gs = ctx.shape_of(grid);
-    let (hout, wout) = (gs[1], gs[2]);
-    let p = hout * wout;
-
+    let out_shape = gs_shape(&xs, &gs)?;
+    let rank = xs.len() - 2;
+    let (nn, cc) = (xs[0], xs[1]);
+    let p = gs_product(&gs[1..gs.len() - 1])?;
+    if gs_product(&out_shape)? == 0 {
+        let out = ctx.emit(|res, s| unsafe {
+            mlx::mlx_zeros(res, out_shape.as_ptr(), out_shape.len(), out_dtype(n), s)
+        })?;
+        ctx.bind(&n.outputs[0], out);
+        return Ok(());
+    }
     let mode = n
         .strings
         .get("mode")
         .map(String::as_str)
         .unwrap_or("linear");
+    let mode = match mode {
+        "bilinear" => "linear",
+        "bicubic" => "cubic",
+        other => other,
+    };
     let padding = n
         .strings
         .get("padding_mode")
         .map(String::as_str)
         .unwrap_or("zeros");
-    let align = n.ints.get("align_corners").copied().unwrap_or(0) != 0;
+    let align = n.ints.get("align_corners").copied().unwrap_or(0) == 1;
     let nearest = mode == "nearest";
-    let zeros = padding == "zeros";
-
-    let ax = if align {
-        (ww - 1) as f32 / 2.0
+    let double = ctx.dtype_of(x) == mlx::mlx_dtype__MLX_FLOAT64
+        || ctx.dtype_of(grid) == mlx::mlx_dtype__MLX_FLOAT64;
+    let calc_dtype = if double {
+        mlx::mlx_dtype__MLX_FLOAT64
     } else {
-        ww as f32 / 2.0
+        mlx::mlx_dtype__MLX_FLOAT32
     };
-    let bx = (ww - 1) as f32 / 2.0;
-    let ay = if align {
-        (hh - 1) as f32 / 2.0
+    let grid = astype(ctx, grid, calc_dtype)?;
+    let grid = reshape(ctx, grid, &[nn, p, rank as i32])?;
+    let mut taps = Vec::with_capacity(rank);
+    for axis in 0..rank {
+        let component = (rank - axis - 1) as i32;
+        let coord = slice(ctx, grid, &[0, 0, component], &[nn, p, component + 1])?;
+        let coord = reshape(ctx, coord, &[nn, p])?;
+        taps.push(gs_taps(
+            ctx,
+            coord,
+            xs[axis + 2],
+            mode,
+            padding,
+            align,
+            double,
+        )?);
+    }
+    let x = if nearest {
+        x
     } else {
-        hh as f32 / 2.0
+        astype(ctx, x, calc_dtype)?
     };
-    let by = (hh - 1) as f32 / 2.0;
-
-    let xf = reshape(ctx, x, &[nn, cc, hh * ww])?;
-    let gflat = reshape(ctx, grid, &[nn, p, 2])?;
-    let gx_s = slice(ctx, gflat, &[0, 0, 0], &[nn, p, 1])?;
-    let gx = reshape(ctx, gx_s, &[nn, p])?;
-    let gy_s = slice(ctx, gflat, &[0, 0, 1], &[nn, p, 2])?;
-    let gy = reshape(ctx, gy_s, &[nn, p])?;
-
-    let axs = scalar_f(ctx, ax);
-    let gxa = mul(ctx, gx, axs)?;
-    let bxs = scalar_f(ctx, bx);
-    let ix = add(ctx, gxa, bxs)?; // [N,P]
-    let ays = scalar_f(ctx, ay);
-    let gya = mul(ctx, gy, ays)?;
-    let bys = scalar_f(ctx, by);
-    let iy = add(ctx, gya, bys)?; // [N,P]
-
-    let dims = (nn, cc, p, ww, hh);
-    let acc = if nearest {
-        let one = scalar_f(ctx, 1.0);
-        let w1 = broadcast_to(ctx, one, &[nn, p])?;
-        let rx = round0(ctx, ix)?;
-        let ry = round0(ctx, iy)?;
-        gs_sample(ctx, xf, rx, ry, w1, zeros, dims)?
+    let acc = if nearest || rank <= 3 {
+        // Keep the usual 2D/3D forms proportional to the number of output points, not input rows.
+        let spatial = gs_product(&xs[2..])?;
+        let x = reshape(ctx, x, &[nn, cc, spatial])?;
+        let branches = taps.iter().map(Vec::len).product::<usize>();
+        let mut acc = None;
+        for branch in 0..branches {
+            let mut remaining = branch;
+            let mut index = scalar_i(ctx, 0);
+            let mut weight = gs_scalar(ctx, 1.0, double);
+            let mut valid = ctx.scalar_bool(true);
+            for (axis, axis_taps) in taps.iter().enumerate() {
+                let tap = &axis_taps[remaining % axis_taps.len()];
+                remaining /= axis_taps.len();
+                let dim = scalar_i(ctx, xs[axis + 2]);
+                index = mul(ctx, index, dim)?;
+                index = add(ctx, index, tap.index)?;
+                if !nearest {
+                    weight = mul(ctx, weight, tap.weight)?;
+                }
+                valid = ctx.binary(mlx::mlx_logical_and, valid, tap.valid)?;
+            }
+            let index = reshape(ctx, index, &[nn, 1, p])?;
+            let valid = reshape(ctx, valid, &[nn, 1, p])?;
+            let mut value = gs_gather(ctx, x, index, valid, padding == "zeros", &[nn, cc, p], 2)?;
+            if !nearest {
+                let weight = reshape(ctx, weight, &[nn, 1, p])?;
+                value = mul(ctx, value, weight)?;
+            }
+            acc = Some(match acc {
+                None => value,
+                Some(previous) => add(ctx, previous, value)?,
+            });
+        }
+        acc.ok_or("GridSample: no sampling branches")?
     } else {
-        let x0f = floor(ctx, ix)?;
-        let y0f = floor(ctx, iy)?;
-        let one = scalar_f(ctx, 1.0);
-        let x1f = add(ctx, x0f, one)?;
-        let y1f = add(ctx, y0f, one)?;
-        let wx1 = sub(ctx, ix, x0f)?;
-        let one2 = scalar_f(ctx, 1.0);
-        let wx0 = sub(ctx, one2, wx1)?;
-        let wy1 = sub(ctx, iy, y0f)?;
-        let one3 = scalar_f(ctx, 1.0);
-        let wy0 = sub(ctx, one3, wy1)?;
-
-        let w00 = mul(ctx, wx0, wy0)?;
-        let mut acc = gs_sample(ctx, xf, x0f, y0f, w00, zeros, dims)?;
-        let w10 = mul(ctx, wx1, wy0)?;
-        let c10 = gs_sample(ctx, xf, x1f, y0f, w10, zeros, dims)?;
-        acc = add(ctx, acc, c10)?;
-        let w01 = mul(ctx, wx0, wy1)?;
-        let c01 = gs_sample(ctx, xf, x0f, y1f, w01, zeros, dims)?;
-        acc = add(ctx, acc, c01)?;
-        let w11 = mul(ctx, wx1, wy1)?;
-        let c11 = gs_sample(ctx, xf, x1f, y1f, w11, zeros, dims)?;
-        add(ctx, acc, c11)?
+        // Separable contraction avoids 2^rank/4^rank graph growth. Contract the largest input
+        // axes first to minimize the live [N,C,P,remaining spatial...] intermediate.
+        let mut order: Vec<usize> = (0..rank).collect();
+        order.sort_by_key(|&axis| std::cmp::Reverse(xs[axis + 2]));
+        let mut perm = vec![0, 1];
+        perm.extend(order.iter().map(|&axis| axis as i32 + 2));
+        let mut value = ctx.transpose(x, &perm)?;
+        let mut remaining = gs_product(&xs[2..])?;
+        for (step, &axis) in order.iter().enumerate() {
+            let dim = xs[axis + 2];
+            remaining /= dim;
+            let gather_shape = [nn, cc, p, 1, remaining];
+            gs_product(&gather_shape)?;
+            let source = if step == 0 {
+                let source = reshape(ctx, value, &[nn, cc, 1, dim, remaining])?;
+                broadcast_to(ctx, source, &[nn, cc, p, dim, remaining])?
+            } else {
+                reshape(ctx, value, &[nn, cc, p, dim, remaining])?
+            };
+            let mut acc = None;
+            for tap in &taps[axis] {
+                let index = reshape(ctx, tap.index, &[nn, 1, p, 1, 1])?;
+                let valid = reshape(ctx, tap.valid, &[nn, 1, p, 1, 1])?;
+                let sample = gs_gather(
+                    ctx,
+                    source,
+                    index,
+                    valid,
+                    padding == "zeros",
+                    &gather_shape,
+                    3,
+                )?;
+                let weight = reshape(ctx, tap.weight, &[nn, 1, p, 1, 1])?;
+                let sample = mul(ctx, sample, weight)?;
+                acc = Some(match acc {
+                    None => sample,
+                    Some(previous) => add(ctx, previous, sample)?,
+                });
+            }
+            value = acc.ok_or("GridSample: no separable sampling taps")?;
+        }
+        value
     };
-
-    let out = reshape(ctx, acc, &[nn, cc, hout, wout])?;
+    let out = reshape(ctx, acc, &out_shape)?;
     let out = astype(ctx, out, out_dtype(n))?;
     let y = contiguous(ctx, out)?;
     ctx.bind(&n.outputs[0], y);
@@ -446,34 +888,88 @@ fn grid_sample_claim(node: &NodeView) -> ClaimResult {
         _ => deny!("missing tensor type/shape info on an input or the output"),
     };
     require!(
-        is_mlx_float(x.dtype) && out.dtype == x.dtype && is_mlx_float(g.dtype),
-        "input/output must share one float dtype and grid must be float, got {} / {} -> {}",
+        is_movable(x.dtype) && out.dtype == x.dtype && is_mlx_cpu_float(g.dtype),
+        "input/output must share one numeric/bool dtype and grid must be floating, got {} / {} -> {}",
         crate::registry::ort_dtype_name(x.dtype),
         crate::registry::ort_dtype_name(g.dtype),
         crate::registry::ort_dtype_name(out.dtype)
     );
     require!(
-        x.shape.len() == 4 && g.shape.len() == 4 && g.shape.last() == Some(&2),
-        "input must be rank 4 and grid must have shape [N,H,W,2], got {:?} and {:?}",
+        x.shape.len() >= 3
+            && g.shape.len() == x.shape.len()
+            && g.shape
+                .last()
+                .is_some_and(|&d| d < 0 || d == x.shape.len() as i64 - 2)
+            && out.shape.len() == x.shape.len(),
+        "input/grid/output ranks or grid coordinate width disagree: {:?} and {:?}",
         x.shape,
         g.shape
     );
     require!(
-        x.shape.iter().all(|&d| d >= 0) && g.shape.iter().all(|&d| d >= 0),
-        "input and grid shapes must be static, got {:?} and {:?}",
-        x.shape,
-        g.shape
+        node.since_version() >= 20 || x.shape.len() == 4,
+        "opset 16 GridSample only defines 2D sampling"
     );
-    let mode = node.string_attr("mode", "linear");
+    let legacy = node.since_version() < 20;
+    let mode = node.string_attr("mode", if legacy { "bilinear" } else { "linear" });
     require!(
-        mode == "linear" || mode == "bilinear" || mode == "nearest",
-        "mode must be \"linear\", \"bilinear\", or \"nearest\", got {mode:?}"
+        mode == "nearest"
+            || if legacy {
+                mode == "bilinear" || mode == "bicubic"
+            } else {
+                mode == "linear" || mode == "cubic"
+            },
+        "invalid GridSample mode {mode:?} for schema {}",
+        node.since_version()
+    );
+    require!(
+        mode == "nearest" || is_mlx_cpu_float(x.dtype),
+        "non-floating linear/cubic interpolation has no agreed intermediate/cast contract"
+    );
+    require!(
+        node.since_version() >= 22
+            || (x.dtype != ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16
+                && g.dtype
+                    != ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16),
+        "bfloat16 GridSample requires opset 22"
     );
     let padding = node.string_attr("padding_mode", "zeros");
     require!(
-        padding == "zeros" || padding == "border",
-        "padding_mode must be \"zeros\" or \"border\", got {padding:?}"
+        matches!(padding.as_str(), "zeros" | "border" | "reflection"),
+        "invalid GridSample padding_mode {padding:?}"
     );
+    require!(
+        matches!(node.int_attr("align_corners", 0), 0 | 1),
+        "align_corners must be 0 or 1"
+    );
+    let compatible = |a: i64, b: i64| a < 0 || b < 0 || a == b;
+    require!(
+        compatible(x.shape[0], g.shape[0])
+            && compatible(out.shape[0], x.shape[0])
+            && compatible(out.shape[1], x.shape[1])
+            && out.shape[2..]
+                .iter()
+                .zip(&g.shape[1..g.shape.len() - 1])
+                .all(|(&a, &b)| compatible(a, b)),
+        "GridSample input/grid/output shapes disagree"
+    );
+    require!(
+        x.shape[2..].iter().all(|&d| d != 0),
+        "input spatial dimensions must be positive"
+    );
+    for shape in [&x.shape, &g.shape, &out.shape] {
+        require!(
+            shape.iter().all(|&d| d <= i64::from(i32::MAX)),
+            "GridSample dimension exceeds int32"
+        );
+    }
+    if x.shape.iter().chain(&g.shape).all(|&d| d >= 0) {
+        let x: Vec<i32> = x.shape.iter().map(|&d| d as i32).collect();
+        let g: Vec<i32> = g.shape.iter().map(|&d| d as i32).collect();
+        require!(
+            gs_shape(&x, &g).is_ok(),
+            "invalid or oversized GridSample geometry"
+        );
+    }
     Ok(())
 }
 
@@ -1904,12 +2400,16 @@ fn shape_keyed(
 }
 
 pub fn register_vision(registry: &mut OpRegistry) {
-    shape_keyed(
-        registry,
-        "GridSample",
-        grid_sample_op,
-        grid_sample_claim,
-        crate::registry::MLX_SLICE_SHAPE_REASON,
+    registry.register_shape_keyed(
+        OpRegistration {
+            domain: "",
+            op_type: "GridSample",
+            min_opset: 16,
+            max_opset: K_ANY_OPSET,
+            handler: grid_sample_op,
+            claim: grid_sample_claim,
+        },
+        "conservatively specialize checked sampling strides and separable geometry to input shapes",
     );
     registry.register_shape_keyed(
         OpRegistration {
@@ -2005,7 +2505,35 @@ mod col2im_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::affine_grid_shape;
+    use super::{affine_grid_shape, gs_product, gs_shape};
+
+    #[test]
+    fn grid_sample_geometry_is_checked_before_indexing_or_allocation() {
+        assert_eq!(
+            gs_shape(&[2, 3, 4, 5], &[2, 6, 7, 2]).unwrap(),
+            [2, 3, 6, 7]
+        );
+        assert_eq!(gs_shape(&[0, 3, 1], &[0, 7, 1]).unwrap(), [0, 3, 7]);
+        assert_eq!(
+            gs_shape(&[2, 0, 1, 2, 3], &[2, 0, 7, 8, 3]).unwrap(),
+            [2, 0, 0, 7, 8]
+        );
+        assert!(gs_product(&[2, i32::MAX]).is_err());
+        assert!(gs_product(&[-1, 2]).is_err());
+        for (x, grid) in [
+            (vec![1, 2], vec![1, 2]),
+            (vec![1, 2, 3], vec![1, 2, 2]),
+            (vec![1, 2, 3, 4], vec![1, 2, 2]),
+            (vec![2, 1, 3, 4], vec![1, 2, 3, 2]),
+            (vec![1, 1, 0, 4], vec![1, 2, 3, 2]),
+            (vec![1, 1, -1, 4], vec![1, 2, 3, 2]),
+            (vec![1, 1, 3, 4], vec![1, -1, 3, 2]),
+            (vec![1, 2, i32::MAX, 2], vec![1, 1, 1, 2]),
+            (vec![1, 2, 3, 4], vec![1, i32::MAX, 2, 2]),
+        ] {
+            assert!(gs_shape(&x, &grid).is_err(), "{x:?} / {grid:?}");
+        }
+    }
 
     #[test]
     fn affine_grid_geometry_is_checked_before_indexing_or_allocation() {

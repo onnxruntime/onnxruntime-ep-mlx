@@ -1,8 +1,8 @@
 """Correctness tests for the MLX EP normalization + pooling family (normpool.cc).
 
 Each registered op runs through the MLX EP (CPU fallback available) and is compared against ORT's
-CPU EP, tolerance-gated (fp32 tight, fp16 loose). Ops left to ORT CPU (MaxUnpool, RoiAlign,
-MaxRoiPool, GridSample) are intentionally not exercised here.
+CPU EP, tolerance-gated (fp32 tight, fp16 loose). Other spatial ops (MaxUnpool, RoiAlign,
+MaxRoiPool, GridSample) have dedicated test modules and are not exercised here.
 """
 
 from __future__ import annotations

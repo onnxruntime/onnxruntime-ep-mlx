@@ -83,6 +83,25 @@ determine output extents and cannot safely be baked into a shape/dtype-keyed clo
 initializer forms remain supported. These coverage changes do not reproduce or establish a speedup
 for the Nemotron streaming workload in issue #10.
 
+**GridSample** supports opset-16 2D `bilinear`/`nearest`/`bicubic` and opset-20+
+general-N `linear`/`nearest`/`cubic`, all three padding modes (`zeros`, `border`,
+`reflection`), and either `align_corners` value. Floating payload and coordinate types are
+independent (`fp16`/`fp32`/`fp64`, plus `bf16` from opset 22). Float64 stays on the MLX CPU stream.
+Nearest uses ties-to-even and exact gathers for all supported integer/bool payloads, without
+lossy float conversions. Symbolic geometry, empty batch/channel/output axes, singleton input
+axes and changed live payload/grid values use checked shape-keyed execution. Input spatial
+axes must be positive; flattened counts and separable intermediates must fit int32 indexing.
+Higher-rank interpolation contracts spatial axes rather than allocating an exponential map.
+Reflection reduces normalized coordinates periodically before they can overflow or lose pixel
+offsets. Axes longer than float32's exact integer range use binary-rational integer indexing and
+ties-to-even, rather than rounding image bounds or nearest indices through float32.
+Non-floating linear/cubic remains an **open semantic-contract gap**, not a backend impossibility:
+the schema admits these types but specifies no intermediate precision/cast rule, ORT 1.31
+has no corresponding CPU kernel, and ONNX's reference casts interpolation coefficients to the
+payload type. String/complex payloads lack the EP's end-to-end dtype mapping and remain unclaimed.
+The numerical oracle is independently derived and cross-checked against ORT's implemented forms
+and ONNX's general-N reference, not inferred from successful registration.
+
 Cast/CastLike integer narrowing discards high bits, floating-to-integer conversions truncate toward
 zero for representable values, and numeric-to-bool uses zero/nonzero (including signed floating
 zeros, infinities and NaNs). Floating-to-integer out-of-range values are undefined by ONNX and are
