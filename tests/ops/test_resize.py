@@ -9,13 +9,15 @@ since ORT CPU has no bf16 Resize kernel.
 Covered claimed matrix: {nearest, linear} x {half_pixel, asymmetric, align_corners,
 pytorch_half_pixel} x {scale-up, scale-down, sizes} x {fp32, fp16, bf16}, plus every nearest_mode
 and a 1-D (NCW) linear case. Cubic / roi / exclude_outside / antialias / dynamic params are left to
-ORT CPU and are not exercised here.
+ORT CPU and are not exercised here. Same-extent fractional scales also cover Upsample-9,
+independent coordinate/index goldens, identity controls, and default/eager value/shape replay.
 """
 
 from __future__ import annotations
 
 import numpy as np
 import onnx_ir as ir
+import onnxruntime as ort
 import pytest
 
 import _models as m
@@ -112,15 +114,16 @@ def resize_ref(
     rank = data.ndim
     for ax in range(rank):
         li, lo = data.shape[ax], out_len[ax]
-        if lo == li:
+        coords = [_coord(ctm, j, scales[ax], li, lo) for j in range(lo)]
+        # Check the actual clamped geometry, independently of the handler's scale predicate.
+        if lo == li and all(min(max(src, 0), li - 1) == j for j, src in enumerate(coords)):
             continue
         if mode == "nearest":
-            idx = [_nearest_index(nmode, _coord(ctm, j, scales[ax], li, lo), li) for j in range(lo)]
+            idx = [_nearest_index(nmode, src, li) for src in coords]
             d = np.take(d, idx, axis=ax)
         else:
             new = np.zeros(d.shape[:ax] + (lo,) + d.shape[ax + 1 :], np.float64)
-            for j in range(lo):
-                src = _coord(ctm, j, scales[ax], li, lo)
+            for j, src in enumerate(coords):
                 x0 = int(np.floor(src))
                 frac = src - x0
                 lo_i = min(max(x0, 0), li - 1)
@@ -226,9 +229,10 @@ def test_linear_1d_ncw_matches_cpu():
 
 # --- bf16 (MLX-interior subgraph vs numpy reference) --------------------------------------------
 @pytest.mark.parametrize("mode", ["nearest", "linear"])
-def test_bf16_interior_matches_ref(mode):
-    in_shape, out_shape = [1, 2, 4, 4], [1, 2, 8, 8]
-    scales = [1.0, 1.0, 2.0, 2.0]
+@pytest.mark.parametrize("scale,out_len", [(2.0, 8), (1.2, 4)])
+def test_bf16_interior_matches_ref(resize_route, mode, scale, out_len):
+    in_shape, out_shape = [1, 2, 4, 4], [1, 2, out_len, out_len]
+    scales = np.array([1.0, 1.0, scale, scale], np.float32)
     data = _sample(in_shape)
     attrs = {"mode": mode, "coordinate_transformation_mode": "half_pixel"}
     if mode == "nearest":
@@ -270,7 +274,7 @@ def test_bf16_interior_matches_ref(mode):
     ref = resize_ref(
         data,
         out_shape,
-        scales,
+        scales.tolist(),
         mode=mode,
         ctm="half_pixel",
         nmode="round_prefer_floor",
@@ -337,3 +341,186 @@ def test_resize_dynamic_spatial_sizes(dtype, mode, ctm) -> None:
     model = _dyn_resize(dtype, 3, sizes=sizes, mode=mode, ctm=ctm)
     x = np.random.default_rng(2).random((1, 3, 7, 5)).astype(dtype)
     _assert_resize_claimed(model, {"x": x}, _TOL[np.dtype(dtype)])
+
+
+# --- same integer extent does not imply identity coordinates ------------------------------------
+@pytest.fixture(params=[False, True], ids=["default", "eager"])
+def resize_route(request, monkeypatch):
+    monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_COMPILE", "1" if request.param else "0")
+
+
+def _strict_resize_session(model):
+    options = ort.SessionOptions()
+    options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+    options.log_severity_level = 3
+    options.add_session_config_entry("session.disable_cpu_ep_fallback", "1")
+    session = ort.InferenceSession(model, options, providers=["MLXExecutionProvider"])
+    session.disable_fallback()
+    return session
+
+
+def _upsample9(*, dt, shape, scales, mode):
+    x = m.tensor("x", _IR_OF[np.dtype(dt)], shape)
+    out = m.tensor("o", _IR_OF[np.dtype(dt)], shape)
+    scales_v = initz("scales", scales)
+    node = ir.node("Upsample", [x, scales_v], attributes={"mode": mode}, outputs=[out])
+    graph = ir.Graph(
+        [x], [out], nodes=[node], initializers=[scales_v],
+        opset_imports={"": 9}, name="mlx_Upsample9_same_extent",
+    )
+    return ir.to_proto(ir.Model(graph, ir_version=10)).SerializeToString()
+
+
+_SAME_EXTENT_CASES = [
+    ("Resize", "nearest", ctm, nmode)
+    for ctm in CTMS
+    for nmode in ["round_prefer_floor", "round_prefer_ceil", "floor", "ceil"]
+] + [
+    ("Resize", "linear", ctm, None) for ctm in CTMS
+] + [
+    ("Upsample", "nearest", "asymmetric", "floor"),
+    ("Upsample", "linear", "asymmetric", None),
+]
+
+
+def _same_extent_golden(mode, ctm, nmode, axis):
+    data = np.arange(16, dtype=np.float32).reshape(1, 1, 4, 4)
+    if mode == "nearest":
+        if ctm == "align_corners" or nmode == "ceil":
+            indices = [0, 1, 2, 3]
+        elif nmode == "floor":
+            indices = [0, 0, 1, 2]
+        else:
+            indices = [0, 1, 2, 2]
+        return np.take(data, indices, axis=axis)
+    # float32(1.2) is exactly 5033165/4194304. These clamped coordinates are derived
+    # from that rational, not from resize_ref or the production coordinate helper.
+    if ctm == "align_corners":
+        coords = [0, 1, 2, 3]
+    elif ctm == "asymmetric":
+        coords = [0, 4194304 / 5033165, 8388608 / 5033165, 12582912 / 5033165]
+    else:
+        coords = [0, 7549747 / 10066330, 3187671 / 2013266, 24326963 / 10066330]
+    coords = np.array(coords, np.float32)
+    if axis == 2:
+        return (4 * coords[:, None] + np.arange(4, dtype=np.float32)).reshape(1, 1, 4, 4)
+    return (4 * np.arange(4, dtype=np.float32)[:, None] + coords).reshape(1, 1, 4, 4)
+
+
+@pytest.mark.parametrize("op,mode,ctm,nmode", _SAME_EXTENT_CASES)
+@pytest.mark.parametrize("axis", [2, 3], ids=["height", "width"])
+def test_resize_ref_same_extent_goldens(op, mode, ctm, nmode, axis):
+    data = np.arange(16, dtype=np.float32).reshape(1, 1, 4, 4)
+    scales = np.ones(4, np.float32)
+    scales[axis] = np.float32(1.2)
+    actual = resize_ref(
+        data, list(data.shape), scales.tolist(), mode=mode, ctm=ctm, nmode=nmode,
+    )
+    expected = _same_extent_golden(mode, ctm, nmode, axis)
+    if mode == "nearest":
+        np.testing.assert_array_equal(actual, expected)
+    else:
+        np.testing.assert_allclose(actual, expected, **_TOL[np.dtype(np.float32)])
+
+
+@pytest.mark.parametrize("op,mode,ctm,nmode", _SAME_EXTENT_CASES)
+@pytest.mark.parametrize("axis", [2, 3], ids=["height", "width"])
+@pytest.mark.parametrize("dt", [np.float32, np.float16])
+def test_same_extent_resampling_replays(resize_route, op, mode, ctm, nmode, axis, dt):
+    shape = [1, 1, 4, 4]
+    scales = np.ones(4, np.float32)
+    scales[axis] = np.float32(1.2)
+    if op == "Upsample":
+        model = _upsample9(dt=dt, shape=shape, scales=scales, mode=mode)
+    else:
+        model = build_resize(
+            dt=dt, in_shape=shape, out_shape=shape, scales=scales,
+            mode=mode, ctm=ctm, nmode=nmode,
+        )
+    session = _strict_resize_session(model)
+    data = np.arange(16, dtype=np.float32).reshape(shape)
+    golden = _same_extent_golden(mode, ctm, nmode, axis)
+    for factor, offset in [(1, 0), (2, 7), (1, 0)]:
+        actual = session.run(None, {"x": (data * factor + offset).astype(dt)})[0]
+        expected = (golden * factor + offset).astype(dt)
+        assert actual.shape == expected.shape
+        assert actual.dtype == expected.dtype
+        if mode == "nearest":
+            np.testing.assert_array_equal(actual, expected)
+        else:
+            np.testing.assert_allclose(actual, expected, **_TOL[np.dtype(dt)])
+
+
+@pytest.mark.parametrize("mode", ["nearest", "linear"])
+@pytest.mark.parametrize("ctm", CTMS)
+def test_same_extent_shape_replay(resize_route, mode, ctm):
+    scales = np.array([1, 1, 1, 1.2], np.float32)
+    session = _strict_resize_session(
+        _dyn_resize(np.float32, 1, scales=scales, mode=mode, ctm=ctm)
+    )
+    for width in [4, 5, 0, 4]:
+        data = np.arange(4 * width, dtype=np.float32).reshape(1, 1, 4, width)
+        out_shape = [1, 1, 4, int(np.floor(width * float(scales[-1])))]
+        expected = (
+            _same_extent_golden(mode, ctm, "round_prefer_floor", 3)
+            if width == 4 else resize_ref(
+                data, out_shape, scales.tolist(), mode=mode, ctm=ctm,
+            )
+        )
+        actual = session.run(None, {"x": data})[0]
+        assert actual.shape == expected.shape
+        assert actual.dtype == expected.dtype
+        np.testing.assert_allclose(actual, expected, **_TOL[np.dtype(np.float32)])
+
+
+_IDENTITY_CASES = [
+    (kind, ctm)
+    for kind in ["unit_scales", "equal_sizes", "singleton"]
+    for ctm in CTMS
+] + [("fractional_align_corners", "align_corners")]
+
+
+@pytest.mark.parametrize("kind,ctm", _IDENTITY_CASES)
+@pytest.mark.parametrize("mode", ["nearest", "linear"])
+@pytest.mark.parametrize("dt", [np.float32, np.float16])
+def test_resize_identity_preserves_nonfinite(resize_route, kind, ctm, mode, dt):
+    data = np.array([np.nan, np.inf, -np.inf, -0.0], dtype=dt).reshape(
+        [1, 1, 4, 1] if kind == "singleton" else [1, 1, 1, 4]
+    )
+    shape = list(data.shape)
+    scales = np.ones(4, np.float32)
+    if kind in ["singleton", "fractional_align_corners"]:
+        scales[-1] = np.float32(1.2)
+    params = (
+        {"sizes": np.array(shape, np.int64)}
+        if kind == "equal_sizes" else {"scales": scales}
+    )
+    session = _strict_resize_session(build_resize(
+        dt=dt, in_shape=shape, out_shape=shape, mode=mode, ctm=ctm, **params,
+    ))
+    actual = session.run(None, {"x": data})[0]
+    assert actual.shape == data.shape
+    assert actual.dtype == data.dtype
+    np.testing.assert_array_equal(actual, data)
+    np.testing.assert_array_equal(np.signbit(actual), np.signbit(data))
+    reference = resize_ref(
+        data, shape, scales.tolist(), mode=mode, ctm=ctm,
+    )
+    np.testing.assert_array_equal(reference, data)
+
+
+@pytest.mark.parametrize("singleton", [False, True], ids=["unit_scales", "singleton"])
+@pytest.mark.parametrize("mode", ["nearest", "linear"])
+def test_upsample9_identity_preserves_nonfinite(resize_route, singleton, mode):
+    data = np.array([np.nan, np.inf, -np.inf, -0.0], np.float32).reshape(
+        [1, 1, 4, 1] if singleton else [1, 1, 1, 4]
+    )
+    scales = np.array([1, 1, 1, 1.2 if singleton else 1], np.float32)
+    session = _strict_resize_session(_upsample9(
+        dt=np.float32, shape=list(data.shape), scales=scales, mode=mode,
+    ))
+    actual = session.run(None, {"x": data})[0]
+    assert actual.shape == data.shape
+    assert actual.dtype == data.dtype
+    np.testing.assert_array_equal(actual, data)
+    np.testing.assert_array_equal(np.signbit(actual), np.signbit(data))
