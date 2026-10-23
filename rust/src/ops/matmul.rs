@@ -236,7 +236,7 @@ pub fn register(registry: &mut OpRegistry) {
             handler: fused_matmul_op,
             claim: fused_matmul_claim,
         },
-        "FusedMatMul empty-result materialization depends on live output extents",
+        "FusedMatMul conservatively specializes empty-result materialization on live output extents",
     );
     registry.register_shapeless(OpRegistration {
         domain: "",
