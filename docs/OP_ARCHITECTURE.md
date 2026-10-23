@@ -187,6 +187,16 @@ numeric/Boolean types, including precise float64 on MLX CPU, but not strings or
 complex tensors. Sequence-producing nodes remain on CPU; their tensor-sequence
 outputs can feed these MLX consumers across the ORT boundary.
 
+`Slice` supports legacy starts/ends/axes attributes and modern int32/int64
+control tensors, including omitted axes/steps, negative axes, reverse slices,
+empty results, and changing boundary or intermediate controls. Lengths, unique
+axes, axis bounds, vector ranks, and nonzero steps are checked before indexing.
+Full-width integer bounds and strides are preserved; strides larger than the
+dimension are clipped in integer arithmetic because they select at most one
+element. Boundary values use the existing bounded general-capture keys, while
+unguarded interior controls execute eagerly. Scalar inputs and known input
+dimensions beyond MLX's int32 array geometry remain unclaimed.
+
 Metal has no float64 kernels; supported float64 forms run through MLX CPU, while
 other forms fall back to ORT CPU. Empty/dynamic support is per-handler, not a
 blanket guarantee. Claimed control-flow nodes translate supported tensor bodies;
