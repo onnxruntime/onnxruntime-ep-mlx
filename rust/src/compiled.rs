@@ -104,7 +104,7 @@ fn is_general_compile_unsafe(n: &NodeDesc) -> bool {
 
 fn host_parameter_indices(n: &NodeDesc) -> &'static [usize] {
     match n.op_type.as_str() {
-        "Reshape" | "Expand" => &[1],
+        "Reshape" | "Expand" | "Squeeze" | "Unsqueeze" => &[1],
         "ConstantOfShape" => &[0],
         "Slice" => &[1, 2, 3, 4],
         "Range" => &[0, 1, 2],
@@ -120,7 +120,15 @@ fn host_parameter_indices(n: &NodeDesc) -> &'static [usize] {
 fn guarded_boundary_parameter(n: &NodeDesc, r: &crate::engine::TensorRef) -> bool {
     matches!(
         n.op_type.as_str(),
-        "Reshape" | "Expand" | "Slice" | "ConstantOfShape" | "TopK" | "Split" | "Pad"
+        "Reshape"
+            | "Expand"
+            | "Slice"
+            | "ConstantOfShape"
+            | "TopK"
+            | "Split"
+            | "Pad"
+            | "Squeeze"
+            | "Unsqueeze"
     ) && r.source == Src::CtxInput
 }
 
@@ -1570,7 +1578,16 @@ mod shape_inference_tests {
 
     #[test]
     fn specialized_routes_do_not_exempt_general_route_boundary_guards() {
-        for op in ["Reshape", "Expand", "Slice", "TopK", "Split", "Pad"] {
+        for op in [
+            "Reshape",
+            "Expand",
+            "Slice",
+            "TopK",
+            "Split",
+            "Pad",
+            "Squeeze",
+            "Unsqueeze",
+        ] {
             let mut parameterized = NodeDesc::new(
                 op.to_string(),
                 String::new(),

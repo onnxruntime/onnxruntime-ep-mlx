@@ -4,8 +4,9 @@
 //! ConstantOfShape and Where.
 //!
 //! Shape/axes/indices operands (Reshape shape, Slice starts/ends/axes/steps, Pad pads, Expand/Tile
-//! shape, ConstantOfShape/Range scalars) are read from their constant inputs at translate time via
-//! `RawHost`/`read_ints`. View-op boundary outputs (transpose/slice/expand/split/gather) are forced
+//! shape, ConstantOfShape/Range scalars) are read at translate time via `RawHost`/`read_ints`.
+//! Live boundary parameters use guarded general traces; unguarded interior parameters stay eager.
+//! View-op boundary outputs (transpose/slice/expand/split/gather) are forced
 //! contiguous before the shared CopyOut memcpy. Zero-size results (Pad/Expand) are re-materialised as
 //! clean zeros arrays rather than rejected to CPU.
 
@@ -581,27 +582,86 @@ fn transpose_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxErr
     Ok(())
 }
 
-fn unsqueeze_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
-    let data = ctx.resolve(&n.inputs[0])?;
-    let (_, axes) = read_list_input_or_attr(ctx, n, 1, "axes")?;
-    let out_rank = ctx.ndim(data) as i32 + axes.len() as i32;
-    let mut a: Vec<i32> = axes.iter().map(|&x| norm_axis(x, out_rank)).collect();
-    a.sort_unstable();
-    let r =
-        ctx.emit(|res, s| unsafe { mlx::mlx_expand_dims_axes(res, data, a.as_ptr(), a.len(), s) })?;
-    ctx.bind(&n.outputs[0], r);
-    Ok(())
+fn checked_rank_change_axes(
+    shape: &[i64],
+    axes: Option<&[i64]>,
+    inserting: bool,
+    allow_negative: bool,
+) -> Result<Vec<i32>, MlxError> {
+    let rank = shape
+        .len()
+        .checked_add(if inserting {
+            axes.map_or(0, <[i64]>::len)
+        } else {
+            0
+        })
+        .and_then(|rank| i32::try_from(rank).ok())
+        .ok_or_else(|| "Squeeze/Unsqueeze rank exceeds int32".to_string())?;
+    let axes = match axes {
+        Some(axes) => axes,
+        None if inserting => return Err("Unsqueeze requires axes".to_string()),
+        None => {
+            return shape
+                .iter()
+                .enumerate()
+                .filter(|&(_, &dim)| dim == 1)
+                .map(|(axis, _)| {
+                    i32::try_from(axis).map_err(|_| "Squeeze rank exceeds int32".to_string())
+                })
+                .collect();
+        }
+    };
+    let mut normalized = Vec::with_capacity(axes.len());
+    for &axis in axes {
+        if (!allow_negative && axis < 0) || axis < -i64::from(rank) || axis >= i64::from(rank) {
+            return Err(format!(
+                "Squeeze/Unsqueeze axis {axis} is out of range for rank {rank}"
+            ));
+        }
+        let axis = norm_axis(axis, rank);
+        if !inserting && shape[axis as usize] >= 0 && shape[axis as usize] != 1 {
+            return Err(format!("Squeeze axis {axis} must have extent 1"));
+        }
+        normalized.push(axis);
+    }
+    normalized.sort_unstable();
+    if inserting && normalized.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err("Unsqueeze axes must be unique".to_string());
+    }
+    normalized.dedup();
+    Ok(normalized)
 }
 
-fn squeeze_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
+fn rank_change_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
+    let shape = ctx.tensor_shape(&n.inputs[0])?;
+    if shape
+        .iter()
+        .any(|&dim| dim < 0 || dim > i64::from(i32::MAX))
+    {
+        return Err("Squeeze/Unsqueeze dimensions must fit nonnegative int32".to_string());
+    }
+    if present(n, 1) && ctx.tensor_shape(&n.inputs[1])?.len() != 1 {
+        return Err("Squeeze/Unsqueeze axes must be one-dimensional".to_string());
+    }
+    let (have_axes, axes) = read_list_input_or_attr(ctx, n, 1, "axes")?;
+    let inserting = n.op_type == "Unsqueeze";
+    let axes = checked_rank_change_axes(
+        &shape,
+        have_axes.then_some(axes.as_slice()),
+        inserting,
+        n.since_version >= 11,
+    )?;
     let data = ctx.resolve(&n.inputs[0])?;
-    let rank = ctx.ndim(data) as i32;
-    let (have, axes) = read_list_input_or_attr(ctx, n, 1, "axes")?;
-    let r = if have {
-        let a: Vec<i32> = axes.iter().map(|&x| norm_axis(x, rank)).collect();
-        ctx.emit(|res, s| unsafe { mlx::mlx_squeeze_axes(res, data, a.as_ptr(), a.len(), s) })?
+    let r = if axes.is_empty() {
+        data
+    } else if inserting {
+        ctx.emit(|res, s| unsafe {
+            mlx::mlx_expand_dims_axes(res, data, axes.as_ptr(), axes.len(), s)
+        })?
     } else {
-        ctx.emit(|res, s| unsafe { mlx::mlx_squeeze(res, data, s) })?
+        ctx.emit(|res, s| unsafe {
+            mlx::mlx_squeeze_axes(res, data, axes.as_ptr(), axes.len(), s)
+        })?
     };
     ctx.bind(&n.outputs[0], r);
     Ok(())
@@ -2229,10 +2289,10 @@ fn transpose_claim(node: &NodeView) -> ClaimResult {
     Ok(())
 }
 
-fn unsqueeze_claim(node: &NodeView) -> ClaimResult {
+fn rank_change_claim(node: &NodeView) -> ClaimResult {
     require!(
-        node.num_inputs() != 0 && node.num_outputs() == 1,
-        "Unsqueeze/Squeeze expects 1+ inputs and 1 output, got {}in/{}out",
+        (1..=2).contains(&node.num_inputs()) && node.num_outputs() == 1,
+        "Unsqueeze/Squeeze expects 1 or 2 inputs and 1 output, got {}in/{}out",
         node.num_inputs(),
         node.num_outputs()
     );
@@ -2242,7 +2302,7 @@ fn unsqueeze_claim(node: &NodeView) -> ClaimResult {
     };
     require!(
         is_movable(data),
-        "data dtype {} is not a movable dtype supported on GPU",
+        "data dtype {} is not a movable numeric/Boolean dtype",
         crate::registry::ort_dtype_name(data)
     );
     require!(
@@ -2251,23 +2311,90 @@ fn unsqueeze_claim(node: &NodeView) -> ClaimResult {
         crate::registry::ort_dtype_name(out),
         crate::registry::ort_dtype_name(data)
     );
-    if node.num_inputs() == 2 {
+    let inserting = node.op_type() == "Unsqueeze";
+    let (have_axes, axes) = if node.since_version() >= 13 {
+        let have_axes = node
+            .input_names()
+            .get(1)
+            .is_some_and(|name| !name.is_empty());
+        if have_axes {
+            let info = match node.input_info(1) {
+                Some(info) => info,
+                None => deny!("Squeeze/Unsqueeze axes must be an int64 tensor"),
+            };
+            require!(
+                info.dtype == ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64
+                    && (node.input_rank_known(1) != Some(true) || info.shape.len() == 1),
+                "Squeeze/Unsqueeze axes must be a one-dimensional int64 tensor"
+            );
+        }
+        (have_axes, node.read_const_int64(1))
+    } else {
         require!(
-            node.is_const_int64(1),
-            "Unsqueeze/Squeeze: only a constant int64 `axes` initializer is claimed; this node's is a runtime value — stays on CPU"
+            node.num_inputs() == 1,
+            "legacy Squeeze/Unsqueeze axes must be an attribute"
         );
-        return Ok(());
-    }
+        let (have, axes) = node.ints_attr("axes");
+        (have, have.then_some(axes))
+    };
+    require!(!inserting || have_axes, "Unsqueeze requires axes");
+    let info = match node.input_info(0) {
+        Some(info) => info,
+        None => deny!("Squeeze/Unsqueeze requires tensor data"),
+    };
     require!(
-        node.num_inputs() == 1,
-        "Unsqueeze/Squeeze: expected 1 or 2 inputs, got {}",
-        node.num_inputs()
+        info.shape.iter().all(|&dim| dim <= i64::from(i32::MAX)),
+        "Squeeze/Unsqueeze dimensions must fit int32"
     );
+    if !inserting && node.since_version() < 13 && axes.as_deref() == Some(&[]) {
+        require!(
+            node.input_rank_known(0) == Some(true)
+                && info.shape.iter().all(|&dim| dim >= 0 && dim != 1),
+            "legacy Squeeze empty axes: shape inference and CPU/reference disagree for singleton dimensions"
+        );
+    }
+    if node.input_rank_known(0) == Some(true) && (!have_axes || axes.is_some()) {
+        let checked = checked_rank_change_axes(
+            &info.shape,
+            axes.as_deref(),
+            inserting,
+            node.since_version() >= 11,
+        );
+        require!(checked.is_ok(), "{}", checked.unwrap_err());
+    }
     Ok(())
 }
 
-fn squeeze_claim(node: &NodeView) -> ClaimResult {
-    unsqueeze_claim(node)
+fn rank_change_compile_shape_safety(node: &NodeView) -> crate::registry::CompileShapeSafety {
+    use crate::registry::CompileShapeSafety;
+    if node.input_rank_known(0) == Some(true)
+        && let Some(info) = node.input_info(0)
+    {
+        let (have_axes, axes) = if node.since_version() >= 13 {
+            let have = node
+                .input_names()
+                .get(1)
+                .is_some_and(|name| !name.is_empty());
+            (have, node.read_const_int64(1))
+        } else {
+            let (have, axes) = node.ints_attr("axes");
+            (have, have.then_some(axes))
+        };
+        if node.op_type() == "Unsqueeze" && axes.is_some() {
+            return CompileShapeSafety::Shapeless;
+        }
+        if (!have_axes && info.shape.iter().all(|&dim| dim >= 0))
+            || axes.as_deref().is_some_and(|axes| {
+                checked_rank_change_axes(&info.shape, Some(axes), false, true)
+                    .is_ok_and(|axes| axes.iter().all(|&axis| info.shape[axis as usize] == 1))
+            })
+        {
+            return CompileShapeSafety::Shapeless;
+        }
+    }
+    CompileShapeSafety::ShapeKeyedOnly {
+        reason: "live axes and changing rank/singleton geometry require shape/value-keyed traces",
+    }
 }
 
 fn flatten_claim(node: &NodeView) -> ClaimResult {
@@ -3303,8 +3430,19 @@ pub fn register(registry: &mut OpRegistry) {
     shapeless(registry, "Concat", concat_op, concat_claim);
     shapeless(registry, "Reshape", reshape_op, reshape_claim);
     shapeless(registry, "Transpose", transpose_op, transpose_claim);
-    shapeless(registry, "Unsqueeze", unsqueeze_op, unsqueeze_claim);
-    shapeless(registry, "Squeeze", squeeze_op, squeeze_claim);
+    for op_type in ["Unsqueeze", "Squeeze"] {
+        registry.register_shape_classified(
+            OpRegistration {
+                domain: "",
+                op_type,
+                min_opset: 1,
+                max_opset: K_ANY_OPSET,
+                handler: rank_change_op,
+                claim: rank_change_claim,
+            },
+            rank_change_compile_shape_safety,
+        );
+    }
     shapeless(registry, "Flatten", flatten_op, flatten_claim);
     shapeless(registry, "Expand", expand_op, expand_claim);
     shape_keyed(
@@ -3386,7 +3524,51 @@ pub fn register(registry: &mut OpRegistry) {
 
 #[cfg(test)]
 mod tests {
-    use super::{checked_pad_axes, checked_pad_geometry, checked_split_sizes, integer_range_count};
+    use super::{
+        checked_pad_axes, checked_pad_geometry, checked_rank_change_axes, checked_split_sizes,
+        integer_range_count,
+    };
+
+    #[test]
+    fn rank_changes_preserve_axes_presence_and_scalar_geometry() {
+        assert_eq!(
+            checked_rank_change_axes(&[1, 2, 1], None, false, true).unwrap(),
+            vec![0, 2]
+        );
+        assert!(
+            checked_rank_change_axes(&[1, 2, 1], Some(&[]), false, true)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            checked_rank_change_axes(&[], None, false, true)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(checked_rank_change_axes(&[], None, true, true).is_err());
+        assert_eq!(
+            checked_rank_change_axes(&[], Some(&[-1]), true, true).unwrap(),
+            vec![0]
+        );
+    }
+
+    #[test]
+    fn rank_changes_validate_full_width_axes_and_duplicates() {
+        for axis in [i64::MIN, i64::MAX, 1i64 << 32, -4, 3] {
+            assert!(checked_rank_change_axes(&[1, 2, 1], Some(&[axis]), false, true).is_err());
+        }
+        assert!(checked_rank_change_axes(&[1, 2, 1], Some(&[1]), false, true).is_err());
+        assert!(checked_rank_change_axes(&[1, 2, 1], Some(&[-1]), false, false).is_err());
+        assert_eq!(
+            checked_rank_change_axes(&[1, 2, 1], Some(&[2, -3, 0]), false, true).unwrap(),
+            vec![0, 2]
+        );
+        assert!(checked_rank_change_axes(&[2, 3], Some(&[0, -4]), true, true).is_err());
+        assert_eq!(
+            checked_rank_change_axes(&[2, 3], Some(&[-1, 0]), true, true).unwrap(),
+            vec![0, 3]
+        );
+    }
 
     #[test]
     fn pad_geometry_preserves_original_coordinate_overlap() {
