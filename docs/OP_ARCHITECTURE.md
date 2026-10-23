@@ -198,6 +198,18 @@ parameters; decode and prefill reject host-read parameters unless they are
 immutable or proven shape-constant. This also protects live Reshape/Expand
 outputs when an unrelated metadata input has fully static geometry.
 
+`Flatten` validates full-width axes with the schema's bounds (nonnegative before
+opset 11) and checks both folded dimensions before narrowing to MLX int32 shapes.
+Products account for zero extents before multiplication, including scalar
+axis-zero inputs and large empty shapes; unrepresentable folded dimensions
+remain on CPU when known, or report an explicit runtime EP error otherwise.
+Dynamic or unknown-rank Flatten geometry uses shape-keyed compilation because
+its reshape target contains concrete products. `Transpose` requires a genuine
+permutation of every nonnegative input axis; negative, repeated and truncated
+wide axes are not normalized into valid permutations. Omitted permutations
+reverse the actual rank, including scalars; unknown ranks are shape-keyed.
+Both views preserve exact numeric/Boolean payload bits, with float64 on MLX CPU.
+
 `Squeeze` and `Unsqueeze` support legacy axes attributes and live int64 axes
 vectors, including omitted optional Squeeze slots, unknown ranks, scalars and
 empty dimensions. Full-width axes are validated before narrowing; Unsqueeze
