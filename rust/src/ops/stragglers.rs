@@ -206,7 +206,7 @@ mod tests {
     fn mean_variance_axes_follow_reduce_mean_contracts() {
         assert_eq!(mean_variance_axes(None, 4).unwrap(), [0, 2, 3]);
         assert_eq!(mean_variance_axes(Some(&[]), 3).unwrap(), [0, 1, 2]);
-        assert_eq!(mean_variance_axes(Some(&[]), 0).unwrap(), []);
+        assert!(mean_variance_axes(Some(&[]), 0).unwrap().is_empty());
         assert_eq!(mean_variance_axes(Some(&[-1, 0]), 3).unwrap(), [2, 0]);
         assert!(mean_variance_axes(None, 3).is_err());
         assert!(mean_variance_axes(Some(&[0, -3]), 3).is_err());
