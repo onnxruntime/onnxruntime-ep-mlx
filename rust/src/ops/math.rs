@@ -292,6 +292,55 @@ fn scalar_like(
     ctx.astype(s, dt)
 }
 
+fn legacy_work_input(
+    ctx: &mut TranslationContext,
+    n: &NodeDesc,
+) -> Result<mlx::mlx_array, MlxError> {
+    let x = ctx.resolve(&n.inputs[0])?;
+    if ctx.dtype_of(x) == mlx::mlx_dtype__MLX_FLOAT16 {
+        // Legacy FLOAT attributes must not overflow or underflow when narrowed to half.
+        ctx.astype(x, mlx::mlx_dtype__MLX_FLOAT32)
+    } else {
+        Ok(x)
+    }
+}
+
+fn affine_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
+    let x = legacy_work_input(ctx, n)?;
+    let alpha = scalar_like(ctx, x, n.floats.get("alpha").copied().unwrap_or(1.0))?;
+    let beta = scalar_like(ctx, x, n.floats.get("beta").copied().unwrap_or(0.0))?;
+    let scaled = ctx.binary(mlx::mlx_multiply, x, alpha)?;
+    let out = ctx.binary(mlx::mlx_add, scaled, beta)?;
+    bind_as_out(ctx, n, out)
+}
+
+fn scale_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
+    let x = legacy_work_input(ctx, n)?;
+    let scale = scalar_like(ctx, x, n.floats.get("scale").copied().unwrap_or(1.0))?;
+    let out = ctx.binary(mlx::mlx_multiply, x, scale)?;
+    bind_as_out(ctx, n, out)
+}
+
+fn scaled_tanh_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
+    let x = legacy_work_input(ctx, n)?;
+    let alpha = n
+        .floats
+        .get("alpha")
+        .copied()
+        .ok_or_else(|| "ScaledTanh alpha has no schema default".to_string())?;
+    let beta = n
+        .floats
+        .get("beta")
+        .copied()
+        .ok_or_else(|| "ScaledTanh beta has no schema default".to_string())?;
+    let alpha = scalar_like(ctx, x, alpha)?;
+    let beta = scalar_like(ctx, x, beta)?;
+    let scaled = ctx.binary(mlx::mlx_multiply, x, beta)?;
+    let tanh = ctx.unary(mlx::mlx_tanh, scaled)?;
+    let out = ctx.binary(mlx::mlx_multiply, alpha, tanh)?;
+    bind_as_out(ctx, n, out)
+}
+
 /// Cast the result back to the declared ONNX output dtype (a no-op when it already matches) so a
 /// stray MLX promotion never widens the boundary tensor.
 fn bind_as_out(
@@ -676,6 +725,27 @@ fn fp64_unary_claim(node: &NodeView) -> ClaimResult {
     unary_same_type_claim(node, false, true)
 }
 
+fn legacy_float_unary_claim(node: &NodeView) -> ClaimResult {
+    fp64_unary_claim(node)?;
+    require!(
+        node.input_info(0).is_some_and(|info| {
+            info.dtype
+                != crate::sys::ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16
+        }),
+        "legacy schema 1 permits only float16, float32, or float64"
+    );
+    Ok(())
+}
+
+fn scaled_tanh_claim(node: &NodeView) -> ClaimResult {
+    legacy_float_unary_claim(node)?;
+    require!(
+        node.float_attr_opt("alpha").is_some() && node.float_attr_opt("beta").is_some(),
+        "ScaledTanh requires explicit alpha and beta; the legacy schema defines no defaults"
+    );
+    Ok(())
+}
+
 fn same_shape_or_unknown(a: &[i64], b: &[i64]) -> bool {
     a.len() == b.len()
         && a.iter()
@@ -1016,6 +1086,24 @@ fn shapeless_dom(
 }
 
 pub fn register(registry: &mut OpRegistry) {
+    for (op_type, handler, claim) in [
+        (
+            "Affine",
+            affine_op as crate::registry::OpHandler,
+            legacy_float_unary_claim as crate::registry::ClaimPredicate,
+        ),
+        ("Scale", scale_op, legacy_float_unary_claim),
+        ("ScaledTanh", scaled_tanh_op, scaled_tanh_claim),
+    ] {
+        registry.register_shapeless(OpRegistration {
+            domain: "",
+            op_type,
+            min_opset: 1,
+            max_opset: 9,
+            handler,
+            claim,
+        });
+    }
     shapeless(registry, "Div", div_op, div_claim);
     registry.register_shape_classified(
         OpRegistration {
