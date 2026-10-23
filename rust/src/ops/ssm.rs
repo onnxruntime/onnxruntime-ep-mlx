@@ -1279,7 +1279,9 @@ fn linear_attention_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(),
             ctx.mark_fast("mlx_linear_attention_scan");
             return Ok(());
         }
-        if (257..=512).contains(&d_k) {
+        let bf16_wide = (257..=512).contains(&d_k)
+            && (dt == mlx::mlx_dtype__MLX_BFLOAT16 || state_dt == mlx::mlx_dtype__MLX_BFLOAT16);
+        if (257..=512).contains(&d_k) && !bf16_wide {
             // Unused common preparation is not an evaluation root, but its arena handles can
             // remain in compiled trace_transient until plan teardown. Keep that ownership cost.
             if let Some((output, present)) = linear_attention_scan_wide(ctx, n, state, scale)? {
@@ -1293,9 +1295,11 @@ fn linear_attention_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(),
                 return Ok(());
             }
         }
-        ctx.mark_composed(
-            "stable unroll: scan disabled, CPU/empty geometry, d_k > 512, or grid limit",
-        );
+        ctx.mark_composed(if bf16_wide {
+            "stable unroll: wide BF16 preserves state-dtype primitives"
+        } else {
+            "stable unroll: scan disabled, CPU/empty geometry, d_k > 512, or grid limit"
+        });
     }
 
     // Zero/weak decay and unnormalized keys remain legal on every route.

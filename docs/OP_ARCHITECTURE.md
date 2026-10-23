@@ -179,15 +179,23 @@ logical/bitwise, all reductions, shape/data-movement, normalizations, attention,
 conv/pooling, quantization (Quantize/Dequantize/DynamicQuantize/MatMulInteger/ConvInteger/
 QLinearMatMul/QLinearConv), random, signal/FFT (DFT/STFT/windows/MelWeightMatrix — audio),
 vision/detection, **recurrent (RNN/GRU/LSTM and
-com.microsoft LinearAttention via stable Metal prefill scans for `Dk <= 512`,
-with static unrolling for single-token, wider, and CPU-stream calls)**, **control flow (If/Scan/Loop via recursive
+com.microsoft LinearAttention via stable Metal prefill scans for eligible `Dk <= 512`,
+with static unrolling for single-token, wider BF16, larger-width, and CPU-stream calls)**, **control flow (If/Scan/Loop via recursive
 subgraph-body translation)**, and host-computed data-dependent operators.
 
 LinearAttention preserves the original typed scan for `Dk <= 256`. The separate
-`257 <= Dk <= 512` scan widens original live inputs and keeps FP32 working state,
-rounding only output and final/window state stores to their declared types.
+`257 <= Dk <= 512` scan is used only when neither the internal activation/output
+dtype nor the recurrent-state dtype is BF16. It widens original live inputs and
+keeps FP32 working state, rounding only output and final/window state stores to
+their declared types.
 Stored window slots do not round the ongoing recurrence. This preserves the
 recurrence, not literal intermediate half-precision rounding.
+Wide BF16-associated prefill retains the existing state-typed MLX primitive
+unroll in the same provider, including standard-domain mixed-state forms already
+admitted by the claim. This restricts only the new optimization, not BF16 operator
+support or CPU fallback policy; the original `Dk <= 256` scan and single-token
+path are unchanged. It is a correctness candidate, not proof of passing numerical
+gates or a BF16 performance claim.
 For source isolation, the wider path leaves the original lazy preparation in
 place. Those unused arrays are not additional evaluation roots, but compiled
 `trace_transient` retains their arena handles until plan teardown. Fresh resource

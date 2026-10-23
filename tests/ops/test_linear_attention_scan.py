@@ -171,6 +171,128 @@ def test_linear_attention_scan_bfloat16(monkeypatch, eager, dk):
         np.testing.assert_allclose(output, reference, rtol=1e-2, atol=1e-3)
 
 
+@pytest.mark.parametrize("eager", [False, True])
+@pytest.mark.parametrize("dk", [257, 512])
+@pytest.mark.parametrize("dtype,state_dtype,domain", [
+    pytest.param(DT.BFLOAT16, DT.BFLOAT16, "com.microsoft", id="bf16-bf16-contrib"),
+    pytest.param(DT.BFLOAT16, DT.FLOAT, "", id="bf16-fp32-standard"),
+    pytest.param(DT.FLOAT, DT.BFLOAT16, "", id="fp32-bf16-standard"),
+    pytest.param(DT.FLOAT, DT.FLOAT, "com.microsoft", id="fp32-fp32-control"),
+    pytest.param(DT.FLOAT16, DT.FLOAT16, "com.microsoft", id="fp16-fp16-control"),
+])
+def test_linear_attention_wide_internal_dtype_route(tmp_path, eager, dk, dtype, state_dtype, domain):
+    trace = tmp_path / "linear_attention_dtype.json"
+    child = r"""
+import os
+import sys
+import numpy as np
+import onnx_ir as ir
+import onnxruntime as ort
+import _models as m
+
+ort.register_execution_provider_library("MLXExecutionProvider", sys.argv[1])
+dk = int(sys.argv[2])
+dtype, state_dtype = ir.DataType(int(sys.argv[3])), ir.DataType(int(sys.argv[4]))
+domain = sys.argv[5]
+shapes = {
+    "query": [1, 7, dk], "key": [1, 7, dk], "value": [1, 7, 3],
+    "past_state": [1, 1, dk, 3], "decay": [1, 7, 1], "beta": [1, 7, 1],
+}
+inputs, operands, nodes = [], [], []
+for name, shape in shapes.items():
+    external = m.tensor(name, ir.DataType.FLOAT, shape)
+    internal_dtype = state_dtype if name == "past_state" else dtype
+    internal = m.tensor(name + "_internal", internal_dtype, shape)
+    inputs.append(external)
+    operands.append(internal)
+    nodes.append(ir.node("Cast", [external], attributes={"to": int(internal_dtype)}, outputs=[internal]))
+internal_outputs = [
+    m.tensor("y_internal", dtype, [1, 7, 3]),
+    m.tensor("state_internal", state_dtype, [1, 1, dk, 3]),
+]
+nodes.append(ir.node(
+    "LinearAttention", operands, domain=domain,
+    attributes={"q_num_heads": 1, "kv_num_heads": 1, "update_rule": "gated_delta"},
+    outputs=internal_outputs,
+))
+outputs = []
+for internal, name, shape in zip(internal_outputs, ["y", "state"], [[1, 7, 3], [1, 1, dk, 3]], strict=True):
+    external = m.tensor(name, ir.DataType.FLOAT, shape)
+    nodes.append(ir.node("Cast", [internal], attributes={"to": int(ir.DataType.FLOAT)}, outputs=[external]))
+    outputs.append(external)
+imports = {"": 27 if not domain else 24, **({domain: 1} if domain else {})}
+graph = ir.Graph(inputs, outputs, nodes=nodes, opset_imports=imports, name="wide_internal_dtype")
+proto = ir.to_proto(ir.Model(graph, ir_version=11))
+op = next(node for node in proto.graph.node if node.op_type == "LinearAttention")
+casts = {node.output[0]: node.attribute[0].i for node in proto.graph.node if node.op_type == "Cast"}
+assert [casts[name] for name in op.input] == [int(dtype)] * 3 + [int(state_dtype)] + [int(dtype)] * 2
+assert all(value.type.tensor_type.elem_type == int(ir.DataType.FLOAT) for value in proto.graph.input)
+model = proto.SerializeToString()
+rng = np.random.default_rng(2431)
+feeds = {
+    "query": rng.normal(size=(1, 7, dk)).astype(np.float32) / 8,
+    "key": rng.normal(size=(1, 7, dk)).astype(np.float32) / 16,
+    "value": rng.normal(size=(1, 7, 3)).astype(np.float32) / 8,
+    "past_state": rng.normal(size=(1, 1, dk, 3)).astype(np.float32) / 16,
+    "decay": np.full((1, 7, 1), -0.1, np.float32),
+    "beta": np.full((1, 7, 1), 0.5, np.float32),
+}
+original = {name: value.copy() for name, value in feeds.items()}
+results = []
+for disabled in ["0", "1"]:
+    os.environ["ONNXRUNTIME_EP_MLX_NO_LINEAR_ATTENTION_SCAN"] = disabled
+    options = ort.SessionOptions()
+    options.log_severity_level = 3
+    options.add_session_config_entry("session.disable_cpu_ep_fallback", "1")
+    session = ort.InferenceSession(
+        model, options, providers=["MLXExecutionProvider"], enable_fallback=False,
+    )
+    session.disable_fallback()
+    results.append(session.run(None, feeds))
+    for name, value in feeds.items():
+        np.testing.assert_array_equal(value, original[name])
+rtol = 1e-2 if ir.DataType.BFLOAT16 in (dtype, state_dtype) else 1e-3
+for actual, expected, shape in zip(results[0], results[1], [[1, 7, 3], [1, 1, dk, 3]], strict=True):
+    assert actual.shape == expected.shape == tuple(shape)
+    assert actual.dtype == expected.dtype == np.float32
+    assert np.isfinite(actual).all() and np.isfinite(expected).all()
+    np.testing.assert_allclose(actual, expected, rtol=rtol, atol=1e-3)
+"""
+    env = {
+        **os.environ,
+        "ONNXRUNTIME_EP_MLX_TRACE": str(trace),
+        "ONNXRUNTIME_EP_MLX_NO_COMPILE": "1" if eager else "0",
+        "ALLOW_RELEASED_ONNX_OPSET_ONLY": "0",
+    }
+    subprocess.run(
+        [
+            sys.executable, "-c", child, os.environ["ONNXRUNTIME_MLX_EP_LIB"],
+            str(dk), str(int(dtype)), str(int(state_dtype)), domain,
+        ],
+        cwd=Path(__file__).parent, env=env, check=True, capture_output=True, text=True,
+        timeout=120,
+    )
+    events = json.loads(trace.read_text())
+    fast = [
+        event for event in events
+        if event.get("cat") == "op.fast"
+        and event.get("args", {}).get("kernel") == "mlx_linear_attention_scan"
+    ]
+    bf16_reason = [
+        event for event in events
+        if event.get("cat") == "op.composed"
+        and event.get("args", {}).get("reason")
+        == "stable unroll: wide BF16 preserves state-dtype primitives"
+    ]
+    if DT.BFLOAT16 in (dtype, state_dtype):
+        assert not fast
+        assert bf16_reason
+    else:
+        # The disabled reference also composes, but only the candidate can emit a fast marker.
+        assert fast
+        assert not bf16_reason
+
+
 @pytest.mark.parametrize("dk,disabled", [
     (33, False), (33, True), (257, False), (512, False), (513, False),
 ])
