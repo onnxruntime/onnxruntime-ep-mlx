@@ -7,7 +7,7 @@ import subprocess
 import sys
 
 import numpy as np
-from onnx import TensorProto as T, helper, numpy_helper
+from onnx import TensorProto as T, checker, helper, numpy_helper
 import onnxruntime as ort
 import pytest
 
@@ -108,13 +108,13 @@ def _assert_draw(op, output, shape, dtype):
 @pytest.mark.parametrize("opset,dtype", [
     (version, dtype)
     for version in [1, 22, 26]
-    for dtype in LEGACY_TYPES + ([T.BFLOAT16] if version >= 22 else [])
+    for dtype in FEED_TYPES + ([T.BFLOAT16] if version >= 22 else [])
 ])
 @pytest.mark.parametrize("output_dtype", [T.FLOAT, T.FLOAT16])
 @pytest.mark.parametrize("eager", [False, True])
 @pytest.mark.parametrize("shape", [(), (2, 128), (0, 3)])
-def test_random_like_all_legal_initializer_types(op, opset, dtype, output_dtype, eager, shape,
-                                               monkeypatch):
+def test_random_like_loadable_initializer_types(op, opset, dtype, output_dtype, eager, shape,
+                                              monkeypatch):
     monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_COMPILE", "1" if eager else "0")
     if dtype == T.BFLOAT16:
         initializer = helper.make_tensor(
@@ -127,6 +127,55 @@ def test_random_like_all_legal_initializer_types(op, opset, dtype, output_dtype,
     first, second = [session.run(None, {})[0] for _ in range(2)]
     _assert_draw(op, first, shape, output_dtype)
     np.testing.assert_array_equal(first, second)
+
+
+@pytest.mark.parametrize("op", OPS)
+@pytest.mark.parametrize("opset", [1, 22, 26])
+@pytest.mark.parametrize("dtype", [T.COMPLEX64, T.COMPLEX128])
+@pytest.mark.parametrize("output_dtype", [T.FLOAT, T.FLOAT16])
+@pytest.mark.parametrize("eager", [False, True])
+@pytest.mark.parametrize("shape", [(), (2, 128), (0, 3)])
+def test_random_like_complex_initializer_loader_rejection(op, opset, dtype, output_dtype,
+                                                        eager, shape, monkeypatch):
+    monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_COMPILE", "1" if eager else "0")
+    initializer = numpy_helper.from_array(_data(dtype, shape), name="x")
+    control = helper.make_model(
+        helper.make_graph(
+            [helper.make_node("Shape", ["x"], ["shape"])], "complex_loader_control", [],
+            [helper.make_tensor_value_info("shape", T.INT64, [len(shape)])],
+            initializer=[initializer],
+        ),
+        opset_imports=[helper.make_opsetid("", opset)], ir_version=11,
+    )
+    model = _model(op, dtype, shape=shape, output_dtype=output_dtype, opset=opset,
+                   initializer=initializer)
+    checker.check_model(control, full_check=True)
+    checker.check_model(model, full_check=True)
+    options = ort.SessionOptions()
+    options.log_severity_level = 3
+    options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+    positive_control = helper.make_model(
+        control.graph, opset_imports=control.opset_import, ir_version=control.ir_version,
+    )
+    positive_control.graph.initializer[0].CopyFrom(
+        numpy_helper.from_array(np.zeros(shape, np.float32), name="x"),
+    )
+    checker.check_model(positive_control, full_check=True)
+    session = ort.InferenceSession(
+        positive_control.SerializeToString(), options, providers=["CPUExecutionProvider"],
+        enable_fallback=False,
+    )
+    session.disable_fallback()
+    np.testing.assert_array_equal(session.run(None, {})[0], np.array(shape, np.int64))
+    rejection = r"^\[ONNXRuntimeError\] : 9 : NOT_IMPLEMENTED :\s*$"
+    with pytest.raises(ort.capi.onnxruntime_pybind11_state.NotImplemented,
+                       match=rejection) as reference_error:
+        ort.InferenceSession(control.SerializeToString(), options,
+                             providers=["CPUExecutionProvider"], enable_fallback=False)
+    with pytest.raises(ort.capi.onnxruntime_pybind11_state.NotImplemented,
+                       match=rejection) as mlx_error:
+        _session(model)
+    assert str(mlx_error.value) == str(reference_error.value)
 
 
 @pytest.mark.parametrize("op", OPS)
