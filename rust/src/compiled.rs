@@ -68,10 +68,12 @@ fn compile_shape_mode_supported(nodes: &[NodeDesc], shapeless: bool) -> bool {
     })
 }
 
-/// Decode uses `mlx_compile(..., shapeless=true)`, so plans containing a primitive without MLX
-/// output-shape inference must use their shape-keyed/eager route instead.
+/// Decode has no host-value specialization key. Shape/Size literals and host-read parameters
+/// must therefore be proven safe independently of MLX's primitive output-shape inference.
 pub fn decode_enabled(has_control_flow: bool, nodes: &[NodeDesc]) -> bool {
-    compile_enabled(has_control_flow) && compile_shape_mode_supported(nodes, true)
+    compile_enabled(has_control_flow)
+        && compile_shape_mode_supported(nodes, true)
+        && !nodes.iter().any(reads_data_dependent_parameter)
 }
 
 /// Op types whose subgraphs keep their existing (eager / compiled-decode) routes because they are
@@ -757,15 +759,14 @@ pub fn try_compiled(
         }
     }
 
-    // Shape-keyed guard: skip (=> eager) when any dynamic input is an empty tensor (a zero-size dim).
-    // Empty arrays are a degenerate edge the eager translator handles directly, but tracing /
-    // `mlx_compile` over a zero-size shape can abort inside MLX. Checked on EVERY call (a shape-keyed
-    // closure would otherwise retrace into the same abort). Shapeless decode never sees empty inputs.
+    // Skip shape-keyed tracing for empty or native-unrepresentable input geometry on EVERY call.
+    // Empty traces can abort inside MLX; dimensions beyond i32 cannot be wrapped as MLX arrays.
+    // Metadata-only eager consumers need neither operation.
     if cfg.shape_mode == ShapeMode::ShapeKeyed {
         let plan = unsafe { &*plan_ptr };
         for di in &slot.get(plan).dyn_inputs {
             let (_data, shape, _dtype) = read_ctx_input_raw(api, kctx, di.ctx_index)?;
-            if shape.contains(&0) {
+            if shape.contains(&0) || shape.iter().any(|&dim| dim > i32::MAX as i64) {
                 return Ok(false);
             }
         }
@@ -1848,7 +1849,7 @@ mod shape_inference_tests {
     }
 
     #[test]
-    fn prefill_does_not_exempt_general_route_boundary_guards() {
+    fn specialized_routes_do_not_exempt_general_route_boundary_guards() {
         for op in ["Reshape", "Expand", "Slice", "TopK"] {
             let mut parameterized = NodeDesc::new(
                 op.to_string(),
@@ -1863,6 +1864,7 @@ mod shape_inference_tests {
             ];
             assert!(reads_data_dependent_parameter(&parameterized));
             assert!(!reads_unguarded_parameter(&parameterized, true));
+            assert!(!decode_enabled(false, std::slice::from_ref(&parameterized)));
             let gqa = NodeDesc::new(
                 "GroupQueryAttention".to_string(),
                 "com.microsoft".to_string(),
