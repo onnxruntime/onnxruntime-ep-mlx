@@ -251,6 +251,16 @@ The explicit schema formulas are used for cases where ORT's LRN kernel only
 accepts rank four or the Python reference mishandles channel iteration or
 negative-input L1 norms.
 
+Constant int64 `Range` bounds and values are generated with checked integer
+arithmetic, not through floating-point start/step arguments. All three bounds
+must be scalars, the output length must fit native int32 geometry, and its
+exact count must agree with ORT's inferred extent. Full-width bounds with small
+spans follow the ONNX function, including cases where ORT 1.31's native kernel
+incorrectly returns empty. Forms whose exact count disagrees with the inferred
+extent remain unclaimed rather than capturing an incorrect shape. Runtime
+bounds and float64 `Range` remain open coverage partitions, not proven backend
+limitations.
+
 `BatchNormalization` implements versioned inference and training, including
 legacy version-7 nonspatial features and version-9 rank-one inputs (`C=1`).
 Version 14 separates statistic types from data/affine types; version 15 also
