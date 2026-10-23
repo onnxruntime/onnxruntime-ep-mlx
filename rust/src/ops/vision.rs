@@ -18,8 +18,8 @@ use std::os::raw::c_void;
 use crate::engine::{MlxError, NodeDesc, Src, TensorRef, TranslationContext, mlx_dtype_from_onnx};
 use crate::mlx::{Array, VectorArray};
 use crate::registry::{
-    ClaimResult, K_ANY_OPSET, NodeView, OpRegistration, OpRegistry, is_int_index, is_mlx_cpu_float,
-    is_mlx_float, is_movable,
+    ClaimResult, K_ANY_OPSET, NodeView, OpRegistration, OpRegistry, is_mlx_cpu_float, is_mlx_float,
+    is_movable,
 };
 use crate::sys::mlx;
 use crate::sys::ort;
