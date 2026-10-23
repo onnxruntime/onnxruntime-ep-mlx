@@ -72,6 +72,20 @@ axis length, and all inverse indices are zero. For example `[2, 0, 3]` with
 axis 0 produces Y shape `[1, 0, 3]`, indices `[0]`, inverse `[0, 0]`, counts `[2]`.
 With axis 1 the same input produces `[2, 0, 3]` and empty metadata outputs.
 
+**ORT CPU authority failure:** hosted run `39907571995` at source `367cd543`
+aborted at the explicit CPU comparison in the scalar/empty regression, after
+that case's strict MLX and independent Reference checks. ORT 1.31's `CreateOutput`
+forms `&Y_data[out_offset]` even when the output span is empty and the copy has
+zero columns. This affects nonempty axes with zero-column slices and nonzero
+row count, such as `[2, 0, 3]` axis 0 and `[2, 3, 0]` axis 1. Those CPU
+comparisons now run in bounded subprocesses with core dumps disabled. A CPU
+success must still match all exact outputs; only ORT 1.31's specific SIGABRT
+is reported as an explicit warning with retained diagnostics, not as CPU
+conformance. Other errors, signals, mismatches and timeouts remain failures.
+All MLX payload/shape/metadata checks and the independent oracle are unchanged;
+no EP form is declined, skipped or tolerance-relaxed. This diagnostic containment
+is pending execution and is not yet proof that all empty cases pass.
+
 The checked live host reader and geometry validation are shared with NonZero;
 NonZero's coordinate/equality contracts are unchanged. Empty buffers never
 become Rust raw slices from null pointers. Every extent and nonempty total
