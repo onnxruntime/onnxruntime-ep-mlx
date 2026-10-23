@@ -146,6 +146,7 @@ def _session(model: bytes, *, cpu: bool, profile: Path | None = None):
     session = ort.InferenceSession(
         model, options,
         providers=["CPUExecutionProvider"] if cpu else ["MLXExecutionProvider"],
+        enable_fallback=False,
     )
     session.disable_fallback()
     return session
