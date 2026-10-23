@@ -1858,7 +1858,6 @@ mod tests {
             ("", "LinearAttention", 27),
             ("", "GridSample", 24),
             ("", "Col2Im", 24),
-            ("", "RoiAlign", 24),
             ("", "MaxRoiPool", 24),
             ("", "MaxUnpool", 24),
         ];
@@ -1887,6 +1886,10 @@ mod tests {
             );
         }
 
+        assert!(matches!(
+            compile_shape_rule("", "RoiAlign", 24),
+            CompileShapeRule::Classified(_)
+        ));
         assert!(matches!(
             compile_shape_rule("com.microsoft", "GroupQueryAttention", 1),
             CompileShapeRule::Classified(_)

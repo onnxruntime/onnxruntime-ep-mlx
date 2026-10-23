@@ -9,17 +9,17 @@
 //! float64 uses that map on the existing MLX CPU-stream route without narrowing.
 //! GridSample uses tensor-product gathers for small ranks and separable interpolation for larger
 //! ranks. Nearest sampling preserves numeric/bool payloads without floating-point conversion.
-//! Adaptive RoiAlign `sampling_ratio==0` and non-float interpolation are left to CPU.
+//! Adaptive RoiAlign reads live ROI geometry eagerly; fixed grids retain shape-keyed compilation.
 //! NonMaxSuppression is host-computed because MLX has no data-dependent compacting primitive.
 
 use std::cmp::Ordering;
 use std::os::raw::c_void;
 
-use crate::engine::{MlxError, NodeDesc, TensorRef, TranslationContext, mlx_dtype_from_onnx};
+use crate::engine::{MlxError, NodeDesc, Src, TensorRef, TranslationContext, mlx_dtype_from_onnx};
 use crate::mlx::{Array, VectorArray};
 use crate::registry::{
-    ClaimResult, K_ANY_OPSET, NodeView, OpRegistration, OpRegistry, is_int_index, is_mlx_cpu_float,
-    is_mlx_float, is_movable,
+    ClaimResult, K_ANY_OPSET, NodeView, OpRegistration, OpRegistry, is_mlx_cpu_float, is_mlx_float,
+    is_movable,
 };
 use crate::sys::mlx;
 use crate::sys::ort;
@@ -1574,6 +1574,209 @@ fn col2im_claim(node: &NodeView) -> ClaimResult {
 // RoiAlign (2D)
 // =================================================================================================
 
+#[derive(Clone, Copy)]
+struct RoiAlignParams {
+    height: i32,
+    width: i32,
+    ratio: i32,
+    scale: f32,
+    half_pixel: bool,
+    max: bool,
+}
+
+fn roi_product(dims: &[i32]) -> Result<i32, MlxError> {
+    if dims.iter().any(|&d| d < 0) {
+        return Err("RoiAlign: dimensions must be nonnegative".into());
+    }
+    if dims.contains(&0) {
+        return Ok(0);
+    }
+    dims.iter().try_fold(1i32, |a, &b| {
+        a.checked_mul(b)
+            .ok_or_else(|| "RoiAlign: grid or tensor element count exceeds int32 indexing".into())
+    })
+}
+
+impl RoiAlignParams {
+    fn new(n: &NodeDesc) -> Result<Self, MlxError> {
+        let dimension = |name, default, minimum| {
+            let value = n.ints.get(name).copied().unwrap_or(default);
+            i32::try_from(value)
+                .ok()
+                .filter(|&v| v >= minimum)
+                .ok_or_else(|| format!("RoiAlign: {name} must be in [{minimum}, int32::MAX]"))
+        };
+        let params = Self {
+            height: dimension("output_height", 1, 1)?,
+            width: dimension("output_width", 1, 1)?,
+            ratio: dimension("sampling_ratio", 0, 0)?,
+            scale: n.floats.get("spatial_scale").copied().unwrap_or(1.0),
+            half_pixel: n
+                .strings
+                .get("coordinate_transformation_mode")
+                .map(String::as_str)
+                .unwrap_or(if n.since_version < 16 {
+                    "output_half_pixel"
+                } else {
+                    "half_pixel"
+                })
+                == "half_pixel",
+            max: n.strings.get("mode").is_some_and(|mode| mode == "max"),
+        };
+        if !params.scale.is_finite() {
+            return Err("RoiAlign: spatial_scale must be finite".into());
+        }
+        roi_product(&[
+            params.height,
+            params.width,
+            params.ratio.max(1),
+            params.ratio.max(1),
+        ])?;
+        Ok(params)
+    }
+
+    fn grid(self, roi: &[f64], double: bool) -> Result<[i32; 2], MlxError> {
+        let extent = |start: f64, end: f64, bins: i32| -> Result<f64, MlxError> {
+            let offset = if self.half_pixel { 0.5 } else { 0.0 };
+            let size = if double {
+                (end * f64::from(self.scale) - offset) - (start * f64::from(self.scale) - offset)
+            } else {
+                f64::from(
+                    (end as f32 * self.scale - offset as f32)
+                        - (start as f32 * self.scale - offset as f32),
+                )
+            };
+            if !size.is_finite() {
+                return Err("RoiAlign: scaled ROI extents must be finite".into());
+            }
+            let size = if self.half_pixel { size } else { size.max(1.0) };
+            let count = if self.ratio > 0 {
+                f64::from(self.ratio)
+            } else if double {
+                (size / f64::from(bins)).ceil()
+            } else {
+                f64::from((size as f32 / bins as f32).ceil())
+            };
+            Ok(count)
+        };
+        let counts = [
+            extent(roi[1], roi[3], self.height)?,
+            extent(roi[0], roi[2], self.width)?,
+        ];
+        // An empty axis makes the entire grid empty, even if the other count cannot be indexed.
+        if counts.iter().any(|&count| count <= 0.0) {
+            return Ok([0; 2]);
+        }
+        if counts.iter().any(|&count| count > f64::from(i32::MAX)) {
+            return Err("RoiAlign: adaptive grid exceeds int32 indexing".into());
+        }
+        let grid = counts.map(|count| count as i32);
+        roi_product(&[self.height, self.width, grid[0], grid[1]])?;
+        Ok(grid)
+    }
+}
+
+fn roi_values(ctx: &mut TranslationContext, input: &TensorRef) -> Result<Vec<f64>, MlxError> {
+    let value = ctx.resolve(input)?;
+    let double = ctx.dtype_of(value) == mlx::mlx_dtype__MLX_FLOAT64;
+    let value = if double {
+        value
+    } else {
+        ctx.astype(value, mlx::mlx_dtype__MLX_FLOAT32)?
+    };
+    let value = ctx.contiguous_eval(value)?;
+    let count = ctx.size_of(value);
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    if double {
+        let ptr = unsafe { mlx::mlx_array_data_float64(value) };
+        if ptr.is_null() {
+            return Err("RoiAlign: evaluated ROI data is unavailable".into());
+        }
+        Ok(unsafe { std::slice::from_raw_parts(ptr, count) }.to_vec())
+    } else {
+        let ptr = unsafe { mlx::mlx_array_data_float32(value) };
+        if ptr.is_null() {
+            return Err("RoiAlign: evaluated ROI data is unavailable".into());
+        }
+        Ok(unsafe { std::slice::from_raw_parts(ptr, count) }
+            .iter()
+            .map(|&v| f64::from(v))
+            .collect())
+    }
+}
+
+fn validate_roi_align(
+    ctx: &mut TranslationContext,
+    n: &NodeDesc,
+    params: RoiAlignParams,
+) -> Result<Vec<[i32; 2]>, MlxError> {
+    let x = ctx.resolve(&n.inputs[0])?;
+    let rois = ctx.resolve(&n.inputs[1])?;
+    let batch = ctx.resolve(&n.inputs[2])?;
+    let xs = ctx.shape_of(x);
+    let rs = ctx.shape_of(rois);
+    if xs.len() != 4
+        || rs.len() != 2
+        || rs[1] != 4
+        || ctx.shape_of(batch) != [rs[0]]
+        || xs[2] <= 0
+        || xs[3] <= 0
+    {
+        return Err("RoiAlign: expected X[N,C,H,W], rois[R,4], batch_indices[R], and positive spatial dimensions".into());
+    }
+    roi_product(&xs)?;
+    roi_product(&[rs[0], xs[1], params.height, params.width])?;
+    let batches = ctx.read_ints_eval(&n.inputs[2])?;
+    if batches.len() != rs[0] as usize || batches.iter().any(|&b| b < 0 || b >= i64::from(xs[0])) {
+        return Err("RoiAlign: batch_indices must be within the input batch".into());
+    }
+    let values = roi_values(ctx, &n.inputs[1])?;
+    if values.iter().any(|v| !v.is_finite()) {
+        return Err("RoiAlign: all ROI coordinates must be finite".into());
+    }
+    values
+        .chunks_exact(4)
+        .map(|roi| {
+            let grid = params.grid(roi, n.outputs[0].otype == 11)?;
+            roi_product(&[xs[1], params.height, params.width, grid[0], grid[1]])?;
+            Ok(grid)
+        })
+        .collect()
+}
+
+pub(crate) fn needs_roi_validation(n: &NodeDesc) -> bool {
+    (n.domain.is_empty() && n.op_type == "RoiAlign")
+        || n.subgraphs
+            .iter()
+            .any(|g| g.nodes.iter().any(needs_roi_validation))
+}
+
+pub(crate) fn validate_compiled_rois(
+    ctx: &mut TranslationContext,
+    nodes: &[NodeDesc],
+) -> Result<bool, MlxError> {
+    for n in nodes {
+        if n.subgraphs
+            .iter()
+            .any(|g| g.nodes.iter().any(needs_roi_validation))
+        {
+            return Ok(false);
+        }
+        if n.domain.is_empty() && n.op_type == "RoiAlign" {
+            if n.inputs
+                .iter()
+                .any(|input| input.source == Src::Intermediate)
+            {
+                return Ok(false);
+            }
+            validate_roi_align(ctx, n, RoiAlignParams::new(n)?)?;
+        }
+    }
+    Ok(true)
+}
+
 /// A single [R,1] ROI column reshaped to [R].
 fn roi_column(
     ctx: &mut TranslationContext,
@@ -1586,40 +1789,90 @@ fn roi_column(
 }
 
 fn roi_align_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
+    let params = RoiAlignParams::new(n)?;
+    let tracing = ctx.shape_keyed_compile() || ctx.shapeless_compile();
+    let grids = if tracing {
+        Vec::new()
+    } else {
+        validate_roi_align(ctx, n, params)?
+    };
+    if n.outputs[0].otype == 11 {
+        return roi_align_double(ctx, n, params, &grids);
+    }
     let x0 = ctx.resolve(&n.inputs[0])?;
     let xc = contiguous(ctx, x0)?;
     let xin = astype(ctx, xc, mlx::mlx_dtype__MLX_FLOAT32)?;
+    let rois = ctx.resolve(&n.inputs[1])?;
+    let rois = astype(ctx, rois, mlx::mlx_dtype__MLX_FLOAT32)?;
+    let batch = ctx.resolve(&n.inputs[2])?;
+    let batch = astype(ctx, batch, mlx::mlx_dtype__MLX_INT32)?;
+    let rr = ctx.shape_of(rois)[0];
+    let cc = ctx.shape_of(xin)[1];
+    let output_shape = [rr, cc, params.height, params.width];
+    roi_product(&output_shape)?;
+    let out = if rr == 0 || cc == 0 {
+        roi_zeros(ctx, &output_shape)?
+    } else if params.ratio > 0 {
+        roi_align_fixed(ctx, xin, rois, batch, params, [params.ratio; 2])?
+    } else {
+        if tracing {
+            return Err("RoiAlign: adaptive sampling requires live eager ROI geometry".into());
+        }
+        let mut outputs = VectorArray::new();
+        for (i, &grid) in grids.iter().enumerate() {
+            let i = i as i32;
+            let roi = slice(ctx, rois, &[i, 0], &[i + 1, 4])?;
+            let batch = slice(ctx, batch, &[i], &[i + 1])?;
+            let output = if grid.contains(&0) {
+                roi_zeros(ctx, &[1, cc, params.height, params.width])?
+            } else {
+                roi_align_fixed(ctx, xin, roi, batch, params, grid)?
+            };
+            outputs.append(output);
+        }
+        ctx.emit(|res, s| unsafe { mlx::mlx_concatenate_axis(res, outputs.as_raw(), 0, s) })?
+    };
+    let out = astype(ctx, out, out_dtype(n))?;
+    let y = contiguous(ctx, out)?;
+    ctx.bind(&n.outputs[0], y);
+    Ok(())
+}
+
+fn roi_zeros(ctx: &mut TranslationContext, shape: &[i32]) -> Result<mlx::mlx_array, MlxError> {
+    ctx.emit(|res, s| unsafe {
+        mlx::mlx_zeros(
+            res,
+            shape.as_ptr(),
+            shape.len(),
+            mlx::mlx_dtype__MLX_FLOAT32,
+            s,
+        )
+    })
+}
+
+fn roi_align_fixed(
+    ctx: &mut TranslationContext,
+    xin: mlx::mlx_array,
+    rois: mlx::mlx_array,
+    batch_idx: mlx::mlx_array,
+    params: RoiAlignParams,
+    grid: [i32; 2],
+) -> Result<mlx::mlx_array, MlxError> {
     let xs = ctx.shape_of(xin);
     let (cc, hh, ww) = (xs[1], xs[2], xs[3]);
-
-    let r0 = ctx.resolve(&n.inputs[1])?;
-    let rois = astype(ctx, r0, mlx::mlx_dtype__MLX_FLOAT32)?; // [R,4]
     let rr = ctx.shape_of(rois)[0];
-    let b0 = ctx.resolve(&n.inputs[2])?;
-    if hh <= 0 || ww <= 0 || ctx.shape_of(b0) != [rr] {
-        return Err(
-            "RoiAlign: positive spatial dimensions and one batch index per ROI are required".into(),
-        );
-    }
-    let batch_idx = astype(ctx, b0, mlx::mlx_dtype__MLX_INT32)?; // [R]
-
-    let mode = n.strings.get("mode").map(String::as_str).unwrap_or("avg");
-    let ctm = n
-        .strings
-        .get("coordinate_transformation_mode")
-        .map(String::as_str)
-        .unwrap_or(if n.since_version < 16 {
-            "output_half_pixel"
-        } else {
-            "half_pixel"
-        });
-    let half_pixel = ctm == "half_pixel";
-    let is_max = mode == "max";
-    let oh = n.ints.get("output_height").copied().unwrap_or(1) as i32;
-    let ow = n.ints.get("output_width").copied().unwrap_or(1) as i32;
-    let sr = n.ints.get("sampling_ratio").copied().unwrap_or(0) as i32;
-    let scale = n.floats.get("spatial_scale").copied().unwrap_or(1.0);
-    let (gh, gw) = (sr, sr);
+    let RoiAlignParams {
+        height: oh,
+        width: ow,
+        scale,
+        half_pixel,
+        max: is_max,
+        ..
+    } = params;
+    let [gh, gw] = grid;
+    let ps = roi_product(&[oh, ow, gh, gw])?;
+    roi_product(&[rr, cc, ps])?;
+    let spatial = roi_product(&[hh, ww])?;
     let offset = if half_pixel { 0.5 } else { 0.0 };
     let count = (gh * gw).max(1) as f32;
 
@@ -1665,8 +1918,8 @@ fn roi_align_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxErr
     let half = scalar_f(ctx, 0.5);
     let iy_h = add(ctx, iy_idx, half)?;
     let ghf = scalar_f(ctx, gh as f32);
-    let iy_frac = div(ctx, iy_h, ghf)?;
-    let iy_term = mul(ctx, iy_frac, binh5)?;
+    let iy_scaled = mul(ctx, iy_h, binh5)?;
+    let iy_term = div(ctx, iy_scaled, ghf)?;
     let ph_term = mul(ctx, ph_idx, binh5)?;
     let yc0 = add(ctx, rsh5, ph_term)?;
     let yc = add(ctx, yc0, iy_term)?;
@@ -1674,13 +1927,12 @@ fn roi_align_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxErr
     let half2 = scalar_f(ctx, 0.5);
     let ix_h = add(ctx, ix_idx, half2)?;
     let gwf = scalar_f(ctx, gw as f32);
-    let ix_frac = div(ctx, ix_h, gwf)?;
-    let ix_term = mul(ctx, ix_frac, binw5)?;
+    let ix_scaled = mul(ctx, ix_h, binw5)?;
+    let ix_term = div(ctx, ix_scaled, gwf)?;
     let pw_term = mul(ctx, pw_idx, binw5)?;
     let xc0 = add(ctx, rsw5, pw_term)?;
     let xc = add(ctx, xc0, ix_term)?;
 
-    let ps = oh * ow * gh * gw;
     let yc_b = broadcast_to(ctx, yc, &[rr, oh, ow, gh, gw])?;
     let yc = reshape(ctx, yc_b, &[rr, ps])?;
     let xc_b = broadcast_to(ctx, xc, &[rr, oh, ow, gh, gw])?;
@@ -1715,7 +1967,7 @@ fn roi_align_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxErr
     let w4 = mul(ctx, lylx, valid)?;
 
     let xb = take_axis(ctx, xin, batch_idx, 0)?; // [R,C,H,W]
-    let xbf = reshape(ctx, xb, &[rr, cc, hh * ww])?;
+    let xbf = reshape(ctx, xb, &[rr, cc, spatial])?;
 
     // corner(yy, xx, w): gather bilinear neighbour, weighted.
     let corner = |ctx: &mut TranslationContext,
@@ -1754,11 +2006,116 @@ fn roi_align_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxErr
         let cnt = scalar_f(ctx, count);
         div(ctx, summed, cnt)?
     };
-    let out = reshape(ctx, out, &[rr, cc, oh, ow])?;
-    let out = astype(ctx, out, out_dtype(n))?;
-    let y = contiguous(ctx, out)?;
-    ctx.bind(&n.outputs[0], y);
+    reshape(ctx, out, &[rr, cc, oh, ow])
+}
+
+fn roi_align_double(
+    ctx: &mut TranslationContext,
+    n: &NodeDesc,
+    params: RoiAlignParams,
+    grids: &[[i32; 2]],
+) -> Result<(), MlxError> {
+    let x = ctx.resolve(&n.inputs[0])?;
+    let shape = ctx.shape_of(x);
+    let [_, channels, height, width] =
+        <[i32; 4]>::try_from(shape).map_err(|_| "RoiAlign: X must have rank four")?;
+    let values = roi_values(ctx, &n.inputs[0])?;
+    let rois = roi_values(ctx, &n.inputs[1])?;
+    let batches = ctx.read_ints_eval(&n.inputs[2])?;
+    let output_shape = [grids.len() as i32, channels, params.height, params.width];
+    let size = roi_product(&output_shape)? as usize;
+    let mut output = Vec::with_capacity(size);
+    let scale = f64::from(params.scale);
+    let offset = if params.half_pixel { 0.5 } else { 0.0 };
+    for ((roi, &batch), &[gh, gw]) in rois.chunks_exact(4).zip(&batches).zip(grids) {
+        let start_x = roi[0] * scale - offset;
+        let start_y = roi[1] * scale - offset;
+        let mut extent_x = roi[2] * scale - offset - start_x;
+        let mut extent_y = roi[3] * scale - offset - start_y;
+        if !params.half_pixel {
+            extent_x = extent_x.max(1.0);
+            extent_y = extent_y.max(1.0);
+        }
+        let bin_x = extent_x / f64::from(params.width);
+        let bin_y = extent_y / f64::from(params.height);
+        for channel in 0..channels {
+            let base = ((batch as usize * channels as usize + channel as usize) * height as usize)
+                * width as usize;
+            for ph in 0..params.height {
+                for pw in 0..params.width {
+                    let mut result = 0.0;
+                    let mut first = true;
+                    for iy in 0..gh {
+                        let y = start_y
+                            + f64::from(ph) * bin_y
+                            + (f64::from(iy) + 0.5) * bin_y / f64::from(gh);
+                        for ix in 0..gw {
+                            let x = start_x
+                                + f64::from(pw) * bin_x
+                                + (f64::from(ix) + 0.5) * bin_x / f64::from(gw);
+                            let (positions, weights) = roi_double_taps(y, x, height, width);
+                            let mut terms = [0.0; 4];
+                            for k in 0..4 {
+                                terms[k] = weights[k] * values[base + positions[k]];
+                            }
+                            let sample = if params.max {
+                                terms
+                                    .into_iter()
+                                    .reduce(|a, b| if a < b { b } else { a })
+                                    .unwrap()
+                            } else {
+                                terms.into_iter().sum()
+                            };
+                            if params.max {
+                                if first || result < sample {
+                                    result = sample;
+                                }
+                                first = false;
+                            } else {
+                                result += sample;
+                            }
+                        }
+                    }
+                    if !params.max {
+                        result /= f64::from((gh * gw).max(1));
+                    }
+                    output.push(result);
+                }
+            }
+        }
+    }
+    let result = ctx.from_host(
+        output.as_ptr().cast(),
+        &output_shape,
+        mlx::mlx_dtype__MLX_FLOAT64,
+    );
+    ctx.bind(&n.outputs[0], result);
     Ok(())
+}
+
+fn roi_double_taps(y: f64, x: f64, height: i32, width: i32) -> ([usize; 4], [f64; 4]) {
+    if y < -1.0 || y > f64::from(height) || x < -1.0 || x > f64::from(width) {
+        return ([0; 4], [0.0; 4]);
+    }
+    let y = y.clamp(0.0, f64::from(height - 1));
+    let x = x.clamp(0.0, f64::from(width - 1));
+    let y0 = y as usize;
+    let x0 = x as usize;
+    let y1 = (y0 + 1).min(height as usize - 1);
+    let x1 = (x0 + 1).min(width as usize - 1);
+    let ly = y - y0 as f64;
+    let lx = x - x0 as f64;
+    let hy = 1.0 - ly;
+    let hx = 1.0 - lx;
+    (
+        [
+            y0 * width as usize + x0,
+            y0 * width as usize + x1,
+            y1 * width as usize + x0,
+            y1 * width as usize + x1,
+        ],
+        [hy * hx, hy * lx, ly * hx, ly * lx],
+    )
 }
 
 fn roi_align_claim(node: &NodeView) -> ClaimResult {
@@ -1778,18 +2135,25 @@ fn roi_align_claim(node: &NodeView) -> ClaimResult {
         _ => deny!("missing tensor type/shape info on an input or the output"),
     };
     require!(
-        is_mlx_float(x.dtype)
+        is_mlx_cpu_float(x.dtype)
             && out.dtype == x.dtype
-            && is_mlx_float(r.dtype)
-            && is_int_index(b.dtype),
-        "input/output must share one float dtype, rois must be float, and batch_indices int32/int64; got {} / {} / {} -> {}",
+            && r.dtype == x.dtype
+            && (x.dtype != 16 || node.since_version() >= 22)
+            && b.dtype == 7,
+        "X/rois/output must share float16/float32/float64 (bfloat16 since opset 22), batch_indices must be int64; got {} / {} / {} -> {}",
         crate::registry::ort_dtype_name(x.dtype),
         crate::registry::ort_dtype_name(r.dtype),
         crate::registry::ort_dtype_name(b.dtype),
         crate::registry::ort_dtype_name(out.dtype)
     );
     require!(
-        x.shape.len() == 4,
+        x.shape.len() == 4
+            && x.shape
+                .iter()
+                .chain(&r.shape)
+                .chain(&b.shape)
+                .chain(&out.shape)
+                .all(|&d| d <= i64::from(i32::MAX)),
         "input must have rank-4 shape, got {:?}",
         x.shape
     );
@@ -1805,8 +2169,8 @@ fn roi_align_claim(node: &NodeView) -> ClaimResult {
     );
     let sampling_ratio = node.int_attr("sampling_ratio", 0);
     require!(
-        sampling_ratio > 0,
-        "sampling_ratio must be positive, got {sampling_ratio}"
+        (0..=i64::from(i32::MAX)).contains(&sampling_ratio),
+        "sampling_ratio must be a nonnegative int32, got {sampling_ratio}"
     );
     let mode = node.string_attr("mode", "avg");
     require!(
@@ -1820,15 +2184,20 @@ fn roi_align_claim(node: &NodeView) -> ClaimResult {
         "spatial dimensions must be positive and batch_indices must match the ROI count"
     );
     require!(
-        node.int_attr("output_height", 1) > 0 && node.int_attr("output_width", 1) > 0,
-        "output_height and output_width must be positive"
+        [
+            node.int_attr("output_height", 1),
+            node.int_attr("output_width", 1)
+        ]
+        .iter()
+        .all(|&d| (1..=i64::from(i32::MAX)).contains(&d)),
+        "output_height and output_width must be positive int32"
     );
     require!(
         [
             node.int_attr("output_height", 1),
             node.int_attr("output_width", 1),
-            sampling_ratio,
-            sampling_ratio,
+            sampling_ratio.max(1),
+            sampling_ratio.max(1),
         ]
         .iter()
         .try_fold(1i64, |size, &dim| size.checked_mul(dim))
@@ -1844,10 +2213,47 @@ fn roi_align_claim(node: &NodeView) -> ClaimResult {
         },
     );
     require!(
-        ctm == "half_pixel" || ctm == "output_half_pixel",
+        (ctm == "half_pixel" || ctm == "output_half_pixel")
+            && (node.since_version() >= 16 || ctm == "output_half_pixel"),
         "coordinate_transformation_mode must be \"half_pixel\" or \"output_half_pixel\", got {ctm:?}"
     );
+    require!(
+        node.float_attr("spatial_scale", 1.0).is_finite(),
+        "spatial_scale must be finite"
+    );
+    let expected = [
+        r.shape[0],
+        x.shape[1],
+        node.int_attr("output_height", 1),
+        node.int_attr("output_width", 1),
+    ];
+    require!(
+        out.shape.len() == 4
+            && out
+                .shape
+                .iter()
+                .zip(expected)
+                .all(|(&a, b)| a < 0 || b < 0 || a == b),
+        "output must match [R,C,output_height,output_width]"
+    );
     Ok(())
+}
+
+fn roi_align_compile_safety(node: &NodeView) -> crate::registry::CompileShapeSafety {
+    use crate::registry::CompileShapeSafety;
+    if node.int_attr("sampling_ratio", 0) == 0 {
+        CompileShapeSafety::EagerOnly {
+            reason: "adaptive grids depend on live ROI values",
+        }
+    } else if node.input_info(0).is_some_and(|x| x.dtype == 11) {
+        CompileShapeSafety::EagerOnly {
+            reason: "float64 RoiAlign uses exact host arithmetic on the CPU route",
+        }
+    } else {
+        CompileShapeSafety::ShapeKeyedOnly {
+            reason: crate::registry::MLX_SLICE_SHAPE_REASON,
+        }
+    }
 }
 
 // =================================================================================================
@@ -2447,12 +2853,16 @@ pub fn register_vision(registry: &mut OpRegistry) {
         col2im_claim,
         crate::registry::MLX_SCATTER_SHAPE_REASON,
     );
-    shape_keyed(
-        registry,
-        "RoiAlign",
-        roi_align_op,
-        roi_align_claim,
-        crate::registry::MLX_SLICE_SHAPE_REASON,
+    registry.register_shape_classified(
+        OpRegistration {
+            domain: "",
+            op_type: "RoiAlign",
+            min_opset: 10,
+            max_opset: K_ANY_OPSET,
+            handler: roi_align_op,
+            claim: roi_align_claim,
+        },
+        roi_align_compile_safety,
     );
     shape_keyed(
         registry,
@@ -2474,6 +2884,107 @@ pub fn register_vision(registry: &mut OpRegistry) {
         non_max_suppression_op,
         non_max_suppression_claim,
     );
+}
+
+#[cfg(test)]
+mod roi_align_tests {
+    use super::{RoiAlignParams, roi_double_taps, roi_product};
+    use crate::engine::NodeDesc;
+    use crate::registry::CompileShapeSafety;
+
+    fn params() -> RoiAlignParams {
+        RoiAlignParams {
+            height: 2,
+            width: 3,
+            ratio: 0,
+            scale: 1.0,
+            half_pixel: true,
+            max: false,
+        }
+    }
+
+    #[test]
+    fn adaptive_counts_and_empty_geometry() {
+        let mut p = params();
+        assert_eq!(p.grid(&[0.0, 0.0, 6.0, 4.0], false).unwrap(), [2, 2]);
+        assert_eq!(p.grid(&[0.0, 0.0, 6.01, 4.01], false).unwrap(), [3, 3]);
+        assert_eq!(p.grid(&[0.0, 0.0, 0.0, 4.0], false).unwrap(), [0, 0]);
+        assert_eq!(p.grid(&[1.0, 1.0, 0.0, 0.0], false).unwrap(), [0, 0]);
+        p.half_pixel = false;
+        assert_eq!(p.grid(&[1.0, 1.0, 0.0, 0.0], false).unwrap(), [1, 1]);
+        p.ratio = 3;
+        assert_eq!(p.grid(&[0.0; 4], false).unwrap(), [3, 3]);
+    }
+
+    #[test]
+    fn geometry_overflow_and_f32_ceil_boundary() {
+        let mut p = params();
+        p.width = 1;
+        let just_over_one = 1.0 + 2f64.powi(-30);
+        assert_eq!(
+            p.grid(&[0.0, 0.0, just_over_one, 2.0], false).unwrap(),
+            [1, 1]
+        );
+        assert_eq!(
+            p.grid(&[0.0, 0.0, just_over_one, 2.0], true).unwrap(),
+            [1, 2]
+        );
+        assert!(p.grid(&[0.0, 0.0, 1e20, 2.0], false).is_err());
+        assert!(p.grid(&[0.0, 0.0, f64::MAX, f64::MAX], true).is_err());
+        assert!(roi_product(&[i32::MAX, 2]).is_err());
+        assert!(roi_product(&[-1, 0]).is_err());
+        assert_eq!(roi_product(&[i32::MAX, i32::MAX, 0]).unwrap(), 0);
+    }
+
+    #[test]
+    fn attributes_are_checked_before_i32_narrowing() {
+        let node = || {
+            NodeDesc::new(
+                "RoiAlign".into(),
+                "".into(),
+                22,
+                CompileShapeSafety::EagerOnly {
+                    reason: "unit test",
+                },
+            )
+        };
+        for (name, values) in [
+            ("sampling_ratio", vec![-1, i64::MAX, 1i64 << 32]),
+            ("output_height", vec![0, -1, i64::MAX, 1i64 << 32]),
+            ("output_width", vec![0, -1, i64::MAX, 1i64 << 32]),
+        ] {
+            for value in values {
+                let mut n = node();
+                n.ints.insert(name.into(), value);
+                assert!(RoiAlignParams::new(&n).is_err(), "{name}={value}");
+            }
+        }
+        let mut n = node();
+        n.ints.insert("sampling_ratio".into(), i64::from(i32::MAX));
+        assert!(RoiAlignParams::new(&n).is_err());
+        for scale in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut n = node();
+            n.floats.insert("spatial_scale".into(), scale);
+            assert!(RoiAlignParams::new(&n).is_err());
+        }
+    }
+
+    #[test]
+    fn exact_double_corner_weights_and_boundary() {
+        assert_eq!(
+            roi_double_taps(-1.0, -1.0, 3, 3),
+            ([0, 1, 3, 4], [1.0, 0.0, 0.0, 0.0])
+        );
+        assert_eq!(
+            roi_double_taps(3.0, 3.0, 3, 3),
+            ([8; 4], [1.0, 0.0, 0.0, 0.0])
+        );
+        assert_eq!(roi_double_taps(3.0001, 0.0, 3, 3), ([0; 4], [0.0; 4]));
+        assert_eq!(
+            roi_double_taps(0.25, 0.5, 3, 3),
+            ([0, 1, 3, 4], [0.375, 0.375, 0.125, 0.125])
+        );
+    }
 }
 
 #[cfg(test)]
