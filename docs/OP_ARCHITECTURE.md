@@ -145,9 +145,20 @@ logical/bitwise, all reductions, shape/data-movement, normalizations, attention,
 conv/pooling, quantization (Quantize/Dequantize/DynamicQuantize/MatMulInteger/ConvInteger/
 QLinearMatMul/QLinearConv), random, signal/FFT (DFT/STFT/windows/MelWeightMatrix — audio),
 vision/detection, **recurrent (RNN/GRU/LSTM and
-com.microsoft LinearAttention via a stable typed Metal prefill scan for `Dk <= 512`,
+com.microsoft LinearAttention via stable Metal prefill scans for `Dk <= 512`,
 with static unrolling for single-token, wider, and CPU-stream calls)**, **control flow (If/Scan/Loop via recursive
 subgraph-body translation)**, and host-computed data-dependent operators.
+
+LinearAttention preserves the original typed scan for `Dk <= 256`. The separate
+`257 <= Dk <= 512` scan widens original live inputs and keeps FP32 working state,
+rounding only output and final/window state stores to their declared types.
+Stored window slots do not round the ongoing recurrence. This preserves the
+recurrence, not literal intermediate half-precision rounding.
+For source isolation, the wider path leaves the original lazy preparation in
+place. Those unused arrays are not additional evaluation roots, but compiled
+`trace_transient` retains their arena handles until plan teardown. Fresh resource
+and performance evidence must include that per-cached-trace ownership cost;
+results for the earlier typed wide scan do not validate this implementation.
 
 These value-kind forms remain on ORT CPU because the current array-only EP boundary
 cannot materialize their results:
