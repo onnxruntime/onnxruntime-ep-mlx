@@ -535,7 +535,13 @@ def test_unique_schema_history_and_rejected_forms():
         model = _model(shape=[2])
         model.graph.input[0].type.tensor_type.elem_type = dtype
         model.graph.output[0].type.tensor_type.elem_type = dtype
-        with pytest.raises(Exception, match="fallback|explicitly assigned|not supported|NOT_IMPLEMENTED"):
+        rejection = "fallback|explicitly assigned|not supported|NOT_IMPLEMENTED"
+        if dtype in [T.COMPLEX64, T.COMPLEX128]:
+            rejection += (
+                rf"|MLDataType for: tensor\({T.DataType.Name(dtype).lower()}\)"
+                " is not currently registered or supported"
+            )
+        with pytest.raises(Exception, match=rejection):
             _session(model)
     for sorted in [-1, 2, 2**63 - 1]:
         with pytest.raises(Exception, match="sorted|fallback|explicitly assigned|not supported"):
