@@ -3405,14 +3405,14 @@ fn upsample_claim(node: &NodeView) -> ClaimResult {
             "Upsample: scales must be a constant float32 initializer because output shape is scale-dependent"
         ),
     };
-    for axis in 0..rank {
-        let expected = (input.shape[axis] as f64 * scales[axis] as f64).floor() as i64;
+    for (axis, &scale) in scales.iter().enumerate().take(rank) {
+        let expected = (input.shape[axis] as f64 * scale as f64).floor() as i64;
         require!(
             output.shape[axis] == expected,
             "Upsample: output dim {axis} ({}) must equal floor(input {} * scale {}) = {expected}",
             output.shape[axis],
             input.shape[axis],
-            scales[axis]
+            scale
         );
     }
     Ok(())

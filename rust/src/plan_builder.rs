@@ -239,6 +239,10 @@ fn initializer_scope(
     Ok(inits)
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "explicit graph snapshot and root/enclosing binding scopes"
+)]
 fn build_graph(
     api: &ort::OrtApi,
     snapshot: &OrtGraphSnapshot,
@@ -318,7 +322,7 @@ fn build_graph(
                             metadata.name
                         ));
                     }
-                    let name = snapshot.values[&value].name.clone();
+                    let name = snapshot.values[value].name.clone();
                     if snapshot.ir.value(*value).producer.is_some()
                         || (!root && formals.contains(&name))
                     {
@@ -348,10 +352,10 @@ fn build_graph(
                     otype: 0,
                 },
                 Some(value) => {
-                    let name = snapshot.values[&value].name.clone();
+                    let name = snapshot.values[value].name.clone();
                     let external = root && ctx_outputs.contains_key(value);
                     OutRef {
-                        otype: snapshot.values[&value]
+                        otype: snapshot.values[value]
                             .tensor
                             .as_ref()
                             .and_then(|tensor| tensor.dtype)
@@ -705,10 +709,10 @@ unsafe fn collect_attributes(api: &ort::OrtApi, node: *const ort::OrtNode, desc:
                     value.split_terminator('\0').map(str::to_owned).collect(),
                 );
             }
-        } else if ty == ort::OrtOpAttrType_ORT_OP_ATTR_TENSOR {
-            if let Some(value) = unsafe { read_tensor_attr(api, attr) } {
-                desc.tensors.insert(name, value);
-            }
+        } else if ty == ort::OrtOpAttrType_ORT_OP_ATTR_TENSOR
+            && let Some(value) = unsafe { read_tensor_attr(api, attr) }
+        {
+            desc.tensors.insert(name, value);
         }
     }
 }

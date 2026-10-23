@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}-${{ github.event_name == 'workflow_dispatch' }}
+  cancel-in-progress: true
+
 # ONNX Runtime telemetry is deliberately NOT disabled here. It stays off on developer
 # machines (rootdir conftest.py) and on in CI, so ORT's maintainers still see the runtime
 # being used. If a job flakes on exit 134 with a green test summary, that is ORT's telemetry
@@ -29,6 +33,42 @@ jobs:
 
       - name: Check formatting
         run: cargo fmt --manifest-path rust/Cargo.toml --all -- --check
+
+  lint:
+    name: Clippy (macOS arm64)
+    runs-on: macos-15
+    env:
+      ORT_VERSION: "1.31.0"
+      MLX_VERSION: "0.32.4"
+      MLX_COMMIT: "36969c094354086e15d2a327a9c50feb20b9cf11"
+      MLXC_COMMIT: "57731b00e8bed710e0750e7356da9f18f8eb3e20"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: ./.github/actions/setup-mlx
+        with:
+          mlx-version: ${{ env.MLX_VERSION }}
+          mlx-commit: ${{ env.MLX_COMMIT }}
+          mlxc-commit: ${{ env.MLXC_COMMIT }}
+
+      - name: Install Rust toolchain (rustup — no third-party action, supply-chain hardening)
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy --no-self-update
+          rustup default stable
+          cargo clippy --version
+
+      - name: Provision ONNX Runtime ${{ env.ORT_VERSION }}
+        run: |
+          set -euo pipefail
+          curl -fsSL \
+            "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-osx-arm64-${ORT_VERSION}.tgz" \
+            | tar xz
+          echo "ORT_HOME=$PWD/onnxruntime-osx-arm64-${ORT_VERSION}" >> "$GITHUB_ENV"
+
+      - name: Clippy (all targets, warnings denied)
+        run: |
+          cd rust
+          ORT_INCLUDE_DIR="$ORT_HOME/include" RUSTFLAGS="-D warnings" cargo clippy --release --all-targets -- -D warnings
 
   build-test:
     name: Build + op tests (macOS arm64)

@@ -749,7 +749,7 @@ fn grid_sample_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxE
         shapes.push(shape);
     }
     let (xs, gs) = (&shapes[0], &shapes[1]);
-    let out_shape = gs_shape(&xs, &gs)?;
+    let out_shape = gs_shape(xs, gs)?;
     let rank = xs.len() - 2;
     let (nn, cc) = (xs[0], xs[1]);
     if gs_product(&out_shape)? == 0 {
@@ -1141,7 +1141,7 @@ fn affine_grid_claim(node: &NodeView) -> ClaimResult {
     let align = node.int_attr("align_corners", 0);
     require!(matches!(align, 0 | 1), "align_corners must be 0 or 1");
     if let Some(size) = node.read_const_ints_any(1) {
-        let mut theta = vec![size.first().copied().unwrap_or(-1), rank, rank + 1];
+        let mut theta = [size.first().copied().unwrap_or(-1), rank, rank + 1];
         if t.shape[0] >= 0 {
             theta[0] = t.shape[0];
         }
@@ -1260,6 +1260,10 @@ impl Col2ImGeometry {
 // Metal scatter reductions reject 64-bit integers. Inverting the map gives each output one
 // contribution per kernel position, so ordinary same-dtype add/OR preserves integer and bool bits.
 // The same map avoids fp32 accumulation for float64 on the MLX CPU stream.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "explicit Col2Im tensor, geometry and spatial attributes"
+)]
 fn col2im_exact(
     ctx: &mut TranslationContext,
     input: mlx::mlx_array,
@@ -1737,7 +1741,9 @@ fn validate_roi_align(
         return Err("RoiAlign: all ROI coordinates must be finite".into());
     }
     values
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|roi| {
             let grid = params.grid(roi, n.outputs[0].otype == 11)?;
             roi_product(&[xs[1], params.height, params.width, grid[0], grid[1]])?;
@@ -2027,7 +2033,7 @@ fn roi_align_double(
     let mut output = Vec::with_capacity(size);
     let scale = f64::from(params.scale);
     let offset = if params.half_pixel { 0.5 } else { 0.0 };
-    for ((roi, &batch), &[gh, gw]) in rois.chunks_exact(4).zip(&batches).zip(grids) {
+    for ((roi, &batch), &[gh, gw]) in rois.as_chunks::<4>().0.iter().zip(&batches).zip(grids) {
         let start_x = roi[0] * scale - offset;
         let start_y = roi[1] * scale - offset;
         let mut extent_x = roi[2] * scale - offset - start_x;

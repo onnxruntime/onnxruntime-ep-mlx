@@ -386,8 +386,14 @@ mod tests {
                     reason: EAGER_REASON,
                 },
             );
-            assert!(!crate::compiled::decode_enabled(false, &[node.clone()]));
-            assert!(!crate::compiled::general_enabled(false, &[node.clone()]));
+            assert!(!crate::compiled::decode_enabled(
+                false,
+                std::slice::from_ref(&node)
+            ));
+            assert!(!crate::compiled::general_enabled(
+                false,
+                std::slice::from_ref(&node)
+            ));
             let mut attention = node.clone();
             attention.op_type = "GroupQueryAttention".into();
             attention.compile_shape_safety = CompileShapeSafety::Shapeless;

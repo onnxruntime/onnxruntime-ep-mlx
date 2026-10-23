@@ -526,12 +526,12 @@ fn merge_broadcast_dim(existing: i64, next: i64) -> Option<i64> {
     if existing < 0 && next < 0 {
         None
     } else if existing == next || next == 1 {
-        if (existing == 0 || existing < 0) && next == 1 {
+        if existing <= 0 && next == 1 {
             return None;
         }
         Some(existing)
     } else if existing == 1 {
-        if next == 0 || next < 0 {
+        if next <= 0 {
             return None;
         }
         Some(next)
