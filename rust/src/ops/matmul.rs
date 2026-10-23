@@ -150,8 +150,10 @@ fn cdist_op(ctx: &mut TranslationContext, node: &NodeDesc) -> Result<(), MlxErro
     let euclidean = metric == "euclidean";
     let bytes: Vec<u8> = if dtype == mlx::mlx_dtype__MLX_FLOAT64 {
         let decode = |data: &[u8]| {
-            data.chunks_exact(8)
-                .map(|v| f64::from_ne_bytes(v.try_into().unwrap()))
+            data.as_chunks::<8>()
+                .0
+                .iter()
+                .map(|v| f64::from_ne_bytes(*v))
                 .collect::<Vec<_>>()
         };
         cdist_values(&decode(&a), &decode(b.data), m, k, features, |sum| {
@@ -162,8 +164,10 @@ fn cdist_op(ctx: &mut TranslationContext, node: &NodeDesc) -> Result<(), MlxErro
         .collect()
     } else {
         let decode = |data: &[u8]| {
-            data.chunks_exact(4)
-                .map(|v| f32::from_ne_bytes(v.try_into().unwrap()))
+            data.as_chunks::<4>()
+                .0
+                .iter()
+                .map(|v| f32::from_ne_bytes(*v))
                 .collect::<Vec<_>>()
         };
         cdist_values(&decode(&a), &decode(b.data), m, k, features, |sum| {
