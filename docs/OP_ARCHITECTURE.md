@@ -232,6 +232,23 @@ The explicit schema formulas are used for cases where ORT's LRN kernel only
 accepts rank four or the Python reference mishandles channel iteration or
 negative-input L1 norms.
 
+`BatchNormalization` implements versioned inference and training, including
+legacy version-7 nonspatial features and version-9 rank-one inputs (`C=1`).
+Version 14 separates statistic types from data/affine types; version 15 also
+allows independent affine types. Supported floating groups, including mixed
+float64, compute in float32 or MLX CPU float64 and cast each output to its
+declared type. Training uses population variance, live momentum updates, and
+optional output slots without freezing inputs. Legacy version-7/9 training
+selects five output slots and returns inverse standard deviation in the
+historically named `saved_var` slot, matching ORT; modern training selects
+three slots. Version-7 nonspatial training composes the equivalent flattened
+feature operation. Empty training populations produce NaN channel statistics,
+while empty channel vectors remain empty. Runtime shape/parameter validation
+and capture classification follow the spatial normalization rules above.
+Version-1/6 inference honors `is_test` instead of silently treating training
+as inference; their training forms remain unclaimed pending the explicit
+mandatory in-place running-statistic contract, not an unavailable MLX kernel.
+
 Metal has no float64 kernels; supported float64 forms run through MLX CPU, while
 other forms fall back to ORT CPU. Empty/dynamic support is per-handler, not a
 blanket guarantee. Claimed control-flow nodes translate supported tensor bodies;
