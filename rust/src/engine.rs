@@ -1232,12 +1232,32 @@ impl<'a> TranslationContext<'a> {
         }
     }
 
-    /// Read a constant int64 parameter input (shape/axes/starts/ends/steps/pads/repeats/split) as a
-    /// host `Vec<i64>` at translate time. The claim predicate verified it is a tensor(int64) input.
+    /// Read an int32/int64 host parameter exactly, widening int32 values before use.
     pub fn read_ints(&self, r: &TensorRef) -> Result<Vec<i64>, MlxError> {
         let h = self.raw_host(r)?;
-        if h.data.is_null() {
+        if !matches!(
+            h.dtype,
+            ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32
+                | ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64
+        ) {
+            return Err(format!(
+                "MLX: integer parameter {} must be int32/int64",
+                r.name
+            ));
+        }
+        if h.count == 0 {
             return Ok(Vec::new());
+        }
+        if h.data.is_null() {
+            return Err(format!("MLX: integer parameter {} has null data", r.name));
+        }
+        if h.dtype == ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32 {
+            return Ok(
+                unsafe { std::slice::from_raw_parts(h.data as *const i32, h.count) }
+                    .iter()
+                    .map(|&value| i64::from(value))
+                    .collect(),
+            );
         }
         let p = h.data as *const i64;
         Ok(unsafe { std::slice::from_raw_parts(p, h.count) }.to_vec())
