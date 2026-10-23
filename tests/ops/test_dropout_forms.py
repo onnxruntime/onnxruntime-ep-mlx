@@ -7,7 +7,7 @@ import onnx_ir as ir
 import onnxruntime as ort
 import pytest
 from onnx_ir import DataType as DT
-from onnxruntime.capi.onnxruntime_pybind11_state import Fail, InvalidArgument, RuntimeException
+from onnxruntime.capi.onnxruntime_pybind11_state import EPFail
 
 
 def _value(name, dtype, shape):
@@ -84,7 +84,9 @@ def _session(model):
     options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
     options.log_severity_level = 3
     options.add_session_config_entry("session.disable_cpu_ep_fallback", "1")
-    return ort.InferenceSession(model, options, providers=["MLXExecutionProvider"])
+    session = ort.InferenceSession(model, options, providers=["MLXExecutionProvider"])
+    session.disable_fallback()
+    return session
 
 
 @pytest.fixture(params=[False, True], ids=["default", "eager"])
@@ -155,7 +157,7 @@ def test_dropout_live_controls_and_error_recovery(execution):
         if not training or ratio == 0:
             assert mask.all()
     for ratio in [np.nan, np.inf, -0.5, 1, 2]:
-        with pytest.raises((Fail, InvalidArgument, RuntimeException), match="Dropout training ratio"):
+        with pytest.raises(EPFail, match="Dropout training ratio"):
             session.run(None, {
                 "x": x, "ratio": np.asarray(ratio, np.float32), "training": np.asarray(True),
             })
@@ -213,7 +215,7 @@ def test_dropout_unknown_control_rank_validation(execution):
     x = np.ones(256, np.float32)
     for ratio, training in [(np.array([0.5], np.float32), np.asarray(True)),
                             (np.asarray(0.5, np.float32), np.array([True]))]:
-        with pytest.raises((Fail, InvalidArgument, RuntimeException), match="scalar"):
+        with pytest.raises(EPFail, match="scalar"):
             session.run(None, {"x": x, "ratio": ratio, "training": training})
     y, mask = session.run(None, {
         "x": x, "ratio": np.asarray(0.5, np.float32), "training": np.asarray(True),
