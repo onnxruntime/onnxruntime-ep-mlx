@@ -1045,16 +1045,51 @@ fn split_to_sequence_op(_ctx: &mut TranslationContext, _n: &NodeDesc) -> Result<
     )
 }
 
+fn checked_tile_shape(shape: &[i64], repeats: &[i64]) -> Result<Vec<i32>, MlxError> {
+    if shape.len() != repeats.len() {
+        return Err("Tile repeats length must equal input rank".to_string());
+    }
+    shape
+        .iter()
+        .zip(repeats)
+        .map(|(&dim, &repeat)| {
+            if dim < 0 || repeat < 0 {
+                return Err("Tile dimensions and repeats must be nonnegative".to_string());
+            }
+            let output = dim
+                .checked_mul(repeat)
+                .and_then(|value| i32::try_from(value).ok())
+                .ok_or_else(|| "Tile output dimension exceeds int32".to_string())?;
+            Ok(output)
+        })
+        .collect()
+}
+
 fn tile_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
-    let data = ctx.resolve(&n.inputs[0])?;
     if ctx.native_attention_decode() && ctx.rope_dynamic() && !n.inputs[1].constant {
         // The token-at-a-time decoder repeats are [1, 1]. Keep this as graph data instead of
         // forcing a host read during the shapeless compiled trace.
+        let data = ctx.resolve(&n.inputs[0])?;
         ctx.bind(&n.outputs[0], data);
         return Ok(());
     }
+    if ctx.tensor_shape(&n.inputs[1])?.len() != 1 {
+        return Err("Tile repeats must be a one-dimensional int64 tensor".to_string());
+    }
+    let shape = ctx.tensor_shape(&n.inputs[0])?;
     let repeats = read_ints(ctx, n, 1)?;
-    let reps: Vec<i32> = repeats.iter().map(|&x| x as i32).collect();
+    let output = checked_tile_shape(&shape, &repeats)?;
+    if output.contains(&0) {
+        let dtype = mlx_dtype_from_onnx(n.outputs[0].otype);
+        let empty = ctx.zeros(&output, dtype)?;
+        ctx.bind(&n.outputs[0], empty);
+        return Ok(());
+    }
+    let reps = repeats
+        .iter()
+        .map(|&repeat| i32::try_from(repeat).map_err(|_| "Tile repeat exceeds int32".to_string()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let data = ctx.resolve(&n.inputs[0])?;
     let r = ctx.emit(|res, s| unsafe { mlx::mlx_tile(res, data, reps.as_ptr(), reps.len(), s) })?;
     ctx.bind(&n.outputs[0], r);
     Ok(())
@@ -2811,7 +2846,49 @@ fn tile_claim(node: &NodeView) -> ClaimResult {
         node.is_const_int64(1),
         "Tile: only a constant `repeats` initializer is claimed; this node's is a runtime value — stays on CPU"
     );
+    require!(
+        node.input_info(1).is_some_and(|info| info.shape.len() == 1),
+        "Tile repeats must be a one-dimensional int64 tensor"
+    );
+    let repeats = match node.read_const_int64(1) {
+        Some(repeats) => repeats,
+        None => deny!("Tile repeats initializer could not be read"),
+    };
+    require!(
+        repeats.iter().all(|&repeat| repeat >= 0),
+        "Tile repeats must be nonnegative"
+    );
+    if node.input_rank_known(0) == Some(true)
+        && let Some(info) = node.input_info(0)
+    {
+        require!(
+            repeats.len() == info.shape.len(),
+            "Tile repeats length must equal input rank"
+        );
+        for (&dim, &repeat) in info.shape.iter().zip(&repeats) {
+            if dim >= 0 {
+                let checked = checked_tile_shape(&[dim], &[repeat]);
+                require!(checked.is_ok(), "{}", checked.unwrap_err());
+            }
+        }
+    }
     Ok(())
+}
+
+fn tile_compile_shape_safety(node: &NodeView) -> crate::registry::CompileShapeSafety {
+    // Runtime repeats remain exclusively admitted by the existing native RoPE capability path.
+    if !node.is_const_int64(1)
+        || (node.input_rank_known(0) == Some(true)
+            && node
+                .input_info(0)
+                .is_some_and(|info| info.shape.iter().all(|&dim| dim > 0)))
+    {
+        crate::registry::CompileShapeSafety::Shapeless
+    } else {
+        crate::registry::CompileShapeSafety::ShapeKeyedOnly {
+            reason: "Tile builds concrete reshape and broadcast targets from input geometry",
+        }
+    }
 }
 
 fn pad_claim(node: &NodeView) -> ClaimResult {
@@ -3617,7 +3694,17 @@ pub fn register(registry: &mut OpRegistry) {
         handler: split_to_sequence_op,
         claim: split_to_sequence_claim,
     });
-    shapeless(registry, "Tile", tile_op, tile_claim);
+    registry.register_shape_classified(
+        OpRegistration {
+            domain: "",
+            op_type: "Tile",
+            min_opset: 1,
+            max_opset: K_ANY_OPSET,
+            handler: tile_op,
+            claim: tile_claim,
+        },
+        tile_compile_shape_safety,
+    );
     shape_keyed(
         registry,
         "Pad",
@@ -3676,8 +3763,33 @@ pub fn register(registry: &mut OpRegistry) {
 mod tests {
     use super::{
         checked_flatten_axis, checked_flatten_shape, checked_pad_axes, checked_pad_geometry,
-        checked_rank_change_axes, checked_split_sizes, checked_transpose_perm, integer_range_count,
+        checked_rank_change_axes, checked_split_sizes, checked_tile_shape, checked_transpose_perm,
+        integer_range_count,
     };
+
+    #[test]
+    fn tile_geometry_checks_full_width_repeats_without_broadcasting() {
+        assert_eq!(checked_tile_shape(&[], &[]).unwrap(), Vec::<i32>::new());
+        assert_eq!(checked_tile_shape(&[2, 3], &[2, 4]).unwrap(), vec![4, 12]);
+        assert_eq!(
+            checked_tile_shape(&[0, 2], &[i64::MAX, 3]).unwrap(),
+            vec![0, 6]
+        );
+        assert_eq!(
+            checked_tile_shape(&[0, i64::MAX], &[1, 0]).unwrap(),
+            vec![0, 0]
+        );
+        for (shape, repeats) in [
+            (vec![2, 3], vec![2]),
+            (vec![2, 3], vec![1, 2, 3]),
+            (vec![0], vec![-(1i64 << 32)]),
+            (vec![1], vec![1i64 << 32]),
+            (vec![2], vec![i64::MAX]),
+            (vec![-1], vec![0]),
+        ] {
+            assert!(checked_tile_shape(&shape, &repeats).is_err());
+        }
+    }
 
     #[test]
     fn transpose_permutations_preserve_rank_and_full_width_bounds() {

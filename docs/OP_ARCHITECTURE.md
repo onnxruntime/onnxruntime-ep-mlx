@@ -183,6 +183,16 @@ wide axes are not normalized into valid permutations. Omitted permutations
 reverse the actual rank, including scalars; unknown ranks are shape-keyed.
 Both views preserve exact numeric/Boolean payload bits, with float64 on MLX CPU.
 
+Modern `Tile` validates constant int64 repeats as a rank-one vector matching the
+data rank, with nonnegative counts and checked output dimensions. It does not
+apply NumPy's implicit rank broadcasting. Empty outputs are constructed from
+metadata without importing unused payloads, including full-width repeat counts
+on zero dimensions and wide empty input dimensions canceled by zero repeats.
+Changing input geometry uses shape-keyed traces because MLX Tile captures
+concrete reshape/broadcast targets. General live repeats and the legacy
+three-floating-input Tile-1 form are not enabled by this coverage; the existing
+native RoPE capability path retains its separate runtime-repeat policy.
+
 Sequence **inputs** are supported by `SequenceLength`, `SequenceAt`, and
 `ConcatFromSequence` from opset 11 onward. These handlers execute eagerly and
 re-read the live ORT sequence on every invocation. Element copies own their MLX
