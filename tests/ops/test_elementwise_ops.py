@@ -442,11 +442,11 @@ def test_mod_int(fmod: int) -> None:
         "a": np.array([[7, -7, 7], [-7, 8, -8]], dtype=np.int64),
         "b": np.array([3, 3, -3], dtype=np.int64),
     }
-    # fmod=1 on integers is left to CPU (float-only claim); fmod=0 is claimed.
+    # Mod13 makes integer fmod=1 invalid, even though ORT CPU accepts it.
     if fmod == 0:
         check(model, feeds, rtol=0, atol=0)
     else:
-        m.assert_matches_cpu(model, feeds, rtol=0, atol=0)
+        m.assert_op_declined(model, feeds, "Mod")
 
 
 # --- BitShift -----------------------------------------------------------------------------------
