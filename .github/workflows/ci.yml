@@ -112,6 +112,43 @@ jobs:
       - name: Python test deps
         run: python -m pip install --upgrade "onnxruntime==${ORT_VERSION}" "onnx==${ONNX_VERSION}" numpy onnx_ir pytest
 
+      - name: Resize unchanged-extent baseline failure control
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          # Roll back only the Resize handler file; this is not a pristine base-tree build.
+          git fetch --no-tags --depth=1 origin "$BASE_SHA"
+          saved=$(mktemp)
+          cp rust/src/ops/shape.rs "$saved"
+          trap 'cp "$saved" rust/src/ops/shape.rs; rm -f "$saved"' EXIT
+          git show "$BASE_SHA:rust/src/ops/shape.rs" > rust/src/ops/shape.rs
+          if ! grep -Fq 'if input_len == output_len {' rust/src/ops/shape.rs; then
+            echo "Base no longer contains the defective shortcut; baseline control not applicable."
+            exit 0
+          fi
+          ORT_INCLUDE_DIR="$ORT_HOME/include" RUSTFLAGS="-D warnings" \
+            cargo build --manifest-path rust/Cargo.toml --release
+          export ONNXRUNTIME_MLX_EP_LIB="$PWD/rust/target/release/libonnxruntime_mlx_ep.dylib"
+          export DYLD_LIBRARY_PATH="$ORT_HOME/lib"
+          status=0
+          python -m pytest \
+            'tests/ops/test_resize.py::test_resize_same_extent_nearest_counterexample[default]' \
+            -q --junitxml=resize-baseline.xml || status=$?
+          test "$status" -eq 1
+          python - <<'PY'
+          import xml.etree.ElementTree as ET
+          cases = list(ET.parse("resize-baseline.xml").getroot().iter("testcase"))
+          assert len(cases) == 1
+          assert cases[0].find("error") is None
+          failure = cases[0].find("failure")
+          assert failure is not None
+          assert "Arrays are not equal" in (failure.text or "")
+          assert "ACTUAL: array([[[[0., 1., 2., 3.]]]]" in (failure.text or "")
+          assert "DESIRED: array([[[[0., 1., 2., 2.]]]]" in (failure.text or "")
+          PY
+
       - name: Build the Rust EP (cargo)
         run: |
           cd rust
@@ -125,6 +162,13 @@ jobs:
           export DYLD_LIBRARY_PATH="$ORT_HOME/lib"
           ORT_INCLUDE_DIR="$ORT_HOME/include" RUSTFLAGS="-D warnings" cargo test --release --lib
 
+      - name: Focused Resize unchanged-extent regressions
+        run: |
+          export ONNXRUNTIME_MLX_EP_LIB="$PWD/rust/target/release/libonnxruntime_mlx_ep.dylib"
+          export DYLD_LIBRARY_PATH="$ORT_HOME/lib"
+          python -m pytest tests/ops/test_resize.py \
+            -k 'not Upsample and not upsample9' -q --junitxml=resize-tests.xml
+
       - name: Op-correctness tests (pytest, MLX vs ORT CPU)
         run: |
           export ONNXRUNTIME_MLX_EP_LIB="$PWD/rust/target/release/libonnxruntime_mlx_ep.dylib"
@@ -136,7 +180,10 @@ jobs:
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: op-test-results
-          path: op-tests.xml
+          path: |
+            op-tests.xml
+            resize-tests.xml
+            resize-baseline.xml
           if-no-files-found: error
 
       - name: Leak check (macOS `leaks` — RAII teardown gate)

@@ -359,6 +359,21 @@ def _strict_resize_session(model):
     return session
 
 
+def test_resize_same_extent_nearest_counterexample(resize_route):
+    shape = [1, 1, 1, 4]
+    data = np.array([0, 1, 2, 3], np.float32).reshape(shape)
+    expected = np.array([0, 1, 2, 2], np.float32).reshape(shape)
+    model = build_resize(
+        dt=np.float32, in_shape=shape, out_shape=shape,
+        scales=np.array([1, 1, 1, 1.2], np.float32),
+        mode="nearest", ctm="half_pixel", nmode="round_prefer_floor",
+    )
+    actual = _strict_resize_session(model).run(None, {"x": data})[0]
+    assert actual.shape == expected.shape
+    assert actual.dtype == expected.dtype
+    np.testing.assert_array_equal(actual, expected)
+
+
 def _upsample9(*, dt, shape, scales, mode):
     x = m.tensor("x", _IR_OF[np.dtype(dt)], shape)
     out = m.tensor("o", _IR_OF[np.dtype(dt)], shape)
