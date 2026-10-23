@@ -262,13 +262,10 @@ fn random_like_input_supported(node: &NodeView, dtype: ort::ONNXTensorElementDat
         return false;
     }
     is_mlx_supported(dtype)
-        || matches!(
-            dtype,
-            ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_DOUBLE
-                | ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_STRING
-                | ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_COMPLEX64
-                | ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_COMPLEX128
-        )
+        || dtype == ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_DOUBLE
+        || dtype == ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_STRING
+        || dtype == ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_COMPLEX64
+        || dtype == ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_COMPLEX128
 }
 
 fn random_like_claim(node: &NodeView, normal: bool) -> ClaimResult {
