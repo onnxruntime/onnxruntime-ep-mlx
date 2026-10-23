@@ -36,7 +36,7 @@ def _session(model, *, mixed=False, profile=None):
     session = ort.InferenceSession(
         model, options,
         providers=["MLXExecutionProvider", "CPUExecutionProvider"] if mixed
-        else ["MLXExecutionProvider"],
+        else ["MLXExecutionProvider"], enable_fallback=False,
     )
     session.disable_fallback()
     return session
