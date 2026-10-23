@@ -613,6 +613,11 @@ fn loop_claim(node: &NodeView) -> ClaimResult {
     require!(ninputs >= 2, "{}", UNSUPPORTED);
     let num_state = ninputs - 2;
     require!(is_int64(node, 0) && is_bool(node, 1), "{}", UNSUPPORTED);
+    require!(
+        node.input_is_host_readable(0) && node.input_is_host_readable(1),
+        "Loop: trip count and initial condition must be graph inputs/initializers \
+         (node-produced controls run on CPU)"
+    );
 
     let subs = node.subgraphs();
     require!(subs.len() == 1 && subs[0].0 == "body", "{}", UNSUPPORTED);
