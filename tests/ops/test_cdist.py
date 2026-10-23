@@ -114,7 +114,8 @@ def test_cdist_symbolic_geometry_empty_and_recovery(dtype, metric, eager, monkey
         a = np.arange(m * n, dtype=dtype).reshape(m, n)
         b = -np.arange(k * n, dtype=dtype).reshape(k, n)
         _compare(session.run(None, {"a": a, "b": b})[0], _reference(a, b, metric))
-    with pytest.raises(ERRORS):
+    with pytest.raises(ort.capi.onnxruntime_pybind11_state.EPFail,
+                       match="CDist: A and B feature dimensions must match"):
         session.run(None, {"a": np.ones((2, 3), dtype), "b": np.ones((4, 2), dtype)})
     a, b = np.ones((2, 3), dtype), np.zeros((4, 3), dtype)
     _compare(session.run(None, {"a": a, "b": b})[0], _reference(a, b, metric))
