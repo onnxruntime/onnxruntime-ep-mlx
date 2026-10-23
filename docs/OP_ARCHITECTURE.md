@@ -163,6 +163,15 @@ vision/detection, **recurrent (RNN/GRU/LSTM and
 com.microsoft LinearAttention via static unrolling)**, **control flow (If/Scan/Loop via recursive
 subgraph-body translation)**, and host-computed data-dependent operators.
 
+`MeanVarianceNormalization` follows the schema-9/13 second-moment expression:
+the epsilon is added after the square root, not inside it. Default axes are
+exactly `[0, 2, 3]`; explicit empty axes reduce all dimensions, including scalar
+inputs. Axes are checked at full integer width before native reduction. Narrow
+floating inputs use float32 arithmetic and round the result back to the input
+type; float64 uses MLX CPU. Empty outputs are built from live metadata without
+reading payloads. Dynamic ranks and empty geometry use shape-keyed compilation,
+so replay cannot freeze a first-call axis list or empty-output branch.
+
 These value-kind forms remain on ORT CPU because the current array-only EP boundary
 cannot materialize their results:
 
