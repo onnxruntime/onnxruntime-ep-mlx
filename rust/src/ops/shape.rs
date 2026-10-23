@@ -1076,23 +1076,32 @@ fn read_range_scalar(
 }
 
 fn shape_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
-    let data = ctx.resolve(&n.inputs[0])?;
-    let input_shape = ctx.shape_of(data);
+    let input_shape = ctx.tensor_shape(&n.inputs[0])?;
     let rank = input_shape.len() as i64;
     let start_attr = int_attr(n, "start", 0);
     let end_attr = int_attr(n, "end", rank);
     let (start, end) = shape_interval(rank, start_attr, end_attr);
-    let result: Vec<i64> = (start..end)
-        .map(|i| input_shape[i as usize] as i64)
-        .collect();
-    let out = ctx.from_host_i64(&result, &[result.len() as i32]);
+    let result: Vec<i64> = (start..end).map(|i| input_shape[i as usize]).collect();
+    let length = i32::try_from(result.len())
+        .map_err(|_| "MLX Shape: output length exceeds native i32 shape range".to_string())?;
+    let out = ctx.from_host_i64(&result, &[length]);
     ctx.bind(&n.outputs[0], out);
     Ok(())
 }
 
 fn size_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
-    let data = ctx.resolve(&n.inputs[0])?;
-    let size = ctx.size_of(data) as i64;
+    let shape = ctx.tensor_shape(&n.inputs[0])?;
+    if shape.iter().any(|&dim| dim < 0) {
+        return Err("MLX Size: runtime tensor has a negative dimension".to_string());
+    }
+    let size = if shape.contains(&0) {
+        0
+    } else {
+        shape.iter().try_fold(1i64, |size, &dim| {
+            size.checked_mul(dim)
+                .ok_or_else(|| "MLX Size: element count exceeds int64".to_string())
+        })?
+    };
     let out = ctx.from_host_i64(&[size], &[]);
     ctx.bind(&n.outputs[0], out);
     Ok(())
@@ -2295,11 +2304,8 @@ fn shape_claim(node: &NodeView) -> ClaimResult {
         node.num_outputs()
     );
     let data = match node.input_info(0) {
-        Some(d) if is_movable(d.dtype) => d,
-        Some(d) => deny!(
-            "data dtype {} is not a movable dtype supported on GPU",
-            crate::registry::ort_dtype_name(d.dtype)
-        ),
+        Some(d) if d.dtype != 0 => d,
+        Some(_) => deny!("Shape: data tensor dtype must be known"),
         None => deny!("missing data tensor type/shape info"),
     };
     let out = match node.output_info(0) {
@@ -2319,7 +2325,7 @@ fn shape_claim(node: &NodeView) -> ClaimResult {
     let rank = data.shape.len() as i64;
     let (s, e) = shape_interval(rank, node.int_attr("start", 0), node.int_attr("end", rank));
     require!(
-        out.shape[0] == e - s,
+        node.input_rank_known(0) != Some(true) || out.shape[0] < 0 || out.shape[0] == e - s,
         "Shape: output extent {} must equal the sliced rank interval {} (start..end)",
         out.shape[0],
         e - s
@@ -2335,8 +2341,8 @@ fn size_claim(node: &NodeView) -> ClaimResult {
         node.num_outputs()
     );
     require!(
-        matches!(node.input_info(0), Some(d) if is_movable(d.dtype)),
-        "Size: data must have a movable GPU dtype with known tensor info"
+        matches!(node.input_info(0), Some(d) if d.dtype != 0),
+        "Size: data must have known tensor type information"
     );
     require!(
         matches!(node.output_info(0), Some(o)
@@ -2345,6 +2351,32 @@ fn size_claim(node: &NodeView) -> ClaimResult {
         "Size: output must be a scalar int64 tensor"
     );
     Ok(())
+}
+
+fn metadata_compile_shape_safety(node: &NodeView) -> crate::registry::CompileShapeSafety {
+    use crate::registry::CompileShapeSafety;
+    match node.input_info(0) {
+        Some(info)
+            if !is_movable(info.dtype) || info.shape.iter().any(|&dim| dim > i32::MAX as i64) =>
+        {
+            CompileShapeSafety::EagerOnly {
+                reason: "conservatively reads non-MLX tensor geometry without converting payloads",
+            }
+        }
+        Some(info)
+            if node.input_rank_known(0) == Some(true)
+                && info.shape.iter().all(|&dim| dim >= 0)
+                && node.input_is_host_readable(0) =>
+        {
+            CompileShapeSafety::Shapeless
+        }
+        Some(_) => CompileShapeSafety::ShapeKeyedOnly {
+            reason: "runtime and intermediate tensor metadata must not freeze in shapeless traces",
+        },
+        None => CompileShapeSafety::EagerOnly {
+            reason: "conservatively requires live tensor metadata",
+        },
+    }
 }
 
 fn constant_of_shape_claim(node: &NodeView) -> ClaimResult {
@@ -2806,8 +2838,28 @@ pub fn register(registry: &mut OpRegistry) {
     );
     shapeless(registry, "Identity", identity_op, identity_claim);
     shapeless(registry, "Range", range_op, range_claim);
-    shapeless(registry, "Shape", shape_op, shape_claim);
-    shapeless(registry, "Size", size_op, size_claim);
+    registry.register_shape_classified(
+        OpRegistration {
+            domain: "",
+            op_type: "Shape",
+            min_opset: 1,
+            max_opset: K_ANY_OPSET,
+            handler: shape_op,
+            claim: shape_claim,
+        },
+        metadata_compile_shape_safety,
+    );
+    registry.register_shape_classified(
+        OpRegistration {
+            domain: "",
+            op_type: "Size",
+            min_opset: 1,
+            max_opset: K_ANY_OPSET,
+            handler: size_op,
+            claim: size_claim,
+        },
+        metadata_compile_shape_safety,
+    );
     registry.register_shape_classified(
         OpRegistration {
             domain: "",

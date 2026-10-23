@@ -22,7 +22,7 @@ use crate::engine::{MlxError, NodeDesc, SubgraphDesc, TensorRef, TranslationCont
 use crate::ops::selective_scan;
 use crate::registry::{
     ClaimPredicate, ClaimResult, GraphView, K_ANY_OPSET, NodeView, OpHandler, OpRegistration,
-    OpRegistry, ValueKind,
+    OpRegistry, ValueKind, is_movable,
 };
 use crate::sys::mlx;
 use crate::sys::ort;
@@ -97,7 +97,11 @@ fn require_tensor_control_flow_boundary(node: &NodeView, op: &str) -> ClaimResul
             continue;
         }
         match node.input_kind(i) {
-            Some(ValueKind::Tensor(_)) => {}
+            Some(ValueKind::Tensor(info)) if is_movable(info.dtype) => {}
+            Some(ValueKind::Tensor(info)) => deny!(
+                "{op}: tensor input[{i}] dtype {} cannot cross the MLX array boundary",
+                crate::registry::ort_dtype_name(info.dtype)
+            ),
             Some(kind) => deny!(
                 "{op}: {} input[{i}] cannot cross the ORT 1.29 plugin EP tensor boundary",
                 kind.description()
@@ -107,7 +111,11 @@ fn require_tensor_control_flow_boundary(node: &NodeView, op: &str) -> ClaimResul
     }
     for i in 0..node.num_outputs() {
         match node.output_kind(i) {
-            Some(ValueKind::Tensor(_)) => {}
+            Some(ValueKind::Tensor(info)) if is_movable(info.dtype) => {}
+            Some(ValueKind::Tensor(info)) => deny!(
+                "{op}: tensor output[{i}] dtype {} cannot cross the MLX array boundary",
+                crate::registry::ort_dtype_name(info.dtype)
+            ),
             Some(kind) => deny!(
                 "{op}: {} output[{i}] cannot cross the ORT 1.29 plugin EP tensor boundary",
                 kind.description()
