@@ -393,6 +393,81 @@ def test_unique_actual_routes_and_compiled_neighbor_cache(tmp_path):
                for event in neighbors)
 
 
+def _rng_union_model(nested, seed):
+    attributes = {} if seed is None else {"seed": seed}
+    body_nodes = [
+        helper.make_node("RandomUniformLike", ["negated"], ["sampled"], **attributes),
+        helper.make_node("Unique", ["sampled"], NAMES, sorted=0),
+    ]
+    outputs = [
+        helper.make_tensor_value_info("sampled", T.FLOAT, [None, None]),
+        helper.make_tensor_value_info("y", T.FLOAT, [None]),
+        *[helper.make_tensor_value_info(name, T.INT64, [None]) for name in NAMES[1:]],
+    ]
+    nodes = [helper.make_node("Neg", ["x"], ["negated"])]
+    inputs = [helper.make_tensor_value_info("x", T.FLOAT, [None, None])]
+    if nested:
+        body = helper.make_graph(body_nodes, "random_unique_body", [], outputs)
+        nodes.append(helper.make_node("If", ["condition"], ["sampled", *NAMES],
+                                      then_branch=body, else_branch=body))
+        inputs.append(helper.make_tensor_value_info("condition", T.BOOL, []))
+    else:
+        nodes.extend(body_nodes)
+    nodes.append(helper.make_node("Neg", ["y"], ["restored"]))
+    outputs[1] = helper.make_tensor_value_info("restored", T.FLOAT, [None])
+    return helper.make_model(helper.make_graph(nodes, "rng_unique_union", inputs, outputs),
+                             opset_imports=[helper.make_opsetid("", 26)], ir_version=11)
+
+
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("seed", [None, 19.0])
+def test_unique_rng_union_workload(nested, seed):
+    session = _session(_rng_union_model(nested, seed))
+    samples = []
+    for iteration, data in enumerate([
+        np.zeros((2, 3), np.float32), np.ones((2, 3), np.float32), _values(np.float32),
+        np.empty((0, 3), np.float32), _values(np.float32),
+    ]):
+        feeds = {"x": data}
+        if nested:
+            feeds["condition"] = np.array(iteration % 2 == 0)
+        sampled, *actual = session.run(None, feeds)
+        assert sampled.dtype == data.dtype and sampled.shape == data.shape
+        expected = _oracle(sampled, sorted=0)
+        expected[0] = -expected[0]
+        _check(actual, expected)
+        samples.append(sampled.copy())
+    if seed is None:
+        assert not np.array_equal(samples[0], samples[1])
+    else:
+        _exact(samples[0], samples[1])
+        _exact(samples[0], samples[4])
+
+
+def test_unique_actual_rng_union_routes(tmp_path):
+    trace = tmp_path / "rng_unique_trace.json"
+    subprocess.run(
+        [sys.executable, "-m", "pytest", Path(__file__).name,
+         "-k", "unique_rng_union_workload", "-q", "-p", "no:cacheprovider"],
+        cwd=Path(__file__).parent,
+        env={**os.environ, "ONNXRUNTIME_EP_MLX_TRACE": str(trace),
+             "ONNXRUNTIME_EP_MLX_NO_COMPILE": "0",
+             "ONNXRUNTIME_EP_MLX_NO_GENERAL_COMPILE": "0",
+             "ONNXRUNTIME_EP_MLX_NO_PREFILL_COMPILE": "0"},
+        check=True, timeout=120)
+    paths = [event["args"] for event in json.loads(trace.read_text())
+             if event.get("cat") == "ep.path"]
+    unique = [event for event in paths
+              if set(event.get("ops", "").split(",")) & {"Unique", "If"}]
+    assert len(unique) == 20
+    assert all(event["path"] == "eager" for event in unique)
+    neighbors = [event for event in paths if "Neg" in event.get("ops", "").split(",")]
+    assert neighbors
+    assert any(event["path"] == "general" and event["cache"] == "HIT" for event in neighbors)
+    assert all(not set(event.get("ops", "").split(",")) & {"Unique", "If"}
+               for event in neighbors)
+
+
 @pytest.mark.parametrize("axis", [-(2**63), -3, 2, 2**63 - 1])
 def test_unique_full_width_invalid_axis_recovers(axis):
     session = _session(_model(shape=None, axis=axis))

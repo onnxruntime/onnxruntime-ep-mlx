@@ -82,7 +82,13 @@ intermediate or control-flow-bound values from the current evaluated MLX array.
 No data-dependent cardinality is captured in general, decode or prefill caches.
 Unique and parents recursively containing Unique have eager partition
 boundaries, keeping eligible adjacent producers/consumers separately compilable.
-Existing Mod/NonZero partition rules are retained.
+Existing Mod/NonZero partition rules are retained. The actual merged RNG/Dropout
+recursive forced-eager check runs first, followed by the Unique-only recursive
+check, before the existing decoder/Mod/NonZero classification. RNG fixed-seed
+classification and live default-key/training guards are unchanged. Additional
+mixed RNG/Unique regressions check flat and If-contained default-fresh/fixed-seed
+execution, exact Unique results from the same call's exposed random values,
+empty transitions and adjacent compiled-cache reuse.
 
 Host sorting takes O(N log N) comparisons (each comparison can inspect an entire
 axis slice), plus host materialization and output copies. It can synchronize
@@ -106,9 +112,16 @@ anywhere in its body is declined because bodies share the parent's GPU plan.
 This change does not expand float64 control-flow transport or non-tensor parent
 boundaries. The recursive neighbor regressions use claimable float32 If bodies.
 
-The source baseline is main `965304020994ed3da4157232102d151b64025ca5`,
+The initial investigation baseline is main `965304020994ed3da4157232102d151b64025ca5`,
 tree `044024a9a213be4eb974e6280af0076b402c69dc`; its pristine git archive SHA256 is
 `3529465d5e2569948d197c97ad869cd3017e962eb25cb027faba99e95987ed16`.
+The current integration base is actual merged main
+`bd941b6a4090ba4df0a9484459ad86fb11b7c1b0`, parent
+`965304020994ed3da4157232102d151b64025ca5`, tree
+`9fb2d55508d362f3ccf87aa472b08bce9cd41c21`; its pristine archive SHA256 is
+`c8555a826e28ff56c86aac3795e69a96afc515c87097d563ab0c3e75beb335ce`.
+RNG/Dropout handler and regression files match that main exactly; only the
+capability decision semantically unions its recursive fence with Unique.
 The pinned manifests are `rust/Cargo.toml` blob
 `d5c2fe2742c9f9f250ea3d080477f87ce28cb471`, lockfile blob
 `f59cfd0eee7051adb51e3f7ca6c38aa820334ca4`, and `python/pyproject.toml` blob

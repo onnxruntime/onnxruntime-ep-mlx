@@ -1567,6 +1567,30 @@ impl GraphView {
     }
 }
 
+pub(crate) fn requires_random_eager_boundary(node: &NodeView) -> bool {
+    let domain = node.domain();
+    let direct = (domain.is_empty() || domain == "ai.onnx")
+        && matches!(
+            node.op_type().as_str(),
+            "RandomNormal"
+                | "RandomNormalLike"
+                | "RandomUniform"
+                | "RandomUniformLike"
+                | "Bernoulli"
+                | "Multinomial"
+                | "Dropout"
+        )
+        && matches!(
+            compile_shape_safety(node),
+            CompileShapeSafety::EagerOnly { .. }
+        );
+    direct
+        || node
+            .subgraphs()
+            .iter()
+            .any(|(_, body)| body.nodes().iter().any(requires_random_eager_boundary))
+}
+
 // ---- Shared claim helpers (port of op_claim.h) --------------------------------------------------
 
 use ort::*;
@@ -1866,12 +1890,6 @@ mod tests {
             ("ai.onnx.ml", "SVMClassifier", 1),
             ("ai.onnx.ml", "FeatureVectorizer", 1),
             ("com.microsoft", "QMoE", 1),
-            ("", "RandomNormal", 1),
-            ("", "RandomNormalLike", 1),
-            ("", "RandomUniform", 1),
-            ("", "RandomUniformLike", 1),
-            ("", "Bernoulli", 15),
-            ("", "Multinomial", 7),
             ("", "RNN", 24),
             ("", "GRU", 24),
             ("", "LSTM", 24),
@@ -1932,6 +1950,33 @@ mod tests {
             compile_shape_rule("", "Softmax", 11),
             CompileShapeRule::Classified(_)
         ));
+    }
+
+    #[test]
+    fn random_and_dropout_classify_live_keys_and_controls_per_node() {
+        for (op_type, since_version) in [
+            ("RandomNormal", 1),
+            ("RandomNormalLike", 1),
+            ("RandomUniform", 1),
+            ("RandomUniformLike", 1),
+            ("Bernoulli", 15),
+            ("Multinomial", 7),
+            ("Dropout", 1),
+            ("Dropout", 6),
+            ("Dropout", 7),
+            ("Dropout", 10),
+            ("Dropout", 12),
+            ("Dropout", 13),
+            ("Dropout", 22),
+        ] {
+            assert!(
+                matches!(
+                    compile_shape_rule("", op_type, since_version),
+                    CompileShapeRule::Classified(_)
+                ),
+                "{op_type}-{since_version} needs per-node random key/control classification"
+            );
+        }
     }
 
     #[test]

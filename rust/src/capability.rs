@@ -155,7 +155,9 @@ pub(crate) unsafe fn get_capability(
                 let metadata = &snapshot.nodes[&node];
                 let mod_boundary = metadata.domain.is_empty() && metadata.op_type == "Mod";
                 let nonzero_boundary = metadata.domain.is_empty() && metadata.op_type == "NonZero";
-                if crate::registry::requires_unique_eager_boundary(&view) {
+                if crate::registry::requires_random_eager_boundary(&view)
+                    || crate::registry::requires_unique_eager_boundary(&view)
+                {
                     CompilePartitionClass::Eager
                 } else if decoder_graph || mod_boundary || nonzero_boundary {
                     crate::registry::compile_shape_safety(&view).partition_class()
