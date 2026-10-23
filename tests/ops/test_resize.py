@@ -354,7 +354,9 @@ def _strict_resize_session(model):
     options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
     options.log_severity_level = 3
     options.add_session_config_entry("session.disable_cpu_ep_fallback", "1")
-    session = ort.InferenceSession(model, options, providers=["MLXExecutionProvider"])
+    session = ort.InferenceSession(
+        model, options, providers=["MLXExecutionProvider"], enable_fallback=False,
+    )
     session.disable_fallback()
     return session
 
