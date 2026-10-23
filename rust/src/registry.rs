@@ -1755,6 +1755,17 @@ mod tests {
     }
 
     #[test]
+    fn unique_preserves_future_dispatch_and_excludes_capture() {
+        assert!(registry().find_entry("", "Unique", 10).is_none());
+        for version in [11, 26, 27, 28] {
+            assert!(matches!(
+                compile_shape_rule("", "Unique", version),
+                CompileShapeRule::Always(CompileShapeSafety::EagerOnly { .. })
+            ));
+        }
+    }
+
+    #[test]
     fn suffix_broadcast_treats_unknown_extents_as_compatible() {
         // ORT reports symbolic dims as -1; an unknown extent is not a literal
         // size and must not be compared as one.

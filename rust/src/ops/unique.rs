@@ -267,7 +267,7 @@ pub fn register(registry: &mut OpRegistry) {
             domain: "",
             op_type: "Unique",
             min_opset: 11,
-            max_opset: 27,
+            max_opset: 28,
             handler: unique_op,
             claim: unique_claim,
         },

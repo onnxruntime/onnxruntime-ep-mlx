@@ -93,10 +93,13 @@ kernel fallback. Float64 transport uses the existing isolated MLX CPU stream.
 
 Complex/string and encoded transport remain explicit provider-pipeline gaps,
 not backend impossibilities. Bfloat16 is absent from schema 11 and only added in
-schema 28; schema 28 is not registered pending a supporting ORT/schema runtime
-and real-route validation. The shared scanner understands bf16 representations
-for existing NonZero and pure typed unit coverage, but this does not authorize
-illegal bf16 Unique11 graphs.
+schema 28. Future Unique28 dispatch for existing schema11-legal input types is
+preserved, as required by the existing registry compatibility test; this is not
+runtime proof of Unique28. ORT 1.31's `cmake/deps.txt` pins ONNX 1.22.0, whose
+schema maximum is 27. Bfloat16 Unique28 remains unclaimed pending a supporting
+ORT/schema runtime and real-route validation. The shared scanner understands
+bf16 representations for existing NonZero and pure typed unit coverage, but this
+does not authorize illegal bf16 Unique11 graphs or prove bf16 Unique28 execution.
 
 Existing control-flow pipeline restrictions still apply: a parent with float64
 anywhere in its body is declined because bodies share the parent's GPU plan.
