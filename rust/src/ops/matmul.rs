@@ -74,6 +74,14 @@ fn fused_matmul_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), Mlx
         }
     }
 
+    if ctx.dim(a, rank_a as i32 - 1) == 0 {
+        let product = ctx.binary(mlx::mlx_matmul, a, b)?;
+        let y = ctx.zeros(&ctx.shape_of(product), dtype)?;
+        ctx.mark_fast("mlx_matmul");
+        ctx.bind(&n.outputs[0], y);
+        return Ok(());
+    }
+
     let alpha = n.floats.get("alpha").copied().unwrap_or(1.0);
     let narrow = dtype == mlx::mlx_dtype__MLX_FLOAT16 || dtype == mlx::mlx_dtype__MLX_BFLOAT16;
     // ORT CUDA uses a T-rounded alpha, but scales the FP32 accumulator before rounding Y to T.

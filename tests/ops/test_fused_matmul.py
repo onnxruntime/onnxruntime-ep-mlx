@@ -41,6 +41,10 @@ def _storage(logical, trans, trans_batch):
 def _oracle(a, b, dtype, alpha):
     # Numerical oracle takes logical operands, never the lowering's physical permutation.
     work = np.float64 if dtype == np.float64 else np.float32
+    if a.shape[-1] == 0:
+        # ORT CUDA returns literal zeros for K=0, before even converting alpha.
+        shape = np.matmul(np.empty(a.shape, work), np.empty(b.shape, work)).shape
+        return _typed(np.zeros(shape, work), dtype)
     scale = _typed(np.float32(alpha), dtype).astype(work)
     with np.errstate(all="ignore"):
         result = np.matmul(a.astype(work), b.astype(work)) * scale
@@ -186,6 +190,46 @@ def test_dynamic_live_replays(dtype, flags, eager, monkeypatch, tmp_path):
         feeds = {"a": _storage(a, ta, tba), "b": _storage(b, tb, tbb)}
         _check(session.run(None, feeds)[0], _oracle(a, b, dtype, 0.25), dtype, exact=True)
     _placement(session)
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("alpha", [np.nan, np.inf, -np.inf, 2**20])
+@pytest.mark.parametrize("flags", FLAGS)
+@pytest.mark.parametrize("eager", [False, True])
+def test_zero_contraction_ignores_exceptional_alpha(dtype, alpha, flags, eager, monkeypatch, tmp_path):
+    monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_COMPILE", "1" if eager else "0")
+    attrs = dict(zip(FLAG_NAMES, flags, strict=True), alpha=float(alpha))
+    session = _session(_model(dtype, [[None] * 4, [None] * 4], attrs), tmp_path)
+    ta, tb, tba, tbb = flags
+    for batch, rows, cols in [(2, 3, 5), (0, 3, 5), (2, 0, 5), (2, 3, 0), (1, 2, 4)]:
+        a = _typed(np.empty((batch, 1, rows, 0)), dtype)
+        b = _typed(np.empty((1, 4, 0, cols)), dtype)
+        actual = session.run(None, {"a": _storage(a, ta, tba), "b": _storage(b, tb, tbb)})[0]
+        expected = _typed(np.zeros((batch, 4, rows, cols)), dtype)
+        _check(actual, expected, dtype, exact=True)
+        assert not np.signbit(actual).any(), "CUDA zero fill produces positive zero"
+    _placement(session)
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("alpha", [np.nan, np.inf, -np.inf, 2**20])
+@pytest.mark.parametrize("trans", list(itertools.product([0, 1], repeat=2)))
+@pytest.mark.parametrize("eager", [False, True])
+def test_zero_contraction_vector_ranks(dtype, alpha, trans, eager, monkeypatch, tmp_path):
+    monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_COMPILE", "1" if eager else "0")
+    ta, tb = trans
+    for a_shape, b_shape, y_shape in [((0,), (0,), ()),
+                                     ((0,), (0, 3), (3,)),
+                                     ((2, 0), (0,), (2,))]:
+        a, b = _typed(np.empty(a_shape), dtype), _typed(np.empty(b_shape), dtype)
+        a_physical, b_physical = _storage(a, ta, False), _storage(b, tb, False)
+        model = _model(dtype, [a_physical.shape, b_physical.shape],
+                       {"transA": ta, "transB": tb, "alpha": float(alpha)})
+        session = _session(model, tmp_path)
+        actual = session.run(None, {"a": a_physical, "b": b_physical})[0]
+        _check(actual, _typed(np.zeros(y_shape), dtype), dtype, exact=True)
+        assert not np.signbit(actual).any(), "CUDA zero fill produces positive zero"
+        _placement(session)
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
