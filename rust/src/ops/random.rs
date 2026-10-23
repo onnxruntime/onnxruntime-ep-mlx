@@ -355,12 +355,16 @@ fn bernoulli_claim(node: &NodeView) -> ClaimResult {
         _ => deny!("missing tensor type/shape info on input or output"),
     };
     require!(
-        is_random_float(inp.dtype),
-        "probability input dtype must be float32 or float16, got {}",
+        is_random_float(inp.dtype)
+            || (node.since_version() >= 22
+                && inp.dtype
+                    == ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16),
+        "probability input dtype must be float32, float16, or bfloat16 since opset 22, got {}",
         crate::registry::ort_dtype_name(inp.dtype)
     );
     require!(
-        is_boundary_type(out.dtype),
+        is_boundary_type(out.dtype)
+            || out.dtype == ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_DOUBLE,
         "output dtype {} is unsupported",
         crate::registry::ort_dtype_name(out.dtype)
     );
