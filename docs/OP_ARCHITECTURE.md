@@ -173,6 +173,21 @@ parameters; decode and prefill reject host-read parameters unless they are
 immutable or proven shape-constant. This also protects live Reshape/Expand
 outputs when an unrelated metadata input has fully static geometry.
 
+`Squeeze` and `Unsqueeze` support legacy axes attributes and live int64 axes
+vectors, including omitted optional Squeeze slots, unknown ranks, scalars and
+empty dimensions. Full-width axes are validated before narrowing; Unsqueeze
+requires unique normalized axes, while Squeeze removes repeated selections
+once, matching ONNX shape inference and ORT. Nonempty boundary axes use bounded
+full-value general-cache keys; empty or data-dependent interior axes stay eager.
+Changing ranks or singleton selection cannot enter unguarded shapeless
+decode/prefill traces. Exact numeric/Boolean payloads retain their bits; float64
+uses MLX CPU. Modern explicitly empty axes mean identity, as specified by ONNX
+shape inference/reference, even though ORT 1.31 squeezes all singleton dimensions.
+Legacy explicitly empty Squeeze attributes remain unclaimed when singleton
+dimensions are possible because ONNX inference disagrees with CPU/reference.
+String, complex, encoded payloads and native-wide dimensions remain outside this
+MLX array materialization path.
+
 Sequence **inputs** are supported by `SequenceLength`, `SequenceAt`, and
 `ConcatFromSequence` from opset 11 onward. These handlers execute eagerly and
 re-read the live ORT sequence on every invocation. Element copies own their MLX
