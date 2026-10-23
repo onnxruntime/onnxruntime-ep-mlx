@@ -1,14 +1,16 @@
 //! State-space / KV-cache "misc" op handlers. Faithful port of the C++ `ops/ssm_misc.cc`:
 //!   * TensorScatter (ai.onnx) — typed per-batch linear/circular KV-cache updates.
 //!   * CausalConvWithState — dilated causal depthwise conv1d, channel layouts, and carry windows.
-//!   * LinearAttention — recurrent linear attention (4 update rules,
-//!     GQA) via static-length unrolling over the time axis T.
+//!   * LinearAttention — stable recurrent linear attention (4 update rules, GQA), with a
+//!     column-parallel Metal prefill scan and an unrolled fallback.
 //!     Only statically translatable, MLX-supported forms are claimed; the rest fall to ORT CPU.
 //!
 //! Live TensorScatter offsets are validated on every eager application; initializer/no-index
 //! updates can compile shape-keyed. Causal convolution supports ndim=1 with static channel/kernel
 //! geometry. Linear attention always uses the recurrence: neither decay strength nor normalized
 //! keys follows from shape alone, so the chunk_size tuning hint cannot justify a WY fast path.
+//! GPU prefill with d_k <= 256 uses a typed SIMD-column scan; wider/CPU forms retain the unroll.
+//! `ONNXRUNTIME_EP_MLX_NO_LINEAR_ATTENTION_SCAN=1` selects the unroll for numerical/perf A/B.
 
 use crate::engine::{MlxError, NodeDesc, Src, TranslationContext, mlx_dtype_from_onnx};
 use crate::registry::{
@@ -18,6 +20,7 @@ use crate::registry::{
 use crate::sys::mlx;
 use crate::sys::ort;
 use crate::{deny, require};
+use std::ffi::CString;
 
 const T_INT64: ort::ONNXTensorElementDataType =
     ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64;
@@ -123,6 +126,7 @@ fn tensor_scatter_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), M
             output = ctx.slice_update(output, slab, &lo, &hi)?;
         }
     }
+
     let cont = ctx.contiguous(output)?;
     ctx.bind(&n.outputs[0], cont);
     Ok(())
@@ -507,7 +511,7 @@ fn causal_conv_claim(node: &NodeView) -> ClaimResult {
 }
 
 // =============================================================================================
-// LinearAttention (com.microsoft) — delta-rule linear attention, static-length unroll over T.
+// LinearAttention (com.microsoft) — stable delta-rule recurrence and fused prefill.
 // =============================================================================================
 fn rule_uses_decay(rule: &str) -> bool {
     rule == "gated" || rule == "gated_delta"
@@ -569,6 +573,225 @@ fn repeat_axis(
     ctx.emit(|res, s| unsafe { mlx::mlx_repeat_axis(res, a, repeats, axis, s) })
 }
 
+// Each SIMD group owns one state column. Time remains sequential, avoiding the unstable WY
+// inversion, but state lives in registers and independent columns/heads run in parallel.
+const LINEAR_ATTENTION_SCAN_SRC: &str = r#"
+    size_t column = thread_position_in_grid.x / 32;
+    if (column >= size_t(B) * H * DV) { return; }
+    uint lane = thread_position_in_grid.x % 32;
+    uint vi = column % DV;
+    size_t bh = column / DV;
+    uint bi = bh / H;
+    uint hi = bh % H;
+    S state[(DK + 31) / 32];
+    for (uint j = 0; j < (DK + 31) / 32; ++j) {
+        uint ki = lane + j * 32;
+        if (ki < DK) {
+            state[j] = initial[(bh * DK + ki) * DV + vi];
+            for (int w = 0; w < WINDOW - TIME; ++w) {
+                present[((size_t(w) * B * H + bh) * DK + ki) * DV + vi] = S(0);
+            }
+        }
+    }
+    for (uint t = 0; t < TIME; ++t) {
+        size_t kt = (bh * TIME + t) * DK;
+        float retrieval = 0.0f;
+        for (uint j = 0; j < (DK + 31) / 32; ++j) {
+            uint ki = lane + j * 32;
+            if (ki < DK) {
+                if (DECAY) {
+                    size_t gi = SCALAR_DECAY ? bh * TIME + t : kt + ki;
+                    S gate = S(precise::exp(float(decay[gi])));
+                    state[j] = S(float(state[j]) * float(gate));
+                }
+                retrieval += float(key[kt + ki]) * float(state[j]);
+            }
+        }
+        S delta = value[(bh * TIME + t) * DV + vi];
+        if (BETA) {
+            S retrieved = S(simd_sum(retrieval));
+            S difference = S(float(delta) - float(retrieved));
+            delta = S(float(beta[bh * TIME + t]) * float(difference));
+        }
+        for (uint j = 0; j < (DK + 31) / 32; ++j) {
+            uint ki = lane + j * 32;
+            if (ki < DK) {
+                S outer = S(float(key[kt + ki]) * float(delta));
+                state[j] = S(float(state[j]) + float(outer));
+                int w = int(t) - (TIME - WINDOW);
+                if (WINDOW > 0 && w >= 0) {
+                    present[((size_t(w) * B * H + bh) * DK + ki) * DV + vi] = state[j];
+                }
+            }
+        }
+        for (uint q = 0; q < HQ / H; ++q) {
+            uint qh = hi * (HQ / H) + q;
+            size_t qt = ((size_t(bi) * HQ + qh) * TIME + t) * DK;
+            float readout = 0.0f;
+            for (uint j = 0; j < (DK + 31) / 32; ++j) {
+                uint ki = lane + j * 32;
+                if (ki < DK) {
+                    readout += float(query[qt + ki]) * float(state[j]);
+                }
+            }
+            S result = S(simd_sum(readout));
+            if (lane == 0) {
+                output[((size_t(bi) * TIME + t) * HQ + qh) * DV + vi] = result;
+            }
+        }
+    }
+    if (WINDOW == 0) {
+        for (uint j = 0; j < (DK + 31) / 32; ++j) {
+            uint ki = lane + j * 32;
+            if (ki < DK) {
+                present[(bh * DK + ki) * DV + vi] = state[j];
+            }
+        }
+    }
+"#;
+
+#[allow(clippy::too_many_arguments)]
+fn linear_attention_scan(
+    ctx: &mut TranslationContext,
+    state: mlx::mlx_array,
+    query: mlx::mlx_array,
+    key: mlx::mlx_array,
+    value: mlx::mlx_array,
+    decay: Option<mlx::mlx_array>,
+    beta: Option<mlx::mlx_array>,
+    scalar_decay: bool,
+    window: i32,
+) -> Result<Option<(mlx::mlx_array, mlx::mlx_array)>, MlxError> {
+    let disabled = std::env::var_os("ONNXRUNTIME_EP_MLX_NO_LINEAR_ATTENTION_SCAN")
+        .is_some_and(|value| value != "0" && !value.is_empty());
+    let shape = ctx.shape_of(value);
+    let (b, h, time, dv) = (shape[0], shape[1], shape[2], shape[3]);
+    let qshape = ctx.shape_of(query);
+    let (hq, dk) = (qshape[1], qshape[3]);
+    // Bound per-lane register state, not legal operator inputs. Wider shapes retain the unroll.
+    if disabled || time <= 1 || b <= 0 || dk <= 0 || dk > 256 {
+        return Ok(None);
+    }
+    let Some(threads) = b
+        .checked_mul(h)
+        .and_then(|x| x.checked_mul(dv))
+        .and_then(|x| x.checked_mul(32))
+    else {
+        return Ok(None);
+    };
+    let mut device = unsafe { mlx::mlx_device_new() };
+    let mut device_type = mlx::mlx_device_type__MLX_CPU;
+    let mut rc = unsafe { mlx::mlx_stream_get_device(&mut device, ctx.stream()) };
+    if rc == 0 {
+        rc = unsafe { mlx::mlx_device_get_type(&mut device_type, device) };
+    }
+    unsafe { mlx::mlx_device_free(device) };
+    if rc != 0 {
+        return Err("LinearAttention: failed to inspect recurrence stream".to_string());
+    }
+    if device_type != mlx::mlx_device_type__MLX_GPU {
+        return Ok(None);
+    }
+
+    let inputs = super::selective_scan::VecString::new(&[
+        "initial", "query", "key", "value", "decay", "beta",
+    ])?;
+    let outputs = super::selective_scan::VecString::new(&["output", "present"])?;
+    let source = CString::new(LINEAR_ATTENTION_SCAN_SRC).unwrap();
+    let kernel = unsafe {
+        mlx::mlx_fast_metal_kernel_new(
+            c"onnxrt_mlx_linear_attention_scan".as_ptr(),
+            inputs.as_raw(),
+            outputs.as_raw(),
+            source.as_ptr(),
+            c"".as_ptr(),
+            true,
+            false,
+        )
+    };
+    if kernel.ctx.is_null() {
+        return Err("LinearAttention: failed to construct fused recurrence".to_string());
+    }
+    let config = unsafe { mlx::mlx_fast_metal_kernel_config_new() };
+    let dtype = ctx.dtype_of(state);
+    rc = unsafe {
+        mlx::mlx_fast_metal_kernel_config_add_template_arg_dtype(config, c"S".as_ptr(), dtype)
+    };
+    for (name, number) in [
+        ("B", b),
+        ("H", h),
+        ("HQ", hq),
+        ("TIME", time),
+        ("DK", dk),
+        ("DV", dv),
+        ("WINDOW", window),
+        ("DECAY", decay.is_some() as i32),
+        ("BETA", beta.is_some() as i32),
+        ("SCALAR_DECAY", scalar_decay as i32),
+    ] {
+        let name = CString::new(name).unwrap();
+        rc |= unsafe {
+            mlx::mlx_fast_metal_kernel_config_add_template_arg_int(config, name.as_ptr(), number)
+        };
+    }
+    let output_shape = [b, time, hq * dv];
+    let mut state_shape = vec![b, h, dk, dv];
+    if window > 0 {
+        state_shape.insert(0, window);
+    }
+    rc |= unsafe {
+        mlx::mlx_fast_metal_kernel_config_add_output_arg(
+            config,
+            output_shape.as_ptr(),
+            output_shape.len(),
+            dtype,
+        )
+    };
+    rc |= unsafe {
+        mlx::mlx_fast_metal_kernel_config_add_output_arg(
+            config,
+            state_shape.as_ptr(),
+            state_shape.len(),
+            dtype,
+        )
+    };
+    rc |= unsafe { mlx::mlx_fast_metal_kernel_config_set_grid(config, threads, 1, 1) };
+    rc |= unsafe {
+        mlx::mlx_fast_metal_kernel_config_set_thread_group(config, threads.min(128), 1, 1)
+    };
+    let mut arguments = crate::mlx::VectorArray::new();
+    for array in [
+        state,
+        query,
+        key,
+        value,
+        decay.unwrap_or(state),
+        beta.unwrap_or(state),
+    ] {
+        arguments.append(array);
+    }
+    let mut results = crate::mlx::VectorArray::new();
+    if rc == 0 {
+        rc = unsafe {
+            mlx::mlx_fast_metal_kernel_apply(
+                results.as_mut_ptr(),
+                kernel,
+                arguments.as_raw(),
+                config,
+                ctx.stream(),
+            )
+        };
+    }
+    unsafe {
+        mlx::mlx_fast_metal_kernel_config_free(config);
+        mlx::mlx_fast_metal_kernel_free(kernel);
+    }
+    if rc != 0 || results.size() != 2 {
+        return Err("LinearAttention: fused recurrence kernel failed".to_string());
+    }
+    Ok(Some((ctx.keep(results.get(0)), ctx.keep(results.get(1)))))
+}
+
 fn linear_attention_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
     let rule = str_attr(n, "update_rule", "gated_delta");
     let uses_decay = rule_uses_decay(&rule);
@@ -614,7 +837,7 @@ fn linear_attention_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(),
     let b = qsh[0];
     let t_len = qsh[1];
     // A dynamic (symbolic) time extent only survives into a SHAPELESS trace; the static-length
-    // unroll below needs a concrete T. Fail the trace so the plan falls back to the eager translator
+    // recurrence needs a concrete T. Fail the trace so the plan falls back to the eager translator
     // (or the shape-keyed general trace), where `shape_of` reports the real extent. The claim admits
     // dynamic-time nodes precisely because this guard keeps them correct.
     if t_len < 0 {
@@ -755,8 +978,34 @@ fn linear_attention_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(),
         None
     };
 
-    // Zero/weak decay is legal for gated_delta, so a shape-only WY dispatch cannot assume a
-    // stabilizing gate or normalized keys. Use the recurrence for every rule and live gate value.
+    if t_len > 1 {
+        if let Some((output, present)) = linear_attention_scan(
+            ctx,
+            state,
+            q4,
+            k4,
+            v4,
+            decay4,
+            beta3,
+            decay_per_head_scalar,
+            state_window,
+        )? {
+            if !n.outputs[0].name.is_empty() {
+                let output = ctx.astype(output, dt)?;
+                ctx.bind(&n.outputs[0], output);
+            }
+            if !n.outputs[1].name.is_empty() {
+                ctx.bind(&n.outputs[1], present);
+            }
+            ctx.mark_fast("mlx_linear_attention_scan");
+            return Ok(());
+        }
+        ctx.mark_composed(
+            "stable unroll: scan disabled, CPU/empty geometry, d_k > 256, or grid limit",
+        );
+    }
+
+    // Zero/weak decay and unnormalized keys remain legal on every route.
     let mut outs: Vec<mlx::mlx_array> = Vec::with_capacity(t_len as usize);
     let mut state_history: Vec<mlx::mlx_array> = if state_window > 0 {
         Vec::with_capacity(state_window as usize)
@@ -948,7 +1197,7 @@ fn linear_attention_common_claim(node: &NodeView, allow_mixed_state: bool) -> Cl
     }
     // The time dimension may be DYNAMIC (symbolic `[-1]`, as in real Qwen3.5/Qwen3-Next decoder
     // exports): the shape-keyed general trace resolves the concrete extent at trace time, and the
-    // handler unrolls over it (with a guard that falls back to eager if it is ever traced shapeless).
+    // handler specializes the recurrence (falling back to eager if it is ever traced shapeless).
     let float_ok = |i: usize| -> bool {
         if !node.input_present(i) {
             return true;
@@ -1313,7 +1562,7 @@ pub fn register(registry: &mut OpRegistry) {
             handler: linear_attention_op as OpHandler,
             claim: linear_attention_claim as ClaimPredicate,
         },
-        crate::registry::MLX_SLICE_SHAPE_REASON,
+        "emits MLX Slice or CustomKernel without Primitive::output_shapes",
     );
     registry.register_shape_keyed(
         OpRegistration {
@@ -1324,7 +1573,7 @@ pub fn register(registry: &mut OpRegistry) {
             handler: linear_attention_op as OpHandler,
             claim: linear_attention_standard_claim as ClaimPredicate,
         },
-        crate::registry::MLX_SLICE_SHAPE_REASON,
+        "emits MLX Slice or CustomKernel without Primitive::output_shapes",
     );
     registry.register_shape_keyed(
         OpRegistration {
@@ -1357,5 +1606,37 @@ pub fn register(registry: &mut OpRegistry) {
             handler,
             claim,
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{engine::Plan, mlx::Stream};
+
+    #[test]
+    fn linear_attention_scan_declines_cpu_stream() {
+        let stream = Stream::new_default_cpu();
+        let mut plan = Plan::new(Vec::new());
+        let mut ctx = TranslationContext::new(
+            &mut plan,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            stream.as_raw(),
+        );
+        let state = ctx
+            .zeros(&[1, 1, 3, 2], mlx::mlx_dtype__MLX_FLOAT32)
+            .unwrap();
+        let query = ctx
+            .zeros(&[1, 1, 5, 3], mlx::mlx_dtype__MLX_FLOAT32)
+            .unwrap();
+        let value = ctx
+            .zeros(&[1, 1, 5, 2], mlx::mlx_dtype__MLX_FLOAT32)
+            .unwrap();
+        assert!(
+            linear_attention_scan(&mut ctx, state, query, query, value, None, None, true, 0)
+                .unwrap()
+                .is_none()
+        );
     }
 }
