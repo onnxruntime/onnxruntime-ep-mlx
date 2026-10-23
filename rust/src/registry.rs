@@ -274,6 +274,7 @@ fn register_builtin_ops(registry: &mut OpRegistry) {
     crate::ops::random::register(registry);
     crate::ops::recurrent::register(registry);
     crate::ops::ssm::register(registry);
+    crate::ops::packed_ssm::register(registry);
     crate::ops::misc::register(registry);
     crate::ops::controlflow::register(registry);
     // norm+attention
@@ -1742,6 +1743,16 @@ mod tests {
     }
 
     #[test]
+    fn packed_state_operators_keep_runtime_metadata_out_of_compiled_traces() {
+        for op_type in ["VarlenCausalConvWithState", "GatedDeltaNet"] {
+            assert!(matches!(
+                compile_shape_rule("com.microsoft", op_type, 1),
+                CompileShapeRule::Always(CompileShapeSafety::EagerOnly { .. })
+            ));
+        }
+    }
+
+    #[test]
     fn known_missing_output_shape_emitters_cannot_be_shapeless() {
         let always_shape_keyed = [
             ("com.microsoft", "PagedAttention", 1),
@@ -1749,7 +1760,6 @@ mod tests {
             ("com.microsoft", "PackedMultiHeadAttention", 1),
             ("", "RotaryEmbedding", 23),
             ("com.microsoft", "RotaryEmbedding", 1),
-            ("com.microsoft", "MRotaryEmbedding", 1),
             ("", "Scan", 24),
             ("", "DeformConv", 22),
             ("", "AveragePool", 24),
@@ -1817,6 +1827,10 @@ mod tests {
 
         assert!(matches!(
             compile_shape_rule("com.microsoft", "GroupQueryAttention", 1),
+            CompileShapeRule::Classified(_)
+        ));
+        assert!(matches!(
+            compile_shape_rule("com.microsoft", "MRotaryEmbedding", 1),
             CompileShapeRule::Classified(_)
         ));
     }

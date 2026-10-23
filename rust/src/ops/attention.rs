@@ -1697,21 +1697,60 @@ fn mrotary_embedding_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<()
     let sin_cache = ctx.resolve(&n.inputs[3])?;
     let xs = ctx.shape_of(x);
     let rank = xs.len();
-    let (b, nh, s, hd, x4) = if rank == 4 {
-        (xs[0], xs[1], xs[2], xs[3], x)
-    } else {
+    let (b, nh, s, hd) = if rank == 4 {
+        (xs[0], xs[1], xs[2], xs[3])
+    } else if rank == 3 {
         let nh = attr_int(n, "num_heads", 0) as i32;
-        let hd = xs[2] / nh;
-        let reshaped = ctx.reshape(x, &[xs[0], xs[1], nh, hd])?;
-        (
-            xs[0],
-            nh,
-            xs[1],
-            hd,
-            ctx.transpose(reshaped, &[0, 2, 1, 3])?,
-        )
+        if nh <= 0 || xs[2] <= 0 || xs[2] % nh != 0 {
+            return Err(
+                "MRotaryEmbedding: num_heads must be positive and divide hidden_size".to_string(),
+            );
+        }
+        (xs[0], nh, xs[1], xs[2] / nh)
+    } else {
+        return Err("MRotaryEmbedding: input must have rank 3 or 4".to_string());
     };
-    let half = ctx.shape_of(cos_cache)[1];
+    if b <= 0 || nh <= 0 || s <= 0 || hd <= 0 {
+        return Err("MRotaryEmbedding: input dimensions must be positive".to_string());
+    }
+    if ctx.shape_of(pos) != [3, b, s] {
+        return Err(format!(
+            "MRotaryEmbedding: position_ids must have shape [3,{b},{s}]"
+        ));
+    }
+    let cache_shape = ctx.shape_of(cos_cache);
+    if cache_shape.len() != 2
+        || ctx.shape_of(sin_cache) != cache_shape
+        || cache_shape[0] <= 0
+        || cache_shape[1] <= 0
+    {
+        return Err(
+            "MRotaryEmbedding: cos/sin caches must have equal positive rank-2 shapes".to_string(),
+        );
+    }
+    let half = cache_shape[1];
+    let rotary_dim = match attr_int(n, "rotary_embedding_dim", 0) {
+        0 => hd as i64,
+        dim => dim,
+    };
+    if rotary_dim <= 0 || rotary_dim > hd as i64 || rotary_dim != 2 * half as i64 {
+        return Err(
+            "MRotaryEmbedding: rotary dimension must match cache width and fit head_size"
+                .to_string(),
+        );
+    }
+    if attr_int(n, "is_packed_batching", 0) != 1 && s > cache_shape[0] {
+        return Err(
+            "MRotaryEmbedding: sequence length exceeds the cache; packed tokens require is_packed_batching=1"
+                .to_string(),
+        );
+    }
+    let x4 = if rank == 4 {
+        x
+    } else {
+        let reshaped = ctx.reshape(x, &[b, s, nh, hd])?;
+        ctx.transpose(reshaped, &[0, 2, 1, 3])?
+    };
     let sections = n
         .int_arrays
         .get("mrope_section")
@@ -2750,6 +2789,26 @@ fn rotary_embedding_claim(node: &NodeView) -> ClaimResult {
     Ok(())
 }
 
+fn mrotary_embedding_compile_shape_safety_for(dynamic: bool) -> CompileShapeSafety {
+    if dynamic {
+        CompileShapeSafety::EagerOnly {
+            reason: "validates dynamic MRotaryEmbedding shapes before MLX execution",
+        }
+    } else {
+        CompileShapeSafety::ShapeKeyedOnly {
+            reason: crate::registry::MLX_SLICE_SHAPE_REASON,
+        }
+    }
+}
+
+fn mrotary_embedding_compile_shape_safety(node: &NodeView) -> CompileShapeSafety {
+    let dynamic = (0..4).any(|index| {
+        node.input_info(index)
+            .is_some_and(|info| info.shape.iter().any(|&dim| dim < 0))
+    });
+    mrotary_embedding_compile_shape_safety_for(dynamic)
+}
+
 fn mrotary_embedding_claim(node: &NodeView) -> ClaimResult {
     require!(
         node.num_inputs() == 4 && node.num_outputs() == 1,
@@ -2774,23 +2833,37 @@ fn mrotary_embedding_claim(node: &NodeView) -> ClaimResult {
     );
     require!(
         (x.shape.len() == 3 || x.shape.len() == 4)
-            && x.shape.iter().all(|&d| d > 0)
-            && out.shape == x.shape,
-        "input/output must have equal static positive rank-3/rank-4 shapes"
+            && !x.shape.contains(&0)
+            && out.shape.len() == x.shape.len()
+            && out
+                .shape
+                .iter()
+                .zip(&x.shape)
+                .all(|(&a, &b)| a < 0 || b < 0 || a == b),
+        "input/output must have compatible nonzero rank-3/rank-4 shapes"
     );
     let (b, s, hd) = if x.shape.len() == 4 {
+        require!(
+            x.shape[1] > 0 && x.shape[3] > 0,
+            "rank-4 input requires static positive num_heads and head_size"
+        );
         (x.shape[0], x.shape[2], x.shape[3])
     } else {
         let nh = node.int_attr("num_heads", 0);
         require!(
-            nh > 0 && x.shape[2] % nh == 0,
-            "rank-3 input requires positive num_heads dividing hidden_size"
+            nh > 0 && x.shape[2] > 0 && x.shape[2] % nh == 0,
+            "rank-3 input requires static positive hidden_size divisible by num_heads"
         );
         (x.shape[0], x.shape[1], x.shape[2] / nh)
     };
     require!(
         pos.dtype == ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64
-            && pos.shape == [3, b, s],
+            && pos.shape.len() == 3
+            && pos.shape[0] == 3
+            && pos.shape[1] != 0
+            && pos.shape[2] != 0
+            && (pos.shape[1] < 0 || b < 0 || pos.shape[1] == b)
+            && (pos.shape[2] < 0 || s < 0 || pos.shape[2] == s),
         "position_ids must be int64 [3,B,S]"
     );
     require!(
@@ -3466,8 +3539,8 @@ fn paged_attention_claim(node: &NodeView) -> ClaimResult {
     if node.input_present(16) {
         require!(
             node.input_info(16)
-                .is_some_and(|v| is_int32(v.dtype) && v.shape == [2]),
-            "attention_metadata must be int32 [2]"
+                .is_some_and(|v| is_int32(v.dtype) && (v.shape == [2] || v.shape == [3])),
+            "attention_metadata must be int32 [2] or [3]"
         );
     }
     if latent {
@@ -3575,15 +3648,16 @@ pub fn register_attention(registry: &mut OpRegistry) {
         rotary_embedding_claim,
         crate::registry::MLX_SLICE_SHAPE_REASON,
     );
-    shape_keyed(
-        registry,
-        "com.microsoft",
-        "MRotaryEmbedding",
-        K_ANY_OPSET,
-        K_ANY_OPSET,
-        mrotary_embedding_op,
-        mrotary_embedding_claim,
-        crate::registry::MLX_SLICE_SHAPE_REASON,
+    registry.register_shape_classified(
+        OpRegistration {
+            domain: "com.microsoft",
+            op_type: "MRotaryEmbedding",
+            min_opset: K_ANY_OPSET,
+            max_opset: K_ANY_OPSET,
+            handler: mrotary_embedding_op,
+            claim: mrotary_embedding_claim,
+        },
+        mrotary_embedding_compile_shape_safety,
     );
 }
 
@@ -3593,10 +3667,22 @@ mod tests {
         ATTENTION_COMPOSED_COMPILE_REASON, GQA_BIAS_COMPILE_REASON, GQA_SLIDING_COMPILE_REASON,
         GQA_UNSUPPORTED_COMPILE_REASON, attention_compile_shape_safety_for,
         attention_mask_dimension_is_compatible, group_query_attention_compile_shape_safety_for,
-        mlx_softmax_precision,
+        mlx_softmax_precision, mrotary_embedding_compile_shape_safety_for,
     };
     use crate::registry::CompileShapeSafety;
     use crate::sys::mlx;
+
+    #[test]
+    fn mrotary_embedding_dynamic_validation_stays_eager() {
+        assert!(matches!(
+            mrotary_embedding_compile_shape_safety_for(true),
+            CompileShapeSafety::EagerOnly { .. }
+        ));
+        assert!(matches!(
+            mrotary_embedding_compile_shape_safety_for(false),
+            CompileShapeSafety::ShapeKeyedOnly { .. }
+        ));
+    }
 
     #[test]
     fn group_query_attention_compile_shape_safety_matrix() {

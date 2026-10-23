@@ -20,6 +20,7 @@ import numpy as np
 import onnxruntime as ort
 import pytest
 from onnx_ir import DataType as DT
+from onnxruntime.capi.onnxruntime_pybind11_state import EPFail
 
 import _models as m
 
@@ -471,3 +472,104 @@ def test_mrotary_embedding_packed_batching():
         "sin": rng.standard_normal((max_seq, hd // 2)).astype(np.float32),
     }
     check(model, feeds, rtol=3e-4, atol=3e-4)
+
+
+def _dynamic_mrotary_model(rank, nh, ir_dtype, packed, layout=1):
+    shape = ["batch_size", "num_tokens", nh * 256]
+    if rank == 4:
+        shape = ["batch_size", nh, "num_tokens", 256]
+    return m.make_model(
+        "MRotaryEmbedding",
+        [
+            m.tensor("input", ir_dtype, shape),
+            m.tensor("position_ids", DT.INT64, [3, "position_batch", "position_tokens"]),
+            m.tensor("cos", ir_dtype, [4, 32]),
+            m.tensor("sin", ir_dtype, [4, 32]),
+        ],
+        [m.tensor("Y", ir_dtype, shape)],
+        domain="com.microsoft",
+        attributes={
+            "num_heads": nh,
+            "rotary_embedding_dim": 64,
+            "mrope_section": [11, 11, 10],
+            "mrope_layout": layout,
+            "is_packed_batching": packed,
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    "rank,packed,nh,ir_dtype,np_dtype,layout",
+    [
+        (3, 1, 8, DT.FLOAT, np.float32, 1),
+        (3, 1, 2, DT.FLOAT, np.float32, 1),
+        (3, 0, 2, DT.FLOAT16, np.float16, 0),
+        (4, 0, 2, DT.FLOAT, np.float32, 1),
+    ],
+    ids=["qwen-packed-query", "qwen-packed-key", "dense-rank3-fp16", "dense-rank4"],
+)
+def test_mrotary_embedding_dynamic_shapes(tmp_path, rank, packed, nh, ir_dtype, np_dtype, layout):
+    model = _dynamic_mrotary_model(rank, nh, ir_dtype, packed, layout)
+    options = ort.SessionOptions()
+    options.enable_profiling = True
+    options.profile_file_prefix = str(tmp_path / "dynamic_mrope")
+    session = ort.InferenceSession(model, options, providers=m.EP_PROVIDERS)
+    reference = ort.InferenceSession(model, providers=["CPUExecutionProvider"])
+    rng = np.random.default_rng(9130)
+    cos = rng.standard_normal((4, 32)).astype(np_dtype)
+    sin = rng.standard_normal((4, 32)).astype(np_dtype)
+    sizes = [(1, 7), (1, 1), (1, 5), (1, 7)] if packed else [(1, 3), (2, 1), (1, 2), (1, 3)]
+    for batch, tokens in sizes:
+        shape = (batch, tokens, nh * 256) if rank == 3 else (batch, nh, tokens, 256)
+        feeds = {
+            "input": rng.standard_normal(shape).astype(np_dtype),
+            "position_ids": rng.integers(0, 4, size=(3, batch, tokens), dtype=np.int64),
+            "cos": cos,
+            "sin": sin,
+        }
+        actual = session.run(None, feeds)[0]
+        expected = reference.run(None, feeds)[0]
+        np.testing.assert_allclose(actual, expected, rtol=3e-3, atol=3e-3)
+        head_shape = (batch, tokens, nh, 256) if rank == 3 else shape
+        np.testing.assert_array_equal(
+            actual.reshape(head_shape)[..., 64:],
+            feeds["input"].reshape(head_shape)[..., 64:],
+        )
+    with open(session.end_profiling()) as profile:
+        events = json.load(profile)
+    providers = [
+        event["args"]["provider"]
+        for event in events
+        if event.get("cat") == "Node" and event.get("args", {}).get("provider")
+    ]
+    assert len(providers) >= len(sizes)
+    assert set(providers) == {"MLXExecutionProvider"}, f"MRotaryEmbedding fell back: {providers}"
+
+
+@pytest.mark.parametrize("position_shape", [(3, 2, 3), (3, 1, 2)])
+def test_mrotary_embedding_dynamic_rejects_mismatched_positions(position_shape):
+    model = _dynamic_mrotary_model(3, 2, DT.FLOAT, 1)
+    session = ort.InferenceSession(model, providers=m.EP_PROVIDERS)
+    session.disable_fallback()
+    feeds = {
+        "input": np.ones((1, 3, 512), dtype=np.float32),
+        "position_ids": np.zeros(position_shape, dtype=np.int64),
+        "cos": np.ones((4, 32), dtype=np.float32),
+        "sin": np.zeros((4, 32), dtype=np.float32),
+    }
+    with pytest.raises(EPFail, match="MRotaryEmbedding: position_ids must have shape"):
+        session.run(None, feeds)
+
+
+def test_mrotary_embedding_dynamic_requires_packed_for_long_token_axis():
+    model = _dynamic_mrotary_model(3, 2, DT.FLOAT, 0)
+    session = ort.InferenceSession(model, providers=m.EP_PROVIDERS)
+    session.disable_fallback()
+    feeds = {
+        "input": np.ones((1, 5, 512), dtype=np.float32),
+        "position_ids": np.zeros((3, 1, 5), dtype=np.int64),
+        "cos": np.ones((4, 32), dtype=np.float32),
+        "sin": np.zeros((4, 32), dtype=np.float32),
+    }
+    with pytest.raises(EPFail, match="MRotaryEmbedding: sequence length exceeds the cache"):
+        session.run(None, feeds)

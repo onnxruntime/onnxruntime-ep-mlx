@@ -8,8 +8,8 @@
 
 use crate::engine::{MlxError, NodeDesc, Src, TranslationContext, mlx_dtype_from_onnx};
 use crate::registry::{
-    ClaimPredicate, ClaimResult, K_ANY_OPSET, NodeView, OpHandler, OpRegistration, OpRegistry,
-    is_mlx_float,
+    ClaimPredicate, ClaimResult, CompileShapeSafety, K_ANY_OPSET, NodeView, OpHandler,
+    OpRegistration, OpRegistry, is_mlx_float,
 };
 use crate::sys::mlx;
 use crate::sys::ort;
@@ -574,19 +574,19 @@ fn chunk4(
     ctx.reshape(s, &[b, h, c])
 }
 
-/// Chunked gated-delta / delta linear attention (chunk_size = 64). A faithful MLX port of HF
+/// Chunked gated-delta / delta linear attention. A faithful MLX port of HF
 /// Qwen3.5's `torch_chunk_gated_delta_rule`; numerically identical to the recurrent unroll (the
 /// ground-truth handler), but expressed as batched matmuls so PREFILL fills the GPU. All ops are
-/// static-shape (the C-axis forward-substitution is a fixed 64-iteration loop), so the whole thing
+/// static-shape (the C-axis forward-substitution is bounded by chunk_size), so the whole thing
 /// is captured inside `mlx_compile`.
 ///
 /// Inputs are already in `[B,H,T,·]` head layout with GQA tiling applied and the query pre-scaled.
 /// `g_bht` is the per-head SCALAR decay `[B,H,T]` (zeros for the `delta` rule); `beta_bht` is
 /// `[B,H,T]`. `state` is the initial `[B,H,d_k,d_v]` recurrent state.
+/// Returns token-major `[B,T,H*d_v]` output and the updated `[B,H,d_k,d_v]` state.
 #[allow(clippy::too_many_arguments)]
-fn linear_attention_chunked(
+pub(super) fn linear_attention_chunked(
     ctx: &mut TranslationContext,
-    n: &NodeDesc,
     q4: mlx::mlx_array,
     k4: mlx::mlx_array,
     v4: mlx::mlx_array,
@@ -599,8 +599,9 @@ fn linear_attention_chunked(
     d_v: i32,
     t_len: i32,
     dt: mlx::mlx_dtype,
-) -> Result<(), MlxError> {
-    let c = CHUNK_SIZE;
+    chunk_size: i32,
+) -> Result<(mlx::mlx_array, mlx::mlx_array), MlxError> {
+    let c = chunk_size.min(t_len);
     let pad = (c - t_len % c) % c;
     let tp = t_len + pad;
     let nc = tp / c;
@@ -703,20 +704,14 @@ fn linear_attention_chunked(
         state = ctx.add(decayed, upd)?;
     }
 
-    if !n.outputs.is_empty() && !n.outputs[0].name.is_empty() {
-        let out5 = ctx.stack(&out_chunks, 2)?; // [B,H,nc,C,d_v]
-        let out_flat = ctx.reshape(out5, &[b, h, tp, d_v])?;
-        let out = ctx.slice(out_flat, &[0, 0, 0, 0], &[b, h, t_len, d_v])?; // drop padding
-        let out = ctx.transpose(out, &[0, 2, 1, 3])?; // [B,T,H,d_v]
-        let out = ctx.reshape(out, &[b, t_len, h * d_v])?;
-        let out = ctx.contiguous(out)?;
-        ctx.bind(&n.outputs[0], out);
-    }
-    if n.outputs.len() >= 2 && !n.outputs[1].name.is_empty() {
-        let ps = ctx.contiguous(state)?;
-        ctx.bind(&n.outputs[1], ps);
-    }
-    Ok(())
+    let out5 = ctx.stack(&out_chunks, 2)?; // [B,H,nc,C,d_v]
+    let out_flat = ctx.reshape(out5, &[b, h, tp, d_v])?;
+    let out = ctx.slice(out_flat, &[0, 0, 0, 0], &[b, h, t_len, d_v])?; // drop padding
+    let out = ctx.transpose(out, &[0, 2, 1, 3])?; // [B,T,H,d_v]
+    let out = ctx.reshape(out, &[b, t_len, h * d_v])?;
+    let out = ctx.contiguous(out)?;
+    let state = ctx.contiguous(state)?;
+    Ok((out, state))
 }
 
 fn linear_attention_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
@@ -889,9 +884,16 @@ fn linear_attention_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(),
     if use_chunked {
         let g_bht = decay4.expect("gated_delta carries decay"); // [B,H,T] scalar decay
         let beta_bht = beta3.expect("gated_delta carries beta"); // [B,H,T]
-        return linear_attention_chunked(
-            ctx, n, q4, k4, v4, g_bht, beta_bht, state, b, h, d_k, d_v, t_len, dt,
-        );
+        let (out, state) = linear_attention_chunked(
+            ctx, q4, k4, v4, g_bht, beta_bht, state, b, h, d_k, d_v, t_len, dt, CHUNK_SIZE,
+        )?;
+        if !n.outputs.is_empty() && !n.outputs[0].name.is_empty() {
+            ctx.bind(&n.outputs[0], out);
+        }
+        if n.outputs.len() >= 2 && !n.outputs[1].name.is_empty() {
+            ctx.bind(&n.outputs[1], state);
+        }
+        return Ok(());
     }
 
     let mut outs: Vec<mlx::mlx_array> = Vec::with_capacity(t_len as usize);
@@ -1297,7 +1299,22 @@ fn gated_rms_norm_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), M
     let out_dt = ctx.dtype_of(x);
     let x_shape = ctx.shape_of(x);
     let c = ctx.dim(scale, 0);
-    let rows = ctx.size_of(x) as i32 / c;
+    let gate_shape = ctx.shape_of(gate);
+    if c <= 0
+        || x_shape.is_empty()
+        || x_shape.iter().any(|&dim| dim <= 0)
+        || x_shape.last().is_none_or(|&dim| dim % c != 0)
+        || gate_shape != x_shape
+    {
+        return Err(
+            "GatedRMSNorm: X and gate must have matching positive shapes and last dimension divisible by scale length"
+                .to_string(),
+        );
+    }
+    let rows = match i32::try_from(ctx.size_of(x) / c as usize) {
+        Ok(rows) if rows > 0 => rows,
+        _ => return Err("GatedRMSNorm: flattened row count is out of range".to_string()),
+    };
 
     let x32 = ctx.astype(x, mlx::mlx_dtype__MLX_FLOAT32)?;
     let x2 = ctx.reshape(x32, &[rows, c])?;
@@ -1321,6 +1338,26 @@ fn gated_rms_norm_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), M
     Ok(())
 }
 
+fn gated_rms_norm_compile_shape_safety_for(dynamic: bool) -> CompileShapeSafety {
+    if dynamic {
+        CompileShapeSafety::EagerOnly {
+            reason: "validates dynamic GatedRMSNorm shapes before MLX execution",
+        }
+    } else {
+        CompileShapeSafety::Shapeless
+    }
+}
+
+fn gated_rms_norm_compile_shape_safety(node: &NodeView) -> CompileShapeSafety {
+    let dynamic = (0..3).any(|index| {
+        node.input_info(index)
+            .is_some_and(|info| info.shape.iter().any(|&dim| dim < 0))
+    }) || node
+        .output_info(0)
+        .is_some_and(|info| info.shape.iter().any(|&dim| dim < 0));
+    gated_rms_norm_compile_shape_safety_for(dynamic)
+}
+
 fn gated_rms_norm_claim(node: &NodeView) -> ClaimResult {
     require!(
         node.num_inputs() == 3 && node.num_outputs() == 1,
@@ -1342,19 +1379,30 @@ fn gated_rms_norm_claim(node: &NodeView) -> ClaimResult {
             && out.dtype == x.dtype,
         "X, scale, gate, and Y must share one MLX float dtype"
     );
+    require!(!x.shape.is_empty(), "X must have rank at least 1");
     require!(
-        !x.shape.is_empty() && x.shape.iter().all(|&d| d > 0),
-        "X must have a static positive shape"
-    );
-    require!(
-        gate.shape == x.shape && out.shape == x.shape,
-        "gate and Y must have the same shape as X"
+        x.shape.iter().all(|&dim| dim != 0)
+            && gate.shape.len() == x.shape.len()
+            && out.shape.len() == x.shape.len()
+            && gate
+                .shape
+                .iter()
+                .zip(&x.shape)
+                .all(|(&gate_dim, &x_dim)| gate_dim < 0 || x_dim < 0 || gate_dim == x_dim)
+            && out
+                .shape
+                .iter()
+                .zip(&x.shape)
+                .all(|(&out_dim, &x_dim)| out_dim < 0 || x_dim < 0 || out_dim == x_dim),
+        "gate and Y must have shapes compatible with X"
     );
     require!(
         scale.shape.len() == 1
             && scale.shape[0] > 0
-            && x.shape.last().unwrap() % scale.shape[0] == 0,
-        "scale must be [C] and X's last dimension must be a multiple of C"
+            && x.shape
+                .last()
+                .is_some_and(|&dim| dim > 0 && dim % scale.shape[0] == 0),
+        "scale must be [C] and X's static last dimension must be a positive multiple of C"
     );
     Ok(())
 }
@@ -1425,11 +1473,6 @@ pub fn register(registry: &mut OpRegistry) {
             linear_attention_gate_op as OpHandler,
             linear_attention_gate_claim as ClaimPredicate,
         ),
-        (
-            "GatedRMSNorm",
-            gated_rms_norm_op as OpHandler,
-            gated_rms_norm_claim as ClaimPredicate,
-        ),
     ] {
         registry.register_shapeless(OpRegistration {
             domain: "com.microsoft",
@@ -1439,5 +1482,34 @@ pub fn register(registry: &mut OpRegistry) {
             handler,
             claim,
         });
+    }
+    registry.register_shape_classified(
+        OpRegistration {
+            domain: "com.microsoft",
+            op_type: "GatedRMSNorm",
+            min_opset: K_ANY_OPSET,
+            max_opset: K_ANY_OPSET,
+            handler: gated_rms_norm_op as OpHandler,
+            claim: gated_rms_norm_claim as ClaimPredicate,
+        },
+        gated_rms_norm_compile_shape_safety,
+    );
+}
+
+#[cfg(test)]
+mod gated_rms_norm_tests {
+    use super::gated_rms_norm_compile_shape_safety_for;
+    use crate::registry::CompileShapeSafety;
+
+    #[test]
+    fn dynamic_shapes_are_validated_eagerly_and_static_shapes_remain_shapeless() {
+        assert!(matches!(
+            gated_rms_norm_compile_shape_safety_for(true),
+            CompileShapeSafety::EagerOnly { .. }
+        ));
+        assert_eq!(
+            gated_rms_norm_compile_shape_safety_for(false),
+            CompileShapeSafety::Shapeless
+        );
     }
 }

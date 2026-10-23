@@ -11,6 +11,7 @@ Covers the ops added in this work:
     non-GQA head counts, with/without ``past_state``, explicit ``scale``, fp16, and zero-size
     (T == 0 / B == 0) are exercised against ORT's CPU contrib kernel (both ``output`` and
     ``present_state``).
+  * ``GatedRMSNorm`` (com.microsoft) — grouped RMS normalization with dynamic leading dimensions.
 
 Each op is exercised through the MLX EP (with ORT CPU fallback available) and compared against ORT's
 CPU EP, tolerance-gated. If a contrib op/schema is not available in this ORT build, the case is
@@ -19,11 +20,13 @@ skipped with a reason rather than failing.
 
 from __future__ import annotations
 
+import json
 import numpy as np
 import onnx_ir as ir
 import onnxruntime as ort
 import pytest
 import ml_dtypes
+from onnxruntime.capi.onnxruntime_pybind11_state import EPFail
 
 import _models as m
 
@@ -291,6 +294,74 @@ def test_gated_rms_norm_grouped():
     feeds = {"x": x, "scale": scale, "gate": gate}
     m.assert_mlx_claims(model, feeds)
     m.assert_matches_ref(model, feeds, [expected], rtol=3e-3, atol=3e-3)
+
+
+def _dynamic_gated_rms_norm_model(dtype: ir.DataType) -> bytes:
+    x_shape = ["batch", "tokens", 12]
+    gate_shape = ["gate_batch", "gate_tokens", 12]
+    return build(
+        "GatedRMSNorm",
+        [
+            m.tensor("x", dtype, x_shape),
+            m.tensor("scale", dtype, [4]),
+            m.tensor("gate", dtype, gate_shape),
+        ],
+        [m.tensor("out", dtype, x_shape)],
+        domain="com.microsoft",
+        attrs=[ir.AttrFloat32("epsilon", 1e-5)],
+    )
+
+
+@pytest.mark.parametrize(
+    "dtype,np_dtype",
+    [(DT.FLOAT, np.float32), (DT.FLOAT16, np.float16)],
+    ids=["fp32", "fp16"],
+)
+def test_gated_rms_norm_dynamic_leading_dimensions(tmp_path, dtype, np_dtype):
+    model = _dynamic_gated_rms_norm_model(dtype)
+    options = ort.SessionOptions()
+    options.enable_profiling = True
+    options.profile_file_prefix = str(tmp_path / "dynamic_gated_rms_norm")
+    session = ort.InferenceSession(model, options, providers=m.EP_PROVIDERS)
+    reference = ort.InferenceSession(model, providers=["CPUExecutionProvider"])
+    rng = np.random.default_rng(1296)
+    scale = rng.standard_normal(4).astype(np_dtype)
+    sizes = [(2, 3), (1, 1), (1, 5), (2, 2)]
+    for batch, tokens in sizes:
+        shape = (batch, tokens, 12)
+        feeds = {
+            "x": rng.standard_normal(shape).astype(np_dtype),
+            "scale": scale,
+            "gate": rng.standard_normal(shape).astype(np_dtype),
+        }
+        actual = session.run(None, feeds)[0]
+        expected = reference.run(None, feeds)[0]
+        np.testing.assert_allclose(actual, expected, rtol=3e-3, atol=3e-3)
+
+    with open(session.end_profiling()) as profile:
+        events = json.load(profile)
+    providers = [
+        event["args"]["provider"]
+        for event in events
+        if event.get("cat") == "Node" and event.get("args", {}).get("provider")
+    ]
+    assert len(providers) >= len(sizes)
+    assert set(providers) == {"MLXExecutionProvider"}, (
+        f"GatedRMSNorm fell back: {providers}"
+    )
+
+
+def test_gated_rms_norm_dynamic_rejects_mismatched_gate_shape():
+    model = _dynamic_gated_rms_norm_model(DT.FLOAT)
+    session = ort.InferenceSession(model, providers=m.EP_PROVIDERS)
+    session.disable_fallback()
+    feeds = {
+        "x": np.ones((1, 3, 12), dtype=np.float32),
+        "scale": np.ones(4, dtype=np.float32),
+        "gate": np.ones((1, 2, 12), dtype=np.float32),
+    }
+    with pytest.raises(EPFail, match="GatedRMSNorm: X and gate must have matching positive shapes"):
+        session.run(None, feeds)
 
 
 # --- TensorScatter (ai.onnx opset 24) -----------------------------------------------------------

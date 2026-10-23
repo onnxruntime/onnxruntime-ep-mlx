@@ -20,13 +20,99 @@ encoders, LLM prefill, and token-at-a-time decode.
 
 The EP translates supported ONNX regions into MLX, compiles reusable closures, and leaves unsupported
 ops on ORT CPU. It covers common encoder and decoder operators, including quantized matmul, GQA/MHA,
-PagedAttention, RoPE, normalization, convolution, pooling, reductions, and shape operations. See
+PagedAttention, RoPE, RMS and gated RMS normalization, packed causal convolution, chunked
+GatedDeltaNet, pooling, reductions, and shape operations. See
 [`docs/OP_ARCHITECTURE.md`](docs/OP_ARCHITECTURE.md) for the coverage table.
 
-Large, fully claimed regions are fastest. Dynamic shapes are compiled per shape key; autoregressive
-decode uses a shapeless path so growing KV length does not retrace. Use
+Large, fully claimed regions are fastest. Dynamic shapes are generally compiled per shape key;
+operators that validate runtime-dependent shapes may execute eagerly. Autoregressive decode uses a
+shapeless path so growing KV length does not retrace. Use
 `ONNXRUNTIME_EP_MLX_VERBOSE=1` or `ONNXRUNTIME_EP_MLX_CLAIM_DEBUG=1` to diagnose fallback and
 fragmentation.
+
+### Packed Qwen state-space operators
+
+`VarlenCausalConvWithState` supports token-major ragged batches, dilated depthwise convolution,
+optional bias/SiLU, and activation-typed raw carry state. `GatedDeltaNet` supports the scalar-decay
+`gated_delta` form, Qwen gate activations, optional Q/K L2 normalization, and inverse grouped-query
+heads. Prefill uses the shared chunked batched-matmul core; single-token requests use a recurrent
+step. Recurrent state and gate arithmetic stay FP32 with FP32/FP16/BF16 activation inputs.
+
+Both operators read cumulative sequence boundaries on the host and run eagerly, with tensor
+arithmetic on MLX. Compact speculative-state capture, per-key-dimension GatedDeltaNet decay, and
+other GatedDeltaNet update rules are not supported and are declined. Tests cover Qwen3.5-0.8B
+geometry, mixed-length batches, chunk tails, changing runtime shapes, and aliased state outputs.
+Full-model GenAI generation has been smoke-tested and matched WebGPU token-for-token on the
+benchmark prompts below. Broader correctness against the original model and performance tuning
+have not been validated.
+
+### Run the exported Qwen3.5 paged model
+
+The example below uses ONNX Runtime GenAI's Engine API, which drives the paged model's packed
+variable-length inputs and the model's chat template. `--ep` selects the provider without editing
+`genai_config.json` (default: `mlx`):
+
+```sh
+export ONNXRUNTIME_MLX_EP_LIB="$PWD/rust/target/release/libonnxruntime_mlx_ep.dylib"
+python examples/qwen35_paged_generate.py \
+  --model-dir /path/to/qwen3.5-0.8b-int4-paged-mlx \
+  --max-new-tokens 128 \
+  --warmup-tokens 8 \
+  --prompt-repeats 1 4 16 \
+  --runs 3 \
+  --prompt "Why is paged attention useful?"
+```
+
+To compare WebGPU, first build its plugin from the ONNX Runtime checkout:
+
+```sh
+python tools/ci_build/build.py \
+  --build_dir build/WebGPUPlugin --config Release --update --build \
+  --use_webgpu shared_lib --build_shared_lib \
+  --skip_tests --skip_submodule_sync --skip_pip_install --no_telemetry \
+  --parallel 2 --target onnxruntime_providers_webgpu
+```
+
+Then run the same benchmark command with `--ep webgpu --ep-library
+/path/to/onnxruntime/build/WebGPUPlugin/Release/libonnxruntime_providers_webgpu.dylib`.
+Alternatively, set `ONNXRUNTIME_WEBGPU_EP_LIB`. `--ep cpu` needs no plugin, but the current CPU EP
+cannot execute this exact packed hybrid graph: it has no kernels for `PagedAttention`,
+`VarlenCausalConvWithState`, or `GatedDeltaNet`. A non-paged CPU-compatible export would be a
+different workload, not an apples-to-apples provider comparison.
+
+Run this with a source-built ONNX Runtime GenAI package that includes the Engine API and is ABI
+compatible with the ONNX Runtime used to build the MLX EP. The released `onnxruntime-genai` 0.18.0
+wheel uses the classic Generator API, which supplies rank-2 `input_ids` and cannot run this paged
+model's rank-1 packed input. The GenAI source build used for validation also requires setting
+`tokenizer_class` to `Qwen2Tokenizer` in `tokenizer_config.json`, because its pinned
+onnxruntime-extensions revision does not recognize `Qwen3_5Tokenizer`.
+
+The script repeats the prompt text to produce several input lengths and reports the exact encoded
+token count for each. It runs an untimed warmup per length, then measures time-to-first-token (from
+request submission through the first generated token) and steady-state decode throughput (excluding
+the first token's latency). Prefix caching is disabled so repeated prompts still execute prefill.
+Multiple measured runs report the median. Model/tokenizer loading and Engine initialization are
+reported separately. `--results-json /path/to/results.json` saves timings and token IDs for comparison;
+`--print-output` decodes text outside the timed region. Output length is a cap, so EOS may end a run
+early; the actual generated count is printed. Use fewer prompt repeats or runs for a quicker pass;
+`--mlx-verbose` prints provider claim and execution summaries.
+
+#### Qwen3.5-0.8B provider comparison
+
+On an Apple M1 with 16 GiB RAM, using ORT 1.31.0 Release and source-built GenAI 0.18.0-dev:
+
+| Prompt tokens | MLX TTFT | WebGPU TTFT | MLX decode | WebGPU decode |
+| ---: | ---: | ---: | ---: | ---: |
+| 19 | 0.163 s | 0.095 s | 10.14 tok/s | 43.79 tok/s |
+| 40 | 0.232 s | 0.158 s | 9.72 tok/s | 43.70 tok/s |
+| 124 | 0.334 s | 0.350 s | 9.77 tok/s | 43.61 tok/s |
+
+These are medians of three runs per prompt length, each generating 128 tokens after an eight-token
+warmup. Both providers used the identical INT4/FP16 paged graph with prefix caching disabled and
+were benchmarked sequentially after compilation finished. WebGPU was built in Release from ORT
+commit `8755f3ef11`; graph capture was not enabled. Every measured output matched between providers.
+WebGPU decoded 4.3-4.5 times faster than this MLX implementation; this is not a comparison of the
+backends' theoretical limits. CPU could not load this graph and has no timing result.
 
 ## Requirements
 

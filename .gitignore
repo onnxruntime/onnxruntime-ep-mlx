@@ -78,3 +78,6 @@ env/
 .python-version
 scratch/
 .DS_Store
+
+# Local build dependencies
+.deps/

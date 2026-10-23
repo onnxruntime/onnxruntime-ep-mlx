@@ -333,7 +333,8 @@ def test_paged_attention_latent_layout_and_rotary_offset():
     np.testing.assert_allclose(actual_cache, expected_cache, rtol=2e-3, atol=2e-3)
 
 
-def test_paged_attention_ort129_optional_inputs_and_cache_outputs():
+@pytest.mark.parametrize("metadata_size", [2, 3])
+def test_paged_attention_ort129_optional_inputs_and_cache_outputs(metadata_size):
     h, kv, d, nb, blk, batch = 4, 2, 8, 4, 4, 1
     hidden, kv_hidden = h * d, kv * d
     rng = np.random.default_rng(129)
@@ -349,7 +350,7 @@ def test_paged_attention_ort129_optional_inputs_and_cache_outputs():
     sink = np.array([-0.5, 0.25, 1.0, -1.0], dtype=np.float16)
     qw = np.linspace(0.75, 1.25, d).astype(np.float16)
     kw = np.linspace(1.25, 0.75, d).astype(np.float16)
-    metadata = np.array([4, 16], dtype=np.int32)
+    metadata = np.array([4, 16, 8][:metadata_size], dtype=np.int32)
     absent = lambda: m.tensor("", DT.FLOAT, [])
     inputs = [
         m.tensor("query", DT.FLOAT16, [2, hidden]),
@@ -368,7 +369,7 @@ def test_paged_attention_ort129_optional_inputs_and_cache_outputs():
         m.tensor("k_norm_weight", DT.FLOAT16, [d]),
         absent(),
         absent(),
-        m.tensor("attention_metadata", DT.INT32, [2]),
+        m.tensor("attention_metadata", DT.INT32, [metadata_size]),
     ]
     outputs = [
         m.tensor("output", DT.FLOAT16, [2, hidden]),
@@ -438,7 +439,7 @@ def test_paged_attention_ort129_optional_inputs_and_cache_outputs():
         m.tensor("k_norm_weight", DT.FLOAT16, [d]),
         absent(),
         absent(),
-        m.tensor("attention_metadata", DT.INT32, [2]),
+        m.tensor("attention_metadata", DT.INT32, [metadata_size]),
     ]
     one_output_model = m.make_model(
         "PagedAttention",
