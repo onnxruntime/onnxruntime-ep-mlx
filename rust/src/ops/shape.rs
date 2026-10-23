@@ -1032,6 +1032,23 @@ fn identity_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxErro
     Ok(())
 }
 
+fn integer_range_count(start: i64, limit: i64, delta: i64) -> Result<usize, MlxError> {
+    if delta == 0 {
+        return Err("MLX Range: delta must be nonzero".to_string());
+    }
+    let distance = i128::from(limit) - i128::from(start);
+    let delta = i128::from(delta);
+    let count = if distance == 0 || distance.signum() != delta.signum() {
+        0
+    } else {
+        (distance.abs() - 1) / delta.abs() + 1
+    };
+    if count > i128::from(i32::MAX) {
+        return Err("MLX Range: output length exceeds native int32 geometry".to_string());
+    }
+    Ok(count as usize)
+}
+
 fn range_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
     if ctx.native_attention_decode()
         && ctx.rope_dynamic()
@@ -1041,6 +1058,33 @@ fn range_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> 
         let start = ctx.resolve(&n.inputs[0])?;
         let start = ctx.reshape(start, &[1])?;
         ctx.bind(&n.outputs[0], start);
+        return Ok(());
+    }
+    if n.outputs[0].otype == ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64 {
+        let mut bounds = [0i64; 3];
+        for (i, value) in bounds.iter_mut().enumerate() {
+            if !ctx.tensor_shape(&n.inputs[i])?.is_empty() {
+                return Err("MLX Range: inputs must be scalars".to_string());
+            }
+            let values = ctx.read_ints_eval(&n.inputs[i])?;
+            if values.len() != 1 {
+                return Err("MLX Range: expected one integer per scalar".to_string());
+            }
+            *value = values[0];
+        }
+        let [start, limit, delta] = bounds;
+        let count = integer_range_count(start, limit, delta)?;
+        let mut values = Vec::new();
+        values
+            .try_reserve_exact(count)
+            .map_err(|error| format!("MLX Range: cannot allocate integer output: {error}"))?;
+        for i in 0..count {
+            let value = i128::from(start) + (i as i128) * i128::from(delta);
+            values
+                .push(i64::try_from(value).map_err(|_| "MLX Range: integer output exceeds int64")?);
+        }
+        let out = ctx.from_host_i64(&values, &[count as i32]);
+        ctx.bind(&n.outputs[0], out);
         return Ok(());
     }
     let start = read_range_scalar(ctx, n, 0)?;
@@ -2352,6 +2396,30 @@ fn range_claim(node: &NodeView) -> ClaimResult {
         ),
         None => deny!("missing output tensor type/shape info"),
     };
+    for i in 0..3 {
+        let info = node.input_info(i).ok_or("Range: missing scalar metadata")?;
+        require!(
+            info.dtype == ty && node.input_rank_known(i) == Some(true) && info.shape.is_empty(),
+            "Range: inputs must be scalars with the same dtype"
+        );
+    }
+    if ty == ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64 {
+        let mut bounds = [0i64; 3];
+        for (i, value) in bounds.iter_mut().enumerate() {
+            let values = match node.read_const_int64(i) {
+                Some(values) if values.len() == 1 => values,
+                _ => deny!("Range: integer bounds must be constant scalar initializers"),
+            };
+            *value = values[0];
+        }
+        let count = integer_range_count(bounds[0], bounds[1], bounds[2])?;
+        require!(
+            out.shape[0] == count as i64,
+            "Range: inferred output extent {} disagrees with exact integer count {count}",
+            out.shape[0]
+        );
+        return Ok(());
+    }
     // Range's output extent is value-dependent, so the bounds MUST be constant scalar initializers:
     // claiming a runtime-bounded Range puts it in the compiled closure where its output feeds a
     // downstream shape/axes reader (e.g. ReduceMean axes in expanded RMSNormalization), forcing a
@@ -2978,4 +3046,30 @@ pub fn register(registry: &mut OpRegistry) {
         handler: resize_op,
         claim: upsample_claim,
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::integer_range_count;
+
+    #[test]
+    fn integer_range_counts_preserve_full_width_bounds() {
+        assert_eq!(
+            integer_range_count(i64::MAX - 6, i64::MAX - 2, 1).unwrap(),
+            4
+        );
+        assert_eq!(
+            integer_range_count(i64::MIN, i64::MAX, i64::MAX).unwrap(),
+            3
+        );
+        assert_eq!(
+            integer_range_count(i64::MAX, i64::MIN, i64::MIN).unwrap(),
+            2
+        );
+        assert_eq!(integer_range_count(4, 4, i64::MIN).unwrap(), 0);
+        assert_eq!(integer_range_count(4, 8, -1).unwrap(), 0);
+        assert_eq!(integer_range_count(8, 4, 1).unwrap(), 0);
+        assert!(integer_range_count(0, 1, 0).is_err());
+        assert!(integer_range_count(i64::MIN, i64::MAX, 1).is_err());
+    }
 }
