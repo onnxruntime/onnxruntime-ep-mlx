@@ -113,7 +113,7 @@ fn is_general_compile_unsafe(n: &NodeDesc) -> bool {
 
 fn host_parameter_indices(n: &NodeDesc) -> &'static [usize] {
     match n.op_type.as_str() {
-        "Reshape" | "Expand" => &[1],
+        "Reshape" | "Expand" | "AffineGrid" => &[1],
         "ConstantOfShape" => &[0],
         "Slice" => &[1, 2, 3, 4],
         "Range" => &[0, 1, 2],
@@ -123,6 +123,7 @@ fn host_parameter_indices(n: &NodeDesc) -> &'static [usize] {
         "MelWeightMatrix" => &[0, 1, 2, 3, 4],
         "MaxUnpool" => &[1, 2],
         "TensorScatter" => &[2],
+        "Col2Im" => &[1, 2],
         "CumSum" | "CumProd" => &[1],
         "RNN" | "GRU" | "LSTM" => &[4],
         "TopK" => &[1],
@@ -137,6 +138,7 @@ fn guarded_boundary_parameter(n: &NodeDesc, r: &crate::engine::TensorRef) -> boo
         n.op_type.as_str(),
         "Reshape"
             | "Expand"
+            | "AffineGrid"
             | "Slice"
             | "ConstantOfShape"
             | "DFT"
@@ -1581,6 +1583,36 @@ mod shape_inference_tests {
     }
 
     #[test]
+    fn affine_grid_size_values_guard_general_capture_only() {
+        let mut node = NodeDesc::new(
+            "AffineGrid".to_string(),
+            String::new(),
+            20,
+            CompileShapeSafety::ShapeKeyedOnly {
+                reason: "host-generated homogeneous grid",
+            },
+        );
+        let mut size = input("size", Src::CtxInput);
+        size.ctx_index = 1;
+        node.inputs = vec![input("theta", Src::CtxInput), size];
+        assert!(reads_data_dependent_parameter(&node));
+        assert!(!reads_unguarded_parameter(&node, true));
+        assert_eq!(boundary_shape_inputs(std::slice::from_ref(&node)), vec![1]);
+        assert!(!compile_shape_mode_supported(
+            std::slice::from_ref(&node),
+            true
+        ));
+        node.inputs[1].source = Src::Intermediate;
+        assert!(reads_unguarded_parameter(&node, true));
+        assert!(boundary_shape_inputs(std::slice::from_ref(&node)).is_empty());
+        node.inputs[1].shape_const = true;
+        assert!(!reads_data_dependent_parameter(&node));
+        node.inputs[1].shape_const = false;
+        node.inputs[1].source = Src::Initializer;
+        assert!(!reads_data_dependent_parameter(&node));
+    }
+
+    #[test]
     fn max_unpool_host_reads_require_constant_indices_and_output_shape() {
         let mut node = NodeDesc::new(
             "MaxUnpool".to_string(),
@@ -1603,6 +1635,32 @@ mod shape_inference_tests {
                 assert!(reads_data_dependent_parameter(&node));
             }
 
+            node.inputs[index].source = Src::Initializer;
+        }
+    }
+
+    #[test]
+    fn col2im_host_geometry_requires_constant_controls() {
+        let mut node = NodeDesc::new(
+            "Col2Im".to_string(),
+            String::new(),
+            18,
+            CompileShapeSafety::ShapeKeyedOnly {
+                reason: "host-read image and block shapes",
+            },
+        );
+        node.inputs = vec![
+            input("x", Src::CtxInput),
+            input("image", Src::Initializer),
+            input("block", Src::Initializer),
+        ];
+        assert!(!reads_unguarded_parameter(&node, true));
+        for index in [1, 2] {
+            for source in [Src::CtxInput, Src::Intermediate] {
+                node.inputs[index].source = source;
+                assert!(reads_unguarded_parameter(&node, true));
+                assert!(reads_data_dependent_parameter(&node));
+            }
             node.inputs[index].source = Src::Initializer;
         }
     }

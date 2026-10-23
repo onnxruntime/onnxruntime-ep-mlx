@@ -4,9 +4,11 @@
 //! Every op reduces to the same primitives the shape handlers already use — host-computed
 //! gather/scatter index maps + `take`/`take_along_axis`/`scatter_add` + on-device coordinate
 //! arithmetic — so they translate exactly to MLX with no bespoke kernel. ROI pooling and MaxUnpool
-//! accept symbolic extents; host-read MaxUnpool controls stay eager unless constant. Unsupported
-//! forms (cubic GridSample, 5-D volumetric, adaptive RoiAlign `sampling_ratio==0`, non-float
-//! payloads) are left to CPU.
+//! accept symbolic extents; host-read MaxUnpool/Col2Im controls stay eager unless constant.
+//! Col2Im preserves integer/bool payloads with an inverse gather map and same-dtype add/OR;
+//! float64 uses that map on the existing MLX CPU-stream route without narrowing.
+//! Unsupported forms (cubic GridSample, 5-D volumetric, adaptive RoiAlign `sampling_ratio==0`,
+//! non-float payloads outside Col2Im) are left to CPU.
 //! NonMaxSuppression is host-computed because MLX has no data-dependent compacting primitive.
 
 use std::cmp::Ordering;
@@ -15,7 +17,8 @@ use std::os::raw::c_void;
 use crate::engine::{MlxError, NodeDesc, TensorRef, TranslationContext, mlx_dtype_from_onnx};
 use crate::mlx::{Array, VectorArray};
 use crate::registry::{
-    ClaimResult, K_ANY_OPSET, NodeView, OpRegistration, OpRegistry, is_int_index, is_mlx_float,
+    ClaimResult, K_ANY_OPSET, NodeView, OpRegistration, OpRegistry, is_int_index, is_mlx_cpu_float,
+    is_mlx_float,
 };
 use crate::sys::mlx;
 use crate::sys::ort;
@@ -295,23 +298,6 @@ fn zeros_1d(ctx: &mut TranslationContext, n: i32) -> Result<mlx::mlx_array, MlxE
 }
 
 /// Read a constant int64/int32 parameter INPUT (image_shape / block_shape / size) at translate time.
-fn read_const_ints(ctx: &TranslationContext, r: &TensorRef) -> Result<Vec<i64>, MlxError> {
-    let h = ctx.raw_host(r)?;
-    if h.data.is_null() {
-        return Ok(Vec::new());
-    }
-    if h.dtype == ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64 {
-        let p = h.data as *const i64;
-        Ok(unsafe { std::slice::from_raw_parts(p, h.count) }.to_vec())
-    } else {
-        let p = h.data as *const i32;
-        Ok(unsafe { std::slice::from_raw_parts(p, h.count) }
-            .iter()
-            .map(|&v| v as i64)
-            .collect())
-    }
-}
-
 fn out_dtype(n: &NodeDesc) -> mlx::mlx_dtype {
     mlx_dtype_from_onnx(n.outputs[0].otype)
 }
@@ -492,44 +478,107 @@ fn grid_sample_claim(node: &NodeView) -> ClaimResult {
 }
 
 // =================================================================================================
-// AffineGrid (2D)
+// AffineGrid (2D / 3D)
 // =================================================================================================
 
-fn affine_grid_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
-    let size = read_const_ints(ctx, &n.inputs[1])?; // (N, C, H, W)
-    let nd = size[0] as i32;
-    let hd = size[2] as i32;
-    let wd = size[3] as i32;
-    let align = n.ints.get("align_corners").copied().unwrap_or(0) != 0;
+fn affine_grid_shape(theta: &[i32], size: &[i64]) -> Result<Vec<i32>, MlxError> {
+    if !matches!(size.len(), 4 | 5) {
+        return Err("AffineGrid: size must contain 4 or 5 dimensions".into());
+    }
+    let rank = size.len() - 2;
+    if theta.len() != 3
+        || theta[1] != rank as i32
+        || theta[2] != rank as i32 + 1
+        || i64::from(theta[0]) != size[0]
+    {
+        return Err(
+            "AffineGrid: theta must have shape [size[0], spatial_rank, spatial_rank+1]".into(),
+        );
+    }
+    if size
+        .iter()
+        .enumerate()
+        .any(|(axis, &d)| d < 0 || (axis != 1 && d > i64::from(i32::MAX)))
+        || size[2..].contains(&0)
+    {
+        return Err("AffineGrid: size requires nonnegative N/C and positive spatial dimensions within int32".into());
+    }
+    let spatial = size[2..].iter().try_fold(1i64, |p, &d| p.checked_mul(d));
+    let base_count = spatial.and_then(|p| p.checked_mul(rank as i64 + 1));
+    let out_count = spatial
+        .and_then(|p| p.checked_mul(size[0]))
+        .and_then(|p| p.checked_mul(rank as i64));
+    if base_count.is_none_or(|p| p > i64::from(i32::MAX))
+        || out_count.is_none_or(|p| p > i64::from(i32::MAX))
+    {
+        return Err("AffineGrid: grid element count exceeds int32 indexing".into());
+    }
+    let mut shape = vec![theta[0]];
+    shape.extend(size[2..].iter().map(|&d| d as i32));
+    shape.push(rank as i32);
+    Ok(shape)
+}
 
-    let coord = |i: i32, l: i32| -> f32 {
+fn affine_grid_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
+    let size = ctx.read_ints_eval(&n.inputs[1])?;
+    let t0 = ctx.resolve(&n.inputs[0])?;
+    let out_shape = affine_grid_shape(&ctx.shape_of(t0), &size)?;
+    let rank = size.len() - 2;
+    let align = n.ints.get("align_corners").copied().unwrap_or(0) != 0;
+    if align && size[2..].contains(&1) {
+        return Err("AffineGrid: align_corners=1 singleton axes are not supported".into());
+    }
+    if size[0] == 0 {
+        let y = ctx.emit(|res, s| unsafe {
+            mlx::mlx_zeros(res, out_shape.as_ptr(), out_shape.len(), out_dtype(n), s)
+        })?;
+        ctx.bind(&n.outputs[0], y);
+        return Ok(());
+    }
+    let coord = |i: i64, l: i64| -> f64 {
         if align {
-            if l <= 1 {
-                -1.0
-            } else {
-                -1.0 + i as f32 * (2.0 / (l - 1) as f32)
-            }
+            -1.0 + i as f64 * (2.0 / (l - 1) as f64)
         } else {
-            ((2.0 * i as f64 + 1.0) / l as f64 - 1.0) as f32
+            (2.0 * i as f64 + 1.0) / l as f64 - 1.0
         }
     };
-    let mut base = vec![0f32; (hd as usize) * (wd as usize) * 3];
-    for h in 0..hd {
-        let yh = coord(h, hd);
-        for w in 0..wd {
-            let r = ((h as usize * wd as usize) + w as usize) * 3;
-            base[r] = coord(w, wd);
-            base[r + 1] = yh;
-            base[r + 2] = 1.0;
+    let points: i64 = size[2..].iter().product();
+    let mut base = Vec::new();
+    base.try_reserve_exact(points as usize * (rank + 1))
+        .map_err(|e| format!("AffineGrid: cannot allocate homogeneous grid: {e}"))?;
+    for point in 0..points {
+        let mut remaining = point;
+        for &dim in size[2..].iter().rev() {
+            base.push(coord(remaining % dim, dim));
+            remaining /= dim;
         }
+        base.push(1.0);
     }
-    let base_arr = host_f32(ctx, &base, &[1, hd * wd, 3]);
+    let base_shape = [1, points as i32, rank as i32 + 1];
+    let double = out_dtype(n) == mlx::mlx_dtype__MLX_FLOAT64;
+    let base_arr = if double {
+        ctx.from_host(
+            base.as_ptr().cast(),
+            &base_shape,
+            mlx::mlx_dtype__MLX_FLOAT64,
+        )
+    } else {
+        let base: Vec<f32> = base.iter().map(|&v| v as f32).collect();
+        host_f32(ctx, &base, &base_shape)
+    };
 
-    let t0 = ctx.resolve(&n.inputs[0])?;
-    let theta = astype(ctx, t0, mlx::mlx_dtype__MLX_FLOAT32)?; // [N,2,3]
-    let theta_t = ctx.transpose(theta, &[0, 2, 1])?; // [N,3,2]
-    let grid = matmul(ctx, base_arr, theta_t)?; // [N,H*W,2]
-    let grid = reshape(ctx, grid, &[nd, hd, wd, 2])?;
+    let theta = astype(
+        ctx,
+        t0,
+        if double {
+            mlx::mlx_dtype__MLX_FLOAT64
+        } else {
+            mlx::mlx_dtype__MLX_FLOAT32
+        },
+    )?;
+    let theta_t = ctx.transpose(theta, &[0, 2, 1])?;
+    let grid = matmul(ctx, base_arr, theta_t)?;
+    let grid = reshape(ctx, grid, &out_shape)?;
     let grid = astype(ctx, grid, out_dtype(n))?;
     let y = contiguous(ctx, grid)?;
     ctx.bind(&n.outputs[0], y);
@@ -543,43 +592,237 @@ fn affine_grid_claim(node: &NodeView) -> ClaimResult {
         node.num_inputs(),
         node.num_outputs()
     );
-    let (t, out) = match (node.input_info(0), node.output_info(0)) {
-        (Some(t), Some(o)) => (t, o),
-        _ => deny!("missing tensor type/shape info on theta or output"),
+    let (t, size_info, out) = match (node.input_info(0), node.input_info(1), node.output_info(0)) {
+        (Some(t), Some(s), Some(o)) => (t, s, o),
+        _ => deny!("missing tensor type/shape info on theta, size, or output"),
     };
     require!(
-        is_mlx_float(t.dtype) && is_mlx_float(out.dtype),
-        "theta and output must be float, got {} -> {}",
+        is_mlx_cpu_float(t.dtype) && out.dtype == t.dtype,
+        "theta and output must share one supported float dtype, got {} -> {}",
         crate::registry::ort_dtype_name(t.dtype),
         crate::registry::ort_dtype_name(out.dtype)
     );
     require!(
-        node.is_const_int_tensor(1),
-        "size must be a constant integer initializer"
+        size_info.dtype == ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64
+            && size_info.shape.len() == 1
+            && matches!(size_info.shape[0], 4 | 5),
+        "size must be an int64 vector of length 4 or 5"
     );
-    let size = match node.read_const_ints_any(1) {
-        Some(v) => v,
-        None => deny!("size must be a constant integer initializer"),
-    };
+    let rank = size_info.shape[0] - 2;
     require!(
-        size.len() == 4,
-        "size must contain 4 dimensions, got {size:?}"
-    );
-    require!(
-        t.shape.len() == 3 && t.shape[1] == 2 && t.shape[2] == 3 && t.shape.iter().all(|&d| d >= 0),
-        "theta must have static shape [N,2,3], got {:?}",
+        t.shape.len() == 3
+            && (t.shape[1] < 0 || t.shape[1] == rank)
+            && (t.shape[2] < 0 || t.shape[2] == rank + 1),
+        "theta must have shape [N,{rank},{}], got {:?}",
+        rank + 1,
         t.shape
     );
     require!(
-        size.iter().all(|&d| d >= 1),
-        "all size dimensions must be positive, got {size:?}"
+        out.shape.len() == rank as usize + 2
+            && (out.shape[0] < 0 || t.shape[0] < 0 || out.shape[0] == t.shape[0])
+            && (out.shape.last().is_some_and(|&d| d < 0 || d == rank)),
+        "output must have shape [N,spatial...,{rank}], got {:?}",
+        out.shape
     );
+    let align = node.int_attr("align_corners", 0);
+    require!(matches!(align, 0 | 1), "align_corners must be 0 or 1");
+    if let Some(size) = node.read_const_ints_any(1) {
+        let mut theta = vec![size.first().copied().unwrap_or(-1), rank, rank + 1];
+        if t.shape[0] >= 0 {
+            theta[0] = t.shape[0];
+        }
+        let theta: Option<Vec<i32>> = theta.iter().map(|&d| i32::try_from(d).ok()).collect();
+        let shape = match theta.and_then(|t| affine_grid_shape(&t, &size).ok()) {
+            Some(shape) => shape,
+            None => deny!("invalid or oversized AffineGrid theta/size geometry"),
+        };
+        require!(
+            out.shape
+                .iter()
+                .zip(&shape)
+                .all(|(&a, &b)| a < 0 || a == i64::from(b)),
+            "output shape disagrees with size"
+        );
+        require!(
+            align == 0 || !size[2..].contains(&1),
+            "align_corners=1 singleton axes have conflicting ONNX function/reference/ORT semantics"
+        );
+    } else {
+        require!(
+            align == 0,
+            "live size with align_corners=1 may select unresolved singleton-axis semantics"
+        );
+    }
     Ok(())
 }
 
 // =================================================================================================
 // Col2Im
 // =================================================================================================
+
+struct Col2ImGeometry {
+    block_size: i64,
+    spatial_size: i64,
+    channels: i32,
+    npos: Vec<i64>,
+    image_strides: Vec<i64>,
+    output_shape: Vec<i32>,
+}
+
+impl Col2ImGeometry {
+    fn new(
+        input: &[i64],
+        image: &[i64],
+        block: &[i64],
+        dilations: &[i64],
+        strides: &[i64],
+        pads: &[i64],
+    ) -> Result<Self, MlxError> {
+        let rank = image.len();
+        if !(1..=3).contains(&rank)
+            || input.len() != 3
+            || block.len() != rank
+            || dilations.len() != rank
+            || strides.len() != rank
+            || pads.len() != 2 * rank
+            || input.iter().any(|&v| v < 0 || v > i32::MAX as i64)
+            || image
+                .iter()
+                .chain(block)
+                .chain(dilations)
+                .chain(strides)
+                .any(|&v| v <= 0 || v > i32::MAX as i64)
+            || pads.iter().any(|&v| v < 0 || v > i32::MAX as i64)
+        {
+            return Err("Col2Im: invalid dimensions or window attributes".into());
+        }
+        let product = |values: &[i64]| -> Result<i64, MlxError> {
+            values.iter().try_fold(1i64, |p, &v| {
+                p.checked_mul(v)
+                    .filter(|&p| p <= i32::MAX as i64)
+                    .ok_or_else(|| "Col2Im: flattened size exceeds int32".into())
+            })
+        };
+        let block_size = product(block)?;
+        let spatial_size = product(image)?;
+        if input[1] == 0 || input[1] % block_size != 0 {
+            return Err("Col2Im: channels must be a positive multiple of block size".into());
+        }
+        let channels = input[1] / block_size;
+        let mut npos = Vec::with_capacity(rank);
+        for d in 0..rank {
+            let effective = dilations[d] * (block[d] - 1) + 1;
+            let padded = image[d] + pads[d] + pads[d + rank];
+            let count = (padded - effective).div_euclid(strides[d]) + 1;
+            if count < 0 {
+                return Err("Col2Im: padded image is smaller than effective block".into());
+            }
+            npos.push(count);
+        }
+        if input[2] != product(&npos)? {
+            return Err("Col2Im: input length must equal product of sliding block counts".into());
+        }
+        product(input)?;
+        product(&[input[0], channels, spatial_size])?;
+        product(&[block_size, input[2]])?;
+        // The scatter map has at most one entry per input element.
+        let mut image_strides = vec![1; rank];
+        for d in (0..rank - 1).rev() {
+            image_strides[d] = image_strides[d + 1] * image[d + 1];
+        }
+        let mut output_shape = vec![input[0] as i32, channels as i32];
+        output_shape.extend(image.iter().map(|&v| v as i32));
+        Ok(Self {
+            block_size,
+            spatial_size,
+            channels: channels as i32,
+            npos,
+            image_strides,
+            output_shape,
+        })
+    }
+}
+
+// Metal scatter reductions reject 64-bit integers. Inverting the map gives each output one
+// contribution per kernel position, so ordinary same-dtype add/OR preserves integer and bool bits.
+// The same map avoids fp32 accumulation for float64 on the MLX CPU stream.
+fn col2im_exact(
+    ctx: &mut TranslationContext,
+    input: mlx::mlx_array,
+    geometry: &Col2ImGeometry,
+    image: &[i64],
+    block: &[i64],
+    dilations: &[i64],
+    strides: &[i64],
+    pads: &[i64],
+) -> Result<mlx::mlx_array, MlxError> {
+    let shape = ctx.shape_of(input);
+    let dtype = ctx.dtype_of(input);
+    let size = geometry.spatial_size;
+    let flat = ctx.reshape(
+        input,
+        &[
+            shape[0],
+            geometry.channels,
+            geometry.block_size as i32 * shape[2],
+        ],
+    )?;
+    let out_shape = [shape[0], geometry.channels, size as i32];
+    let zero = ctx.emit(|res, s| unsafe {
+        mlx::mlx_zeros(res, out_shape.as_ptr(), out_shape.len(), dtype, s)
+    })?;
+    let mut output = zero;
+    for kernel in 0..geometry.block_size {
+        let mut kc = vec![0; image.len()];
+        let mut remainder = kernel;
+        for d in (0..image.len()).rev() {
+            kc[d] = remainder % block[d];
+            remainder /= block[d];
+        }
+        let mut indices = Vec::with_capacity(size as usize);
+        let mut valid = Vec::with_capacity(size as usize);
+        for spatial in 0..size {
+            let mut index = 0;
+            let mut ok = true;
+            for d in 0..image.len() {
+                let coordinate = (spatial / geometry.image_strides[d]) % image[d];
+                let position = coordinate + pads[d] - kc[d] * dilations[d];
+                if position < 0
+                    || position % strides[d] != 0
+                    || position / strides[d] >= geometry.npos[d]
+                {
+                    ok = false;
+                    break;
+                }
+                index = index * geometry.npos[d] + position / strides[d];
+            }
+            indices.push(if ok {
+                (kernel * i64::from(shape[2]) + index) as i32
+            } else {
+                0
+            });
+            valid.push(u8::from(ok));
+        }
+        let index = host_i32(ctx, &indices, &[size as i32]);
+        let mask = ctx.from_host(
+            valid.as_ptr() as *const c_void,
+            &[size as i32],
+            mlx::mlx_dtype__MLX_BOOL,
+        );
+        let values = take_axis(ctx, flat, index, 2)?;
+        let values = where_(ctx, mask, values, zero)?;
+        output = ctx.binary(
+            if dtype == mlx::mlx_dtype__MLX_BOOL {
+                mlx::mlx_logical_or
+            } else {
+                mlx::mlx_add
+            },
+            output,
+            values,
+        )?;
+    }
+    ctx.reshape(output, &geometry.output_shape)
+}
 
 fn col2im_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
     let in0 = ctx.resolve(&n.inputs[0])?;
@@ -588,8 +831,8 @@ fn col2im_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError>
     let nn = is[0];
     let l = is[2];
 
-    let image_shape = read_const_ints(ctx, &n.inputs[1])?;
-    let block_shape = read_const_ints(ctx, &n.inputs[2])?;
+    let image_shape = ctx.read_ints_eval(&n.inputs[1])?;
+    let block_shape = ctx.read_ints_eval(&n.inputs[2])?;
     let r = image_shape.len();
 
     let dil = n
@@ -608,27 +851,54 @@ fn col2im_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError>
         .cloned()
         .unwrap_or_else(|| vec![0; 2 * r]);
 
-    let mut kk: i64 = 1;
-    for &block in &block_shape {
-        kk *= block;
+    let geometry = Col2ImGeometry::new(
+        &is.iter().map(|&v| i64::from(v)).collect::<Vec<_>>(),
+        &image_shape,
+        &block_shape,
+        &dil,
+        &stride,
+        &pads,
+    )?;
+    for index in [1, 2] {
+        let control = ctx.resolve(&n.inputs[index])?;
+        if ctx.shape_of(control) != [r as i32] {
+            return Err(
+                "Col2Im: image_shape and block_shape must be matching rank-1 vectors".into(),
+            );
+        }
     }
-    let c = is[1] / kk as i32;
-    let mut ss: i64 = 1;
-    for &image_dim in &image_shape {
-        ss *= image_dim;
+    let (kk, ss, c) = (
+        geometry.block_size,
+        geometry.spatial_size,
+        geometry.channels,
+    );
+    let npos = &geometry.npos;
+    let img_stride = &geometry.image_strides;
+    if nn == 0 || l == 0 {
+        let dtype = ctx.dtype_of(input);
+        let shape = &geometry.output_shape;
+        let output = ctx
+            .emit(|res, s| unsafe { mlx::mlx_zeros(res, shape.as_ptr(), shape.len(), dtype, s) })?;
+        ctx.bind(&n.outputs[0], output);
+        return Ok(());
     }
-
-    let mut npos = vec![0i64; r];
-    let mut img_stride = vec![1i64; r];
-    // Indexing aligned shape vectors keeps each spatial dimension's values together.
-    #[allow(clippy::needless_range_loop)]
-    for d in 0..r {
-        npos[d] = (image_shape[d] + pads[d] + pads[r + d] - dil[d] * (block_shape[d] - 1) - 1)
-            / stride[d]
-            + 1;
-    }
-    for d in (0..r.saturating_sub(1)).rev() {
-        img_stride[d] = img_stride[d + 1] * image_shape[d + 1];
+    if !matches!(
+        ctx.dtype_of(input),
+        mlx::mlx_dtype__MLX_FLOAT32 | mlx::mlx_dtype__MLX_FLOAT16 | mlx::mlx_dtype__MLX_BFLOAT16
+    ) {
+        let out = col2im_exact(
+            ctx,
+            input,
+            &geometry,
+            &image_shape,
+            &block_shape,
+            &dil,
+            &stride,
+            &pads,
+        )?;
+        let out = contiguous(ctx, out)?;
+        ctx.bind(&n.outputs[0], out);
+        return Ok(());
     }
 
     // Host-compute the (column, output-spatial) map, dropping out-of-range positions.
@@ -693,9 +963,7 @@ fn col2im_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError>
         out_acc = scatter_add(ctx, out_acc, idx, updates)?;
     }
 
-    let mut out_shape = vec![nn, c];
-    out_shape.extend(image_shape.iter().map(|&d| d as i32));
-    let out = reshape(ctx, out_acc, &out_shape)?;
+    let out = reshape(ctx, out_acc, &geometry.output_shape)?;
     let out = astype(ctx, out, out_dtype(n))?;
     let y = contiguous(ctx, out)?;
     ctx.bind(&n.outputs[0], y);
@@ -714,62 +982,77 @@ fn col2im_claim(node: &NodeView) -> ClaimResult {
         _ => deny!("missing tensor type/shape info on input[0] or output"),
     };
     require!(
-        is_mlx_float(i.dtype) && out.dtype == i.dtype,
-        "Col2Im input/output must be the same float dtype (fp32/fp16/bf16), got {} -> {}",
+        (is_mlx_float(i.dtype) || matches!(i.dtype, 2..=7 | 9..=13)) && out.dtype == i.dtype,
+        "Col2Im input/output must share a supported float, integer or bool dtype, got {} -> {}",
         crate::registry::ort_dtype_name(i.dtype),
         crate::registry::ort_dtype_name(out.dtype)
     );
     require!(
-        i.shape.len() == 3 && i.shape.iter().all(|&d| d >= 0),
-        "Col2Im input[0] must be a static rank-3 [N,C*prod(block),L] tensor, got shape {:?}",
+        i.shape.len() == 3 && i.shape.iter().all(|&d| d <= i32::MAX as i64),
+        "Col2Im input[0] must be rank-3 [N,C*prod(block),L] with MLX-representable dims, got shape {:?}",
         i.shape
     );
-    require!(
-        node.is_const_int_tensor(1) && node.is_const_int_tensor(2),
-        "Col2Im `image_shape` (input 1) and `block_shape` (input 2) must be constant integer \
-         initializers; runtime values stay on CPU"
-    );
-    let image_shape = match node.read_const_ints_any(1) {
-        Some(v) => v,
-        None => deny!("Col2Im `image_shape` (input 1) is not a readable constant int tensor"),
+    let (image_info, block_info) = match (node.input_info(1), node.input_info(2)) {
+        (Some(image), Some(block)) => (image, block),
+        _ => deny!("Col2Im: missing shape control type/shape info"),
     };
-    let block_shape = match node.read_const_ints_any(2) {
-        Some(v) => v,
-        None => deny!("Col2Im `block_shape` (input 2) is not a readable constant int tensor"),
+    require!(
+        image_info.dtype == 7
+            && block_info.dtype == 7
+            && image_info.shape.len() == 1
+            && block_info.shape.len() == 1
+            && (1..=3).contains(&image_info.shape[0])
+            && block_info.shape == image_info.shape,
+        "Col2Im: image_shape/block_shape must be int64 vectors of the same known length 1-3"
+    );
+    let r = image_info.shape[0] as usize;
+    require!(
+        out.shape.len() == r + 2
+            && (out.shape[0] < 0 || i.shape[0] < 0 || out.shape[0] == i.shape[0]),
+        "Col2Im: output rank and batch must match input geometry"
+    );
+    let attribute = |name: &str, count: usize, default: i64| -> Option<Vec<i64>> {
+        let (present, values) = node.ints_attr(name);
+        let values = if present {
+            values
+        } else {
+            vec![default; count]
+        };
+        (values.len() == count && values.iter().all(|&v| v >= default && v <= i32::MAX as i64))
+            .then_some(values)
     };
-    let r = image_shape.len();
-    require!(
-        (1..=3).contains(&r) && block_shape.len() == r,
-        "Col2Im supports 1-3 spatial dims with matching image_shape/block_shape ranks \
-         (got image rank {r}, block rank {})",
-        block_shape.len()
-    );
-    require!(
-        image_shape.iter().all(|&d| d >= 1),
-        "Col2Im `image_shape` dims must all be >= 1, got {image_shape:?}"
-    );
-    let mut kk: i64 = 1;
-    for &b in &block_shape {
+    let (dilations, strides, pads) = match (
+        attribute("dilations", r, 1),
+        attribute("strides", r, 1),
+        attribute("pads", 2 * r, 0),
+    ) {
+        (Some(d), Some(s), Some(p)) => (d, s, p),
+        _ => deny!("Col2Im: invalid strides, dilations or pads"),
+    };
+    let image = node.read_const_ints_any(1);
+    let block = node.read_const_ints_any(2);
+    for shape in [&image, &block].into_iter().flatten() {
         require!(
-            b >= 1,
-            "Col2Im `block_shape` dims must all be >= 1, got {block_shape:?}"
+            shape.len() == r && shape.iter().all(|&v| v > 0 && v <= i32::MAX as i64),
+            "Col2Im: image/block dimensions must be positive int32"
         );
-        kk *= b;
     }
-    require!(
-        kk != 0 && i.shape[1] % kk == 0 && i.shape[1] / kk >= 1,
-        "Col2Im input channels {} must be a positive multiple of prod(block_shape)={kk}",
-        i.shape[1]
-    );
-    let ints_ok = |name: &str, want: usize| -> bool {
-        let (present, v) = node.ints_attr(name);
-        !present || v.len() == want
-    };
-    require!(
-        ints_ok("dilations", r) && ints_ok("strides", r) && ints_ok("pads", 2 * r),
-        "Col2Im `dilations`/`strides` must have {r} entries and `pads` {} entries (per spatial dim)",
-        2 * r
-    );
+    if let (Some(image), Some(block)) = (image, block)
+        && i.shape.iter().all(|&v| v >= 0)
+    {
+        let geometry =
+            match Col2ImGeometry::new(&i.shape, &image, &block, &dilations, &strides, &pads) {
+                Ok(geometry) => geometry,
+                Err(reason) => deny!("{reason}"),
+            };
+        require!(
+            out.shape
+                .iter()
+                .zip(&geometry.output_shape)
+                .all(|(&a, &b)| a < 0 || a == i64::from(b)),
+            "Col2Im: output shape does not match derived geometry"
+        );
+    }
     Ok(())
 }
 
@@ -1628,7 +1911,17 @@ pub fn register_vision(registry: &mut OpRegistry) {
         grid_sample_claim,
         crate::registry::MLX_SLICE_SHAPE_REASON,
     );
-    shapeless(registry, "AffineGrid", affine_grid_op, affine_grid_claim);
+    registry.register_shape_keyed(
+        OpRegistration {
+            domain: "",
+            op_type: "AffineGrid",
+            min_opset: 20,
+            max_opset: K_ANY_OPSET,
+            handler: affine_grid_op,
+            claim: affine_grid_claim,
+        },
+        "conservatively specialize host-generated homogeneous grid to size values",
+    );
     shape_keyed(
         registry,
         "Col2Im",
@@ -1663,4 +1956,86 @@ pub fn register_vision(registry: &mut OpRegistry) {
         non_max_suppression_op,
         non_max_suppression_claim,
     );
+}
+
+#[cfg(test)]
+mod col2im_tests {
+    use super::Col2ImGeometry;
+
+    #[test]
+    fn checked_geometry_and_empty_batch() {
+        let geometry = |input: &[i64], image: &[i64], block: &[i64]| {
+            Col2ImGeometry::new(
+                input,
+                image,
+                block,
+                &vec![1; image.len()],
+                &vec![1; image.len()],
+                &vec![0; 2 * image.len()],
+            )
+        };
+        let g = geometry(&[2, 12, 9], &[4, 5], &[2, 3]).unwrap();
+        assert_eq!(g.output_shape, [2, 2, 4, 5]);
+        assert_eq!(g.npos, [3, 3]);
+        assert!(geometry(&[0, 12, 9], &[4, 5], &[2, 3]).is_ok());
+        for (input, image, block) in [
+            (vec![1, 2, 2], vec![4], vec![2]),
+            (vec![1, 3, 3], vec![4], vec![2]),
+            (vec![1, 2, 3], vec![0], vec![2]),
+            (vec![1, 2, 3], vec![4], vec![0]),
+            (vec![1, 2, 3], vec![4], vec![5]),
+            (vec![1, 2, 3], vec![i64::MAX], vec![2]),
+            (vec![1, 2, 3], vec![i32::MAX as i64; 3], vec![2; 3]),
+            (vec![i32::MAX as i64, 2, 3], vec![4], vec![2]),
+        ] {
+            assert!(geometry(&input, &image, &block).is_err());
+        }
+        for (dilations, strides, pads) in [
+            (vec![0], vec![1], vec![0, 0]),
+            (vec![1], vec![0], vec![0, 0]),
+            (vec![1], vec![1], vec![-1, 0]),
+            (vec![1, 1], vec![1], vec![0, 0]),
+        ] {
+            assert!(
+                Col2ImGeometry::new(&[1, 2, 3], &[4], &[2], &dilations, &strides, &pads).is_err()
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::affine_grid_shape;
+
+    #[test]
+    fn affine_grid_geometry_is_checked_before_indexing_or_allocation() {
+        assert_eq!(
+            affine_grid_shape(&[2, 3, 4], &[2, 0, 1, 2, 3]).unwrap(),
+            [2, 1, 2, 3, 3]
+        );
+        assert_eq!(
+            affine_grid_shape(&[0, 2, 3], &[0, 0, 2, 3]).unwrap(),
+            [0, 2, 3, 2]
+        );
+        assert_eq!(
+            affine_grid_shape(&[2, 2, 3], &[2, 1 << 40, 2, 3]).unwrap(),
+            [2, 2, 3, 2]
+        );
+        for (theta, size) in [
+            (vec![2, 2, 3], vec![2, 1, 2]),
+            (vec![2, 2], vec![2, 1, 2, 3]),
+            (vec![2, 3, 4], vec![2, 1, 2, 3]),
+            (vec![2, 2, 3], vec![3, 1, 2, 3]),
+            (vec![2, 2, 3], vec![2, -1, 2, 3]),
+            (vec![2, 2, 3], vec![2, 1, 0, 3]),
+            (vec![2, 2, 3], vec![2, 1, 1 << 32, 3]),
+            (vec![2, 2, 3], vec![2, 1, 1 << 30, 3]),
+            (vec![2, 3, 4], vec![2, 1, i64::MAX, i64::MAX, i64::MAX]),
+        ] {
+            assert!(
+                affine_grid_shape(&theta, &size).is_err(),
+                "{theta:?} / {size:?}"
+            );
+        }
+    }
 }

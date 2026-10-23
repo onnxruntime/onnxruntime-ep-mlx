@@ -457,7 +457,7 @@ def test_vision_symbolic_extents(op, execution_mode):
         m.assert_mlx_claims(model, feeds)
 
 
-def test_grouped_conv3d_is_declined():
+def test_grouped_conv3d_is_claimed():
     model = m.make_model(
         "Conv", [m.tensor("x", DT.FLOAT, [1, 2, 3, 3, 3]),
                  m.tensor("w", DT.FLOAT, [2, 1, 2, 2, 2])],
@@ -465,4 +465,4 @@ def test_grouped_conv3d_is_declined():
     )
     feeds = {"x": np.ones([1, 2, 3, 3, 3], dtype=np.float32),
              "w": np.ones([2, 1, 2, 2, 2], dtype=np.float32)}
-    m.assert_op_declined(model, feeds, "Conv")
+    m.assert_op_claimed(model, feeds, "Conv", rtol=0, atol=0)

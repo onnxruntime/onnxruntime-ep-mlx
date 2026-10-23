@@ -19,6 +19,7 @@
 
 use std::os::raw::{c_char, c_void};
 
+use super::kv_cache::{self, QuantizedCache};
 use crate::engine::{MlxError, NodeDesc, Src, TranslationContext};
 use crate::mlx::{Array, VectorArray};
 use crate::registry::{
@@ -58,6 +59,21 @@ fn sub(
     b: mlx::mlx_array,
 ) -> Result<mlx::mlx_array, MlxError> {
     ctx.binary(mlx::mlx_subtract, a, b)
+}
+
+fn quantized_cache_zeros(
+    ctx: &mut TranslationContext,
+    shape: &[i32],
+    dtype: mlx::mlx_dtype,
+) -> Result<mlx::mlx_array, MlxError> {
+    let zero = ctx.zeros(shape, dtype)?;
+    if dtype == mlx::mlx_dtype__MLX_UINT8 {
+        let bias = ctx.scalar_i32(0x88);
+        let bias = ctx.astype(bias, dtype)?;
+        ctx.add(zero, bias)
+    } else {
+        Ok(zero)
+    }
 }
 
 fn capped_attention_logits(
@@ -102,7 +118,8 @@ fn attention_probs_with_sink(
 }
 
 fn gqa_composed(n: &NodeDesc) -> bool {
-    n.floats.get("softcap").copied().unwrap_or(0.0) > 0.0
+    attr_int(n, "kv_cache_bit_width", 0) != 0
+        || n.floats.get("softcap").copied().unwrap_or(0.0) > 0.0
         || attr_int(n, "qk_output", 0) != 0
         || attr_int(n, "smooth_softmax", 0) == 1
         || present(n, 11)
@@ -533,6 +550,18 @@ fn gqa_batched(
     let kv_heads = ks[1];
     let new_seq = ks[2];
     let cap = ctx.shape_of(past_k)[2];
+    let kquant = if present(n, 3) {
+        QuantizedCache::resolve(ctx, n, 0, false, kv_heads, head)?
+    } else {
+        None
+    };
+    let vquant = if present(n, 4) {
+        QuantizedCache::resolve(ctx, n, 1, false, kv_heads, head)?
+    } else {
+        None
+    };
+    let cache_head = kquant.map_or(head, |q| q.width);
+    let cache_dt = ctx.dtype_of(past_k);
     let lengths = read_int_input(ctx, &n.inputs[5])?;
     let total = read_int_input(ctx, &n.inputs[6])?;
     if lengths.len() != batch as usize
@@ -606,12 +635,42 @@ fn gqa_batched(
             }
         }
         let kb = slice(ctx, kb, &[0, 0, 0, 0], &[1, kv_heads, new_rows, head])?;
-        let pk = slice(ctx, past_k, &[b, 0, 0, 0], &[b + 1, kv_heads, cap, head])?;
-        let pv = slice(ctx, past_v, &[b, 0, 0, 0], &[b + 1, kv_heads, cap, head])?;
-        let old_k = slice(ctx, pk, &[0, 0, 0, 0], &[1, kv_heads, past, head])?;
-        let old_v = slice(ctx, pv, &[0, 0, 0, 0], &[1, kv_heads, past, head])?;
-        let ak = concat2(ctx, old_k, kb, 2)?;
-        let av = concat2(ctx, old_v, vb, 2)?;
+        let pk = slice(
+            ctx,
+            past_k,
+            &[b, 0, 0, 0],
+            &[b + 1, kv_heads, cap, cache_head],
+        )?;
+        let pv = slice(
+            ctx,
+            past_v,
+            &[b, 0, 0, 0],
+            &[b + 1, kv_heads, cap, cache_head],
+        )?;
+        let old_k = slice(ctx, pk, &[0, 0, 0, 0], &[1, kv_heads, past, cache_head])?;
+        let old_v = slice(ctx, pv, &[0, 0, 0, 0], &[1, kv_heads, past, cache_head])?;
+        let kb = if let Some(quant) = kquant {
+            quant.encode(ctx, kb)?
+        } else {
+            kb
+        };
+        let vb = if let Some(quant) = vquant {
+            quant.encode(ctx, vb)?
+        } else {
+            vb
+        };
+        let stored_k = concat2(ctx, old_k, kb, 2)?;
+        let stored_v = concat2(ctx, old_v, vb, 2)?;
+        let ak = if let Some(quant) = kquant {
+            quant.decode(ctx, stored_k, head)?
+        } else {
+            stored_k
+        };
+        let av = if let Some(quant) = vquant {
+            quant.decode(ctx, stored_v, head)?
+        } else {
+            stored_v
+        };
         let dt = ctx.dtype_of(qb);
         let mut mask = if window > 0 {
             causal_window_mask(ctx, seq, length, query_past, window, dt)?
@@ -687,29 +746,29 @@ fn gqa_batched(
         outputs.append(out);
         let tail_len = capacity - length;
         let tail_k = if length < cap {
-            slice(ctx, pk, &[0, 0, length, 0], &[1, kv_heads, cap, head])?
+            slice(ctx, pk, &[0, 0, length, 0], &[1, kv_heads, cap, cache_head])?
         } else {
-            ctx.zeros(&[1, kv_heads, tail_len, head], dt)?
+            quantized_cache_zeros(ctx, &[1, kv_heads, tail_len, cache_head], cache_dt)?
         };
         let tail_v = if length < cap {
-            slice(ctx, pv, &[0, 0, length, 0], &[1, kv_heads, cap, head])?
+            slice(ctx, pv, &[0, 0, length, 0], &[1, kv_heads, cap, cache_head])?
         } else {
-            ctx.zeros(&[1, kv_heads, tail_len, head], dt)?
+            quantized_cache_zeros(ctx, &[1, kv_heads, tail_len, cache_head], cache_dt)?
         };
         let pk = if new_seq == 0 {
             pk
         } else {
-            concat2(ctx, ak, tail_k, 2)?
+            concat2(ctx, stored_k, tail_k, 2)?
         };
         let pv = if new_seq == 0 {
             pv
         } else {
-            concat2(ctx, av, tail_v, 2)?
+            concat2(ctx, stored_v, tail_v, 2)?
         };
         // A growing ragged cache can require padding beyond its original capacity.
         let pad = capacity - ctx.shape_of(pk)[2];
         if pad > 0 {
-            let zeros = ctx.zeros(&[1, kv_heads, pad, head], dt)?;
+            let zeros = quantized_cache_zeros(ctx, &[1, kv_heads, pad, cache_head], cache_dt)?;
             keys.append(concat2(ctx, pk, zeros, 2)?);
             values.append(concat2(ctx, pv, zeros, 2)?);
         } else {
@@ -897,6 +956,17 @@ fn group_query_attention_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Resul
     // contract this equals the number of valid past keys; in the fixed-capacity shared-buffer
     // contract it is the runtime-owned max length and exceeds the valid past.
     let cap = ctx.shape_of(past_k)[2];
+    let kquant = if present(n, 3) {
+        QuantizedCache::resolve(ctx, n, 0, false, kv_heads, head)?
+    } else {
+        None
+    };
+    let vquant = if present(n, 4) {
+        QuantizedCache::resolve(ctx, n, 1, false, kv_heads, head)?
+    } else {
+        None
+    };
+    let cache_head = kquant.map_or(head, |q| q.width);
 
     // Recover how many past keys are actually valid and whether the runtime handed us a max-length
     // shared buffer to write in place. `total_sequence_length` (input[6], int32 scalar) counts the
@@ -1122,29 +1192,49 @@ fn group_query_attention_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Resul
                 ctx,
                 past_k,
                 &[batch_index, 0, 0, 0],
-                &[batch_index + 1, kv_heads, cap, head],
+                &[batch_index + 1, kv_heads, cap, cache_head],
             )?;
             let past_vb = slice(
                 ctx,
                 past_v,
                 &[batch_index, 0, 0, 0],
-                &[batch_index + 1, kv_heads, cap, head],
+                &[batch_index + 1, kv_heads, cap, cache_head],
             )?;
             let seed_start = if use_staging { 0 } else { seed_offset };
             let seed_k = slice(
                 ctx,
                 past_kb,
                 &[0, 0, seed_start, 0],
-                &[1, kv_heads, end_before, head],
+                &[1, kv_heads, end_before, cache_head],
             )?;
             let seed_v = slice(
                 ctx,
                 past_vb,
                 &[0, 0, seed_start, 0],
-                &[1, kv_heads, end_before, head],
+                &[1, kv_heads, end_before, cache_head],
             )?;
-            let work_k = concat2(ctx, seed_k, kb, 2)?;
-            let work_v = concat2(ctx, seed_v, vb, 2)?;
+            let kb = if let Some(quant) = kquant {
+                quant.encode(ctx, kb)?
+            } else {
+                kb
+            };
+            let vb = if let Some(quant) = vquant {
+                quant.encode(ctx, vb)?
+            } else {
+                vb
+            };
+            let stored_k = concat2(ctx, seed_k, kb, 2)?;
+            let stored_v = concat2(ctx, seed_v, vb, 2)?;
+            let work_k = if let Some(quant) = kquant {
+                quant.decode(ctx, stored_k, head)?
+            } else {
+                stored_k
+            };
+            let work_v = if let Some(quant) = vquant {
+                quant.decode(ctx, stored_v, head)?
+            } else {
+                stored_v
+            };
             let seed_rows = end_before - seed_start;
             let k_len = seed_rows + s;
             let mask =
@@ -1203,21 +1293,23 @@ fn group_query_attention_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Resul
             let write_start = if use_staging { seed_offset } else { 0 };
             let write_k = slice(
                 ctx,
-                work_k,
+                stored_k,
                 &[0, 0, write_start, 0],
-                &[1, kv_heads, k_len, head],
+                &[1, kv_heads, k_len, cache_head],
             )?;
             let write_v = slice(
                 ctx,
-                work_v,
+                stored_v,
                 &[0, 0, write_start, 0],
-                &[1, kv_heads, k_len, head],
+                &[1, kv_heads, k_len, cache_head],
             )?;
             let (pk, pv) = if end_after < cap {
                 let kdt = ctx.dtype_of(past_kb);
                 let vdt = ctx.dtype_of(past_vb);
-                let tail_k = ctx.zeros(&[1, kv_heads, cap - end_after, head], kdt)?;
-                let tail_v = ctx.zeros(&[1, kv_heads, cap - end_after, head], vdt)?;
+                let tail_k =
+                    quantized_cache_zeros(ctx, &[1, kv_heads, cap - end_after, cache_head], kdt)?;
+                let tail_v =
+                    quantized_cache_zeros(ctx, &[1, kv_heads, cap - end_after, cache_head], vdt)?;
                 (
                     concat2(ctx, write_k, tail_k, 2)?,
                     concat2(ctx, write_v, tail_v, 2)?,
@@ -2282,7 +2374,10 @@ fn group_query_attention_claim(node: &NodeView) -> ClaimResult {
     } else {
         vec![0usize, 1, 2]
     };
-    if node.input_present(3) {
+    let quantized = node
+        .input_info(3)
+        .is_some_and(|v| kv_cache::integer_cache(v.dtype));
+    if node.input_present(3) && !quantized {
         float_idx.extend([3, 4]);
     }
     if do_rotary {
@@ -2316,8 +2411,8 @@ fn group_query_attention_claim(node: &NodeView) -> ClaimResult {
             None => deny!("output {} lacks tensor type/shape info", idx),
         };
         require!(
-            dtype == out_type,
-            "output {} must have dtype {}, got {}",
+            dtype == node.input_info(idx + 2).map_or(out_type, |v| v.dtype),
+            "output {} must retain its cache dtype (activation dtype {}), got {}",
             idx,
             crate::registry::ort_dtype_name(out_type),
             crate::registry::ort_dtype_name(dtype)
@@ -2374,6 +2469,21 @@ fn group_query_attention_claim(node: &NodeView) -> ClaimResult {
         "query hidden size must match head count"
     );
     let head = q.shape[2] / total_heads;
+    kv_cache::claim(node, false, out_type, kvh, head)?;
+    let bits = node.int_attr("kv_cache_bit_width", 0);
+    require!(
+        bits != 4 || head % 2 == 0,
+        "GQA packed INT4 requires an even logical head size (pinned CheckPast byte geometry)"
+    );
+    require!(
+        !sliding || bits == 0 || head % if bits == 4 { 32 } else { 16 } == 0,
+        "sliding integer cache rows must satisfy pinned 16-byte alignment"
+    );
+    let cache_head = if node.int_attr("kv_cache_bit_width", 0) == 4 {
+        (head + 1) / 2
+    } else {
+        head
+    };
     if has_bias {
         let bias = node.input_info(10).unwrap();
         require!(
@@ -2410,9 +2520,9 @@ fn group_query_attention_claim(node: &NodeView) -> ClaimResult {
             require!(
                 cache.shape.len() == 4
                     && cache.shape[1] == kvh
-                    && cache.shape[3] == head
+                    && cache.shape[3] == cache_head
                     && (cache.shape[0] < 0 || q.shape[0] < 0 || cache.shape[0] == q.shape[0]),
-                "past cache must be [batch,kv_num_heads,capacity,head_size]"
+                "past cache must be [batch,kv_num_heads,capacity,stored_head_size]"
             );
         }
     }
@@ -2479,16 +2589,6 @@ fn group_query_attention_claim(node: &NodeView) -> ClaimResult {
             "head_sink must be [num_heads] in activation dtype"
         );
     }
-    require!(
-        !node.input_present(12) && !node.input_present(13),
-        "quantized KV cache scales are unsupported"
-    );
-    require!(
-        node.string_attr("k_quant_type", "NONE") == "NONE"
-            && node.string_attr("v_quant_type", "NONE") == "NONE"
-            && node.int_attr("kv_cache_bit_width", 0) == 0,
-        "quantized KV cache is unsupported"
-    );
     require!(
         node.input_present(14) == node.input_present(15),
         "q_norm_weight and k_norm_weight must be provided together"
@@ -2575,6 +2675,11 @@ fn group_query_attention_compile_shape_safety_for(
 }
 
 fn group_query_attention_compile_shape_safety(node: &NodeView) -> CompileShapeSafety {
+    if node.int_attr("kv_cache_bit_width", 0) != 0 {
+        return CompileShapeSafety::EagerOnly {
+            reason: "integer KV cache quantization uses live eager scales and byte-preserving writes",
+        };
+    }
     if (node.int_attr("do_rotary", 0) != 0 && node.input_present(9))
         || node
             .input_info(1)
@@ -3649,6 +3754,14 @@ fn paged_attention_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), 
     } else {
         Some(ctx.resolve(&n.inputs[4])?)
     };
+    let kquant = QuantizedCache::resolve(ctx, n, 0, true, kv_heads, head)?;
+    let vquant = if latent {
+        None
+    } else {
+        QuantizedCache::resolve(ctx, n, 1, true, kv_heads, v_head)?
+    };
+    let cache_head = kquant.map_or(head, |q| q.width);
+    let vcache_head = vquant.map_or(v_head, |q| q.width);
     let cshape = ctx.shape_of(kcache); // [num_blocks, block_size, kv, head]
     let vcshape = vcache.map(|cache| ctx.shape_of(cache));
     let block_size = cshape[1];
@@ -3740,7 +3853,7 @@ fn paged_attention_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), 
         None
     };
 
-    let mut outs: Vec<mlx::mlx_array> = Vec::new();
+    let mut prepared = Vec::new();
     for b in 0..batch {
         let s0 = cum[b] as i32;
         let s1 = cum[b + 1] as i32;
@@ -3749,7 +3862,6 @@ fn paged_attention_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), 
             continue;
         }
         let pastb = past[b] as i32;
-        let total = pastb + nq;
 
         // Slice this sequence's packed rows and split into [1, heads, nq, head].
         let qb = slice(ctx, q, &[s0, 0], &[s1, hidden])?;
@@ -3809,8 +3921,13 @@ fn paged_attention_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), 
             let knew =
                 ctx.emit(|res, st| unsafe { mlx::mlx_take_axis(res, knew, row_idx, 0, st) })?;
             let knew = ctx.reshape(knew, &[write_slots.len() as i32, 1, kv_heads, head])?;
+            let knew = if let Some(quant) = kquant {
+                quant.encode(ctx, knew)?
+            } else {
+                knew
+            };
             let flat_slots = cshape[0] * block_size;
-            let kc = ctx.reshape(kcache, &[flat_slots, kv_heads, head])?;
+            let kc = ctx.reshape(kcache, &[flat_slots, kv_heads, cache_head])?;
             let kc = ctx.emit(|res, st| unsafe {
                 mlx::mlx_scatter_single(res, kc, slot_idx, knew, 0, st)
             })?;
@@ -3821,7 +3938,12 @@ fn paged_attention_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), 
                 let vnew =
                     ctx.emit(|res, st| unsafe { mlx::mlx_take_axis(res, vnew, row_idx, 0, st) })?;
                 let vnew = ctx.reshape(vnew, &[write_slots.len() as i32, 1, kv_heads, v_head])?;
-                let vc = ctx.reshape(current_vcache, &[flat_slots, kv_heads, v_head])?;
+                let vnew = if let Some(quant) = vquant {
+                    quant.encode(ctx, vnew)?
+                } else {
+                    vnew
+                };
+                let vc = ctx.reshape(current_vcache, &[flat_slots, kv_heads, vcache_head])?;
                 let vc = ctx.emit(|res, st| unsafe {
                     mlx::mlx_scatter_single(res, vc, slot_idx, vnew, 0, st)
                 })?;
@@ -3829,28 +3951,50 @@ fn paged_attention_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), 
             }
             cache_updated = true;
         }
+        prepared.push((b, nq, pastb, qh, kh_new, vh_new));
+    }
 
+    let mut outs: Vec<mlx::mlx_array> = Vec::new();
+    for (b, nq, pastb, qh, kh_new, vh_new) in prepared {
+        let total = pastb + nq;
         // Gather the cached prefix [0, past) from the physical blocks and append the new K/V.
-        let (kh, vh) = if pastb > 0 {
-            let nblk = ((pastb + block_size - 1) / block_size) as usize;
+        // Quantized PagedAttention reads the updated physical pages for *all* rows, including
+        // skipped/remapped current slots. It must not attend to the unquantized new K/V.
+        let read_len = if kquant.is_some() { total } else { pastb };
+        let (kh, vh) = if read_len > 0 {
+            let nblk = ((read_len + block_size - 1) / block_size) as usize;
             let idx: Vec<i32> = (0..nblk).map(|j| bt[b * max_blocks + j] as i32).collect();
             let idx_arr = i32_host_array(ctx, &idx);
             let gk =
                 ctx.emit(|res, s| unsafe { mlx::mlx_take_axis(res, kcache, idx_arr, 0, s) })?;
+            let gk = if let Some(quant) = kquant {
+                quant.decode(ctx, gk, head)?
+            } else {
+                gk
+            };
             let gk = ctx.reshape(gk, &[1, (nblk as i32) * block_size, kv_hidden])?;
             let gk = split_heads(ctx, gk, 1, (nblk as i32) * block_size, kv_heads, head)?; // [1,kv,N,head]
-            let gk = slice(ctx, gk, &[0, 0, 0, 0], &[1, kv_heads, pastb, head])?;
+            let gk = slice(ctx, gk, &[0, 0, 0, 0], &[1, kv_heads, read_len, head])?;
             let gv = if latent {
                 slice(ctx, gk, &[0, 0, 0, 0], &[1, kv_heads, pastb, v_head])?
             } else {
                 let gv = ctx.emit(|res, s| unsafe {
                     mlx::mlx_take_axis(res, vcache.unwrap(), idx_arr, 0, s)
                 })?;
+                let gv = if let Some(quant) = vquant {
+                    quant.decode(ctx, gv, v_head)?
+                } else {
+                    gv
+                };
                 let gv = ctx.reshape(gv, &[1, (nblk as i32) * block_size, v_hidden])?;
                 let gv = split_heads(ctx, gv, 1, (nblk as i32) * block_size, kv_heads, v_head)?;
-                slice(ctx, gv, &[0, 0, 0, 0], &[1, kv_heads, pastb, v_head])?
+                slice(ctx, gv, &[0, 0, 0, 0], &[1, kv_heads, read_len, v_head])?
             };
-            (concat2(ctx, gk, kh_new, 2)?, concat2(ctx, gv, vh_new, 2)?) // [1,kv,total,head]
+            if kquant.is_some() {
+                (gk, gv)
+            } else {
+                (concat2(ctx, gk, kh_new, 2)?, concat2(ctx, gv, vh_new, 2)?)
+            }
         } else {
             (kh_new, vh_new)
         };
@@ -3935,8 +4079,8 @@ fn paged_attention_claim(node: &NodeView) -> ClaimResult {
         "is_causal must be 0 or 1"
     );
     require!(
-        node.num_outputs() >= 1,
-        "PagedAttention requires at least 1 output"
+        (1..=3).contains(&node.num_outputs()),
+        "PagedAttention requires 1 to 3 outputs"
     );
     require!(
         node.int_attr("v_head_size", 0) >= 0,
@@ -3946,13 +4090,6 @@ fn paged_attention_claim(node: &NodeView) -> ClaimResult {
         node.int_attr("rotary_offset", 0) >= 0,
         "rotary_offset must be non-negative"
     );
-    for attr in ["k_cache_dtype", "v_cache_dtype"] {
-        let dtype = node.string_attr(attr, "");
-        require!(
-            !matches!(dtype.as_str(), "int4" | "float4e2m1"),
-            "{attr}={dtype:?} sub-byte packing is unsupported"
-        );
-    }
     // T = fp16/bf16 only; output dtype must match the query.
     let out_dt = match node.output_info(0) {
         Some(o) if is_mlx_float(o.dtype) => o.dtype,
@@ -3979,11 +4116,18 @@ fn paged_attention_claim(node: &NodeView) -> ClaimResult {
         "kv_cache_layout must be SEPARATE or LATENT"
     );
     let latent = layout == "LATENT";
+    let quantized = node
+        .input_info(3)
+        .is_some_and(|v| kv_cache::integer_cache(v.dtype));
+    require!(
+        !latent || !quantized,
+        "quantized LATENT cache contract is not supported"
+    );
     let packed = !latent && !node.input_present(1) && !node.input_present(2);
     for idx in if packed {
-        vec![0usize, 3]
+        vec![0usize]
     } else {
-        vec![0usize, 1, 3]
+        vec![0usize, 1]
     } {
         match dtype_of(node, idx) {
             Some(dt) => require!(
@@ -4003,11 +4147,7 @@ fn paged_attention_claim(node: &NodeView) -> ClaimResult {
             "LATENT layout aliases value to key and requires absent value/value_cache"
         );
     } else {
-        for idx in if packed {
-            vec![4usize]
-        } else {
-            vec![2usize, 4]
-        } {
+        for idx in if packed { vec![] } else { vec![2usize] } {
             require!(
                 dtype_of(node, idx) == Some(out_dt),
                 "input {idx} must be present and share the output float dtype"
@@ -4042,6 +4182,14 @@ fn paged_attention_claim(node: &NodeView) -> ClaimResult {
         "query must have rank 2 and a hidden size divisible by its separate or packed head count"
     );
     let head = query.shape[1] / query_heads;
+    kv_cache::claim(node, true, out_dt, kv_heads, head)?;
+    let cache_head = if dtype_of(node, 3)
+        == Some(ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8)
+    {
+        (head + 1) / 2
+    } else {
+        head
+    };
     let v_head = match node.int_attr("v_head_size", 0) {
         0 => head,
         value => value,
@@ -4080,14 +4228,14 @@ fn paged_attention_claim(node: &NodeView) -> ClaimResult {
     }
     require!(
         node.input_info(3).is_some_and(|v| {
-            v.shape.len() == 4 && v.shape[2] == kv_heads && v.shape[3] == head
+            v.shape.len() == 4 && v.shape[2] == kv_heads && v.shape[3] == cache_head
         }),
         "key_cache must be [num_blocks,block_size,kv_num_heads,head_size]"
     );
     if !latent {
         require!(
             node.input_info(4).is_some_and(|v| {
-                v.shape.len() == 4 && v.shape[2] == kv_heads && v.shape[3] == v_head
+                v.shape.len() == 4 && v.shape[2] == kv_heads && v.shape[3] == cache_head
             }),
             "value_cache must be [num_blocks,block_size,kv_num_heads,v_head_size]"
         );
@@ -4135,13 +4283,6 @@ fn paged_attention_claim(node: &NodeView) -> ClaimResult {
             "rotary_offset must be a multiple of 8"
         );
     }
-    require!(
-        node.string_attr("k_quant_type", "NONE") == "NONE"
-            && node.string_attr("v_quant_type", "NONE") == "NONE"
-            && !node.input_present(14)
-            && !node.input_present(15),
-        "quantized KV cache is unsupported"
-    );
     if node.input_present(10) {
         require!(
             node.input_info(10).is_some_and(|v| is_int32(v.dtype)
@@ -4186,8 +4327,9 @@ fn paged_attention_claim(node: &NodeView) -> ClaimResult {
     for idx in 1..node.num_outputs().min(3) {
         if node.output_present(idx) {
             require!(
-                node.output_info(idx).is_some_and(|v| v.dtype == out_dt),
-                "cache output {idx} must share activation dtype"
+                node.output_info(idx)
+                    .is_some_and(|v| Some(v.dtype) == dtype_of(node, idx + 2)),
+                "cache output {idx} must retain cache storage dtype"
             );
         }
     }
