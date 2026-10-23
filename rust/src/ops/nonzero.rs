@@ -97,7 +97,7 @@ fn coordinates(
 }
 
 fn nonzero_op(ctx: &mut TranslationContext, node: &NodeDesc) -> Result<(), MlxError> {
-    if ctx.in_compiled_trace {
+    if ctx.shapeless_compile() || ctx.shape_keyed_compile() {
         return Err("MLX NonZero: data-dependent cardinality requires eager execution".into());
     }
     let input = &node.inputs[0];
