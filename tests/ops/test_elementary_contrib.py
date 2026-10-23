@@ -59,9 +59,13 @@ def _session(model, path):
     options.enable_profiling = True
     options.profile_file_prefix = str(path)
     session = ort.InferenceSession(model.SerializeToString(), options,
-                                   providers=["MLXExecutionProvider"])
+                                   providers=["MLXExecutionProvider"], enable_fallback=False)
     session.disable_fallback()
-    assert "MLXExecutionProvider" in session.get_providers()
+    providers = session.get_providers()
+    assert providers in (
+        ["MLXExecutionProvider"],
+        ["MLXExecutionProvider", "CPUExecutionProvider"],
+    ), providers
     return session
 
 
@@ -108,23 +112,14 @@ def _oracle(op, arrays, types, attrs=None):
         return np.asarray(not any(invalid(value).any() for value in values), dtype=np.bool_)
     result = np.empty(x.shape, dtype=cast)
     bias = None
-    if len(arrays) > 1 and op in ("FastGelu", "BiasAdd"):
+    if len(arrays) > 1 and op == "BiasAdd":
         bias = np.broadcast_to(_typed(arrays[1], dtype), x.shape)
     with np.errstate(over="ignore", invalid="ignore"):
         for index in np.ndindex(x.shape):
             value = x[index]
             if bias is not None:
                 value = cast(work(value) + work(bias[index]))
-            if op == "FastGelu":
-                square = cast(work(value) * work(value))
-                factor = cast(work(cast(0.035677)) * work(square))
-                inner = cast(work(cast(0.797885)) + work(factor))
-                inner = cast(work(value) * work(inner))
-                gate = cast(math.tanh(float(inner)))
-                gate = cast(work(1) + work(gate))
-                product = cast(work(value) * work(gate))
-                result[index] = cast(work(cast(0.5)) * work(product))
-            elif op == "QuickGelu":
+            if op == "QuickGelu":
                 alpha = cast(np.float32(attrs.get("alpha", 1.702)))
                 z = cast(work(value) * work(alpha))
                 result[index] = cast(work(value) * work(_sigmoid(z, dtype)))
@@ -155,7 +150,7 @@ def _compare(actual, expected, *, exact=False):
 
 
 @pytest.mark.parametrize("dtype", FLOATS)
-@pytest.mark.parametrize("alpha", [None, 1.702, 0.0, -1.0, 2.0])
+@pytest.mark.parametrize("alpha", [None, 1.702, 0.0, -1.0, 2.0, 1.0])
 @pytest.mark.parametrize("eager", [False, True])
 def test_quick_gelu_live_types_attributes(dtype, alpha, eager, monkeypatch, tmp_path):
     monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_COMPILE", "1" if eager else "0")
@@ -170,25 +165,8 @@ def test_quick_gelu_live_types_attributes(dtype, alpha, eager, monkeypatch, tmp_
     _placement(session)
 
 
-@pytest.mark.parametrize("dtype", FLOATS)
-@pytest.mark.parametrize("bias_shape", [None, (), (3,), (2, 1), (2, 3)])
-@pytest.mark.parametrize("eager", [False, True])
-def test_fast_gelu_function_bias_forms(dtype, bias_shape, eager, monkeypatch, tmp_path):
-    monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_COMPILE", "1" if eager else "0")
-    shapes = [(2, 3)] + ([] if bias_shape is None else [bias_shape])
-    types = [dtype] * len(shapes)
-    session = _session(_model("FastGelu", types, shapes, crossing=True), tmp_path / "fast")
-    for shift in [0, 1, -1, 0]:
-        arrays = [_typed(np.arange(6).reshape(2, 3) / 2 - 1 + shift, dtype)]
-        if bias_shape is not None:
-            arrays.append(_typed(np.full(bias_shape, shift / 4), dtype))
-        _compare(session.run(None, _feed(arrays, types))[0], _oracle("FastGelu", arrays, types))
-    _placement(session)
-
-
 @pytest.mark.parametrize("op,types", [
-    ("FastGelu", [dtype]) for dtype in FLOATS
-] + [("QuickGelu", [dtype]) for dtype in FLOATS]
+    ("QuickGelu", [dtype]) for dtype in FLOATS]
     + [("ScaledSiLU", [dtype]) for dtype in SCALED_FLOATS])
 @pytest.mark.parametrize("shape", [(), (0,), (2, 0, 3)])
 def test_scalar_and_empty(op, types, shape, tmp_path):
@@ -198,7 +176,7 @@ def test_scalar_and_empty(op, types, shape, tmp_path):
     _placement(session)
 
 
-@pytest.mark.parametrize("op", ["FastGelu", "ScaledSiLU"])
+@pytest.mark.parametrize("op", ["ScaledSiLU"])
 @pytest.mark.parametrize("dtype", SCALED_FLOATS)
 def test_explicit_missing_optional(op, dtype, tmp_path):
     arrays = [_typed([1, -1, 0], dtype)]
@@ -295,7 +273,6 @@ def test_scaled_silu_literal_goldens_and_alpha(dtype, golden, alpha, tmp_path):
     ("QuickGelu", [T.INT32], [[2]], {}),
     ("IsAllFinite", [T.FLOAT, T.DOUBLE], [[2], [2]], {}),
     ("IsAllFinite", [T.FLOAT], [[2]], {"isnan_only": 1, "isinf_only": -1}),
-    ("FastGelu", [T.FLOAT] * 2, [[1, 3], [2, 3]], {}),
 ])
 def test_invalid_schema_or_claim_forms_fail_closed(op, types, shapes, attrs, tmp_path):
     # No CPU fallback proxy is accepted as successful execution of an unsupported form.
@@ -305,7 +282,7 @@ def test_invalid_schema_or_claim_forms_fail_closed(op, types, shapes, attrs, tmp
         _session(_model(op, types, shapes, attrs=attrs), tmp_path / "invalid")
 
 
-@pytest.mark.parametrize("op", ["FastGelu", "QuickGelu", "BiasAdd", "IsAllFinite", "ScaledSiLU"])
+@pytest.mark.parametrize("op", ["QuickGelu", "BiasAdd", "IsAllFinite", "ScaledSiLU"])
 def test_required_inputs_and_outputs_cannot_be_omitted(op, tmp_path):
     types = [T.FLOAT] * (3 if op == "BiasAdd" else 1)
     shapes = [[1, 1, 1], [1], [1, 1, 1]] if op == "BiasAdd" else [[1]]
@@ -322,7 +299,7 @@ def test_required_inputs_and_outputs_cannot_be_omitted(op, tmp_path):
             _session(model, tmp_path / f"omitted_{missing_input}")
 
 
-@pytest.mark.parametrize("op", ["FastGelu", "QuickGelu", "BiasAdd", "IsAllFinite", "ScaledSiLU"])
+@pytest.mark.parametrize("op", ["QuickGelu", "BiasAdd", "IsAllFinite", "ScaledSiLU"])
 def test_wrong_input_and_output_arities(op, tmp_path):
     types = [T.FLOAT] * (3 if op == "BiasAdd" else 1)
     shapes = [[1, 1, 1], [1], [1, 1, 1]] if op == "BiasAdd" else [[1]]
@@ -345,26 +322,24 @@ def test_wrong_input_and_output_arities(op, tmp_path):
             _session(model, tmp_path / variant)
 
 
-@pytest.mark.parametrize("op", ["FastGelu", "QuickGelu", "ScaledSiLU"])
+@pytest.mark.parametrize("op", ["QuickGelu", "ScaledSiLU"])
 @pytest.mark.parametrize("dtype", SCALED_FLOATS)
 @pytest.mark.parametrize("eager", [False, True])
 def test_symbolic_shape_changing_same_session(op, dtype, eager, monkeypatch, tmp_path):
     monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_COMPILE", "1" if eager else "0")
-    types = [dtype, dtype] if op == "FastGelu" else [dtype]
-    shapes = [[2, 3], [3]] if op == "FastGelu" else [[2, 3]]
+    types = [dtype]
+    shapes = [[2, 3]]
     session = _session(_model(op, types, shapes, symbolic=True, crossing=True),
                        tmp_path / "dynamic")
     for n, channels in [(2, 3), (1, 2), (0, 3), (2, 0), (2, 3)]:
         arrays = [_typed(np.full((n, channels), 0.75), dtype)]
-        if op == "FastGelu":
-            arrays.append(_typed(np.full((channels,), -0.25), dtype))
         _compare(session.run(None, _feed(arrays, types))[0], _oracle(op, arrays, types),
                  exact=op == "ScaledSiLU")
     _placement(session)
 
 
 @pytest.mark.parametrize("op,dtype", [
-    (op, dtype) for op in ("FastGelu", "QuickGelu") for dtype in FLOATS
+    (op, dtype) for op in ("QuickGelu",) for dtype in FLOATS
 ] + [("ScaledSiLU", dtype) for dtype in SCALED_FLOATS])
 def test_nonfinite_live_values(op, dtype, tmp_path):
     session = _session(_model(op, [dtype], [[4]]), tmp_path / "nonfinite")
@@ -380,13 +355,13 @@ def _example(op):
         return [np.ones((1, 2, 3)), np.ones(3), -np.ones((1, 2, 3))]
     if op == "IsAllFinite":
         return [np.ones(3), np.empty((0, 2))]
-    if op in ("FastGelu", "ScaledSiLU"):
+    if op == "ScaledSiLU":
         return [np.ones(3), np.asarray(2.0)]
     return [np.ones(3)]
 
 
 @pytest.mark.parametrize("op,dtype", [
-    (op, dtype) for op in ("FastGelu", "QuickGelu", "IsAllFinite", "ScaledSiLU")
+    (op, dtype) for op in ("QuickGelu", "IsAllFinite", "ScaledSiLU")
     for dtype in SCALED_FLOATS
 ] + [("BiasAdd", dtype) for dtype in (T.FLOAT16, T.FLOAT)])
 def test_initializer_and_live_input_sources(op, dtype, tmp_path):
@@ -415,7 +390,7 @@ def test_attribute_types_are_not_coerced(op, attrs, tmp_path):
         _session(_model(op, [T.FLOAT], [[3]], attrs=attrs), tmp_path / "attribute_type")
 
 
-@pytest.mark.parametrize("op", ["FastGelu", "QuickGelu", "BiasAdd", "IsAllFinite", "ScaledSiLU"])
+@pytest.mark.parametrize("op", ["QuickGelu", "BiasAdd", "IsAllFinite", "ScaledSiLU"])
 def test_output_dtype_is_not_coerced(op, tmp_path):
     arrays = _example(op)
     model = _model(op, [T.FLOAT] * len(arrays), [x.shape for x in arrays])
@@ -424,7 +399,7 @@ def test_output_dtype_is_not_coerced(op, tmp_path):
         _session(model, tmp_path / "output_type")
 
 
-@pytest.mark.parametrize("op", ["FastGelu", "QuickGelu", "BiasAdd", "IsAllFinite", "ScaledSiLU"])
+@pytest.mark.parametrize("op", ["QuickGelu", "BiasAdd", "IsAllFinite", "ScaledSiLU"])
 @pytest.mark.parametrize("depth", [1, 2])
 def test_nested_eager_parent_with_live_branch(op, depth, tmp_path):
     arrays = [_typed(x, T.FLOAT) for x in _example(op)]

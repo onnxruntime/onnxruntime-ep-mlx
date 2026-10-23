@@ -11,10 +11,7 @@ use crate::{deny, require};
 const EAGER_REASON: &str = "provider-owned live host arithmetic preserves explicit typed rounding";
 
 pub(crate) fn is_elementary(op: &str) -> bool {
-    matches!(
-        op,
-        "FastGelu" | "QuickGelu" | "BiasAdd" | "IsAllFinite" | "ScaledSiLU"
-    )
+    matches!(op, "QuickGelu" | "BiasAdd" | "IsAllFinite" | "ScaledSiLU")
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -93,14 +90,6 @@ impl Float {
         self.round(value)
     }
 
-    fn tanh(self, x: f64) -> f64 {
-        self.round(if self == Self::F64 {
-            x.tanh()
-        } else {
-            (x as f32).tanh() as f64
-        })
-    }
-
     fn decode(self, bytes: &[u8]) -> Vec<f64> {
         let width = match self {
             Self::F16 | Self::BF16 => 2,
@@ -146,17 +135,6 @@ fn compatible(a: &[i64], b: &[i64]) -> bool {
 fn geometry(op: &str, shapes: &[Vec<i64>]) -> Result<(), String> {
     let x = &shapes[0];
     match op {
-        "FastGelu" if shapes.len() == 2 => {
-            let bias = &shapes[1];
-            if bias.len() > x.len()
-                || bias
-                    .iter()
-                    .zip(&x[x.len().saturating_sub(bias.len())..])
-                    .any(|(&b, &x)| b >= 0 && x >= 0 && b != 1 && b != x)
-            {
-                return Err("FastGelu: bias must broadcast without enlarging X; enlarging forms are OPEN (schema function/shape inference conflict)".into());
-            }
-        }
         "BiasAdd" => {
             if x.len() != 3
                 || shapes[1].len() != 1
@@ -178,7 +156,7 @@ fn claim(node: &NodeView) -> ClaimResult {
     let op = node.op_type();
     let count = node.num_inputs();
     let arity = match op.as_str() {
-        "FastGelu" | "ScaledSiLU" => (1..=2).contains(&count),
+        "ScaledSiLU" => (1..=2).contains(&count),
         "BiasAdd" => count == 3,
         "QuickGelu" => count == 1,
         "IsAllFinite" => count >= 1,
@@ -191,7 +169,7 @@ fn claim(node: &NodeView) -> ClaimResult {
     );
     let mut inputs: Vec<SlotInfo> = Vec::new();
     for i in 0..count {
-        if i == 1 && matches!(op.as_str(), "FastGelu" | "ScaledSiLU") && !node.input_present(i) {
+        if i == 1 && op == "ScaledSiLU" && !node.input_present(i) {
             continue;
         }
         let Some(input) = node.input_info(i) else {
@@ -258,31 +236,6 @@ fn claim(node: &NodeView) -> ClaimResult {
     .map_err(Into::into)
 }
 
-fn bias_index(mut index: usize, shape: &[i64], bias: &[i64]) -> usize {
-    let mut result = 0;
-    let mut stride = 1;
-    for (&extent, &b) in shape.iter().rev().zip(bias.iter().rev()) {
-        let coordinate = index % extent as usize;
-        index /= extent as usize;
-        if b != 1 {
-            result += coordinate * stride;
-        }
-        stride *= b as usize;
-    }
-    result
-}
-
-fn fast_gelu(kind: Float, x: f64) -> f64 {
-    // Follow the v1 schema function's typed constants and individual ONNX operations.
-    let square = kind.mul(x, x);
-    let cubic_factor = kind.mul(kind.round(0.035677), square);
-    let inner = kind.add(kind.round(0.797885), cubic_factor);
-    let inner = kind.mul(x, inner);
-    let gate = kind.add(kind.round(1.0), kind.tanh(inner));
-    let product = kind.mul(x, gate);
-    kind.mul(kind.round(0.5), product)
-}
-
 fn scaled_silu(kind: Float, x: f64, scale: f32) -> f64 {
     // Scale is decoded independently of T; never round scale to T before the product.
     let z = kind.round(((x as f32) * scale) as f64);
@@ -292,20 +245,14 @@ fn scaled_silu(kind: Float, x: f64, scale: f32) -> f64 {
 
 fn execute(ctx: &mut TranslationContext, node: &NodeDesc) -> Result<(), MlxError> {
     if ctx.shapeless_compile() || ctx.shape_keyed_compile() {
-        return Err(format!(
-            "MLX {}: requires eager host arithmetic",
-            node.op_type
-        ));
+        return Err(format!("MLX {}: requires eager host arithmetic", node.op_type));
     }
     let mut values = Vec::new();
     let mut shapes = Vec::new();
     let mut kinds = Vec::new();
     let mut output_dtype = None;
     for (i, input) in node.inputs.iter().enumerate() {
-        if i == 1
-            && matches!(node.op_type.as_str(), "FastGelu" | "ScaledSiLU")
-            && input.name.is_empty()
-        {
+        if i == 1 && node.op_type == "ScaledSiLU" && input.name.is_empty() {
             continue;
         }
         let host = read_live(ctx, input, &node.op_type)?;
@@ -357,14 +304,6 @@ fn execute(ctx: &mut TranslationContext, node: &NodeDesc) -> Result<(), MlxError
         .iter()
         .enumerate()
         .map(|(i, &x)| match node.op_type.as_str() {
-            "FastGelu" => {
-                let x = if values.len() == 2 {
-                    kind.add(x, values[1][bias_index(i, &shapes[0], &shapes[1])])
-                } else {
-                    x
-                };
-                fast_gelu(kind, x)
-            }
             "QuickGelu" => {
                 let z = kind.mul(kind.round(alpha as f64), x);
                 kind.mul(x, kind.sigmoid(z))
@@ -393,13 +332,7 @@ fn execute(ctx: &mut TranslationContext, node: &NodeDesc) -> Result<(), MlxError
 }
 
 pub fn register(registry: &mut OpRegistry) {
-    for op_type in [
-        "FastGelu",
-        "QuickGelu",
-        "BiasAdd",
-        "IsAllFinite",
-        "ScaledSiLU",
-    ] {
+    for op_type in ["QuickGelu", "BiasAdd", "IsAllFinite", "ScaledSiLU"] {
         registry.register_eager(
             OpRegistration {
                 domain: "com.microsoft",
@@ -424,10 +357,6 @@ mod tests {
         assert!(geometry("BiasAdd", &[vec![2, 3, 4], vec![1], vec![1, 3, 4]]).is_err());
         assert!(geometry("ScaledSiLU", &[vec![2, 3], vec![]]).is_ok());
         assert!(geometry("ScaledSiLU", &[vec![2, 3], vec![1]]).is_err());
-        assert!(geometry("FastGelu", &[vec![2, 0, 3], vec![3]]).is_ok());
-        assert!(geometry("FastGelu", &[vec![2, 3], vec![2, 1]]).is_ok());
-        assert!(geometry("FastGelu", &[vec![1, 3], vec![2, 3]]).is_err());
-        assert_eq!(bias_index(5, &[2, 3], &[2, 1]), 1);
     }
 
     #[test]
@@ -445,13 +374,7 @@ mod tests {
     #[test]
     fn every_route_is_eager_including_nested_descriptors() {
         use crate::registry::CompileShapeSafety;
-        for op in [
-            "FastGelu",
-            "QuickGelu",
-            "BiasAdd",
-            "IsAllFinite",
-            "ScaledSiLU",
-        ] {
+        for op in ["QuickGelu", "BiasAdd", "IsAllFinite", "ScaledSiLU"] {
             let node = NodeDesc::new(
                 op.into(),
                 "com.microsoft".into(),

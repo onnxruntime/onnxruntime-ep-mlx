@@ -1,101 +1,119 @@
-# Elementary contrib operators (source checkpoint)
+# Four elementary contrib operators
 
-The MLX EP registers **com.microsoft v1** FastGelu, QuickGelu, BiasAdd,
-IsAllFinite and ScaledSiLU. This is source implementation and fixture coverage,
-not runtime qualification or completion of the full operator audit.
+The MLX EP registers **com.microsoft v1 QuickGelu, BiasAdd, IsAllFinite and
+ScaledSiLU**. This four-op scope supersedes PR #72's original five-op addition;
+FastGelu remains a separate OPEN audit obligation, detailed below. Source
+support is not complete runtime qualification or completion of the operator audit.
 
-All five deliberately execute **eagerly on provider-owned host data**. Live graph
-inputs, initializers and evaluated intermediates use the existing checked host
-reader. No ORT CPU fallback is used. Compile classification excludes decode,
-general and prefill capture, recursively through control-flow bodies, and splits
-these eager boundaries even outside decoder graphs. Existing float64 CPU-stream
-coloring applies; no global dtype/transport policy is widened. Float64 payloads
-inside control flow remain refused by the existing body guard.
-
-## Implemented contracts
-
-| Operator | Types | Inputs and behavior |
+| Operator | Legal types | Contract |
 | --- | --- | --- |
-| QuickGelu | F16, BF16, F32, F64 | One X; FLOAT alpha defaults to 1.702. Typed v1 function: X * sigmoid(cast_T(alpha) * X). |
-| FastGelu | F16, BF16, F32, F64 | X, optional homogeneous bias; absent and explicit empty-name slot are equivalent. Typed schema function constants 0.797885, 0.035677 and 0.5, with rounding at each ONNX operation. |
-| BiasAdd | F16, F32 | Exactly X[N,S,C], bias[C], skip[N,S,C]; Y = (X + bias) + skip, with typed additions. No generic residual broadcasting. |
-| IsAllFinite | homogeneous F16, BF16, F32, F64 | At least one tensor, arbitrary individual shapes; scalar BOOL output. Every element of every live input participates; empty inputs contribute true. |
-| ScaledSiLU | independent T and M: F16, BF16, F32 | X plus optional **rank-zero** scale; scale overrides FLOAT alpha (default 1). Z = cast_T(float32(X) * float32(scale)); S = cast_T(sigmoid(float32(Z))); Y = cast_T(float32(Z) * float32(S)). |
+| QuickGelu | F16, BF16, F32, F64 | Required X/Y of matching type/shape; FLOAT alpha defaults to 1.702. Typed X * sigmoid(cast_T(alpha) * X). No optional input. |
+| BiasAdd | F16, F32 | Exactly X[N,S,C], bias[C], skip[N,S,C]; typed (X + bias) + skip. No generic broadcasting or optional inputs. |
+| IsAllFinite | Homogeneous F16, BF16, F32, F64 | One or more independently shaped inputs, scalar BOOL output. Empty tensors contribute true. INT isnan_only/isinf_only default to zero; any nonzero value is true. Both nonzero is invalid. |
+| ScaledSiLU | Independent T and M: F16, BF16, F32 | Required X plus optional rank-zero scale, including all nine T/M pairs. Present scale overrides FLOAT alpha (default 1); absent/empty-name slot uses alpha. |
 
-IsAllFinite INT flags use nonzero truth, including negative integers. Both flags
-nonzero is **invalid**, not a precedence choice. With isnan_only only NaNs fail;
-with isinf_only only either infinity fails; otherwise either kind fails.
+ScaledSiLU computes Z_T = cast_T(float32(X) * effective_scale), then
+S_T = cast_T(sigmoid(float32(Z_T))), then Y = cast_T(float32(Z_T) * float32(S_T)).
+It is not Swish(X, scale). Scale is independently decoded into F32, never
+prematurely rounded to T. A one-element vector is not a scalar. Live geometry,
+type/arity and attribute types are validated rather than silently coerced.
 
-ScaledSiLU is **SiLU(scale * X)**, not Swish(X, scale). Scale is never pre-rounded
-to X's type. Host evaluation makes the two intermediate T roundings observable
-and prevents compiled optimization/fusion from erasing them. A vector of length
-one is not a scalar. BiasAdd and all optional inputs validate live geometry as
-well as static/symbolic metadata. Zero dimensions are legal.
+All four use provider-owned eager host arithmetic/scans, not ORT CPU fallback.
+Recursive eager boundaries exclude decode/general/prefill capture, including
+nested bodies, without globally widening host readers or movable dtypes.
+Existing float64 CPU coloring and control-flow payload restrictions remain.
+The RandomLike metadata-only input policy is not a payload transport grant.
+BF16 fixtures use explicit Cast boundaries rather than assuming direct NumPy
+BF16 loader support. Scalar/empty/symbolic/live/initializer/intermediate inputs,
+signed zero and nonfinite values retain their existing independent references
+and thresholds.
 
-FastGelu's schema function explicitly uses standard Add(X, bias); it therefore
-defines more bias shapes than the CPU/CUDA kernel's rank-one, last-dimension
-helper. The EP implements these function-defined broadcasts **when they preserve
-X's shape**, including scalar X/bias and multidimensional bias. Expanding X to a
-larger result is **OPEN and declined with a specific claim reason**: the function
-would expand it, but schema shape inference unconditionally propagates X's shape.
-This boundary is not presented as a backend impossibility or kernel restriction.
+## Mathematical contracts and source authority
 
-QuickGelu and FastGelu follow the typed schema function rather than claiming
-bitwise identity with every fused upstream kernel. ScaledSiLU follows the
-explicit staged CPU implementation. Transcendental results retain host libm
-behavior, including IEEE NaN/infinity arithmetic. No performance claim is made.
+For `com.microsoft`, official CUDA behavior takes precedence over conflicting
+CPU behavior. References are independent mathematical/typed contracts, not
+observed-output transplants or an assumption that CPU is the oracle. Bit identity
+between different exp/libm/device implementations is not a prerequisite for
+mathematical support. The existing literal goldens, typed stages and comparison
+thresholds are nevertheless binding; a concrete disagreement must be classified,
+not hidden by widening a tolerance or substituting an oracle.
 
-## Immutable semantic authority
+Pinned ORT v1.31.0 source commit
+[`402979ac1bef89dcd55add41eaa7277c407599eb`](https://github.com/microsoft/onnxruntime/commit/402979ac1bef89dcd55add41eaa7277c407599eb)
+is semantic source authority, not installed-binary identity proof:
 
-Matching upstream tag **v1.31.0** resolves to commit
-[`402979ac1bef89dcd55add41eaa7277c407599eb`](https://github.com/microsoft/onnxruntime/commit/402979ac1bef89dcd55add41eaa7277c407599eb).
-These are source contracts, **not proof of the installed runtime binary's
-identity**, generator provenance or a fresh runtime query.
+- [QuickGelu schema/function, contrib_defs.cc 628-660](https://github.com/microsoft/onnxruntime/blob/402979ac1bef89dcd55add41eaa7277c407599eb/onnxruntime/core/graph/contrib_ops/contrib_defs.cc#L628-L660).
+  The F32 [CPU implementation, activations.h 62-97](https://github.com/microsoft/onnxruntime/blob/402979ac1bef89dcd55add41eaa7277c407599eb/onnxruntime/contrib_ops/cpu/activations.h#L62-L97)
+  uses MLAS logistic or, for alpha=1, MLAS SiLU. This does not supersede the
+  schema's typed mathematical contract or prove CPU/CUDA numerical equivalence.
+  Fixtures retain independent references and include alpha=1, default/explicit
+  1.702, zero, negative and other positive alpha. Native78's two default-F32 B1
+  positives establish only those historical CPU controls, not this candidate.
+- [BiasAdd schema, diffusion_defs.cc 198-228](https://github.com/microsoft/onnxruntime/blob/402979ac1bef89dcd55add41eaa7277c407599eb/onnxruntime/core/graph/contrib_ops/diffusion_defs.cc#L198-L228)
+  and [CUDA additions, bias_add_impl.cu 31-53](https://github.com/microsoft/onnxruntime/blob/402979ac1bef89dcd55add41eaa7277c407599eb/onnxruntime/contrib_ops/cuda/diffusion/bias_add_impl.cu#L31-L53).
+  Independent typed addition is the reference; no CPU contrib kernel is invented.
+- [IsAllFinite schema, contrib_defs.cc 965-1006](https://github.com/microsoft/onnxruntime/blob/402979ac1bef89dcd55add41eaa7277c407599eb/onnxruntime/core/graph/contrib_ops/contrib_defs.cc#L965-L1006)
+  and [constructor rejection, isfinite.h 14-27](https://github.com/microsoft/onnxruntime/blob/402979ac1bef89dcd55add41eaa7277c407599eb/onnxruntime/contrib_ops/cuda/math/isfinite.h#L14-L27).
+  Exact boolean classification is independently referenced without a fabricated
+  CPU kernel. Direct backend registration does not narrow schema legality.
+- [ScaledSiLU schema, bert_defs.cc 5587-5611](https://github.com/microsoft/onnxruntime/blob/402979ac1bef89dcd55add41eaa7277c407599eb/onnxruntime/core/graph/contrib_ops/bert_defs.cc#L5587-L5611)
+  and [CPU stages, scaled_silu.cc 12-80](https://github.com/microsoft/onnxruntime/blob/402979ac1bef89dcd55add41eaa7277c407599eb/onnxruntime/contrib_ops/cpu/bert/scaled_silu.cc#L12-L80).
+  Line 61 requires NumDimensions()==0, not Size()==1. Retained official CUDA
+  discovery source `contrib_ops/cuda/bert/scaled_silu.cc` independently checks
+  rank zero and registers all nine T/M combinations; `scaled_silu_impl.cu`
+  independently loads scale into F32 and explicitly casts Z, sigmoid and product
+  to T (lines 20-40). Those stages agree with the implementation's mathematical
+  contract. These retained discovery bytes are not among the twelve immutably
+  verified v1.31 source files, and are not proof of installed CUDA identity or
+  execution. Existing exact literal goldens stay binding; Native78 never reached
+  B6/B7 CPU controls.
 
-- [bert_defs.cc, FastGelu schema/function, lines 3591-3636](https://github.com/microsoft/onnxruntime/blob/402979ac1bef89dcd55add41eaa7277c407599eb/onnxruntime/core/graph/contrib_ops/bert_defs.cc#L3591-L3636):
-  typed constants, optional Add, shape propagation.
-- [bias_gelu_helper.h, lines 17-45](https://github.com/microsoft/onnxruntime/blob/402979ac1bef89dcd55add41eaa7277c407599eb/onnxruntime/contrib_ops/cpu/bert/bias_gelu_helper.h#L17-L45):
-  narrower fused-kernel geometry, not the function's full broadcast definition.
-- [contrib_defs.cc, QuickGelu, lines 628-660](https://github.com/microsoft/onnxruntime/blob/402979ac1bef89dcd55add41eaa7277c407599eb/onnxruntime/core/graph/contrib_ops/contrib_defs.cc#L628-L660):
-  default alpha, full type set and context-dependent typed function.
-- [contrib_defs.cc, IsAllFinite, lines 965-1006](https://github.com/microsoft/onnxruntime/blob/402979ac1bef89dcd55add41eaa7277c407599eb/onnxruntime/core/graph/contrib_ops/contrib_defs.cc#L965-L1006)
-  and [CUDA constructor, lines 14-27](https://github.com/microsoft/onnxruntime/blob/402979ac1bef89dcd55add41eaa7277c407599eb/onnxruntime/contrib_ops/cuda/math/isfinite.h#L14-L27):
-  homogeneous variadic types, scalar bool, both-true rejection.
-- [IsAllFinite CUDA implementation, lines 25-64](https://github.com/microsoft/onnxruntime/blob/402979ac1bef89dcd55add41eaa7277c407599eb/onnxruntime/contrib_ops/cuda/math/isfinite.cc#L25-L64):
-  empty identity, multi-input scan, float/half/double CUDA registrations.
-- [BiasAdd CUDA validation, lines 33-70](https://github.com/microsoft/onnxruntime/blob/402979ac1bef89dcd55add41eaa7277c407599eb/onnxruntime/contrib_ops/cuda/diffusion/bias_add.cc#L33-L70)
-  and [addition order, lines 31-53](https://github.com/microsoft/onnxruntime/blob/402979ac1bef89dcd55add41eaa7277c407599eb/onnxruntime/contrib_ops/cuda/diffusion/bias_add_impl.cu#L31-L53);
-  [BiasAdd schema, diffusion_defs.cc, lines 198-228](https://github.com/microsoft/onnxruntime/blob/402979ac1bef89dcd55add41eaa7277c407599eb/onnxruntime/core/graph/contrib_ops/diffusion_defs.cc#L198-L228).
-- [ScaledSiLU schema, lines 5587-5611](https://github.com/microsoft/onnxruntime/blob/402979ac1bef89dcd55add41eaa7277c407599eb/onnxruntime/core/graph/contrib_ops/bert_defs.cc#L5587-L5611)
-  and [CPU implementation, lines 12-80](https://github.com/microsoft/onnxruntime/blob/402979ac1bef89dcd55add41eaa7277c407599eb/onnxruntime/contrib_ops/cpu/bert/scaled_silu.cc#L12-L80):
-  independent M, rank-zero scale, float32 work and three T casts.
+Pinned schemas and the twelve independently verified upstream source files are
+semantic evidence only: neither they nor historical discovery sources prove the
+identity of a loaded runtime, a schema-catalog generator, or actual device
+dispatch. No CUDA execution is claimed.
 
-The retained inventory SHA256 is
-`136a948551de882468e8b9f4d16c6b7d11340dd8cb92120f191acd169224b323`;
-its five `runtime_schemas` records, not its empty standard `schemas`, were read
-with stdlib JSON. Historical schema/source discovery was at 755; the scheduler
-checked F470 runtime bytes separately. Neither fact proves catalog generator
-binary identity. Current upstream main `cb2a4f584be4f18d60bfb072e0813b9d110a6f9b`
-was also read for comparison, but release-tag sources above are the cited authority.
+## FastGelu remains a separate OPEN lifecycle
 
-## Fixtures and pending runtime admission
+FastGelu is not registered by this four-op addition. It is not removed from the
+audit queue, declared impossible, or represented as completed. Historical
+five-op commit `77f3ae388da3b296ea1c54d0204381439280ed8f`, its reviews and original
+299 manually enumerated static Python cases remain preserved in history. Its
+original minus-two and present-bias goldens/tolerances and failed Native78 raw
+evidence remain immutable, not silently replaced by this filtered fixture module.
 
-`tests/ops/test_elementary_contrib.py` contains typed independent oracles,
-literal ScaledSiLU goldens, every T/M pair, attribute defaults/overrides,
-missing/empty optional slots, zero/scalar/symbolic shapes, same-session changing
-values and shapes, initializer/live/intermediate inputs, nested If parents,
-malformed arities/types/geometry and default/forced-eager routes.
-BF16 is exercised through explicit Cast boundaries rather than pretending that
-the Python ORT loader accepts a NumPy BF16 feed. CPU kernels are not used as
-proxies: source registrations cover less than schema types (FastGelu CPU F32;
-IsAllFinite CUDA F16/F32/F64), and CPU availability does not define EP feasibility.
+The pinned FastGelu schema function and CPU kernel use different polynomial
+constants and arithmetic/transcendental paths. Native78 failed a CPU-versus-schema
+reference check before MLX registration, on a separate historical baseline, not
+this candidate. That failure is not a CUDA defect or a failed current MLX result.
+CPU matching is not the prospective contract gate under CUDA-first policy.
+Retained authorized CUDA evidence stops at the wrapper's registration, bias
+validation and `LaunchFastGeluKernel` call; it does not establish device
+coefficients, rounding stages or scalar/half2 behavior. The remaining obligation
+is an authorized CUDA-contract arithmetic/reference assessment, followed by any
+justified source correction and focused validation without weakening original
+goldens/thresholds. No guessed CPU tanh substitute or excluded-source refetch is
+authorized. Shape-expanding bias's schema/function shape-inference conflict is a
+separate OPEN boundary. Simpler well-defined scalar/shape-preserving
+generalizations are not rejected merely because of CPU-kernel restrictions.
 
-Every positive session disables CPU assignment fallback and runtime fallback.
-Profiles select a **nonempty** set of Node `*_kernel_time` events independently
-of provider, then require **every event** to report MLX, rejecting missing provider
-metadata. Automatically listed CPU providers are not mistaken for actual CPU
-assignment. Rust fixtures cover typed literal stages, geometry and recursive
-compiled-route exclusion. Fixture source inventory is not test collection.
-Only source/AST inspection and Rust 1.98 formatting are permitted at this
-checkpoint; build, collection, inference and GPU validation remain unrun pending
-the scheduler's explicit local-window admission.
+## Evidence boundaries
+
+The filtered module has **17 Python test functions / 233 manually enumerated
+STATIC parameter cases**, plus **3 Rust test functions**. These are not observed
+collection/execution counts. The original five-op hosted run `39934916520` checked
+out merge `18de3d008ea0c2793c1247f609d226d008bafff4`, tree
+`2c4fdfae9cf8370d021833ae136720d0532467af`; its successful results do not qualify
+this four-op final diff or establish module-specific execution of the old 299.
+Strict sessions and nonempty actual Node `*_kernel_time` profiles retain the
+constructor/runtime/assignment fallback prohibitions and all-MLX requirements.
+The provider descriptor must be exactly ordered `[MLX]` or `[MLX, CPU]`; listing
+CPU is not actual CPU assignment. Function-expanded/rewritten already-owned
+positives are not missing-support evidence, and provider ownership does not prove
+physical GPU/compiled/host route. Exact dtype/shape/value/live replays, BF16 Cast
+boundaries, all nine scale pairs and nested eager routing remain focused evidence
+targets. Numerical/provider failure, invalid model, strict assignment gap and
+actual loader limits must remain distinct. No oracle substitution, tolerance
+weakening, skipped failure or retry is authorized. Final-diff CI and separately
+admitted focused runtime evidence must be attributed to their exact inputs and
+checkouts; this source reconciliation grants no local execution or binary reuse.
