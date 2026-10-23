@@ -423,6 +423,41 @@ def test_grid_sample_nearest_preserves_float_bits(padding, execution_mode):
     np.testing.assert_array_equal(actual.view(np.uint32), x.view(np.uint32))
 
 
+@pytest.mark.parametrize("grid_dtype", FLOATS)
+@pytest.mark.parametrize("align", [0, 1])
+def test_grid_sample_standard_axis_subnormal_normalization_contract(grid_dtype, align,
+                                                                  execution_mode):
+    dtype = NUMPY[grid_dtype]
+    info = ml_dtypes.finfo(dtype) if grid_dtype == DT.BFLOAT16 else np.finfo(dtype)
+    smallest = info.smallest_subnormal
+    largest = np.nextafter(dtype(info.tiny), dtype(0), dtype=dtype)
+    values = np.array([-largest, -smallest, 0, smallest, largest], dtype=dtype)
+    grid = np.stack([np.full(5, -1, dtype=dtype), values], axis=-1).reshape(1, 1, 5, 2)
+    grid = _cast(grid, grid_dtype)
+    x = np.array([10, 20, 30, 40], np.float32).reshape(1, 1, 2, 2)
+    model = _model(2, grid_dtype=grid_dtype, mode="nearest", align=align)
+    actual = _session(model).run(None, {"x": x, "grid": grid})[0]
+    expected = _expected(x, grid, grid_dtype=grid_dtype, mode="nearest", align=align)
+    np.testing.assert_array_equal(actual, expected)
+
+    # Ordinary axes use fp32 (or fp64 for a double grid) denormalization, like ORT. Adding a
+    # positive subnormal to one can round to one before nearest-even is applied; this is not
+    # evidence that Metal flushed the grid itself. Prove the distinction against an actual CPU
+    # kernel and an exact-real rational oracle, instead of silently weakening nearest checks.
+    cpu_dtype = DT.DOUBLE if grid_dtype == DT.DOUBLE else DT.FLOAT
+    cpu_model = _model(2, cpu_dtype, cpu_dtype, mode="nearest", align=align)
+    cpu_x = x.astype(NUMPY[cpu_dtype])
+    cpu_grid = grid.astype(NUMPY[cpu_dtype])
+    cpu = m.run_cpu(cpu_model, {"x": cpu_x, "grid": cpu_grid})[0]
+    np.testing.assert_array_equal(cpu, expected.astype(NUMPY[cpu_dtype]))
+    rational = []
+    for value in values:
+        position = (Fraction(float(value)) + 1) / 2 if align else Fraction(float(value)) + Fraction(1, 2)
+        rational.append(x[0, 0, round(position), 0])
+    rational = np.array(rational).reshape(1, 1, 1, 5)
+    assert not np.array_equal(cpu, rational), "control must expose real-vs-floating normalization"
+
+
 @pytest.mark.parametrize("kwargs", [
     {"opset": 16, "mode": "linear"}, {"opset": 20, "mode": "bilinear"},
     {"opset": 16, "mode": "cubic"}, {"opset": 22, "mode": "bicubic"},

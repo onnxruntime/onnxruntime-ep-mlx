@@ -95,6 +95,11 @@ Higher-rank interpolation contracts spatial axes rather than allocating an expon
 Reflection reduces normalized coordinates periodically before they can overflow or lose pixel
 offsets. Axes longer than float32's exact integer range use binary-rational integer indexing and
 ties-to-even, rather than rounding image bounds or nearest indices through float32.
+Ordinary axes retain fp32 coordinate arithmetic (fp64 if either tensor is double), matching
+ORT's accumulation-precision denormalization: a perturbation smaller than that arithmetic can
+round away before nearest-even. Standard even-axis subnormal controls distinguish this from
+Metal flushing and from exact-real binary-rational indexing; they do not claim exact-real
+coordinate arithmetic for every ordinary-axis grid.
 Non-floating linear/cubic remains an **open semantic-contract gap**, not a backend impossibility:
 the schema admits these types but specifies no intermediate precision/cast rule, ORT 1.31
 has no corresponding CPU kernel, and ONNX's reference casts interpolation coefficients to the
