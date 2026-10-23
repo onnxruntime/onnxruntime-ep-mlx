@@ -81,6 +81,12 @@ The MLX 0.32.2 audit found these missing-`output_shapes` primitives in current l
 | `FFT` | DFT/STFT |
 | `CustomKernel` | the fused selective-scan branch inside ONNX Scan |
 
+RoiAlign's fixed-ratio floating grids retain shape-keyed compilation and validate live
+boundary ROIs/batch indices before every apply. Adaptive/default sampling is eager:
+its per-ROI ceiling counts depend on ROI values, not just shapes. The float64
+host-arithmetic route and fixed grids with interior validation dependencies also
+execute eagerly; neither route captures runtime ROI data in a shape-only closure.
+
 `GroupQueryAttention` is classified per node. Single-batch causal forms with past caches, without
 sliding/local windows or attention bias, retain the slice-free shapeless decode configuration
 (exact data-fed RoPE cache rows plus shape-preserving cache updates). Ragged/dynamic batches,
