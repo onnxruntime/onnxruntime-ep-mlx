@@ -269,12 +269,6 @@ fn combined_causal_mask(
     } else {
         ctx.astype(mask, dt)?
     };
-    // In token-at-a-time cached self-attention the sole query follows every past key, so the
-    // causal mask is all zeros. Returning the external mask directly also avoids MLX baking the
-    // current KV extent into an internal Broadcast during shapeless compilation.
-    if q_len == 1 && past_seq == k_len - 1 {
-        return Ok(additive);
-    }
     ctx.add(causal, additive)
 }
 
@@ -1295,7 +1289,10 @@ fn attention_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxErr
             ctx, n, qh4, present_k, present_v, b, qh, kvh, s, k_len, hd_q, hd_v, past_len, dt, mask,
         )?
     } else {
-        let mask = if causal {
+        // A single current key follows all past keys, so this query can attend every key.
+        // Do not capture a host-sized all-zero causal mask in the shapeless decode closure.
+        let all_keys_visible = s == 1 && past_len == k_len - 1;
+        let mask = if causal && !all_keys_visible {
             // MLX's built-in causal mode is lower-right aligned; ONNX aligns to the actual past.
             Some(combined_causal_mask(ctx, s, k_len, past_len, dt, mask)?)
         } else {
@@ -2039,6 +2036,7 @@ const GQA_BIAS_COMPILE_REASON: &str =
     "attention-bias GroupQueryAttention emits MLX Slice and its bias semantics are eager-only";
 const ATTENTION_COMPOSED_COMPILE_REASON: &str =
     "Attention v24/v25 logits or dynamic mask form uses composed MLX operations and is eager-only";
+const ATTENTION_CAUSAL_SHAPE_REASON: &str = "causal Attention requires proven single-query/single-current-key geometry for shapeless decode";
 
 fn group_query_attention_compile_shape_safety_for(
     claimable: bool,
@@ -2081,10 +2079,19 @@ fn attention_requires_composed_path(node: &NodeView) -> bool {
         || matches!((dtype_of(node, 0), dtype_of(node, 2)), (Some(q), Some(v)) if q != v)
 }
 
-fn attention_compile_shape_safety_for(claimable: bool, composed: bool) -> CompileShapeSafety {
+fn attention_compile_shape_safety_for(
+    claimable: bool,
+    composed: bool,
+    causal: bool,
+    single_query_key: bool,
+) -> CompileShapeSafety {
     if !claimable || composed {
         CompileShapeSafety::EagerOnly {
             reason: ATTENTION_COMPOSED_COMPILE_REASON,
+        }
+    } else if causal && !single_query_key {
+        CompileShapeSafety::ShapeKeyedOnly {
+            reason: ATTENTION_CAUSAL_SHAPE_REASON,
         }
     } else {
         CompileShapeSafety::Shapeless
@@ -2095,6 +2102,12 @@ fn attention_compile_shape_safety(node: &NodeView) -> CompileShapeSafety {
     attention_compile_shape_safety_for(
         attention_claim(node).is_ok(),
         attention_requires_composed_path(node),
+        node.int_attr("is_causal", 0) != 0,
+        [0, 1].into_iter().all(|index| {
+            node.input_info(index).is_some_and(|info| {
+                matches!(info.shape.len(), 3 | 4) && info.shape[info.shape.len() - 2] == 1
+            })
+        }),
     )
 }
 
@@ -3650,16 +3663,30 @@ mod tests {
     #[test]
     fn attention_v25_composed_forms_stay_eager_and_legacy_decode_stays_shapeless() {
         assert_eq!(
-            attention_compile_shape_safety_for(true, false),
+            attention_compile_shape_safety_for(true, false, true, true),
             CompileShapeSafety::Shapeless,
             "the pre-v25 fast-SDPA form must retain dynamic decode replay"
         );
         assert_eq!(
-            attention_compile_shape_safety_for(true, true),
+            attention_compile_shape_safety_for(true, true, true, true),
             CompileShapeSafety::EagerOnly {
                 reason: ATTENTION_COMPOSED_COMPILE_REASON
             },
             "nonpad, window, softcap, QK-output, or mixed-T1/T2 forms must not capture a first-call shape"
+        );
+    }
+
+    #[test]
+    fn causal_attention_cannot_capture_unproven_query_key_alignment() {
+        assert_eq!(
+            attention_compile_shape_safety_for(true, false, true, false),
+            CompileShapeSafety::ShapeKeyedOnly {
+                reason: super::ATTENTION_CAUSAL_SHAPE_REASON
+            }
+        );
+        assert_eq!(
+            attention_compile_shape_safety_for(true, false, false, false),
+            CompileShapeSafety::Shapeless
         );
     }
 
