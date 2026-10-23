@@ -126,6 +126,7 @@ def test_conformance(op: str) -> None:
         "-p",
         "no:cacheprovider",
         "-q",
+        "--tb=short",
     ]
     proc = subprocess.run(
         cmd, cwd=_OTD, env=env, capture_output=True, text=True, check=False

@@ -4,7 +4,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::engine::{MlxError, NodeDesc, TranslationContext, mlx_dtype_from_onnx};
+use crate::engine::{MlxError, NodeDesc, TranslationContext, dim_i32, mlx_dtype_from_onnx};
 use crate::mlx::{Array, VectorArray};
 use crate::registry::{
     ClaimPredicate, ClaimResult, CompileShapeSafety, K_ANY_OPSET, NodeView, OpHandler,
@@ -59,9 +59,15 @@ fn random_normal_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), Ml
     random_normal_with_shape(ctx, n, attr_shape(n))
 }
 
+fn random_like_shape(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<Vec<i32>, MlxError> {
+    ctx.tensor_shape(&n.inputs[0])?
+        .into_iter()
+        .map(dim_i32)
+        .collect()
+}
+
 fn random_normal_like_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
-    let x = ctx.resolve(&n.inputs[0])?;
-    let shape = ctx.shape_of(x);
+    let shape = random_like_shape(ctx, n)?;
     random_normal_with_shape(ctx, n, shape)
 }
 
@@ -86,8 +92,7 @@ fn random_uniform_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), M
 }
 
 fn random_uniform_like_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
-    let x = ctx.resolve(&n.inputs[0])?;
-    let shape = ctx.shape_of(x);
+    let shape = random_like_shape(ctx, n)?;
     random_uniform_with_shape(ctx, n, shape)
 }
 
@@ -249,6 +254,20 @@ fn random_uniform_claim(node: &NodeView) -> ClaimResult {
     random_shape_claim(node, false)
 }
 
+fn random_like_input_supported(node: &NodeView, dtype: ort::ONNXTensorElementDataType) -> bool {
+    use ort::*;
+    if dtype == ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16
+        && node.since_version() < 22
+    {
+        return false;
+    }
+    is_mlx_supported(dtype)
+        || dtype == ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_DOUBLE
+        || dtype == ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_STRING
+        || dtype == ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_COMPLEX64
+        || dtype == ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_COMPLEX128
+}
+
 fn random_like_claim(node: &NodeView, normal: bool) -> ClaimResult {
     require!(
         node.num_inputs() == 1 && node.num_outputs() == 1,
@@ -265,8 +284,8 @@ fn random_like_claim(node: &NodeView, normal: bool) -> ClaimResult {
         _ => deny!("missing tensor type/shape info on input or output"),
     };
     require!(
-        is_mlx_supported(inp.dtype),
-        "input dtype {} is not supported by MLX",
+        random_like_input_supported(node, inp.dtype),
+        "input dtype {} is not legal for this RandomLike schema",
         crate::registry::ort_dtype_name(inp.dtype)
     );
     require!(
@@ -282,10 +301,17 @@ fn random_like_claim(node: &NodeView, normal: bool) -> ClaimResult {
         crate::registry::ort_dtype_name(out.dtype)
     );
     require!(
-        shapes_compatible(&inp.shape, &out.shape),
+        node.input_rank_known(0) == Some(false) || shapes_compatible(&inp.shape, &out.shape),
         "input/output shapes must be compatible, got {:?} -> {:?}",
         inp.shape,
         out.shape
+    );
+    require!(
+        inp.shape
+            .iter()
+            .chain(&out.shape)
+            .all(|&dim| dim <= i32::MAX as i64),
+        "RandomLike dimensions must fit MLX's native int32 geometry"
     );
     if normal {
         let mean = node.float_attr_opt("mean").unwrap_or(0.0);
@@ -500,12 +526,12 @@ fn merge_broadcast_dim(existing: i64, next: i64) -> Option<i64> {
     if existing < 0 && next < 0 {
         None
     } else if existing == next || next == 1 {
-        if (existing == 0 || existing < 0) && next == 1 {
+        if existing <= 0 && next == 1 {
             return None;
         }
         Some(existing)
     } else if existing == 1 {
-        if next == 0 || next < 0 {
+        if next <= 0 {
             return None;
         }
         Some(next)
@@ -699,6 +725,16 @@ fn random_compile_shape_safety(node: &NodeView) -> CompileShapeSafety {
     if node.float_attr_opt("seed").is_none() {
         CompileShapeSafety::EagerOnly {
             reason: "unseeded random draws consume the live default key",
+        }
+    } else if matches!(
+        node.op_type().as_str(),
+        "RandomNormalLike" | "RandomUniformLike"
+    ) && node
+        .input_info(0)
+        .is_some_and(|info| !is_mlx_supported(info.dtype))
+    {
+        CompileShapeSafety::EagerOnly {
+            reason: "reads non-MLX RandomLike geometry without converting payloads",
         }
     } else {
         CompileShapeSafety::ShapeKeyedOnly {

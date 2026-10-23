@@ -558,7 +558,7 @@ fn block_quant_matmul_claim(node: &NodeView, fp4: bool) -> ClaimResult {
         "activation/output must share fp16 or bf16 dtype"
     );
     require!(
-        a.shape.len() >= 1
+        !a.shape.is_empty()
             && b.shape.len() == 2
             && a.shape.iter().all(|&d| d > 0)
             && b.shape.iter().all(|&d| d > 0),

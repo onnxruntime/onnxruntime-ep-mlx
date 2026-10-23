@@ -60,7 +60,9 @@ fn image_decoder_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), Ml
     };
     let rgb = decoded.into_rgb8().into_raw();
     let mut pixels = if pixel_format == "Grayscale" {
-        rgb.chunks_exact(3)
+        rgb.as_chunks::<3>()
+            .0
+            .iter()
             .map(|pixel| {
                 let value = 299 * u32::from(pixel[0])
                     + 587 * u32::from(pixel[1])
@@ -72,7 +74,7 @@ fn image_decoder_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), Ml
         rgb
     };
     if pixel_format == "BGR" {
-        for pixel in pixels.chunks_exact_mut(3) {
+        for pixel in pixels.as_chunks_mut::<3>().0 {
             pixel.swap(0, 2);
         }
     }

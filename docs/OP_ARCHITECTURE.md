@@ -68,12 +68,18 @@ The following table is the current support contract. Do not broaden claims witho
 | **GatherBlockQuantized** | `com.microsoft` | int4 embedding, symmetric (3-input, `zp=8`) **and** asymmetric (4-input `zero_points`) | gather + int4 dequant | Symmetric: `w=(q-8)·scale`. Asymmetric: `w=(q-zp)·scale`. |
 | **Softmax** | `ai.onnx` | any valid axis; `fp32`/`fp16`/`bf16` | `mlx_softmax_axis` / `mlx_softmax_axes` | Opset <13 normalizes the complete suffix starting at `axis` (default 1); opset >=13 normalizes one axis (default -1). Legacy multi-axis suffixes use shape-keyed compilation because MLX selects the lowering using singleton extents; single-axis forms retain shapeless compilation. |
 | **NonZero** | `ai.onnx` | schema 9/13; bool, all 8/16/32/64-bit signed/unsigned integers, fp16/fp32/fp64 and (schema 13) bf16 | provider-owned exact eager host scan + int64 MLX output | Live payload determines row-major coordinates and `[rank, count]` shape on every call. Scalar output is `[0, count]` per ONNX, unlike ORT 1.31 CPU's `[1, count]`. |
+| **Unique** | `ai.onnx` | schema 11; bool, all 8/16/32/64-bit signed/unsigned integers, fp16/fp32/fp64; flat or axis slices, scalar/unknown rank/empty shapes, all optional outputs | provider-owned exact eager host sort/group + byte-preserving MLX outputs | [Contracts and authority limits](UNIQUE.md). Live cardinality and exact metadata; recursive eager parent boundaries. Legal NaNs use deterministic NaN-last sorting; NumPy half-axis ordering disagreement is explicit. Future28 dispatch is preserved; bf16 Unique28 remains unclaimed/unvalidated. Native validation pending. |
 | **MatMul** | `ai.onnx` | rank >=1 floating operands, including vector-vector, vector-matrix and batched vector forms | `mlx_matmul` | ONNX vector promotion/squeezing and batch broadcasting are native MLX semantics. Empty contraction dimensions, empty batches and symbolic extents are supported. Float64 uses the isolated MLX CPU stream; integer MatMul stays on ORT CPU. |
+| **FusedMatMul** | `com.microsoft`, schema 1 | matching fp16/fp32/fp64/bf16 A/B/Y, alpha and all four transpose flags | transpose + `mlx_matmul` + scale | Batch transpose rotates axis 0 behind all batch axes, before last-two transpose; either batch flag requires equal ranks >=3, matching ORT's compute helper. Vector last-two transpose is a no-op. Narrow scaling uses a dtype-rounded alpha and FP32 product/scaling before the final output cast, avoiding an intermediate fp16/bf16 result. Empty-result materialization uses shape-keyed compilation. Float64 retains the existing isolated MLX CPU stream. Source implementation and fixtures only; runtime/compiled evidence pending. |
 | **GatherND** | `ai.onnx` | numeric/bool data; any valid `batch_dims`; statically known positive index-tuple width | flattened gather plus per-batch offsets | Preserves scalar slices, zero-size index grids/tails/batches, and live negative indices. Symbolic extents use shape-keyed compilation because flattening strides depend on concrete shapes. Float64 data uses the isolated MLX CPU stream. |
 | **Add** | `ai.onnx` | `fp32`/`fp16`/`bf16` | MLX elementwise add | Floating forms only (fp32 via the residual-add predicate, fp16/bf16 via the elementwise predicate). |
 | **Mul** | `ai.onnx` | `fp32`/`fp16`/`bf16` | MLX elementwise multiply | Floating forms only. |
 | **Sub** | `ai.onnx` | `fp32`/`fp16`/`bf16`, `int64` | MLX elementwise subtract | Covers supported numeric/bookkeeping forms only. |
 | **Sigmoid** | `ai.onnx`, `com.microsoft` | `fp32`/`fp16`/`bf16` | MLX elementwise sigmoid | Standalone `SiLU`/`Swish` are not claimed. |
+| **QuickGelu** | `com.microsoft` | v1; `fp16`/`bf16`/`fp32`/`fp64`; FLOAT alpha default 1.702 | provider-owned eager typed sigmoid/product | [Elementary contracts and evidence](ELEMENTARY_CONTRIB.md). Independent mathematical reference; not a claim of CUDA execution or CPU bit identity. |
+| **BiasAdd** | `com.microsoft` | v1; `fp16`/`fp32`; exactly X[N,S,C], bias[C], skip[N,S,C] | provider-owned eager typed (X + bias) + skip | No generic broadcasting. Exact live geometry and typed addition order. |
+| **IsAllFinite** | `com.microsoft` | v1; homogeneous variadic `fp16`/`bf16`/`fp32`/`fp64`; scalar bool output | provider-owned eager exact predicates/reduction | Empty identity true; nonzero flags select NaN/Inf checks; both nonzero invalid. |
+| **ScaledSiLU** | `com.microsoft` | v1; independent X/scale `fp16`/`bf16`/`fp32`; optional rank-zero scale overrides FLOAT alpha default 1 | provider-owned eager literal typed SiLU(scale * X) | All nine type pairs; round Z, sigmoid and product to X type. FastGelu remains a separate [OPEN audit obligation](ELEMENTARY_CONTRIB.md#fastgelu-remains-a-separate-open-lifecycle), not registered by this batch. |
 | **Cast / CastLike** | `ai.onnx` | all pairs among bool, signed/unsigned 8/16/32/64-bit integers, `fp16`/`bf16`/`fp32`/`fp64` (13 types, including same-type) | MLX astype | Float64 conversions use the isolated MLX CPU stream; other types use Metal. CastLike reads only the target's declared dtype, not its values or shape. |
 | **Div** | `ai.onnx` | same-dtype float or `int32`/`int64`, scalar-or-suffix broadcast | MLX divide; integer floor quotient corrected toward zero | MLX 0.32.4 floors integer division; opposite-sign inputs with a nonzero remainder add one to preserve ONNX truncation without float conversion. Zero and correction use the input dtype, including for values beyond exact floating-point representation. Integer division by zero and unrepresentable quotients are not defined by this support contract. |
 | **Mod** | `ai.onnx` | Mod10/13, same-dtype numeric inputs with multidirectional broadcasting | magnitude remainder/sign restoration for floats; integer remainder/correction | [Versioned contracts](MOD.md): Mod10 permits integer `fmod=1`; Mod13 requires integers for `fmod=0` and floats for `fmod=1`. Floating arithmetic uses explicit MLX CPU/DOUBLE primitives to avoid Metal remainder precision loss. All forms are eager-only; integer zero divisors are validated on every call. Mod28 is not registered. |
@@ -81,7 +87,25 @@ The following table is the current support contract. Do not broaden claims witho
 | **Conv** | `ai.onnx` | rank-3/4, static positive W shape; symbolic X batch/channel/spatial dimensions allowed | MLX conv1d/conv2d/conv_general | W and group determine the required input channels; concrete channels are checked at execution. |
 | **RNN / GRU / LSTM** | `ai.onnx` | layout=0, default activations, no sequence_lens; symbolic sequence length allowed | shape-keyed unrolling | Each concrete input shape gets its own trace. Empty sequences preserve initial states and produce an empty Y. |
 | **Dropout** | `ai.onnx` | Versioned floating data, optional ratio/training controls and mask; legacy `is_test` | identity/ones for inference, uniform sampling and scaled masking for training | Opsets 1/6 honor `is_test`; 7/10 retain inference behavior because they provide no per-node training selector. Mask dtype follows the schema (data dtype before opset 10, bool thereafter). Modern controls are live scalar tensors, including intermediate producers; inference ignores the ratio value. BF16 data requires opset 13 and BF16 ratio requires opset 22. Training is an eager partition boundary, preserving compiled neighbors and fresh default keys; explicit INT64 seed bits are preserved. Float64 data uses the MLX CPU stream. |
-| **RandomNormal / RandomNormalLike / RandomUniform / RandomUniformLike / Bernoulli / Multinomial** | `ai.onnx` | Existing versioned dtype/shape/attribute restrictions | MLX random primitives | Unseeded forms are eager partition boundaries: each call consumes the live default key, including inside control-flow bodies. Explicit float-seed forms retain their existing shape-keyed, fixed-key behavior. The eager boundary does not downgrade neighboring deterministic nodes. Wider RNG dtype families, type-only Like inputs and extreme uniform endpoints remain separate coverage gaps. |
+| **RandomNormal / RandomNormalLike / RandomUniform / RandomUniformLike / Bernoulli / Multinomial** | `ai.onnx` | Existing versioned output dtype/attribute restrictions; Like reads tensor geometry only | MLX random primitives | Unseeded forms are eager partition boundaries: each call consumes the live default key, including inside control-flow bodies. Explicit float-seed forms remain fixed-key and shape-keyed when their inputs can be traced. Like's metadata claim accepts every legal input type in schema 1/22, including string/complex/double with explicit float32/float16 output dtype, without converting its payload; non-MLX input types remain eager even with a seed. [ORT 1.31 initializer sizing](https://github.com/microsoft/onnxruntime/blob/v1.31.0/onnxruntime/core/framework/tensorprotoutils.cc#L1402-L1437) rejects complex initializers, as seen in [hosted run 39913638545](https://github.com/onnxruntime/onnxruntime-ep-mlx/actions/runs/39913638545/job/120282096717): these cases assert the exact session-initialization error against an independent CPU Shape control, not RNG execution. Scalar, empty and unknown-rank geometry is checked without narrowing wide dimensions. Recursive eager boundaries preserve neighboring deterministic compilation. Wider RNG output dtype families and extreme uniform endpoints remain separate coverage gaps. |
+
+The FusedMatMul source contract follows immutable ORT
+[`402979ac`](https://github.com/microsoft/onnxruntime/tree/402979ac1bef89dcd55add41eaa7277c407599eb):
+`contrib_defs.cc` for schema/vector behavior, `matmul_helper.h` for batch permutation/rank rules,
+and CUDA `math/matmul.cc` plus `shared_inc/fpgeneric.h` for narrow alpha conversion and FP32
+accumulation. Nonzero INT flags are interpreted at full width, as in the runtime kernels;
+upstream shape inference truncates them to C++ `int`, so unusually large flags can infer
+different extents. No inference workaround or global claim/stream boundary is introduced.
+The schema does not prohibit nonfinite alpha; the fixtures use an explicit NumPy oracle
+for those cases because ORT's double CPU constructor rejects them. CPU comparisons are
+restricted to its registered float/double forms, never exception-driven oracle substitution.
+For a zero contraction length, the result is literal positive zeros before alpha conversion
+or scaling, matching ORT CUDA even for nonfinite alpha or a finite fp16 alpha that overflows
+when narrowed. The zero-K fixtures cross all four transpose flags, dtype families, symbolic
+replays, vector promotion, and empty-output cases with an explicit zero-fill oracle.
+Tests in `tests/ops/test_fused_matmul.py` cover default/eager requests, not yet proven compiled
+or CPU-stream execution. Absence of an earlier native registration does not establish a
+baseline failure: ORT expansion/rewrites and actual placement still require admitted execution.
 
 Runtime-bounded **Range** and runtime-repeat **Tile** remain on ORT CPU. Their parameter values
 determine output extents and cannot safely be baked into a shape/dtype-keyed closure. Constant
@@ -100,7 +124,8 @@ Complex64/complex128 and string forms admitted by the ONNX schemas remain **unim
 coverage gaps**, not backend impossibilities; they need end-to-end provider dtype/host-value
 support and dedicated oracles. ORT 1.31 CPU itself implements only bool/uint8/int32/int64/fp32
 NonZero and disagrees with ONNX on scalar output rank. No tolerance or fallback is used to
-hide these differences. Unique's existing support is unchanged.
+hide these differences. Unique shares the checked exact live host reader, without changing
+NonZero's coordinate/equality rules; see [Unique contracts](UNIQUE.md).
 
 **GridSample** supports opset-16 2D `bilinear`/`nearest`/`bicubic` and opset-20+
 general-N `linear`/`nearest`/`cubic`, all three padding modes (`zeros`, `border`,
@@ -235,12 +260,22 @@ and zero for any empty dimension. Non-MLX payloads use eager metadata reads;
 dynamic or intermediate numeric geometry uses shape-keyed compilation. This does not enable
 string/encoded payload outputs or control-flow array boundaries.
 Fully static graph-input/initializer metadata retains shapeless eligibility.
+Double inputs captured by `If`, `Loop`, or `Scan` bodies may be read by `Shape`
+and `Size` without importing their payloads. These bodies and their enclosing
+control-flow nodes stay eager, including for static geometry; unrelated numeric
+work retains its existing compilation eligibility. Actual Double computation
+inside control-flow bodies remains declined.
 Existing host-value specialization and eager fences still protect geometry
 controlled by changing parameter values; root input shapes alone are not a
 sufficient cache key. General capture value-specializes supported boundary
 parameters; decode and prefill reject host-read parameters unless they are
 immutable or proven shape-constant. This also protects live Reshape/Expand
 outputs when an unrelated metadata input has fully static geometry.
+
+`Loop` reads its trip count and initial condition on the host. As with `If`,
+node-produced controls are left to ORT CPU instead of being fused with their
+producers into a plan whose intermediate values cannot be read as host inputs.
+Graph-input and initializer controls retain live-value specialization.
 
 `Flatten` validates full-width axes with the schema's bounds (nonnegative before
 opset 11) and checks both folded dimensions before narrowing to MLX int32 shapes.
@@ -376,6 +411,18 @@ other forms fall back to ORT CPU. Empty/dynamic support is per-handler, not a
 blanket guarantee. Claimed control-flow nodes translate supported tensor bodies;
 other control-flow forms remain on CPU.
 
+Already-claimed nested `If` conditions and `Loop` trip counts/initial conditions
+can read bound body formal inputs eagerly, including BOOL/INT64 slices supplied
+by `Scan` and the iteration/condition formals supplied by an enclosing `Loop`.
+Reads validate exact dtype and one-element payloads; INT64 controls never pass
+through floating point. Direct graph-input/initializer controls retain their
+host-value-specialized compiled path. Intermediate controls remain ineligible
+for compiled specialization and use checked evaluated host reads only in eager
+execution. This does not widen claims for node-produced `If` conditions or change
+Loop/Scan arity, passthrough-condition, optional/dynamic termination, scan-output,
+container, or float64 restrictions. The focused nested-control fixtures are
+source coverage pending native validation, not a full control-flow audit claim.
+
 The **core Rust modules** register:
 
 | Module | Registered ops |
@@ -385,13 +432,14 @@ The **core Rust modules** register:
 | `shape.rs` | Gather/scatter, reshape/layout, crop/pad, depth/space transforms, Resize/Upsample, Compress, ReverseSequence, EyeLike |
 | `norm.rs` | RMS/Layer/Group/Instance/Batch/Lp normalization, LRN, Microsoft skip-norm variants |
 | `attention.rs` | GroupQueryAttention, Attention (opset 23 & 24), MultiHeadAttention, RotaryEmbedding |
-| `matmul.rs` | MatMul, Gemm |
+| `matmul.rs` | MatMul, Gemm, com.microsoft::FusedMatMul |
 | `conv.rs` | Conv/ConvTranspose/DeformConv and local/global pooling |
 | `quant.rs` | MatMulNBits, GatherBlockQuantized, Quantize/Dequantize/DynamicQuantize, MatMulInteger, ConvInteger, QLinearMatMul, QLinearConv |
 | `ssm.rs` | TensorScatter (opset 24), CausalConvWithState, LinearAttention (linear/gated/delta/gated_delta, GQA) |
 | `selective_scan.rs` | Mamba-1 selective scan: recognises the `Scan` body and replaces the per-timestep unroll with one custom Metal kernel (state kept in registers) |
 | `nonzero.rs` | Exact eager NonZero host scan with live cardinality and int64 coordinates |
-| `misc.rs` / `image.rs` | Constants, losses, Unique/Det, sequence-to-tensor consumers, numeric TF-IDF, and image decoding |
+| `unique.rs` / `host_scan.rs` | Exact eager Unique grouping/axis slices; shared checked live host payload access |
+| `misc.rs` / `image.rs` | Constants, losses, Det, sequence-to-tensor consumers, numeric TF-IDF, and image decoding |
 | `random.rs` / `signal.rs` / `recurrent.rs` / `vision.rs` / `controlflow.rs` | Random, signal/FFT/window, RNN/GRU/LSTM, vision/detection, and recursive control-flow translations |
 
 Reductions accept scalar inputs. `ReduceMax` and `ReduceMin` also claim Boolean

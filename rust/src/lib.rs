@@ -87,77 +87,6 @@ pub(crate) fn panic_payload_message(payload: &Box<dyn std::any::Any + Send>) -> 
     }
 }
 
-#[cfg(test)]
-mod ffi_tests {
-    use std::ffi::c_char;
-    use std::sync::LazyLock;
-
-    use super::guard_ffi_status;
-    use crate::factory::ORT_API_VERSION;
-    use crate::sys::ort;
-
-    unsafe extern "C" fn create_status(
-        _code: ort::OrtErrorCode,
-        _message: *const c_char,
-    ) -> *mut ort::OrtStatus {
-        std::ptr::NonNull::<ort::OrtStatus>::dangling().as_ptr()
-    }
-
-    #[test]
-    fn ffi_guard_contains_panics_and_returns_failure_status() {
-        let mut api: ort::OrtApi = unsafe { std::mem::zeroed() };
-        api.CreateStatus = Some(create_status);
-        let status = unsafe {
-            guard_ffi_status(&api, "ffi_guard_contains_panics", || {
-                panic!("intentional FFI containment test")
-            })
-        };
-        assert!(!status.is_null());
-    }
-
-    #[test]
-    fn package_minor_version_matches_target_abi() {
-        assert_eq!(
-            env!("CARGO_PKG_VERSION_MINOR").parse::<u32>().unwrap(),
-            ORT_API_VERSION
-        );
-    }
-
-    unsafe extern "C" fn legacy_only_api(version: u32) -> *const ort::OrtApi {
-        static API: LazyLock<ort::OrtApi> = LazyLock::new(|| {
-            let mut api: ort::OrtApi = unsafe { std::mem::zeroed() };
-            api.CreateStatus = Some(create_status);
-            api
-        });
-        if version < ORT_API_VERSION {
-            &*API
-        } else {
-            std::ptr::null()
-        }
-    }
-
-    #[test]
-    fn registration_rejects_runtime_without_target_abi() {
-        let mut base: ort::OrtApiBase = unsafe { std::mem::zeroed() };
-        base.GetApi = Some(legacy_only_api);
-        let mut factory = std::ptr::null_mut();
-        let mut count = 0;
-        let status = unsafe {
-            super::CreateEpFactories(
-                c"MLXExecutionProvider".as_ptr(),
-                &base,
-                std::ptr::null(),
-                &mut factory,
-                1,
-                &mut count,
-            )
-        };
-        assert!(!status.is_null());
-        assert!(factory.is_null());
-        assert_eq!(count, 0);
-    }
-}
-
 /// ORT resolves this symbol via `dlsym` when a session calls
 /// `register_execution_provider_library`.
 ///
@@ -242,4 +171,75 @@ pub unsafe extern "C" fn ReleaseEpFactory(factory: *mut ort::OrtEpFactory) -> *m
         factory::release_factory(factory);
     }
     ptr::null_mut()
+}
+
+#[cfg(test)]
+mod ffi_tests {
+    use std::ffi::c_char;
+    use std::sync::LazyLock;
+
+    use super::guard_ffi_status;
+    use crate::factory::ORT_API_VERSION;
+    use crate::sys::ort;
+
+    unsafe extern "C" fn create_status(
+        _code: ort::OrtErrorCode,
+        _message: *const c_char,
+    ) -> *mut ort::OrtStatus {
+        std::ptr::NonNull::<ort::OrtStatus>::dangling().as_ptr()
+    }
+
+    #[test]
+    fn ffi_guard_contains_panics_and_returns_failure_status() {
+        let mut api: ort::OrtApi = unsafe { std::mem::zeroed() };
+        api.CreateStatus = Some(create_status);
+        let status = unsafe {
+            guard_ffi_status(&api, "ffi_guard_contains_panics", || {
+                panic!("intentional FFI containment test")
+            })
+        };
+        assert!(!status.is_null());
+    }
+
+    #[test]
+    fn package_minor_version_matches_target_abi() {
+        assert_eq!(
+            env!("CARGO_PKG_VERSION_MINOR").parse::<u32>().unwrap(),
+            ORT_API_VERSION
+        );
+    }
+
+    unsafe extern "C" fn legacy_only_api(version: u32) -> *const ort::OrtApi {
+        static API: LazyLock<ort::OrtApi> = LazyLock::new(|| {
+            let mut api: ort::OrtApi = unsafe { std::mem::zeroed() };
+            api.CreateStatus = Some(create_status);
+            api
+        });
+        if version < ORT_API_VERSION {
+            &*API
+        } else {
+            std::ptr::null()
+        }
+    }
+
+    #[test]
+    fn registration_rejects_runtime_without_target_abi() {
+        let mut base: ort::OrtApiBase = unsafe { std::mem::zeroed() };
+        base.GetApi = Some(legacy_only_api);
+        let mut factory = std::ptr::null_mut();
+        let mut count = 0;
+        let status = unsafe {
+            super::CreateEpFactories(
+                c"MLXExecutionProvider".as_ptr(),
+                &base,
+                std::ptr::null(),
+                &mut factory,
+                1,
+                &mut count,
+            )
+        };
+        assert!(!status.is_null());
+        assert!(factory.is_null());
+        assert_eq!(count, 0);
+    }
 }

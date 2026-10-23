@@ -27,6 +27,14 @@ The setup script builds pinned MLX 0.32.4 (`36969c09`) and mlx-c (`57731b00`).
 Both are required dependencies; mlx-c's v0.7.0 tag targets MLX 0.32.2 instead.
 Use an empty prefix or one already provisioned with the same pins.
 
+CI caches only the installed prefix, shared by the independent Clippy, build/test,
+and wheel jobs. Exact cache keys include the runner OS/architecture, MLX version,
+both source commits, compiler/Xcode/SDK/macOS/CMake identity, deployment target and
+build flags, and the setup script/action content hash. There are no fallback restore
+keys across these boundaries. Every restore still runs the setup script's stamp,
+header and runtime-file checks; an invalid nonempty prefix fails explicitly.
+Concurrent cold-cache jobs may each build the runtime; later matching runs reuse it.
+
 Alternatively, set `ORT_INCLUDE_DIR` to the 1.31 include directory; it takes
 precedence over `ORT_HOME/include`. Each MLX prefix must contain `include/` and
 `lib/`. Keep those libraries available at runtime: the standalone dylib links

@@ -1,7 +1,7 @@
-//! Dense linear-algebra op handlers (MatMul, Gemm). Faithful port of the C++ `ops/matmul.cc`.
+//! Dense linear-algebra op handlers (MatMul, Gemm, com.microsoft::FusedMatMul).
 //!
-//! Both map onto MLX's dense GEMM (`mlx_matmul`), which carries numpy/ONNX batch-dim broadcasting and
-//! the resolved dtype (fp32/fp16/bf16) through with no per-dtype code. An empty product is
+//! These use MLX's dense GEMM (`mlx_matmul`) with numpy/ONNX batch-dim broadcasting.
+//! FusedMatMul widens scaled fp16/bf16 products to avoid premature output rounding. An empty product is
 //! re-materialised as a clean, correctly-shaped zeros array (mlx_matmul leaves an empty result with
 //! no backing buffer, which the boundary CopyOut cannot memcpy).
 
@@ -38,6 +38,73 @@ fn matmul_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError>
         ctx.bind(&n.outputs[0], z);
         return Ok(());
     }
+    ctx.bind(&n.outputs[0], y);
+    Ok(())
+}
+
+fn fused_matmul_axes(rank: usize, trans: bool, trans_batch: bool) -> Vec<i32> {
+    let mut axes: Vec<i32> = (0..rank as i32).collect();
+    if rank >= 2 {
+        if trans_batch {
+            axes[..rank - 1].rotate_left(1);
+        }
+        if trans {
+            axes.swap(rank - 2, rank - 1);
+        }
+    }
+    axes
+}
+
+fn fused_matmul_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
+    let mut a = ctx.resolve(&n.inputs[0])?;
+    let mut b = ctx.resolve(&n.inputs[1])?;
+    let dtype = ctx.dtype_of(a);
+    let flag = |name: &str| n.ints.get(name).copied().unwrap_or(0) != 0;
+    let (trans_batch_a, trans_batch_b) = (flag("transBatchA"), flag("transBatchB"));
+    let (rank_a, rank_b) = (ctx.ndim(a), ctx.ndim(b));
+    if (trans_batch_a || trans_batch_b) && (rank_a < 3 || rank_a != rank_b) {
+        return Err("FusedMatMul batch transpose requires equal input ranks >= 3".into());
+    }
+    for (value, rank, trans, trans_batch) in [
+        (&mut a, rank_a, flag("transA"), trans_batch_a),
+        (&mut b, rank_b, flag("transB"), trans_batch_b),
+    ] {
+        if rank >= 2 && (trans || trans_batch) {
+            *value = ctx.transpose(*value, &fused_matmul_axes(rank, trans, trans_batch))?;
+        }
+    }
+
+    if ctx.dim(a, rank_a as i32 - 1) == 0 {
+        let product = ctx.binary(mlx::mlx_matmul, a, b)?;
+        let y = ctx.zeros(&ctx.shape_of(product), dtype)?;
+        ctx.mark_fast("mlx_matmul");
+        ctx.bind(&n.outputs[0], y);
+        return Ok(());
+    }
+
+    let alpha = n.floats.get("alpha").copied().unwrap_or(1.0);
+    let narrow = dtype == mlx::mlx_dtype__MLX_FLOAT16 || dtype == mlx::mlx_dtype__MLX_BFLOAT16;
+    // ORT CUDA uses a T-rounded alpha, but scales the FP32 accumulator before rounding Y to T.
+    // Widening avoids premature output overflow/underflow and double rounding in a T matmul.
+    if narrow && alpha != 1.0 {
+        a = ctx.astype(a, mlx::mlx_dtype__MLX_FLOAT32)?;
+        b = ctx.astype(b, mlx::mlx_dtype__MLX_FLOAT32)?;
+    }
+    let mut y = ctx.binary(mlx::mlx_matmul, a, b)?;
+    if alpha != 1.0 {
+        let mut scale = scalar_like(ctx, alpha, dtype)?;
+        if narrow {
+            scale = ctx.astype(scale, mlx::mlx_dtype__MLX_FLOAT32)?;
+        }
+        y = ctx.binary(mlx::mlx_multiply, y, scale)?;
+        if narrow {
+            y = ctx.astype(y, dtype)?;
+        }
+    }
+    if ctx.size_of(y) == 0 {
+        y = ctx.zeros(&ctx.shape_of(y), dtype)?;
+    }
+    ctx.mark_fast("mlx_matmul");
     ctx.bind(&n.outputs[0], y);
     Ok(())
 }
@@ -148,7 +215,37 @@ fn gemm_claim(node: &NodeView) -> ClaimResult {
     Ok(())
 }
 
+fn fused_matmul_claim(node: &NodeView) -> ClaimResult {
+    require!(
+        node.num_inputs() == 2 && node.num_outputs() == 1,
+        "FusedMatMul expects exactly 2 inputs and 1 output"
+    );
+    matmul_claim(node)?;
+    if node.int_attr("transBatchA", 0) != 0 || node.int_attr("transBatchB", 0) != 0 {
+        let a = node.input_info(0).expect("matmul_claim checked input A");
+        let b = node.input_info(1).expect("matmul_claim checked input B");
+        require!(
+            a.shape.len() >= 3 && a.shape.len() == b.shape.len(),
+            "FusedMatMul batch transpose requires equal input ranks >= 3, got {} and {}",
+            a.shape.len(),
+            b.shape.len()
+        );
+    }
+    Ok(())
+}
+
 pub fn register(registry: &mut OpRegistry) {
+    registry.register_shape_keyed(
+        OpRegistration {
+            domain: "com.microsoft",
+            op_type: "FusedMatMul",
+            min_opset: 1,
+            max_opset: 1,
+            handler: fused_matmul_op,
+            claim: fused_matmul_claim,
+        },
+        "FusedMatMul conservatively specializes empty-result materialization on live output extents",
+    );
     registry.register_shapeless(OpRegistration {
         domain: "",
         op_type: "MatMul",
@@ -165,4 +262,19 @@ pub fn register(registry: &mut OpRegistry) {
         handler: gemm_op,
         claim: gemm_claim,
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fused_matmul_axes;
+
+    #[test]
+    fn fused_transpose_order() {
+        assert_eq!(fused_matmul_axes(1, true, false), [0]);
+        assert_eq!(fused_matmul_axes(2, true, false), [1, 0]);
+        assert_eq!(fused_matmul_axes(3, false, true), [1, 0, 2]);
+        assert_eq!(fused_matmul_axes(3, true, true), [1, 2, 0]);
+        assert_eq!(fused_matmul_axes(5, false, true), [1, 2, 3, 0, 4]);
+        assert_eq!(fused_matmul_axes(5, true, true), [1, 2, 3, 4, 0]);
+    }
 }

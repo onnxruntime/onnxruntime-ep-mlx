@@ -1718,7 +1718,10 @@ fn resize_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError>
     for axis in 0..rank {
         let input_len = input_shape[axis] as i64;
         let output_len = output_lengths[axis] as i64;
-        if input_len == output_len {
+        // Equal rounded extents alone do not make fractional-scale coordinates an identity.
+        if input_len == output_len
+            && (scales[axis] == 1.0 || coordinate_mode == "align_corners" || input_len <= 1)
+        {
             continue;
         }
         if mode == "nearest" {
@@ -3405,14 +3408,14 @@ fn upsample_claim(node: &NodeView) -> ClaimResult {
             "Upsample: scales must be a constant float32 initializer because output shape is scale-dependent"
         ),
     };
-    for axis in 0..rank {
-        let expected = (input.shape[axis] as f64 * scales[axis] as f64).floor() as i64;
+    for (axis, &scale) in scales.iter().enumerate().take(rank) {
+        let expected = (input.shape[axis] as f64 * scale as f64).floor() as i64;
         require!(
             output.shape[axis] == expected,
             "Upsample: output dim {axis} ({}) must equal floor(input {} * scale {}) = {expected}",
             output.shape[axis],
             input.shape[axis],
-            scales[axis]
+            scale
         );
     }
     Ok(())
