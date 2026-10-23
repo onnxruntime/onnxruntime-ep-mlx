@@ -197,6 +197,26 @@ element. Boundary values use the existing bounded general-capture keys, while
 unguarded interior controls execute eagerly. Scalar inputs and known input
 dimensions beyond MLX's int32 array geometry remain unclaimed.
 
+`InstanceNormalization`, `LpNormalization`, and `LRN` support their legacy
+schemas, live numeric payloads, symbolic/unknown ranks, and empty dimensions.
+Instance normalization requires rank at least three and exact channel vectors;
+Lp normalization checks its full-width axis before narrowing and supports
+orders one and two, including zero norms. LRN applies the schema's channel
+window to general `[N,C,...]` tensors, including asymmetric even windows.
+Full-width positive window sizes are clipped to contributing channel offsets
+without changing the original `alpha/size` coefficient or allocating padding
+proportional to the requested size. Windows covering every channel reduce once.
+Narrow inputs accumulate and apply affine parameters in float32 before the
+final cast; float64 computes on MLX CPU. Instance statistics compensate the
+residual mean to avoid cancellation for small variance around a large offset.
+Dynamic rank/channel/empty dispatch
+uses shape-keyed capture, retaining shapeless eligibility for the existing
+fully static positive Instance/Lp forms. Runtime channel-vector, rank, axis,
+and native-dimension errors are explicit and do not poison later valid runs.
+The explicit schema formulas are used for cases where ORT's LRN kernel only
+accepts rank four or the Python reference mishandles channel iteration or
+negative-input L1 norms.
+
 Metal has no float64 kernels; supported float64 forms run through MLX CPU, while
 other forms fall back to ORT CPU. Empty/dynamic support is per-handler, not a
 blanket guarantee. Claimed control-flow nodes translate supported tensor bodies;
