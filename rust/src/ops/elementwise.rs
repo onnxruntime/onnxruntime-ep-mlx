@@ -282,24 +282,30 @@ fn mod_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
             remainder
         }
     } else {
-        let dt = if is_float64(dtype) {
-            mlx::mlx_dtype__MLX_FLOAT64
-        } else {
-            mlx::mlx_dtype__MLX_FLOAT32
-        };
-        let a = ctx.astype(a, dt)?;
-        let b = ctx.astype(b, dt)?;
-        let magnitude_a = ctx.unary(mlx::mlx_abs, a)?;
-        let magnitude_b = ctx.unary(mlx::mlx_abs, b)?;
-        let magnitude = ctx.binary(mlx::mlx_remainder, magnitude_a, magnitude_b)?;
-        let zero = ctx.zeros_like(magnitude)?;
-        let negative = ctx.binary(mlx::mlx_less, a, zero)?;
-        let negated = ctx.unary(mlx::mlx_negative, magnitude)?;
-        let signed = ctx.where_(negative, negated, magnitude)?;
-        let a_zero = ctx.binary(mlx::mlx_equal, a, zero)?;
-        let r_zero = ctx.binary(mlx::mlx_equal, magnitude, zero)?;
-        let preserve_zero = ctx.binary(mlx::mlx_logical_and, a_zero, r_zero)?;
-        ctx.where_(preserve_zero, a, signed)?
+        // Metal's fused remainder loses large quotients and flushes subnormal divisors.
+        // Keep this primitive chain on MLX CPU, widening narrow inputs exactly to DOUBLE.
+        let cpu = crate::mlx::Stream::new_default_cpu();
+        let s = cpu.as_raw();
+        let a =
+            ctx.emit(|res, _| unsafe { mlx::mlx_astype(res, a, mlx::mlx_dtype__MLX_FLOAT64, s) })?;
+        let b =
+            ctx.emit(|res, _| unsafe { mlx::mlx_astype(res, b, mlx::mlx_dtype__MLX_FLOAT64, s) })?;
+        let magnitude_a = ctx.emit(|res, _| unsafe { mlx::mlx_abs(res, a, s) })?;
+        let magnitude_b = ctx.emit(|res, _| unsafe { mlx::mlx_abs(res, b, s) })?;
+        let magnitude =
+            ctx.emit(|res, _| unsafe { mlx::mlx_remainder(res, magnitude_a, magnitude_b, s) })?;
+        let zero = ctx.scalar_f64(0.0);
+        let negative = ctx.emit(|res, _| unsafe { mlx::mlx_less(res, a, zero, s) })?;
+        let negated = ctx.emit(|res, _| unsafe { mlx::mlx_negative(res, magnitude, s) })?;
+        let signed =
+            ctx.emit(|res, _| unsafe { mlx::mlx_where(res, negative, negated, magnitude, s) })?;
+        let a_zero = ctx.emit(|res, _| unsafe { mlx::mlx_equal(res, a, zero, s) })?;
+        let r_zero = ctx.emit(|res, _| unsafe { mlx::mlx_equal(res, magnitude, zero, s) })?;
+        let preserve_zero =
+            ctx.emit(|res, _| unsafe { mlx::mlx_logical_and(res, a_zero, r_zero, s) })?;
+        let signed =
+            ctx.emit(|res, _| unsafe { mlx::mlx_where(res, preserve_zero, a, signed, s) })?;
+        ctx.emit(|res, _| unsafe { mlx::mlx_astype(res, signed, mlx_dtype_from_onnx(dtype), s) })?
     };
     bind_as_out(ctx, n, r)
 }

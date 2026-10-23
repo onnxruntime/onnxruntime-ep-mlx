@@ -97,6 +97,7 @@ def test_mod_scalar_multidirectional(dtype, np_dtype, shapes, eager, monkeypatch
     m.assert_mlx_claims(model, {"a": a, "b": b})
     session = m._session(model, m.EP_PROVIDERS)
     for x, y in [(a, b), (-a, -b), (a, b)]:
+        x, y = np.asarray(x), np.asarray(y)
         _assert_float_exact(session.run(None, {"a": x, "b": y})[0], _fmod_reference(x, y))
 
 
@@ -205,6 +206,7 @@ def test_mod_integer_zero_divisor_recovery(dtype, np_dtype, fmod, opset):
     b = np.array([3, 3], dtype=np_dtype)
     model = _model(dtype, a.shape, b.shape, fmod=fmod, opset=opset)
     session = m._session(model, m.EP_PROVIDERS)
+    session.disable_fallback()
     for divisor in [b, np.array([3, 0], dtype=np_dtype), b]:
         if np.any(divisor == 0):
             with pytest.raises(Exception, match="Mod integer divisor must not contain zero"):
@@ -226,8 +228,10 @@ def test_mod_initializer_divisor(divisor):
     model = ir.to_proto(ir.Model(graph, ir_version=11)).SerializeToString()
     data = np.array([np.iinfo(np.int64).min, np.iinfo(np.int64).max], np.int64)
     if divisor == 0:
+        session = m._session(model, m.EP_PROVIDERS)
+        session.disable_fallback()
         with pytest.raises(Exception, match="Mod integer divisor must not contain zero"):
-            m.run_mlx(model, {"a": data})
+            session.run(None, {"a": data})
     else:
         m.assert_mlx_claims(model, {"a": data})
         np.testing.assert_array_equal(

@@ -17,10 +17,14 @@ ORT CPU kernel happens to execute them. `fmod` must be zero or one.
 Floating remainder uses MLX remainder on nonnegative magnitudes and restores
 the dividend sign. It does not reconstruct a remainder by dividing, rounding,
 multiplying, and subtracting: that loses finite remainders when a quotient
-rounds or overflows. FLOAT16/BFLOAT16 arithmetic is widened to FLOAT before
-rounding the output back; DOUBLE remains DOUBLE on the existing isolated MLX
-CPU stream. Zero divisors, NaNs, and infinite operands follow the floating
+rounds or overflows. The primitive chain explicitly uses the MLX CPU stream
+with exact DOUBLE inputs, then rounds the result back to the declared dtype.
+This avoids Metal's fused remainder precision loss and subnormal-divisor
+flushing without introducing a custom kernel or falling back to ORT CPU.
+DOUBLE remains DOUBLE throughout. Zero divisors, NaNs, and infinite operands follow the floating
 `fmod` contract. Signed-zero inputs are preserved when the result is zero.
+Floating Mod therefore trades GPU fusion for correctness; it remains a live
+dependency in general compiled replay, rather than a host-computed constant.
 
 Integer Mod checks for zero divisors on every execution and reports an EP
 error, including after a successful run of the same shape. It uses the eager
