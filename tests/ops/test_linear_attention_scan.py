@@ -62,6 +62,60 @@ def typed_reference(feeds, rule, qh, h, kh, dk, dv, window=0, state_dtype=None):
     return output.reshape(batch, time, max(qh, h) * dv), state
 
 
+def fp32_working_reference(
+    feeds, rule, qh, h, kh, dk, dv, window=0, *, input_dtype=None, state_dtype=None,
+):
+    """FP64 primitives with FP32 carry/readout, followed by declared T/S stores."""
+    input_dtype = input_dtype or feeds["query"].dtype
+    state_dtype = state_dtype or feeds.get("past_state", feeds["query"]).dtype
+    effective = {
+        name: value.astype(state_dtype if name == "past_state" else input_dtype).astype(np.float64)
+        for name, value in feeds.items()
+    }
+
+    def working(value):
+        return np.asarray(value).astype(np.float32).astype(np.float64)
+
+    batch, time, _ = effective["query"].shape
+    q = effective["query"].reshape(batch, time, qh, dk)
+    k = np.repeat(effective["key"].reshape(batch, time, kh, dk), h // kh, axis=2)
+    v = effective["value"].reshape(batch, time, h, dv)
+    if qh < h:
+        q = np.repeat(q, h // qh, axis=2)
+    past = effective.get("past_state")
+    state = (past[-1] if window else past) if past is not None else np.zeros((batch, h, dk, dv))
+    state = working(state)
+    scale = working(1 / working(np.sqrt(dk)))
+    output = np.empty((batch, time, max(qh, h), dv), np.float64)
+    history = []
+    for token in range(time):
+        if rule in ["gated", "gated_delta"]:
+            decay = effective["decay"][:, token]
+            decay = decay.reshape(batch, h, decay.shape[-1] // h)
+            state = working(state * working(np.exp(decay))[:, :, :, None])
+        delta = v[:, token]
+        if rule in ["delta", "gated_delta"]:
+            retrieval = working(np.einsum("bhk,bhkv->bhv", k[:, token], state))
+            beta = effective["beta"][:, token, :, None]
+            delta = working(beta * working(delta - retrieval))
+        state = working(state + working(k[:, token, :, :, None] * delta[:, :, None, :]))
+        history.append(state.copy())
+        readout = np.repeat(state, qh // h, axis=1) if qh > h else state
+        dot = working(np.einsum("bhk,bhkv->bhv", q[:, token], readout))
+        output[:, token] = working(dot * scale)
+    if window:
+        state = np.zeros((window, batch, h, dk, dv), np.float64)
+        if history:
+            kept = history[-window:]
+            state[-len(kept):] = np.stack(kept)
+        elif past is not None:
+            state = past.copy()
+    return (
+        output.reshape(batch, time, max(qh, h) * dv).astype(input_dtype).astype(np.float64),
+        state.astype(state_dtype).astype(np.float64),
+    )
+
+
 @pytest.mark.parametrize("eager", [False, True])
 @pytest.mark.parametrize("dtype", [DT.FLOAT, DT.FLOAT16])
 @pytest.mark.parametrize("rule", ["linear", "gated", "delta", "gated_delta"])
@@ -134,32 +188,57 @@ def test_linear_attention_scan_arithmetic(monkeypatch, eager, dtype, rule, geome
 
 
 @pytest.mark.parametrize("eager", [False, True])
-@pytest.mark.parametrize("dk", [33, 257, 512])
-def test_linear_attention_scan_bfloat16(monkeypatch, eager, dk):
+@pytest.mark.parametrize("rule", ["linear", "gated", "delta", "gated_delta"])
+@pytest.mark.parametrize("geometry", [
+    (1, 7, 1, 1, 1, 33, 3, 0, True, False),
+    (1, 7, 1, 1, 1, 257, 3, 0, True, False),
+    (1, 3, 2, 4, 1, 512, 3, 4, False, True),
+    (1, 1, 4, 2, 1, 257, 3, 3, True, False),
+    (1, 0, 2, 2, 2, 257, 3, 4, True, False),
+    (0, 3, 2, 2, 1, 512, 3, 0, True, True),
+])
+def test_linear_attention_scan_bfloat16(monkeypatch, eager, rule, geometry):
+    batch, time, qh, h, kh, dk, dv, window, scalar, shared = geometry
     if eager:
         monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_COMPILE", "1")
+    state_shape = [batch, h, dk, dv]
+    if window:
+        state_shape.insert(0, window)
     model = bf16_boundaries(
         "LinearAttention",
         [
-            ("query", [1, 7, dk]), ("key", [1, 7, dk]), ("value", [1, 7, 3]),
-            ("past_state", [1, 1, dk, 3]), ("decay", [1, 7, 1]), ("beta", [1, 7, 1]),
+            ("query", [batch, time, qh * dk]), ("key", [batch, time, kh * dk]),
+            ("value", [batch, time, h * dv]), ("past_state", state_shape),
+            ("decay", [batch, time, h if scalar else h * dk]),
+            ("beta", [batch, time, 1 if shared else h]),
         ],
-        [("y", [1, 7, 3]), ("state", [1, 1, dk, 3])],
+        [("y", [batch, time, max(qh, h) * dv]), ("state", state_shape)],
         domain="com.microsoft",
-        attrs=[ir.AttrInt64("q_num_heads", 1), ir.AttrInt64("kv_num_heads", 1)],
+        attrs=[
+            ir.AttrInt64("q_num_heads", qh), ir.AttrInt64("kv_num_heads", h),
+            ir.AttrInt64("state_window", window), ir.AttrString("update_rule", rule),
+        ],
     )
     rng = np.random.default_rng(2431)
     feeds = {
-        "query": rng.normal(size=(1, 7, dk)).astype(np.float32) / 8,
-        "key": rng.normal(size=(1, 7, dk)).astype(np.float32) / 16,
-        "value": rng.normal(size=(1, 7, 3)).astype(np.float32) / 8,
-        "past_state": rng.normal(size=(1, 1, dk, 3)).astype(np.float32) / 16,
-        "decay": np.full((1, 7, 1), -0.1, np.float32),
-        "beta": np.full((1, 7, 1), 0.5, np.float32),
+        "query": rng.normal(size=(batch, time, qh * dk)).astype(np.float32) / 8,
+        "key": rng.normal(size=(batch, time, kh * dk)).astype(np.float32) / 16,
+        "value": rng.normal(size=(batch, time, h * dv)).astype(np.float32) / 8,
+        "past_state": rng.normal(size=state_shape).astype(np.float32) / 16,
+        "decay": np.full((batch, time, h if scalar else h * dk), -0.1, np.float32),
+        "beta": np.full((batch, time, 1 if shared else h), 0.5, np.float32),
     }
+    original = {name: value.copy() for name, value in feeds.items()}
     actual = strict_session(model).run(None, feeds)
-    typed = typed_reference(feeds, "gated_delta", 1, 1, 1, dk, 3, state_dtype=ml_dtypes.bfloat16)
-    for output, reference in zip(actual, typed, strict=True):
+    target = (
+        fp32_working_reference(
+            feeds, rule, qh, h, kh, dk, dv, window,
+            input_dtype=ml_dtypes.bfloat16, state_dtype=ml_dtypes.bfloat16,
+        )
+        if 257 <= dk <= 512 else
+        typed_reference(feeds, rule, qh, h, kh, dk, dv, window, state_dtype=ml_dtypes.bfloat16)
+    )
+    for output, reference in zip(actual, target, strict=True):
         assert output.shape == reference.shape
         assert output.dtype == np.float32
         assert np.isfinite(output).all() and np.isfinite(reference).all()
@@ -169,14 +248,27 @@ def test_linear_attention_scan_bfloat16(monkeypatch, eager, dk):
         expected = strict_session(model).run(None, feeds)
     for output, reference in zip(actual, expected, strict=True):
         np.testing.assert_allclose(output, reference, rtol=1e-2, atol=1e-3)
+    for output, reference in zip(expected, target, strict=True):
+        np.testing.assert_allclose(output, reference, rtol=1e-2, atol=1e-3)
+    if time == 0:
+        np.testing.assert_array_equal(actual[1], target[1])
+    for name, value in feeds.items():
+        np.testing.assert_array_equal(value, original[name])
 
 
 @pytest.mark.parametrize("eager", [False, True])
 @pytest.mark.parametrize("dk", [257, 512])
 @pytest.mark.parametrize("dtype,state_dtype,domain", [
     pytest.param(DT.BFLOAT16, DT.BFLOAT16, "com.microsoft", id="bf16-bf16-contrib"),
+    pytest.param(DT.BFLOAT16, DT.BFLOAT16, "", id="bf16-bf16-standard"),
+    pytest.param(DT.BFLOAT16, DT.FLOAT16, "", id="bf16-fp16-standard"),
     pytest.param(DT.BFLOAT16, DT.FLOAT, "", id="bf16-fp32-standard"),
+    pytest.param(DT.FLOAT16, DT.BFLOAT16, "", id="fp16-bf16-standard"),
+    pytest.param(DT.FLOAT16, DT.FLOAT16, "", id="fp16-fp16-standard"),
+    pytest.param(DT.FLOAT16, DT.FLOAT, "", id="fp16-fp32-standard"),
     pytest.param(DT.FLOAT, DT.BFLOAT16, "", id="fp32-bf16-standard"),
+    pytest.param(DT.FLOAT, DT.FLOAT16, "", id="fp32-fp16-standard"),
+    pytest.param(DT.FLOAT, DT.FLOAT, "", id="fp32-fp32-standard"),
     pytest.param(DT.FLOAT, DT.FLOAT, "com.microsoft", id="fp32-fp32-control"),
     pytest.param(DT.FLOAT16, DT.FLOAT16, "com.microsoft", id="fp16-fp16-control"),
 ])
@@ -185,10 +277,12 @@ def test_linear_attention_wide_internal_dtype_route(tmp_path, eager, dk, dtype, 
     child = r"""
 import os
 import sys
+import ml_dtypes
 import numpy as np
 import onnx_ir as ir
 import onnxruntime as ort
 import _models as m
+from test_linear_attention_scan import fp32_working_reference
 
 ort.register_execution_provider_library("MLXExecutionProvider", sys.argv[1])
 dk = int(sys.argv[2])
@@ -257,6 +351,20 @@ for actual, expected, shape in zip(results[0], results[1], [[1, 7, 3], [1, 1, dk
     assert actual.dtype == expected.dtype == np.float32
     assert np.isfinite(actual).all() and np.isfinite(expected).all()
     np.testing.assert_allclose(actual, expected, rtol=rtol, atol=1e-3)
+if ir.DataType.BFLOAT16 in (dtype, state_dtype):
+    types = {
+        ir.DataType.FLOAT: np.float32, ir.DataType.FLOAT16: np.float16,
+        ir.DataType.BFLOAT16: ml_dtypes.bfloat16,
+    }
+    target = fp32_working_reference(
+        feeds, "gated_delta", 1, 1, 1, dk, 3,
+        input_dtype=types[dtype], state_dtype=types[state_dtype],
+    )
+    for outputs in results:
+        for actual, expected in zip(outputs, target, strict=True):
+            assert actual.shape == expected.shape
+            assert np.isfinite(expected).all()
+            np.testing.assert_allclose(actual, expected, rtol=rtol, atol=1e-3)
 """
     env = {
         **os.environ,
@@ -284,13 +392,16 @@ for actual, expected, shape in zip(results[0], results[1], [[1, 7, 3], [1, 1, dk
         and event.get("args", {}).get("reason")
         == "stable unroll: wide BF16 preserves state-dtype primitives"
     ]
+    fp32_reason = [
+        event for event in events
+        if event.get("cat") == "op.composed"
+        and event.get("args", {}).get("reason") == "stable unroll: wide BF16 FP32 working state"
+    ]
+    # Both dtype families use the FP32 wide scan; the disabled control still composes.
+    assert fast
+    assert not bf16_reason
     if DT.BFLOAT16 in (dtype, state_dtype):
-        assert not fast
-        assert bf16_reason
-    else:
-        # The disabled reference also composes, but only the candidate can emit a fast marker.
-        assert fast
-        assert not bf16_reason
+        assert fp32_reason
 
 
 @pytest.mark.parametrize("dk,disabled", [
@@ -351,6 +462,61 @@ for batch, time in [(1, 5), (1, 5), (2, 7), (2, 1), (1, 0), (1, 5)]:
     else:
         assert fast
         assert not composed
+
+
+@pytest.mark.parametrize("eager", [False, True])
+@pytest.mark.parametrize("disabled", [False, True])
+@pytest.mark.parametrize("dk", [257, 512])
+def test_linear_attention_wide_bfloat16_dynamic_replay(monkeypatch, eager, disabled, dk):
+    if eager:
+        monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_COMPILE", "1")
+    monkeypatch.setenv(NO_SCAN, "1" if disabled else "0")
+    model = bf16_boundaries(
+        "LinearAttention",
+        [
+            ("query", ["batch", "time", 2 * dk]), ("key", ["batch", "time", 2 * dk]),
+            ("value", ["batch", "time", 6]), ("past_state", ["batch", 2, dk, 3]),
+            ("decay", ["batch", "time", 2]), ("beta", ["batch", "time", 2]),
+        ],
+        [("y", ["batch", "time", 6]), ("state", ["batch", 2, dk, 3])],
+        domain="com.microsoft",
+        attrs=[ir.AttrInt64("q_num_heads", 2), ir.AttrInt64("kv_num_heads", 2)],
+    )
+    session = strict_session(model)
+    rng = np.random.default_rng(2435)
+    previous = None
+    for batch, time, decay in [
+        (1, 5, 0.), (1, 5, -1e-7), (2, 7, -.1), (2, 1, 0.),
+        (1, 0, 0.), (0, 3, -.1), (1, 5, -.1),
+    ]:
+        past = (
+            previous.copy() if previous is not None and previous.shape[0] == batch
+            else rng.normal(size=(batch, 2, dk, 3)).astype(np.float32) / 16
+        )
+        feeds = {
+            "query": rng.normal(size=(batch, time, 2 * dk)).astype(np.float32) / 8,
+            "key": rng.normal(size=(batch, time, 2 * dk)).astype(np.float32) / 16,
+            "value": rng.normal(size=(batch, time, 6)).astype(np.float32) / 8,
+            "past_state": past,
+            "decay": np.full((batch, time, 2), decay, np.float32),
+            "beta": rng.uniform(.25, .75, (batch, time, 2)).astype(np.float32),
+        }
+        original = {name: value.copy() for name, value in feeds.items()}
+        actual = session.run(None, feeds)
+        target = fp32_working_reference(
+            feeds, "gated_delta", 2, 2, 2, dk, 3,
+            input_dtype=ml_dtypes.bfloat16, state_dtype=ml_dtypes.bfloat16,
+        )
+        for output, reference in zip(actual, target, strict=True):
+            assert output.shape == reference.shape
+            assert output.dtype == np.float32
+            assert np.isfinite(output).all() and np.isfinite(reference).all()
+            np.testing.assert_allclose(output, reference, rtol=1e-2, atol=1e-3)
+        for name, value in feeds.items():
+            np.testing.assert_array_equal(value, original[name])
+        if time == 0:
+            np.testing.assert_array_equal(actual[1], target[1])
+        previous = actual[1]
 
 
 @pytest.mark.parametrize("eager", [False, True])

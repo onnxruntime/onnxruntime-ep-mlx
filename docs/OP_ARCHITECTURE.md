@@ -180,22 +180,28 @@ conv/pooling, quantization (Quantize/Dequantize/DynamicQuantize/MatMulInteger/Co
 QLinearMatMul/QLinearConv), random, signal/FFT (DFT/STFT/windows/MelWeightMatrix — audio),
 vision/detection, **recurrent (RNN/GRU/LSTM and
 com.microsoft LinearAttention via stable Metal prefill scans for eligible `Dk <= 512`,
-with static unrolling for single-token, wider BF16, larger-width, and CPU-stream calls)**, **control flow (If/Scan/Loop via recursive
+with static unrolling for single-token, larger-width, and CPU-stream calls)**, **control flow (If/Scan/Loop via recursive
 subgraph-body translation)**, and host-computed data-dependent operators.
 
 LinearAttention preserves the original typed scan for `Dk <= 256`. The separate
-`257 <= Dk <= 512` scan is used only when neither the internal activation/output
-dtype nor the recurrent-state dtype is BF16. It widens original live inputs and
+`257 <= Dk <= 512` scan includes BF16 activation/output and recurrent-state
+storage. It widens original live inputs and
 keeps FP32 working state, rounding only output and final/window state stores to
 their declared types.
 Stored window slots do not round the ongoing recurrence. This preserves the
 recurrence, not literal intermediate half-precision rounding.
-Wide BF16-associated prefill retains the existing state-typed MLX primitive
-unroll in the same provider, including standard-domain mixed-state forms already
-admitted by the claim. This restricts only the new optimization, not BF16 operator
-support or CPU fallback policy; the original `Dk <= 256` scan and single-token
-path are unchanged. It is a correctness candidate, not proof of passing numerical
-gates or a BF16 performance claim.
+For BF16-associated calls in this wide range, the composed path also uses FP32
+working state and readout, including scan-disabled, single-token, and CPU-stream
+calls. Query scaling follows the FP32 readout; inputs are not first quantized to
+the state storage dtype. Each final/window state is stored as S and each output
+as T, without feeding window-store rounding into the next token. Empty-time calls
+still return the unchanged stored state. This intentionally replaces historical
+wide-BF16 primitive-S arithmetic and its no-fast-scan expectation, following
+official ONNX/CUDA-first precision rather than typed compatibility.
+The original `Dk <= 256` and `Dk > 512` precision policies, and non-BF16
+single-token paths, are unchanged. This is a scoped correctness candidate, not
+general standard-domain precision compliance, numerical acceptance, or a BF16
+performance claim.
 For source isolation, the wider path leaves the original lazy preparation in
 place. Those unused arrays are not additional evaluation roots, but compiled
 `trace_transient` retains their arena handles until plan teardown. Fresh resource

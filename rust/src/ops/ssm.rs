@@ -901,7 +901,7 @@ fn linear_attention_scan_wide(
         return Ok(None);
     }
 
-    // Re-resolve live inputs: the common preparation has already rounded them to state dtype.
+    // Re-resolve live inputs without inheriting primitive-path casts or query scaling.
     let query = ctx.resolve(&n.inputs[0])?;
     let key = ctx.resolve(&n.inputs[1])?;
     let value = ctx.resolve(&n.inputs[2])?;
@@ -1200,6 +1200,18 @@ fn linear_attention_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(),
         return Ok(());
     }
 
+    let wide_bf16 = (257..=512).contains(&d_k)
+        && (dt == mlx::mlx_dtype__MLX_BFLOAT16 || state_dt == mlx::mlx_dtype__MLX_BFLOAT16);
+    let working_dt = if wide_bf16 {
+        mlx::mlx_dtype__MLX_FLOAT32
+    } else {
+        state_dt
+    };
+    let initial_state = state;
+    if wide_bf16 {
+        state = ctx.astype(state, working_dt)?;
+    }
+
     // 3D -> 4D (B, H, T, ·): reshape by head count, transpose heads before T, tile Q/K for GQA.
     let to_heads = |ctx: &mut TranslationContext,
                     a: mlx::mlx_array,
@@ -1209,9 +1221,9 @@ fn linear_attention_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(),
         let r = ctx.reshape(a, &[b, t_len, heads, last])?;
         ctx.transpose(r, &[0, 2, 1, 3])
     };
-    let query = ctx.astype(query, state_dt)?;
-    let key = ctx.astype(key, state_dt)?;
-    let value = ctx.astype(value, state_dt)?;
+    let query = ctx.astype(query, working_dt)?;
+    let key = ctx.astype(key, working_dt)?;
+    let value = ctx.astype(value, working_dt)?;
     let q_heads = to_heads(ctx, query, hq, d_k)?;
     let q4 = if hq < h {
         repeat_axis(ctx, q_heads, h / hq, 1)? // inverse GQA: one Q head serves multiple KV states
@@ -1221,8 +1233,8 @@ fn linear_attention_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(),
     let k_heads = to_heads(ctx, key, n_k_heads, d_k)?;
     let k4 = repeat_axis(ctx, k_heads, h / n_k_heads, 1)?; // each K head serves one or more KV states
     let v4 = to_heads(ctx, value, h, d_v)?; // (B, H, T, d_v)
-    let scale_s = la_scalar(ctx, scale, state_dt)?;
-    let q4 = ctx.mul(q4, scale_s)?; // scaled query
+    let scale_s = la_scalar(ctx, scale, working_dt)?;
+    let q4 = if wide_bf16 { q4 } else { ctx.mul(q4, scale_s)? };
 
     // Decay may be per-head-per-key-dim `[B,T,H*d_k]` (the op-test / ORT reference form) OR a
     // per-head SCALAR `[B,T,H]` (Qwen3.5 GatedDeltaNet exports one gate per value head). Detect it
@@ -1237,16 +1249,16 @@ fn linear_attention_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(),
     } else if decay_per_head_scalar {
         // [B,T,H] -> [B,H,T]
         let d = ctx.resolve(&n.inputs[4])?;
-        let d = ctx.astype(d, state_dt)?;
+        let d = ctx.astype(d, working_dt)?;
         Some(ctx.transpose(d, &[0, 2, 1])?)
     } else {
         let d = ctx.resolve(&n.inputs[4])?;
-        let d = ctx.astype(d, state_dt)?;
+        let d = ctx.astype(d, working_dt)?;
         Some(to_heads(ctx, d, h, d_k)?)
     };
     let beta3 = if uses_beta {
         let bta = ctx.resolve(&n.inputs[5])?;
-        let bta = ctx.astype(bta, state_dt)?;
+        let bta = ctx.astype(bta, working_dt)?;
         let beta = ctx.transpose(bta, &[0, 2, 1])?;
         Some(if ctx.shape_of(beta)[1] == 1 && h > 1 {
             repeat_axis(ctx, beta, h, 1)?
@@ -1279,12 +1291,12 @@ fn linear_attention_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(),
             ctx.mark_fast("mlx_linear_attention_scan");
             return Ok(());
         }
-        let bf16_wide = (257..=512).contains(&d_k)
-            && (dt == mlx::mlx_dtype__MLX_BFLOAT16 || state_dt == mlx::mlx_dtype__MLX_BFLOAT16);
-        if (257..=512).contains(&d_k) && !bf16_wide {
+        if (257..=512).contains(&d_k) {
             // Unused common preparation is not an evaluation root, but its arena handles can
             // remain in compiled trace_transient until plan teardown. Keep that ownership cost.
-            if let Some((output, present)) = linear_attention_scan_wide(ctx, n, state, scale)? {
+            if let Some((output, present)) =
+                linear_attention_scan_wide(ctx, n, initial_state, scale)?
+            {
                 if !n.outputs[0].name.is_empty() {
                     ctx.bind(&n.outputs[0], output);
                 }
@@ -1295,8 +1307,8 @@ fn linear_attention_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(),
                 return Ok(());
             }
         }
-        ctx.mark_composed(if bf16_wide {
-            "stable unroll: wide BF16 preserves state-dtype primitives"
+        ctx.mark_composed(if wide_bf16 {
+            "stable unroll: wide BF16 FP32 working state"
         } else {
             "stable unroll: scan disabled, CPU/empty geometry, d_k > 512, or grid limit"
         });
@@ -1359,6 +1371,11 @@ fn linear_attention_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(),
         let q_row = ctx.expand_dims(q_t, 2)?; // (B,H,1,d_k)
         let out_m = ctx.matmul(q_row, readout_state)?; // (B,Hout,1,d_v)
         let out_t = ctx.squeeze(out_m, 2)?; // (B,H,d_v)
+        let out_t = if wide_bf16 {
+            ctx.mul(out_t, scale_s)?
+        } else {
+            out_t
+        };
         outs.push(out_t);
     }
 
@@ -1378,7 +1395,7 @@ fn linear_attention_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(),
             let kept = t_len.min(state_window);
             let leading = state_window - kept;
             let mut window = if leading > 0 {
-                Some(ctx.zeros(&[leading, b, h, d_k, d_v], state_dt)?)
+                Some(ctx.zeros(&[leading, b, h, d_k, d_v], working_dt)?)
             } else {
                 None
             };
@@ -1393,6 +1410,11 @@ fn linear_attention_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(),
                 .ok_or_else(|| "MLX LinearAttention state_window produced no states".to_string())?
         } else {
             state
+        };
+        let ps = if wide_bf16 {
+            ctx.astype(ps, state_dt)?
+        } else {
+            ps
         };
         let ps = ctx.contiguous(ps)?;
         ctx.bind(&n.outputs[1], ps);
@@ -1909,7 +1931,11 @@ pub fn register(registry: &mut OpRegistry) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{engine::Plan, mlx::Stream};
+    use crate::{
+        engine::{OutRef, Plan, TensorRef},
+        mlx::{Array, Stream, VectorArray},
+        sys::ort,
+    };
 
     #[test]
     fn linear_attention_scan_declines_cpu_stream() {
@@ -1935,5 +1961,136 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn linear_attention_wide_bfloat16_cpu_working_state() {
+        for dk in [257_i32, 512] {
+            for time in [1_i32, 3] {
+                for window in [0_i32, 4] {
+                    let stream = Stream::new_default_cpu();
+                    let mut plan = Plan::new(Vec::new());
+                    let mut ctx = TranslationContext::new(
+                        &mut plan,
+                        std::ptr::null(),
+                        std::ptr::null_mut(),
+                        stream.as_raw(),
+                    );
+                    let mut node = NodeDesc::new(
+                        "LinearAttention".into(),
+                        String::new(),
+                        27,
+                        crate::registry::CompileShapeSafety::Shapeless,
+                    );
+                    node.ints.extend([
+                        ("q_num_heads".into(), 1),
+                        ("kv_num_heads".into(), 1),
+                        ("state_window".into(), i64::from(window)),
+                    ]);
+                    node.strings.insert("update_rule".into(), "linear".into());
+                    node.floats.insert("scale".into(), 1.0);
+                    let mut query = vec![0.0f32; (time * dk) as usize];
+                    for token in 0..time {
+                        query[(token * dk) as usize] = 1.0;
+                    }
+                    let slots = window.max(1);
+                    let mut past = vec![0.0f32; (slots * dk) as usize];
+                    past[((slots - 1) * dk) as usize] = 1.0;
+                    let state_shape = if window > 0 {
+                        vec![window, 1, 1, dk, 1]
+                    } else {
+                        vec![1, 1, dk, 1]
+                    };
+                    let float = ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT;
+                    let bf16 =
+                        ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16;
+                    for (name, shape, data) in [
+                        ("query", vec![1, time, dk], query.clone()),
+                        ("key", vec![1, time, dk], query),
+                        ("value", vec![1, time, 1], vec![1.0 / 256.0; time as usize]),
+                        ("past", state_shape.clone(), past),
+                    ] {
+                        let array = ctx.keep(Array::from_data(
+                            data.as_ptr().cast(),
+                            &shape,
+                            mlx::mlx_dtype__MLX_FLOAT32,
+                        ));
+                        let array = if name == "past" {
+                            ctx.astype(array, mlx::mlx_dtype__MLX_BFLOAT16).unwrap()
+                        } else {
+                            array
+                        };
+                        ctx.bind(
+                            &OutRef {
+                                name: name.into(),
+                                external: false,
+                                ctx_index: 0,
+                                otype: if name == "past" { bf16 } else { float },
+                            },
+                            array,
+                        );
+                        node.inputs.push(TensorRef {
+                            name: name.into(),
+                            source: Src::Intermediate,
+                            ..TensorRef::absent()
+                        });
+                    }
+                    for (name, otype) in [("y", float), ("present", bf16)] {
+                        node.outputs.push(OutRef {
+                            name: name.into(),
+                            external: false,
+                            ctx_index: 0,
+                            otype,
+                        });
+                    }
+                    linear_attention_op(&mut ctx, &node).unwrap();
+                    let resolve = |ctx: &mut TranslationContext, name: &str| {
+                        ctx.resolve(&TensorRef {
+                            name: name.into(),
+                            source: Src::Intermediate,
+                            ..TensorRef::absent()
+                        })
+                        .unwrap()
+                    };
+                    let output = resolve(&mut ctx, "y");
+                    let state = resolve(&mut ctx, "present");
+                    assert_eq!(ctx.dtype_of(output), mlx::mlx_dtype__MLX_FLOAT32);
+                    assert_eq!(ctx.dtype_of(state), mlx::mlx_dtype__MLX_BFLOAT16);
+                    assert_eq!(ctx.shape_of(output), [1, time, 1]);
+                    assert_eq!(ctx.shape_of(state), state_shape);
+                    let state = ctx.astype(state, mlx::mlx_dtype__MLX_FLOAT32).unwrap();
+                    let mut arrays = VectorArray::new();
+                    arrays.append(output);
+                    arrays.append(state);
+                    crate::mlx::eval(&arrays).unwrap();
+                    let output_data = unsafe { mlx::mlx_array_data_float32(output) };
+                    let state_data = unsafe { mlx::mlx_array_data_float32(state) };
+                    assert!(!output_data.is_null() && !state_data.is_null());
+                    let output = unsafe { std::slice::from_raw_parts(output_data, time as usize) };
+                    for (token, &value) in output.iter().enumerate() {
+                        assert_eq!(value, 1.0 + (token + 1) as f32 / 256.0);
+                    }
+                    // Each increment is half a BF16 ulp at 1: primitive-S carry would stay 1.
+                    let stored = [1.0, 1.0078125, 1.015625];
+                    let actual =
+                        unsafe { std::slice::from_raw_parts(state_data, (slots * dk) as usize) };
+                    for slot in 0..slots {
+                        let first = if window == 0 {
+                            stored[time as usize - 1]
+                        } else if slot < window - time {
+                            0.0
+                        } else {
+                            stored[(slot - (window - time)) as usize]
+                        };
+                        assert_eq!(actual[(slot * dk) as usize], first);
+                        assert!(
+                            actual[(slot * dk + 1) as usize..((slot + 1) * dk) as usize]
+                                .iter()
+                                .all(|&value| value == 0.0)
+                        );
+                    }
+                }
+            }
+        }
     }
 }
