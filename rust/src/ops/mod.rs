@@ -2,6 +2,7 @@
 
 pub mod attention;
 pub mod conv;
+pub mod elementary_contrib;
 pub mod elementwise;
 mod host_scan;
 pub mod image;
