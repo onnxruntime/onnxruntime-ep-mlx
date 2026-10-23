@@ -6,6 +6,7 @@ from pathlib import Path
 import subprocess
 import sys
 
+import ml_dtypes
 import numpy as np
 import onnx_ir as ir
 import onnxruntime as ort
@@ -19,6 +20,48 @@ DT = ir.DataType
 NO_SCAN = "ONNXRUNTIME_EP_MLX_NO_LINEAR_ATTENTION_SCAN"
 
 
+def typed_reference(feeds, rule, qh, h, kh, dk, dv, window=0, state_dtype=None):
+    """Independent FP64 primitives with explicit rounding at every state-dtype boundary."""
+    batch, time, _ = feeds["query"].shape
+    dtype = state_dtype or feeds.get("past_state", feeds["query"]).dtype
+
+    def rounded(value):
+        return np.asarray(value).astype(dtype).astype(np.float64)
+
+    q, k, v = [rounded(feeds[name]) for name in ["query", "key", "value"]]
+    q = rounded(q.reshape(batch, time, qh, dk) * rounded(1 / np.sqrt(dk)))
+    k = np.repeat(k.reshape(batch, time, kh, dk), h // kh, axis=2)
+    v = v.reshape(batch, time, h, dv)
+    if qh < h:
+        q = np.repeat(q, h // qh, axis=2)
+    past = feeds.get("past_state")
+    state = rounded(past[-1] if window else past) if past is not None else np.zeros((batch, h, dk, dv))
+    output = np.empty((batch, time, max(qh, h), dv), np.float64)
+    history = []
+    for token in range(time):
+        if rule in ["gated", "gated_delta"]:
+            decay = rounded(feeds["decay"][:, token]).reshape(batch, h, -1)
+            state = rounded(state * rounded(np.exp(decay))[:, :, :, None])
+        delta = v[:, token]
+        if rule in ["delta", "gated_delta"]:
+            retrieval = rounded(np.einsum("bhk,bhkv->bhv", k[:, token], state))
+            beta = rounded(feeds["beta"][:, token, :, None])
+            delta = rounded(beta * rounded(delta - retrieval))
+        outer = rounded(k[:, token, :, :, None] * delta[:, :, None, :])
+        state = rounded(state + outer)
+        history.append(state.copy())
+        readout = np.repeat(state, qh // h, axis=1) if qh > h else state
+        output[:, token] = rounded(np.einsum("bhk,bhkv->bhv", q[:, token], readout))
+    if window:
+        state = np.zeros((window, batch, h, dk, dv), np.float64)
+        if history:
+            kept = history[-window:]
+            state[-len(kept):] = np.stack(kept)
+        elif past is not None:
+            state = rounded(past)
+    return output.reshape(batch, time, max(qh, h) * dv), state
+
+
 @pytest.mark.parametrize("eager", [False, True])
 @pytest.mark.parametrize("dtype", [DT.FLOAT, DT.FLOAT16])
 @pytest.mark.parametrize("rule", ["linear", "gated", "delta", "gated_delta"])
@@ -29,6 +72,10 @@ NO_SCAN = "ONNXRUNTIME_EP_MLX_NO_LINEAR_ATTENTION_SCAN"
     (1, 2, 2, 2, 2, 31, 2, 4, False, True, True),
     (1, 9, 2, 2, 2, 256, 4, 0, True, True, True),
     (1, 3, 2, 2, 2, 257, 3, 0, False, False, True),
+    (2, 7, 2, 4, 1, 257, 3, 0, False, True, False),
+    (1, 8, 4, 2, 1, 511, 5, 3, True, False, True),
+    (1, 2, 2, 2, 2, 512, 2, 4, False, True, True),
+    (1, 3, 2, 2, 2, 513, 3, 0, False, False, True),
 ])
 def test_linear_attention_scan_arithmetic(monkeypatch, eager, dtype, rule, geometry):
     batch, time, qh, h, kh, dk, dv, window, scalar, shared, past = geometry
@@ -49,6 +96,12 @@ def test_linear_attention_scan_arithmetic(monkeypatch, eager, dtype, rule, geome
             values = rng.uniform(0.25, 0.75, array.shape)
         feeds[name] = values.astype(array.dtype)
     fused = strict_session(model).run(None, feeds)
+    typed = typed_reference(feeds, rule, qh, h, kh, dk, dv, window)
+    for actual, expected in zip(fused, typed, strict=True):
+        assert actual.shape == expected.shape
+        assert actual.dtype == feeds["query"].dtype
+        assert np.isfinite(actual).all() and np.isfinite(expected).all()
+        np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-3)
     with monkeypatch.context() as unfused:
         unfused.setenv(NO_SCAN, "1")
         reference = strict_session(model).run(None, feeds)
@@ -81,29 +134,36 @@ def test_linear_attention_scan_arithmetic(monkeypatch, eager, dtype, rule, geome
 
 
 @pytest.mark.parametrize("eager", [False, True])
-def test_linear_attention_scan_bfloat16(monkeypatch, eager):
+@pytest.mark.parametrize("dk", [33, 257, 512])
+def test_linear_attention_scan_bfloat16(monkeypatch, eager, dk):
     if eager:
         monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_COMPILE", "1")
     model = bf16_boundaries(
         "LinearAttention",
         [
-            ("query", [1, 7, 33]), ("key", [1, 7, 33]), ("value", [1, 7, 3]),
-            ("past", [1, 1, 33, 3]), ("decay", [1, 7, 1]), ("beta", [1, 7, 1]),
+            ("query", [1, 7, dk]), ("key", [1, 7, dk]), ("value", [1, 7, 3]),
+            ("past_state", [1, 1, dk, 3]), ("decay", [1, 7, 1]), ("beta", [1, 7, 1]),
         ],
-        [("y", [1, 7, 3]), ("state", [1, 1, 33, 3])],
+        [("y", [1, 7, 3]), ("state", [1, 1, dk, 3])],
         domain="com.microsoft",
         attrs=[ir.AttrInt64("q_num_heads", 1), ir.AttrInt64("kv_num_heads", 1)],
     )
     rng = np.random.default_rng(2431)
     feeds = {
-        "query": rng.normal(size=(1, 7, 33)).astype(np.float32) / 8,
-        "key": rng.normal(size=(1, 7, 33)).astype(np.float32) / 16,
+        "query": rng.normal(size=(1, 7, dk)).astype(np.float32) / 8,
+        "key": rng.normal(size=(1, 7, dk)).astype(np.float32) / 16,
         "value": rng.normal(size=(1, 7, 3)).astype(np.float32) / 8,
-        "past": rng.normal(size=(1, 1, 33, 3)).astype(np.float32) / 16,
+        "past_state": rng.normal(size=(1, 1, dk, 3)).astype(np.float32) / 16,
         "decay": np.full((1, 7, 1), -0.1, np.float32),
         "beta": np.full((1, 7, 1), 0.5, np.float32),
     }
     actual = strict_session(model).run(None, feeds)
+    typed = typed_reference(feeds, "gated_delta", 1, 1, 1, dk, 3, state_dtype=ml_dtypes.bfloat16)
+    for output, reference in zip(actual, typed, strict=True):
+        assert output.shape == reference.shape
+        assert output.dtype == np.float32
+        assert np.isfinite(output).all() and np.isfinite(reference).all()
+        np.testing.assert_allclose(output, reference, rtol=1e-2, atol=1e-3)
     with monkeypatch.context() as unfused:
         unfused.setenv(NO_SCAN, "1")
         expected = strict_session(model).run(None, feeds)
@@ -111,12 +171,15 @@ def test_linear_attention_scan_bfloat16(monkeypatch, eager):
         np.testing.assert_allclose(output, reference, rtol=1e-2, atol=1e-3)
 
 
-@pytest.mark.parametrize("dk,disabled", [(33, False), (33, True), (257, False)])
+@pytest.mark.parametrize("dk,disabled", [
+    (33, False), (33, True), (257, False), (512, False), (513, False),
+])
 def test_linear_attention_scan_route_and_dynamic_replay(tmp_path, dk, disabled):
     trace = tmp_path / "linear_attention.json"
     child = r"""
 import sys
 import numpy as np
+import onnx
 import onnxruntime as ort
 from test_ssm_contracts import linear_reference, strict_session
 from test_ssm_quant import _linear_attention_model
@@ -126,16 +189,19 @@ model, _ = _linear_attention_model(
     "gated_delta", B=1, T=5, q_heads=2, kv_heads=2, d_k=dk, d_v=3,
     with_past=True, scalar_decay=True, dyn_time=True,
 )
-session = strict_session(model)
+model = onnx.load_model_from_string(model)
+for value in [*model.graph.input, *model.graph.output]:
+    value.type.tensor_type.shape.dim[0].dim_param = "batch"
+session = strict_session(model.SerializeToString())
 rng = np.random.default_rng(2432)
-for time in [5, 5, 7, 1, 5]:
+for batch, time in [(1, 5), (1, 5), (2, 7), (2, 1), (0, 3), (1, 0), (1, 5)]:
     feeds = {
-        "query": (rng.normal(size=(1, time, 2 * dk)) / 8).astype(np.float32),
-        "key": (rng.normal(size=(1, time, 2 * dk)) / 16).astype(np.float32),
-        "value": (rng.normal(size=(1, time, 6)) / 8).astype(np.float32),
-        "past_state": (rng.normal(size=(1, 2, dk, 3)) / 16).astype(np.float32),
-        "decay": -rng.uniform(0, .1, (1, time, 2)).astype(np.float32),
-        "beta": rng.uniform(.25, .75, (1, time, 2)).astype(np.float32),
+        "query": (rng.normal(size=(batch, time, 2 * dk)) / 8).astype(np.float32),
+        "key": (rng.normal(size=(batch, time, 2 * dk)) / 16).astype(np.float32),
+        "value": (rng.normal(size=(batch, time, 6)) / 8).astype(np.float32),
+        "past_state": (rng.normal(size=(batch, 2, dk, 3)) / 16).astype(np.float32),
+        "decay": -rng.uniform(0, .1, (batch, time, 2)).astype(np.float32),
+        "beta": rng.uniform(.25, .75, (batch, time, 2)).astype(np.float32),
     }
     for actual, expected in zip(session.run(None, feeds), linear_reference(feeds), strict=True):
         np.testing.assert_allclose(actual, expected, rtol=1e-4, atol=1e-5)
@@ -157,12 +223,38 @@ for time in [5, 5, 7, 1, 5]:
         event for event in events
         if event.get("cat") == "op.composed" and event.get("name") == "LinearAttention"
     ]
-    if disabled or dk > 256:
+    if disabled or dk > 512:
         assert not fast
         assert composed
     else:
         assert fast
-        assert not composed
+        # Empty-batch applications deliberately retain the unroll.
+        assert composed
+
+
+@pytest.mark.parametrize("eager", [False, True])
+@pytest.mark.parametrize("dk", [257, 512])
+@pytest.mark.parametrize("time", [128, 200])
+def test_linear_attention_wide_zero_weak_decay(monkeypatch, eager, dk, time):
+    if eager:
+        monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_COMPILE", "1")
+    model, feeds = _linear_attention_model(
+        "gated_delta", B=1, T=time, q_heads=2, kv_heads=2, d_k=dk, d_v=4,
+        with_past=True, scalar_decay=True,
+    )
+    rng = np.random.default_rng(2434)
+    for name, array in feeds.items():
+        feeds[name] = (rng.normal(size=array.shape) * .1).astype(array.dtype)
+    feeds["beta"].fill(.95)
+    session = strict_session(model)
+    for decay in [0., -1e-7, -.1, 0.]:
+        feeds["decay"].fill(decay)
+        expected = linear_reference(feeds)
+        for actual, reference in zip(session.run(None, feeds), expected, strict=True):
+            assert actual.shape == reference.shape
+            assert actual.dtype == np.float32
+            assert np.isfinite(actual).all() and np.isfinite(reference).all()
+            np.testing.assert_allclose(actual, reference, rtol=2e-3, atol=2e-5)
 
 
 @pytest.mark.parametrize("float64", [False, True])

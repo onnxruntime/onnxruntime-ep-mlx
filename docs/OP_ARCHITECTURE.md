@@ -145,7 +145,8 @@ logical/bitwise, all reductions, shape/data-movement, normalizations, attention,
 conv/pooling, quantization (Quantize/Dequantize/DynamicQuantize/MatMulInteger/ConvInteger/
 QLinearMatMul/QLinearConv), random, signal/FFT (DFT/STFT/windows/MelWeightMatrix — audio),
 vision/detection, **recurrent (RNN/GRU/LSTM and
-com.microsoft LinearAttention via static unrolling)**, **control flow (If/Scan/Loop via recursive
+com.microsoft LinearAttention via a stable typed Metal prefill scan for `Dk <= 512`,
+with static unrolling for single-token, wider, and CPU-stream calls)**, **control flow (If/Scan/Loop via recursive
 subgraph-body translation)**, and host-computed data-dependent operators.
 
 These value-kind forms remain on ORT CPU because the current array-only EP boundary

@@ -9,7 +9,7 @@
 //! updates can compile shape-keyed. Causal convolution supports ndim=1 with static channel/kernel
 //! geometry. Linear attention always uses the recurrence: neither decay strength nor normalized
 //! keys follows from shape alone, so the chunk_size tuning hint cannot justify a WY fast path.
-//! GPU prefill with d_k <= 256 uses a typed SIMD-column scan; wider/CPU forms retain the unroll.
+//! GPU prefill with d_k <= 512 uses a typed SIMD-column scan; wider/CPU forms retain the unroll.
 //! `ONNXRUNTIME_EP_MLX_NO_LINEAR_ATTENTION_SCAN=1` selects the unroll for numerical/perf A/B.
 
 use crate::engine::{MlxError, NodeDesc, Src, TranslationContext, mlx_dtype_from_onnx};
@@ -668,8 +668,8 @@ fn linear_attention_scan(
     let (b, h, time, dv) = (shape[0], shape[1], shape[2], shape[3]);
     let qshape = ctx.shape_of(query);
     let (hq, dk) = (qshape[1], qshape[3]);
-    // Bound per-lane register state, not legal operator inputs. Wider shapes retain the unroll.
-    if disabled || time <= 1 || b <= 0 || dk <= 0 || dk > 256 {
+    // Bound per-lane state to 16 typed values, not legal operator inputs.
+    if disabled || time <= 1 || b <= 0 || dk <= 0 || dk > 512 {
         return Ok(None);
     }
     let Some(threads) = b
@@ -1001,7 +1001,7 @@ fn linear_attention_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(),
             return Ok(());
         }
         ctx.mark_composed(
-            "stable unroll: scan disabled, CPU/empty geometry, d_k > 256, or grid limit",
+            "stable unroll: scan disabled, CPU/empty geometry, d_k > 512, or grid limit",
         );
     }
 
