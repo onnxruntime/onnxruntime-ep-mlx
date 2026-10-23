@@ -7,6 +7,7 @@ pub mod image;
 mod kv_cache;
 pub mod math;
 pub mod matmul;
+pub mod nonzero;
 pub mod norm;
 pub mod onnx_ml_linear;
 pub mod onnx_ml_preprocess;

@@ -116,10 +116,6 @@ _EXCLUDE = [
     r"^test_bitshift_(left|right)_uint16_cpu$",
     r"^test_(max|min)_(u?int16)_cpu$",
     r"^test_top_k_uint64_cpu$",
-    # Pow(float32, uint64): MLX rejects the wider exponent to avoid lossy narrowing;
-    # ORT 1.31 CPU only supports int32/int64/float/double exponents (NOT_IMPLEMENTED).
-    # Keep float32/uint32 enabled: MLX serves it even though ORT CPU cannot.
-    r"^test_pow_types_float32_uint64_cpu$",
     # ImageDecoder(20): ORT 1.27 CPU has no kernel (NOT_IMPLEMENTED); needs image codec libs.
     r"^test_image_decoder_",
     # Range: the reference models are stamped opset 27 (ai.onnx official support in ORT 1.29 is
@@ -142,7 +138,7 @@ globals().update(backend_test_cases(_backend_test.enable_report()))
 
 
 def test_pow_exclusion_scope() -> None:
-    """Only the unsupported uint64 exponent may be excluded from Pow coverage."""
+    """All published Pow reference cases remain enabled."""
     node_cases = globals()["OnnxBackendNodeModelTest"]
     pow_cases = {
         name: getattr(node_cases, name)
@@ -153,11 +149,12 @@ def test_pow_exclusion_scope() -> None:
         "test_pow_cpu",
         "test_pow_types_float32_uint32_cpu",
         "test_pow_types_float32_int64_cpu",
+        "test_pow_types_float32_uint64_cpu",
     } <= pow_cases.keys()
     assert {
         name for name, case in pow_cases.items()
         if getattr(case, "__unittest_skip__", False)
-    } == {"test_pow_types_float32_uint64_cpu"}
+    } == set()
 
 
 if __name__ == "__main__":

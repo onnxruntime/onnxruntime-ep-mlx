@@ -1,8 +1,8 @@
 //! Misc op handlers: Constant (scalar/list value forms), TfIdfVectorizer, OneHot, Trilu, Scatter
-//! (opset 9/10), Det, NonZero, Unique, sequence consumers, OptionalHasElement/GetElement and the loss ops
+//! (opset 9/10), Det, Unique, sequence consumers, OptionalHasElement/GetElement and the loss ops
 //! (NegativeLogLikelihoodLoss / SoftmaxCrossEntropyLoss). Faithful port of the C++ `ops/misc2.cc`
 //! (plus OneHot/Trilu from `math.cc` and Constant from `shape.cc`). Host-computed ops (Det /
-//! NonZero / Unique) materialise their input, compute on the host, and wrap the result back as a
+//! Unique) materialise their input, compute on the host, and wrap the result back as a
 //! fresh MLX array (mlx-c exposes no det / argwhere / unique primitive). Only statically
 //! translatable, MLX-supported forms are claimed; every other form is left to ORT CPU.
 
@@ -801,65 +801,6 @@ fn det_claim(node: &NodeView) -> ClaimResult {
 }
 
 // =============================================================================================
-// NonZero — int64 [rank, nnz] coordinates of non-zero elements (row-major order). Host-computed.
-// =============================================================================================
-fn nonzero_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
-    let x = ctx.resolve(&n.inputs[0])?;
-    let zero = ctx.zeros_like(x)?;
-    let mask = ctx.binary(mlx::mlx_not_equal, x, zero)?;
-    let ev = ctx.contiguous_eval(mask)?;
-
-    let shape = ctx.shape_of(ev);
-    let rank = shape.len();
-    let total: usize = shape.iter().map(|&d| d as usize).product();
-    let mut strides = vec![1i64; rank];
-    for i in (0..rank.saturating_sub(1)).rev() {
-        strides[i] = strides[i + 1] * shape[i + 1] as i64;
-    }
-    let m = unsafe { mlx::mlx_array_data_bool(ev) };
-    let mut nnz = 0usize;
-    for i in 0..total {
-        if unsafe { *m.add(i) } {
-            nnz += 1;
-        }
-    }
-    let mut out = vec![0i64; rank * nnz];
-    let mut col = 0usize;
-    for lin in 0..total {
-        if !unsafe { *m.add(lin) } {
-            continue;
-        }
-        for j in 0..rank {
-            out[j * nnz + col] = (lin as i64 / strides[j]) % shape[j] as i64;
-        }
-        col += 1;
-    }
-    let res = ctx.from_host(
-        out.as_ptr() as *const c_void,
-        &[rank as i32, nnz as i32],
-        I64,
-    );
-    ctx.bind(&n.outputs[0], res);
-    Ok(())
-}
-
-fn nonzero_claim(node: &NodeView) -> ClaimResult {
-    require!(
-        node.num_inputs() == 1 && node.num_outputs() == 1,
-        "NonZero: data-dependent output shape with no MLX primitive — stays on CPU"
-    );
-    let (x, out) = match (node.input_info(0), node.output_info(0)) {
-        (Some(a), Some(b)) => (a, b),
-        _ => deny!("NonZero: data-dependent output shape with no MLX primitive — stays on CPU"),
-    };
-    require!(
-        is_mlx_supported(x.dtype) && out.dtype == T_INT64 && !x.shape.is_empty(),
-        "NonZero: data-dependent output shape with no MLX primitive — stays on CPU"
-    );
-    Ok(())
-}
-
-// =============================================================================================
 // Unique — flattened unique elements (+ optional indices / inverse / counts). Host-computed.
 // =============================================================================================
 fn unique_groups<T: Copy + PartialOrd + Eq + Hash>(
@@ -1528,14 +1469,6 @@ pub fn register(registry: &mut OpRegistry) {
         crate::registry::MLX_SCATTER_SHAPE_REASON,
     );
     shapeless(registry, "Det", K_ANY_OPSET, K_ANY_OPSET, det_op, det_claim);
-    shapeless(
-        registry,
-        "NonZero",
-        K_ANY_OPSET,
-        K_ANY_OPSET,
-        nonzero_op,
-        nonzero_claim,
-    );
     shapeless(
         registry,
         "Unique",
