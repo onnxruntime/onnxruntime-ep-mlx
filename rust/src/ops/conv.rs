@@ -526,7 +526,7 @@ fn deform_conv_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxE
     }
     if let Some(kernel) = n.int_arrays.get("kernel_shape")
         && kernel.as_slice()
-            != &w_shape[2..]
+            != w_shape[2..]
                 .iter()
                 .map(|&v| i64::from(v))
                 .collect::<Vec<_>>()
@@ -708,6 +708,10 @@ fn deform_conv_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxE
 
 // ---- ConvTranspose ------------------------------------------------------------------------------
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "explicit ONNX ConvTranspose padding attributes and geometry"
+)]
 fn transpose_pads(
     auto_pad: &str,
     input: &[i64],

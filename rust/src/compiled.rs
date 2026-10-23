@@ -461,10 +461,9 @@ pub fn detect_batch_size(
             && !inp.constant
             && seen.insert(inp.ctx_index)
             && let Ok((_data, shape, _dtype)) = read_ctx_input_raw(api, kctx, inp.ctx_index)
+            && inp.name == "input_ids"
         {
-            if inp.name == "input_ids" {
-                return shape.first().map(|&dim| dim as i32);
-            }
+            return shape.first().map(|&dim| dim as i32);
         }
     }
     None

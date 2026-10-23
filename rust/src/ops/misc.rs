@@ -138,14 +138,14 @@ fn tfidf_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> 
     let mode = n.strings.get("mode").unwrap().as_str();
     let indexes = n.int_arrays.get("ngram_indexes").unwrap();
     let weights = n.float_arrays.get("weights");
-    if let Some(w) = weights {
-        if w.len() != indexes.len() {
-            return Err(format!(
-                "MLX TfIdfVectorizer: weights size {} must equal ngram_indexes size {}",
-                w.len(),
-                indexes.len()
-            ));
-        }
+    if let Some(w) = weights
+        && w.len() != indexes.len()
+    {
+        return Err(format!(
+            "MLX TfIdfVectorizer: weights size {} must equal ngram_indexes size {}",
+            w.len(),
+            indexes.len()
+        ));
     }
     if indexes.iter().any(|&index| index < 0) {
         return Err("MLX TfIdfVectorizer: ngram_indexes must be non-negative".to_string());
@@ -177,7 +177,7 @@ fn tfidf_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> 
                 if last_min >= row_size {
                     break;
                 }
-                for gram_size in 1..=max_gram {
+                for (gram_size, gram) in grams.iter().enumerate().take(max_gram + 1).skip(1) {
                     let Some(pos) = (gram_size - 1)
                         .checked_mul(skip_distance)
                         .and_then(|d| start.checked_add(d))
@@ -190,7 +190,7 @@ fn tfidf_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> 
                     if gram_size < start_gram {
                         continue;
                     }
-                    for (tokens, &pool_idx) in &grams[gram_size] {
+                    for (tokens, &pool_idx) in gram {
                         let mut matches = None;
                         for (token_offset, &expected_value) in tokens.iter().enumerate() {
                             let token_pos = start + token_offset * skip_distance;

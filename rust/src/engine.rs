@@ -1346,7 +1346,7 @@ impl<'a> TranslationContext<'a> {
         a: mlxsys::mlx_array,
         t: mlxsys::mlx_dtype,
     ) -> Result<mlxsys::mlx_array, MlxError> {
-        let key = (a.ctx as usize, t as u32);
+        let key = (a.ctx as usize, t);
         if let Some(&casted) = self.astype_cache.get(&key) {
             return Ok(casted);
         }

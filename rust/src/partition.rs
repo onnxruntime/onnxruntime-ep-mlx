@@ -476,8 +476,8 @@ mod tests {
         let (succ, pred) = chain(5);
         assert_eq!(
             cluster_edges(
-                &vec![true; 5],
-                &vec![false; 5],
+                &[true; 5],
+                &[false; 5],
                 &[Shapeless, ShapeKeyed, Eager, ShapeKeyed, Shapeless],
                 &succ,
                 &pred,
@@ -490,25 +490,13 @@ mod tests {
     fn uniformly_coloured_graphs_remain_maximal() {
         let (succ, pred) = chain(8);
         assert_eq!(
-            cluster_edges(
-                &vec![true; 8],
-                &vec![false; 8],
-                &vec![Shapeless; 8],
-                &succ,
-                &pred,
-            ),
+            cluster_edges(&[true; 8], &[false; 8], &[Shapeless; 8], &succ, &pred,),
             vec![(0..8).collect::<Vec<_>>()]
         );
         let succ = vec![vec![1, 2], vec![3], vec![3], vec![]];
         let pred = vec![vec![], vec![0], vec![0], vec![1, 2]];
         assert_eq!(
-            cluster_edges(
-                &vec![true; 4],
-                &vec![true; 4],
-                &vec![Shapeless; 4],
-                &succ,
-                &pred,
-            ),
+            cluster_edges(&[true; 4], &[true; 4], &[Shapeless; 4], &succ, &pred,),
             vec![vec![0, 1, 2, 3]]
         );
     }
@@ -518,8 +506,8 @@ mod tests {
         let (succ, pred) = chain(5);
         assert_eq!(
             cluster_edges(
-                &vec![true; 5],
-                &vec![false; 5],
+                &[true; 5],
+                &[false; 5],
                 &[Shapeless, Shapeless, ShapeKeyed, Shapeless, Shapeless],
                 &succ,
                 &pred,
@@ -532,8 +520,8 @@ mod tests {
         assert_eq!(
             build_contiguous_clusters(
                 &order,
-                &vec![true; 5],
-                &vec![false; 5],
+                &[true; 5],
+                &[false; 5],
                 &[Shapeless, ShapeKeyed, ShapeKeyed, Shapeless, Shapeless],
             ),
             vec![

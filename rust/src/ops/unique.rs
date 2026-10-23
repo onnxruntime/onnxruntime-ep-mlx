@@ -290,8 +290,10 @@ mod tests {
     fn i64_values(result: &Unique) -> Vec<i64> {
         result
             .data
-            .chunks_exact(8)
-            .map(|bytes| i64::from_ne_bytes(bytes.try_into().unwrap()))
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|bytes| i64::from_ne_bytes(*bytes))
             .collect()
     }
 
@@ -468,8 +470,14 @@ mod tests {
                 reason: "data-dependent cardinality",
             },
         );
-        assert!(!crate::compiled::decode_enabled(false, &[node.clone()]));
-        assert!(!crate::compiled::general_enabled(false, &[node.clone()]));
+        assert!(!crate::compiled::decode_enabled(
+            false,
+            std::slice::from_ref(&node)
+        ));
+        assert!(!crate::compiled::general_enabled(
+            false,
+            std::slice::from_ref(&node)
+        ));
         let mut attention = node.clone();
         attention.op_type = "GroupQueryAttention".into();
         attention.compile_shape_safety = CompileShapeSafety::Shapeless;

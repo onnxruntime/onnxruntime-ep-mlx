@@ -1584,6 +1584,10 @@ fn attention_zero_fully_masked_rows(
     ctx.where_(all_masked, zero, values)
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "explicit attention tensors and head/cache geometry"
+)]
 fn attention_qk_output_op(
     ctx: &mut TranslationContext,
     n: &NodeDesc,
@@ -2228,8 +2232,8 @@ fn mrotary_embedding_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<()
             }
         }
     } else {
-        for stream in 1..3 {
-            let stop = sections[stream] * 3;
+        for (stream, &width) in sections.iter().enumerate().take(3).skip(1) {
+            let stop = width * 3;
             let mut col = stream as i64;
             while col < stop && col < half as i64 {
                 assignment[col as usize] = stream;
@@ -4078,10 +4082,11 @@ fn paged_attention_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), 
     if n.outputs.len() > 1 && !n.outputs[1].name.is_empty() {
         ctx.bind(&n.outputs[1], kcache);
     }
-    if n.outputs.len() > 2 && !n.outputs[2].name.is_empty() {
-        if let Some(vcache) = vcache {
-            ctx.bind(&n.outputs[2], vcache);
-        }
+    if n.outputs.len() > 2
+        && !n.outputs[2].name.is_empty()
+        && let Some(vcache) = vcache
+    {
+        ctx.bind(&n.outputs[2], vcache);
     }
     Ok(())
 }

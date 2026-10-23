@@ -485,7 +485,7 @@ pub fn emit(
 
     // One thread per (batch, d_inner) pair.
     let threads = batch.saturating_mul(d_inner);
-    let group = threads.min(256).max(1);
+    let group = threads.clamp(1, 256);
     rc |= unsafe { mlx::mlx_fast_metal_kernel_config_set_grid(config, threads, 1, 1) };
     rc |= unsafe { mlx::mlx_fast_metal_kernel_config_set_thread_group(config, group, 1, 1) };
 

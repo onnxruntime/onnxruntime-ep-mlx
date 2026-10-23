@@ -26,8 +26,9 @@ python -m pytest tests/backend -q
 Set `ORT_HOME` to the release root from the build guide, or point
 `DYLD_LIBRARY_PATH` at the corresponding ORT `lib/` directory.
 
-CI also gates all Rust targets with `cargo clippy --release --all-targets -- -D warnings`
-after provisioning the same native dependencies. Install the lint component with
+An independent CI lint job gates all Rust targets with
+`cargo clippy --release --all-targets -- -D warnings` after provisioning the same native
+dependencies, in parallel with the build/test job. Install the lint component with
 `rustup component add clippy` to run it locally from `rust/`.
 
 The root `pytest.ini` defaults to short tracebacks (`--tb=short`), retaining assertion
