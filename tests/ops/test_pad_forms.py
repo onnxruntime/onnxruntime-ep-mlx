@@ -238,6 +238,7 @@ def test_pad_interior_controls(eager, monkeypatch):
     monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_COMPILE", "1" if eager else "0")
     model = _model([2, 3], [0, 2], [1], live=True, opset=19)
     model.graph.input[1].name = "pad_values"
+    model.graph.input[1].type.tensor_type.shape.dim[0].dim_value = 3
     model.graph.initializer.append(numpy_helper.from_array(
         np.array([2, 1], np.int64), name="parts"))
     model.graph.node.insert(0, helper.make_node(
