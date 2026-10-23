@@ -123,15 +123,6 @@ fn unique(
     };
     dim_i32(items as i64)?;
     let values = values(data, dtype, width);
-    if axis.is_some()
-        && sorted == 1
-        && dtype == mlx::mlx_dtype__MLX_FLOAT16
-        && values.iter().any(|value| value.is_nan())
-    {
-        return Err(
-            "MLX Unique: sorted float16 axis NaNs have unresolved reference ordering".into(),
-        );
-    }
     let offset = |item: usize, element: usize| {
         (element / columns * items + item) * columns + element % columns
     };
@@ -389,14 +380,6 @@ mod tests {
             let result = unique(&data, &[3], dtype, None, 1).unwrap();
             assert_eq!(result.first, [0, 2]);
             assert_eq!(result.counts, [2, 1]);
-            let nan = 0x7e11u16.to_ne_bytes();
-            assert!(unique(&nan, &[1, 1], mlx::mlx_dtype__MLX_FLOAT16, Some(0), 1).is_err());
-            assert_eq!(
-                unique(&nan, &[1, 1], mlx::mlx_dtype__MLX_FLOAT16, Some(0), 0)
-                    .unwrap()
-                    .first,
-                [0]
-            );
             assert_eq!(&result.data[..2], &0x8000u16.to_ne_bytes());
         }
         let result = unique(&[1, 0, 1], &[3], mlx::mlx_dtype__MLX_BOOL, None, 1).unwrap();
@@ -408,6 +391,24 @@ mod tests {
         let result = unique(&data, &[3], mlx::mlx_dtype__MLX_FLOAT64, None, 1).unwrap();
         assert_eq!(result.first, [0, 1]);
         assert_eq!(result.counts, [2, 1]);
+    }
+
+    #[test]
+    fn float16_axis_nans_are_legal_and_sort_last_without_merging_slices() {
+        let bits = [0x8000u16, 0, 1, 0x7c00, 0xfc00, 0x7e11, 0xfe22, 0x7e11];
+        let bytes: Vec<_> = bits.into_iter().flat_map(u16::to_ne_bytes).collect();
+        let result = unique(&bytes, &[8, 1], mlx::mlx_dtype__MLX_FLOAT16, Some(0), 1).unwrap();
+        assert_eq!(result.first, [4, 0, 2, 3, 5, 6, 7]);
+        assert_eq!(result.inverse, [1, 1, 2, 3, 0, 4, 5, 6]);
+        assert_eq!(result.counts, [1, 2, 1, 1, 1, 1, 1]);
+        let expected: Vec<_> = result
+            .first
+            .iter()
+            .flat_map(|&index| bits[index as usize].to_ne_bytes())
+            .collect();
+        assert_eq!(result.data, expected);
+        let result = unique(&bytes, &[8, 1], mlx::mlx_dtype__MLX_FLOAT16, Some(0), 0).unwrap();
+        assert_eq!(result.first, [0, 2, 3, 4, 5, 6, 7]);
     }
 
     #[test]

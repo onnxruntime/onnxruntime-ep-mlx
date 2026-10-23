@@ -26,26 +26,31 @@ Infinities and subnormals use their numeric ordering.
 ## NaN authority limits
 
 The schema links NumPy but does not specify a NaN equivalence relation, NaN
-ordering, or representative payload/sign selection. The implementation follows
-the ONNX Reference/NumPy convention for the supported forms: flattened NaNs form one group, sorted last;
-NaN-containing axis slices are distinct, ordered lexicographically with NaNs
-after non-NaNs. Equivalent sort keys retain input order. Y always retains the
+ordering, or representative payload/sign selection. Flattened NaNs form one group,
+as in ONNX Reference/NumPy; NaN-containing axis slices remain distinct.
+Sorting consistently places NaNs after non-NaNs, with lexicographic whole-slice
+comparison. Equivalent sort keys retain input order. Y always retains the
 first representative's original bytes, including NaN payloads and signed zero.
-This is an explicit reference-aligned choice, not a claim that all authorities
-agree on NaNs or on representative bytes.
+This preserves numeric ascending order for all non-NaN values, including
+float16, without rejecting legal NaN payloads. NaN placement is a deterministic
+provider convention for a schema-unspecified case, not universal oracle agreement.
 
-One narrow form remains an explicit runtime error: **sorted float16 axis slices
-containing NaNs**. NumPy 2.3.4's structured half comparison puts these NaNs before
-finite values, unlike its float32/float64 ordering. Neither the schema nor ORT's
-NaN comparator resolves this discrepancy. Unsorted float16 axis NaNs and
-flattened float16 NaNs remain implemented. A regression records the exact
-Reference disagreement and checks invalid-then-finite recovery in the same EP
-session; it does not pretend this unsupported form passed.
+**Authority disagreement, not an unsupported form:** NumPy 2.3.4's structured
+float16 axis comparison puts NaNs before finite values, unlike its float32/float64
+comparison and flattened half comparison. The regression records the exact
+Reference indices `[5, 6, 7, 4, 0, 2, 3]` for bit patterns
+`[8000, 0000, 0001, 7c00, fc00, 7e11, fe22, 7e11]` (hex half values,
+shape `[8, 1]`, axis 0), versus provider/oracle indices
+`[4, 0, 2, 3, 5, 6, 7]`. Both retain distinct NaN slices and merge signed-zero
+slices. This discrepancy does not establish an ONNX prohibition on NaN-last.
+The EP regression keeps the unchanged independent typed oracle, checks every
+payload/metadata byte, and runs NaN-to-finite-to-NaN feeds in the same session.
+It does not turn a legal input into a claimed-node runtime error.
 
 ORT 1.31 CPU uses `std::map` with floating `<`, which does not define a strict
 weak ordering when NaNs occur. It is not a reliable NaN oracle. ONNX 1.22 and
 the pinned ONNX 1.23.2 Reference have a separate unsorted bug: they gather original X on axis zero
-instead of reordering sorted Y on the requested axis (and returns early for
+instead of reordering sorted Y on the requested axis (and return early for
 single-output models). Tests record that defect explicitly; on those versions,
 Reference comparisons use its sorted variant while every EP result, including
 unsorted results, is checked against an independent typed enumeration oracle.

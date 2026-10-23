@@ -253,17 +253,16 @@ def test_unique_signed_zeros_infinities_and_nan_payloads(dtype, bits, axis, sort
     model = _model(dtype, [8, 1], axis=axis, sorted=sorted)
     expected = _oracle(data, axis, sorted)
     session = _session(model)
-    if dtype == np.float16 and axis is not None and sorted == 1:
-        with pytest.raises(Exception, match="Unique.*float16 axis NaNs.*ordering"):
-            session.run(None, {"x": data})
+    _check(session.run(None, {"x": data}), expected)
+    if dtype == np.float16 and axis is not None:
         finite = data.copy()
         finite[np.isnan(finite)] = 1
         _check(session.run(None, {"x": finite}), _oracle(finite, axis, sorted))
-        return
-    _check(session.run(None, {"x": data}), expected)
+        _check(session.run(None, {"x": data}), expected)
     # NaN equivalence follows ONNX Reference/NumPy, not ORT CPU's std::map<float>.
     # Its NaN comparator is not a strict weak ordering; do not bless it as an oracle.
-    # NumPy may choose a different signed-zero representation for an axis slice.
+    # NumPy half-axis NaN placement is a separately recorded authority discrepancy.
+    # It is not grounds to reject legal input or weaken the strict EP oracle above.
     if dtype != np.float16 or axis is None:
         _reference_check(model, data, expected, axis=axis, sorted=sorted, payload=False)
 
@@ -274,8 +273,17 @@ def test_unique_numpy234_float16_axis_nan_order_dispute():
                         np.uint16).view(np.float16).reshape(8, 1)
         model = _model(np.float16, [8, 1], axis=0, sorted=1)
         result = ReferenceEvaluator(model).run(None, {"x": data})
-        np.testing.assert_array_equal(result[1], [5, 6, 7, 4, 0, 2, 3])
-        np.testing.assert_array_equal(_oracle(data, 0, 1)[1], [4, 0, 2, 3, 5, 6, 7])
+        reference_order = np.array([5, 6, 7, 4, 0, 2, 3], np.int64)
+        expected_reference = [
+            np.take(data, reference_order, axis=0), reference_order,
+            np.array([4, 4, 5, 6, 3, 0, 1, 2], np.int64),
+            np.array([1, 1, 1, 1, 2, 1, 1], np.int64),
+        ]
+        _check(result, expected_reference)
+        expected = _oracle(data, 0, 1)
+        np.testing.assert_array_equal(expected[1], [4, 0, 2, 3, 5, 6, 7])
+        np.testing.assert_array_equal(expected[2], [1, 1, 2, 3, 0, 4, 5, 6])
+        np.testing.assert_array_equal(expected[3], [1, 2, 1, 1, 1, 1, 1])
 
 
 def test_unique_exact_double_neighbors():
