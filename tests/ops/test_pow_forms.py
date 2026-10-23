@@ -209,6 +209,24 @@ def test_pow_large_integer_near_one(base_dtype, exponent_dtype, eager, monkeypat
         actual, expected, rtol=1e-5 if base_dtype == np.float32 else 1e-12, atol=0)
 
 
+@pytest.mark.parametrize("base_dtype", [np.float32, np.float64])
+@pytest.mark.parametrize("exponent_dtype", [np.float32, np.float64])
+@pytest.mark.parametrize("eager", [False, True])
+def test_pow_float_near_one(base_dtype, exponent_dtype, eager, monkeypatch):
+    monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_COMPILE", "1" if eager else "0")
+    near_one = np.nextafter(base_dtype(1), base_dtype(2))
+    base = np.asarray([near_one, -near_one, near_one, -near_one], base_dtype)
+    exponent = np.asarray([2**24, 2**24, -(2**24) + 1, -(2**24) + 1], exponent_dtype)
+    with localcontext() as context:
+        context.prec = 100
+        expected = np.asarray([float(Decimal(float(x)) ** int(n))
+                               for x, n in zip(base, exponent, strict=True)], base_dtype)
+    actual = _session(_model(base_dtype, exponent_dtype, [4], [4])).run(
+        None, {"base": base, "exponent": exponent})[0]
+    np.testing.assert_allclose(
+        actual, expected, rtol=1e-5 if base_dtype == np.float32 else 1e-12, atol=0)
+
+
 @pytest.mark.parametrize("opset", [1, 6, 7, 11, 12, 13, 15, 26])
 @pytest.mark.parametrize("constant", [None, "base", "exponent"])
 def test_pow_schema_versions_and_initializers(opset, constant):
@@ -306,16 +324,39 @@ def test_pow_integer_base_boundary(base_dtype, exponent_dtype):
 
 @pytest.mark.parametrize("exponent_dtype", [np.int64, np.uint64, np.float32])
 def test_pow_shapeless_replay(exponent_dtype):
-    model = _model(np.float32, exponent_dtype, [None, 1], [None, 1])
-    model.graph.input[1].name = "input_ids"
-    model.graph.node[0].input[1] = "input_ids"
+    model = _model(np.float32, exponent_dtype, [None, 1, 8], [None, 1, 8])
+    # The decode configuration requires a real KV-cache contract, not just an input_ids name.
+    model.opset_import.append(helper.make_opsetid("com.microsoft", 1))
+    for name in ("q", "k", "v"):
+        model.graph.input.append(helper.make_tensor_value_info(name, T.FLOAT, [1, 1, 8]))
+    for name in ("pk", "pv"):
+        model.graph.input.append(helper.make_tensor_value_info(name, T.FLOAT, [1, 1, None, 8]))
+    for name in ("lengths", "total"):
+        model.graph.input.append(helper.make_tensor_value_info(name, T.INT32, [1]))
+    model.graph.node.insert(0, helper.make_node(
+        "GroupQueryAttention", ["q", "k", "v", "pk", "pv", "lengths", "total"],
+        ["attention", "present_k", "present_v"], domain="com.microsoft",
+        num_heads=1, kv_num_heads=1, do_rotary=0))
+    model.graph.node.append(helper.make_node("Add", ["attention", "powered"], ["out"]))
+    model.graph.output[0].name = "out"
+    for name in ("present_k", "present_v"):
+        model.graph.output.append(helper.make_tensor_value_info(name, T.FLOAT, [1, 1, None, 8]))
     session = _session(model)
     for index, batch in enumerate([2, 2, 3, 2]):
-        base = np.full((batch, 1), -1, np.float32)
-        values = np.arange(batch).reshape(batch, 1) + 2**24 + index
+        base = np.full((batch, 1, 8), -1, np.float32)
+        values = np.arange(batch * 8).reshape(batch, 1, 8) + 2**24 + index
         exponent = values.astype(exponent_dtype)
-        expected = np.asarray([[-1 if int(n) % 2 else 1] for n in exponent.flat], np.float32)
-        _exact(session.run(None, {"base": base, "input_ids": exponent})[0], expected)
+        expected = np.asarray([-1 if int(n) % 2 else 1 for n in exponent.flat], np.float32)
+        past = [1, 2, 3, 1][index]
+        feeds = {"base": base, "exponent": exponent,
+                 **{name: np.zeros((1, 1, 8), np.float32) for name in ("q", "k", "v")},
+                 **{name: np.zeros((1, 1, past, 8), np.float32) for name in ("pk", "pv")},
+                 "lengths": np.array([past], np.int32),
+                 "total": np.array([past + 1], np.int32)}
+        actual = session.run(None, feeds)
+        _exact(actual[0], expected.reshape(base.shape))
+        assert actual[1].shape == (1, 1, past + 1, 8)
+        assert actual[2].shape == (1, 1, past + 1, 8)
 
 
 def test_pow_actual_general_route(tmp_path):
@@ -348,5 +389,5 @@ def test_pow_actual_shapeless_route(tmp_path):
     paths = [event["args"] for event in json.loads(trace.read_text())
              if event.get("cat") == "ep.path" and "Pow" in event["args"].get("ops", "")]
     assert [event["cache"] for event in paths if event["path"] == "decode"] == [
-        "MISS", "HIT", "HIT", "HIT"] * 3
+        "MISS", "HIT", "HIT", "HIT"] * 3, paths
     assert not [event for event in paths if event["path"] != "decode"]

@@ -46,6 +46,40 @@ fn div_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
     Ok(())
 }
 
+/// Compiled Metal power loses relative accuracy near one under its fast-math settings. MLX Log
+/// and Exp explicitly use metal::precise, so use that composition in this well-conditioned range.
+fn pow_float(
+    ctx: &mut TranslationContext,
+    a: mlx::mlx_array,
+    b: mlx::mlx_array,
+) -> Result<mlx::mlx_array, MlxError> {
+    let power = ctx.binary(mlx::mlx_power, a, b)?;
+    let magnitude = ctx.unary(mlx::mlx_abs, a)?;
+    let half = scalar_like(ctx, a, 0.5)?;
+    let two = scalar_like(ctx, a, 2.0)?;
+    let above_half = ctx.binary(mlx::mlx_greater, magnitude, half)?;
+    let below_two = ctx.binary(mlx::mlx_less, magnitude, two)?;
+    let near_one = ctx.binary(mlx::mlx_logical_and, above_half, below_two)?;
+    let finite = ctx.unary(mlx::mlx_isfinite, b)?;
+    let zero = scalar_like(ctx, a, 0.0)?;
+    let negative_base = ctx.binary(mlx::mlx_less, a, zero)?;
+    let integral = ctx.unary(mlx::mlx_floor, b)?;
+    let integral = ctx.binary(mlx::mlx_equal, integral, b)?;
+    let positive_base = ctx.unary(mlx::mlx_logical_not, negative_base)?;
+    let real_power = ctx.binary(mlx::mlx_logical_or, positive_base, integral)?;
+    let stable = ctx.binary(mlx::mlx_logical_and, near_one, finite)?;
+    let stable = ctx.binary(mlx::mlx_logical_and, stable, real_power)?;
+    let logarithm = ctx.unary(mlx::mlx_log, magnitude)?;
+    let exponent = ctx.binary(mlx::mlx_multiply, logarithm, b)?;
+    let result = ctx.unary(mlx::mlx_exp, exponent)?;
+    let parity = ctx.binary(mlx::mlx_remainder, b, two)?;
+    let odd = ctx.binary(mlx::mlx_not_equal, parity, zero)?;
+    let negative = ctx.binary(mlx::mlx_logical_and, negative_base, odd)?;
+    let negated = ctx.unary(mlx::mlx_negative, result)?;
+    let result = ctx.where_(negative, negated, result)?;
+    ctx.where_(stable, result, power)
+}
+
 /// Keep every integer exponent bit without a 64-step multiplication graph. Each chunk has at most
 /// 24 significant bits, so its power-of-two-scaled floating exponent is exact even in float32.
 /// All factors have exponents of the same sign: no overflow/underflow cancellation is introduced.
@@ -96,7 +130,7 @@ fn pow_integer_exponent(
         let exponent = ctx.binary(mlx::mlx_multiply, exponent, scale)?;
         let negated = ctx.unary(mlx::mlx_negative, exponent)?;
         let exponent = ctx.where_(negative, negated, exponent)?;
-        let factor = ctx.binary(mlx::mlx_power, abs_a, exponent)?;
+        let factor = pow_float(ctx, abs_a, exponent)?;
         let factor = ctx.where_(empty, float_one, factor)?;
         result = ctx.binary(mlx::mlx_multiply, result, factor)?;
     }
@@ -157,7 +191,7 @@ fn pow_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
         };
         a = ctx.astype(a, working)?;
         b = ctx.astype(b, working)?;
-        ctx.binary(mlx::mlx_power, a, b)?
+        pow_float(ctx, a, b)?
     } else {
         if ctx.dtype_of(a) != mlx::mlx_dtype__MLX_FLOAT64 {
             a = ctx.astype(a, mlx::mlx_dtype__MLX_FLOAT32)?;
