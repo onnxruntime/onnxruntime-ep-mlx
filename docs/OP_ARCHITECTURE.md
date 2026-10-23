@@ -162,6 +162,18 @@ dimensions are possible because ONNX inference disagrees with CPU/reference.
 String, complex, encoded payloads and native-wide dimensions remain outside this
 MLX array materialization path.
 
+`Flatten` validates full-width axes with the schema's bounds (nonnegative before
+opset 11) and checks both folded dimensions before narrowing to MLX int32 shapes.
+Products account for zero extents before multiplication, including scalar
+axis-zero inputs and large empty shapes; unrepresentable folded dimensions
+remain on CPU when known, or report an explicit runtime EP error otherwise.
+Dynamic or unknown-rank Flatten geometry uses shape-keyed compilation because
+its reshape target contains concrete products. `Transpose` requires a genuine
+permutation of every nonnegative input axis; negative, repeated and truncated
+wide axes are not normalized into valid permutations. Omitted permutations
+reverse the actual rank, including scalars; unknown ranks are shape-keyed.
+Both views preserve exact numeric/Boolean payload bits, with float64 on MLX CPU.
+
 Sequence **inputs** are supported by `SequenceLength`, `SequenceAt`, and
 `ConcatFromSequence` from opset 11 onward. These handlers execute eagerly and
 re-read the live ORT sequence on every invocation. Element copies own their MLX

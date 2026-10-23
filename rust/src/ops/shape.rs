@@ -569,13 +569,42 @@ fn reshape_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError
     Ok(())
 }
 
-fn transpose_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
-    let data = ctx.resolve(&n.inputs[0])?;
-    let rank = ctx.ndim(data) as i32;
-    let perm: Vec<i32> = match n.int_arrays.get("perm") {
-        Some(p) => p.iter().map(|&x| norm_axis(x, rank)).collect(),
-        None => (0..rank).rev().collect(),
+fn checked_transpose_perm(rank: usize, perm: Option<&[i64]>) -> Result<Vec<i32>, MlxError> {
+    let rank = i32::try_from(rank).map_err(|_| "Transpose rank exceeds int32".to_string())?;
+    let Some(perm) = perm else {
+        return Ok((0..rank).rev().collect());
     };
+    if perm.len() != rank as usize {
+        return Err("Transpose permutation length must equal input rank".to_string());
+    }
+    let mut seen = vec![false; perm.len()];
+    let mut result = Vec::with_capacity(perm.len());
+    for &axis in perm {
+        if axis < 0 || axis >= i64::from(rank) {
+            return Err(format!(
+                "Transpose axis {axis} is out of range for rank {rank}"
+            ));
+        }
+        let axis = axis as i32;
+        if seen[axis as usize] {
+            return Err("Transpose permutation must contain each axis exactly once".to_string());
+        }
+        seen[axis as usize] = true;
+        result.push(axis);
+    }
+    Ok(result)
+}
+
+fn transpose_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
+    let shape = ctx.tensor_shape(&n.inputs[0])?;
+    if shape
+        .iter()
+        .any(|&dim| dim < 0 || dim > i64::from(i32::MAX))
+    {
+        return Err("Transpose input dimensions must fit nonnegative int32".to_string());
+    }
+    let perm = checked_transpose_perm(shape.len(), n.int_arrays.get("perm").map(Vec::as_slice))?;
+    let data = ctx.resolve(&n.inputs[0])?;
     let t = ctx.transpose(data, &perm)?;
     // Zero-copy strided view; materialised to contiguous only if it reaches the output boundary.
     ctx.bind(&n.outputs[0], t);
@@ -667,24 +696,48 @@ fn rank_change_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxE
     Ok(())
 }
 
+fn checked_flatten_axis(rank: usize, axis: i64, allow_negative: bool) -> Result<usize, MlxError> {
+    let rank =
+        i64::from(i32::try_from(rank).map_err(|_| "Flatten rank exceeds int32".to_string())?);
+    if (!allow_negative && axis < 0) || axis < -rank || axis > rank {
+        return Err(format!(
+            "Flatten axis {axis} is out of range for rank {rank}"
+        ));
+    }
+    Ok((if axis < 0 { axis + rank } else { axis }) as usize)
+}
+
+fn checked_flatten_product(dims: &[i64]) -> Result<i32, MlxError> {
+    if dims.iter().any(|&dim| dim < 0 || dim > i64::from(i32::MAX)) {
+        return Err("Flatten input dimensions must fit nonnegative int32".to_string());
+    }
+    if dims.contains(&0) {
+        return Ok(0);
+    }
+    dims.iter().try_fold(1i32, |product, &dim| {
+        product
+            .checked_mul(dim as i32)
+            .ok_or_else(|| "Flatten folded dimension exceeds int32".to_string())
+    })
+}
+
+fn checked_flatten_shape(
+    shape: &[i64],
+    axis: i64,
+    allow_negative: bool,
+) -> Result<[i32; 2], MlxError> {
+    let axis = checked_flatten_axis(shape.len(), axis, allow_negative)?;
+    Ok([
+        checked_flatten_product(&shape[..axis])?,
+        checked_flatten_product(&shape[axis..])?,
+    ])
+}
+
 fn flatten_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
+    let shape = ctx.tensor_shape(&n.inputs[0])?;
+    let target = checked_flatten_shape(&shape, int_attr(n, "axis", 1), n.since_version >= 11)?;
     let data = ctx.resolve(&n.inputs[0])?;
-    let shape = ctx.shape_of(data);
-    let rank = shape.len() as i64;
-    let mut axis = int_attr(n, "axis", 1);
-    if axis < 0 {
-        axis += rank;
-    }
-    let mut outer: i32 = 1;
-    let mut inner: i32 = 1;
-    for (i, &d) in shape.iter().enumerate() {
-        if (i as i64) < axis {
-            outer *= d;
-        } else {
-            inner *= d;
-        }
-    }
-    let r = ctx.reshape(data, &[outer, inner])?;
+    let r = ctx.reshape(data, &target)?;
     ctx.bind(&n.outputs[0], r);
     Ok(())
 }
@@ -2264,7 +2317,7 @@ fn reshape_claim(node: &NodeView) -> ClaimResult {
     Ok(())
 }
 
-fn transpose_claim(node: &NodeView) -> ClaimResult {
+fn movable_view_claim(node: &NodeView) -> ClaimResult {
     require!(
         node.num_inputs() == 1 && node.num_outputs() == 1,
         "expects 1 input and 1 output, got {}in/{}out",
@@ -2277,7 +2330,7 @@ fn transpose_claim(node: &NodeView) -> ClaimResult {
     };
     require!(
         is_movable(data),
-        "input dtype {} is not a movable dtype supported on GPU",
+        "input dtype {} is not a movable numeric/Boolean dtype",
         crate::registry::ort_dtype_name(data)
     );
     require!(
@@ -2287,6 +2340,39 @@ fn transpose_claim(node: &NodeView) -> ClaimResult {
         crate::registry::ort_dtype_name(data)
     );
     Ok(())
+}
+
+fn transpose_claim(node: &NodeView) -> ClaimResult {
+    movable_view_claim(node)?;
+    let info = match node.input_info(0) {
+        Some(info) => info,
+        None => deny!("Transpose requires tensor data"),
+    };
+    require!(
+        info.shape.iter().all(|&dim| dim <= i64::from(i32::MAX)),
+        "Transpose input dimensions must fit int32"
+    );
+    let (have_perm, perm) = node.ints_attr("perm");
+    if node.input_rank_known(0) == Some(true) || have_perm {
+        let rank = if node.input_rank_known(0) == Some(true) {
+            info.shape.len()
+        } else {
+            perm.len()
+        };
+        let checked = checked_transpose_perm(rank, have_perm.then_some(perm.as_slice()));
+        require!(checked.is_ok(), "{}", checked.unwrap_err());
+    }
+    Ok(())
+}
+
+fn transpose_compile_shape_safety(node: &NodeView) -> crate::registry::CompileShapeSafety {
+    if node.input_rank_known(0) == Some(true) {
+        crate::registry::CompileShapeSafety::Shapeless
+    } else {
+        crate::registry::CompileShapeSafety::ShapeKeyedOnly {
+            reason: "a runtime input rank determines the transpose permutation",
+        }
+    }
 }
 
 fn rank_change_claim(node: &NodeView) -> ClaimResult {
@@ -2398,7 +2484,51 @@ fn rank_change_compile_shape_safety(node: &NodeView) -> crate::registry::Compile
 }
 
 fn flatten_claim(node: &NodeView) -> ClaimResult {
-    transpose_claim(node)
+    movable_view_claim(node)?;
+    let info = match node.input_info(0) {
+        Some(info) => info,
+        None => deny!("Flatten requires tensor data"),
+    };
+    require!(
+        info.shape.iter().all(|&dim| dim <= i64::from(i32::MAX)),
+        "Flatten input dimensions must fit int32"
+    );
+    let axis = node.int_attr("axis", 1);
+    require!(
+        (-i64::from(i32::MAX)..=i64::from(i32::MAX)).contains(&axis),
+        "Flatten axis exceeds the native int32 rank range"
+    );
+    require!(
+        node.since_version() >= 11 || axis >= 0,
+        "Flatten before schema11 requires nonnegative axis"
+    );
+    if node.input_rank_known(0) == Some(true) {
+        let axis = match checked_flatten_axis(info.shape.len(), axis, node.since_version() >= 11) {
+            Ok(axis) => axis,
+            Err(error) => deny!("{error}"),
+        };
+        for dims in [&info.shape[..axis], &info.shape[axis..]] {
+            if dims.iter().all(|&dim| dim >= 0) {
+                let checked = checked_flatten_product(dims);
+                require!(checked.is_ok(), "{}", checked.unwrap_err());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn flatten_compile_shape_safety(node: &NodeView) -> crate::registry::CompileShapeSafety {
+    if node.input_rank_known(0) == Some(true)
+        && node
+            .input_info(0)
+            .is_some_and(|info| info.shape.iter().all(|&dim| dim > 0))
+    {
+        crate::registry::CompileShapeSafety::Shapeless
+    } else {
+        crate::registry::CompileShapeSafety::ShapeKeyedOnly {
+            reason: "concrete flattened products must not freeze across changing input geometry",
+        }
+    }
 }
 
 fn expand_claim(node: &NodeView) -> ClaimResult {
@@ -2831,7 +2961,7 @@ fn identity_claim(node: &NodeView) -> ClaimResult {
         ),
         _ => deny!("Identity: missing input or output type information"),
     }
-    transpose_claim(node)
+    movable_view_claim(node)
 }
 
 fn range_claim(node: &NodeView) -> ClaimResult {
@@ -3429,7 +3559,17 @@ pub fn register(registry: &mut OpRegistry) {
     );
     shapeless(registry, "Concat", concat_op, concat_claim);
     shapeless(registry, "Reshape", reshape_op, reshape_claim);
-    shapeless(registry, "Transpose", transpose_op, transpose_claim);
+    registry.register_shape_classified(
+        OpRegistration {
+            domain: "",
+            op_type: "Transpose",
+            min_opset: 1,
+            max_opset: K_ANY_OPSET,
+            handler: transpose_op,
+            claim: transpose_claim,
+        },
+        transpose_compile_shape_safety,
+    );
     for op_type in ["Unsqueeze", "Squeeze"] {
         registry.register_shape_classified(
             OpRegistration {
@@ -3443,7 +3583,17 @@ pub fn register(registry: &mut OpRegistry) {
             rank_change_compile_shape_safety,
         );
     }
-    shapeless(registry, "Flatten", flatten_op, flatten_claim);
+    registry.register_shape_classified(
+        OpRegistration {
+            domain: "",
+            op_type: "Flatten",
+            min_opset: 1,
+            max_opset: K_ANY_OPSET,
+            handler: flatten_op,
+            claim: flatten_claim,
+        },
+        flatten_compile_shape_safety,
+    );
     shapeless(registry, "Expand", expand_op, expand_claim);
     shape_keyed(
         registry,
@@ -3525,9 +3675,84 @@ pub fn register(registry: &mut OpRegistry) {
 #[cfg(test)]
 mod tests {
     use super::{
-        checked_pad_axes, checked_pad_geometry, checked_rank_change_axes, checked_split_sizes,
-        integer_range_count,
+        checked_flatten_axis, checked_flatten_shape, checked_pad_axes, checked_pad_geometry,
+        checked_rank_change_axes, checked_split_sizes, checked_transpose_perm, integer_range_count,
     };
+
+    #[test]
+    fn transpose_permutations_preserve_rank_and_full_width_bounds() {
+        assert_eq!(checked_transpose_perm(0, None).unwrap(), Vec::<i32>::new());
+        assert_eq!(
+            checked_transpose_perm(0, Some(&[])).unwrap(),
+            Vec::<i32>::new()
+        );
+        assert_eq!(checked_transpose_perm(3, None).unwrap(), vec![2, 1, 0]);
+        assert_eq!(
+            checked_transpose_perm(3, Some(&[1, 2, 0])).unwrap(),
+            vec![1, 2, 0]
+        );
+        for perm in [
+            vec![],
+            vec![0],
+            vec![0, 0],
+            vec![-1, 0],
+            vec![0, 2],
+            vec![i64::MIN, 0],
+            vec![i64::MAX, 0],
+            vec![1 << 32, 1],
+        ] {
+            assert!(checked_transpose_perm(2, Some(&perm)).is_err());
+        }
+    }
+
+    #[test]
+    fn flatten_axes_obey_schema_versions_and_scalar_bounds() {
+        assert_eq!(checked_flatten_shape(&[], 0, false).unwrap(), [1, 1]);
+        assert_eq!(
+            checked_flatten_shape(&[2, 3, 4], -3, true).unwrap(),
+            [1, 24]
+        );
+        assert_eq!(checked_flatten_shape(&[2, 3, 4], -1, true).unwrap(), [6, 4]);
+        assert_eq!(checked_flatten_shape(&[2, 3, 4], 3, true).unwrap(), [24, 1]);
+        assert!(checked_flatten_axis(3, -1, false).is_err());
+        assert!(checked_flatten_axis(0, 1, true).is_err());
+        for axis in [i64::MIN, i64::MAX, 1 << 32, -4, 4] {
+            assert!(checked_flatten_axis(3, axis, true).is_err());
+        }
+    }
+
+    #[test]
+    fn flatten_products_are_zero_aware_and_never_narrow_overflow() {
+        assert_eq!(
+            checked_flatten_shape(&[65536, 65536, 0], 0, true).unwrap(),
+            [1, 0]
+        );
+        assert_eq!(
+            checked_flatten_shape(&[65536, 65536, 0], 1, true).unwrap(),
+            [65536, 0]
+        );
+        assert_eq!(
+            checked_flatten_shape(&[0, 65536, 65536], 2, true).unwrap(),
+            [0, 65536]
+        );
+        assert_eq!(
+            checked_flatten_shape(
+                &[
+                    0,
+                    i64::from(i32::MAX),
+                    i64::from(i32::MAX),
+                    i64::from(i32::MAX)
+                ],
+                4,
+                true
+            )
+            .unwrap(),
+            [0, 1]
+        );
+        for shape in [vec![0, 65536, 65536], vec![0, 1 << 32], vec![0, -1]] {
+            assert!(checked_flatten_shape(&shape, 1, true).is_err());
+        }
+    }
 
     #[test]
     fn rank_changes_preserve_axes_presence_and_scalar_geometry() {
