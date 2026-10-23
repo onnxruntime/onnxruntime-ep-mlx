@@ -211,6 +211,11 @@ and zero for any empty dimension. Non-MLX payloads use eager metadata reads;
 dynamic or intermediate numeric geometry uses shape-keyed compilation. This does not enable
 string/encoded payload outputs or control-flow array boundaries.
 Fully static graph-input/initializer metadata retains shapeless eligibility.
+Double inputs captured by `If`, `Loop`, or `Scan` bodies may be read by `Shape`
+and `Size` without importing their payloads. These bodies and their enclosing
+control-flow nodes stay eager, including for static geometry; unrelated numeric
+work retains its existing compilation eligibility. Actual Double computation
+inside control-flow bodies remains declined.
 Existing host-value specialization and eager fences still protect geometry
 controlled by changing parameter values; root input shapes alone are not a
 sufficient cache key. General capture value-specializes supported boundary

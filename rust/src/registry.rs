@@ -258,6 +258,11 @@ fn registry() -> &'static OpRegistry {
 
 /// Compile-shape capability declared by the registered lowering for one concrete node.
 pub fn compile_shape_safety(node: &NodeView) -> CompileShapeSafety {
+    if requires_float64_metadata_eager_boundary(node) {
+        return CompileShapeSafety::EagerOnly {
+            reason: "float64 metadata reads must not import payloads into a compiled GPU closure",
+        };
+    }
     registry().compile_shape_safety(node)
 }
 
@@ -1550,21 +1555,41 @@ impl GraphView {
         })
     }
 
-    /// Any node anywhere in this body (including nested bodies) carries a float64 tensor.
+    /// Any node anywhere in this body (including nested bodies) consumes a float64 payload.
     ///
     /// A control-flow node is claimed as a whole and its body is translated inside the parent's
     /// plan, so the body never gets a cluster — or a stream — of its own. GetCapability's fp64
     /// colouring only sees the control-flow node itself, so a float64 tensor buried in a body would
-    /// otherwise ride along on the GPU stream and hard-error inside MLX. Callers use this to decline
-    /// such bodies outright.
-    pub fn body_uses_float64(&self) -> bool {
+    /// otherwise ride along on the GPU stream and hard-error inside MLX. Shape and Size only read
+    /// metadata; their recursive eager boundary prevents the compiled input importer from wrapping
+    /// the ignored payload in an MLX array.
+    pub fn body_uses_float64_data(&self) -> bool {
         self.nodes().iter().any(|n| {
-            node_uses_float64(n)
+            (node_uses_float64(n) && !is_float64_metadata_read(n))
                 || n.subgraphs()
                     .iter()
-                    .any(|(_, body)| body.body_uses_float64())
+                    .any(|(_, body)| body.body_uses_float64_data())
         })
     }
+}
+
+fn is_float64_metadata_read(node: &NodeView) -> bool {
+    matches!(node.domain().as_str(), "" | "ai.onnx")
+        && matches!(node.op_type().as_str(), "Shape" | "Size")
+        && node.num_inputs() == 1
+        && node.num_outputs() == 1
+        && node.input_info(0).is_some_and(|s| is_float64(s.dtype))
+        && node.output_info(0).is_some_and(|s| {
+            s.dtype == ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64
+        })
+}
+
+pub(crate) fn requires_float64_metadata_eager_boundary(node: &NodeView) -> bool {
+    node.subgraphs().iter().any(|(_, body)| {
+        body.nodes().iter().any(|child| {
+            is_float64_metadata_read(child) || requires_float64_metadata_eager_boundary(child)
+        })
+    })
 }
 
 pub(crate) fn requires_random_eager_boundary(node: &NodeView) -> bool {
