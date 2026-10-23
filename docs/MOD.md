@@ -23,12 +23,20 @@ This avoids Metal's fused remainder precision loss and subnormal-divisor
 flushing without introducing a custom kernel or falling back to ORT CPU.
 DOUBLE remains DOUBLE throughout. Zero divisors, NaNs, and infinite operands follow the floating
 `fmod` contract. Signed-zero inputs are preserved when the result is zero.
-Floating Mod therefore trades GPU fusion for correctness; it remains a live
-dependency in general compiled replay, rather than a host-computed constant.
+Floating Mod therefore trades GPU fusion for correctness. Mod is explicitly
+eager-only on the general, decode, and prefill routes, including when ordinary
+compilation is enabled. Mixed graphs partition around this eager node; the
+CPU primitive chain casts back before its output can reach a GPU consumer.
+Live operands are recomputed on every call, never captured as constants.
+The eager Mod boundary is honored in non-decoder graphs as well, so adjacent
+eligible GPU operations keep their own general compiled partitions.
 
 Integer Mod checks for zero divisors on every execution and reports an EP
 error, including after a successful run of the same shape. It uses the eager
 MLX route so this validation cannot be captured once and omitted on replay.
+This intentionally also changes integer Mod routing: preserving compilation
+would require a separate per-execution value-validation mechanism on all
+compiled routes, not merely dtype-aware eligibility.
 Signed minimum divided by minus one produces a zero remainder without
 executing overflowing signed division. Integer arithmetic never passes
 through a floating-point representation.

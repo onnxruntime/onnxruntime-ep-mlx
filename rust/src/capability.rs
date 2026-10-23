@@ -152,7 +152,9 @@ pub(crate) unsafe fn get_capability(
             .iter()
             .map(|&node| {
                 let view = NodeView::new(ort_api, raw_nodes_by_id[&node]);
-                if decoder_graph {
+                let metadata = &snapshot.nodes[&node];
+                let mod_boundary = metadata.domain.is_empty() && metadata.op_type == "Mod";
+                if decoder_graph || mod_boundary {
                     crate::registry::compile_shape_safety(&view).partition_class()
                 } else {
                     CompilePartitionClass::Shapeless

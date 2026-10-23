@@ -3,6 +3,10 @@
 from fractions import Fraction
 import json
 import math
+import os
+from pathlib import Path
+import subprocess
+import sys
 
 import ml_dtypes
 import numpy as np
@@ -73,7 +77,7 @@ def _float_inputs(dtype):
 
 @pytest.mark.parametrize("dtype,np_dtype", FLOATS)
 @pytest.mark.parametrize("opset", [10, 13, 26])
-@pytest.mark.parametrize("eager", [False, True], ids=["general", "eager"])
+@pytest.mark.parametrize("eager", [False, True], ids=["default-route", "forced-eager"])
 def test_mod_floating_exact_replay(dtype, np_dtype, opset, eager, monkeypatch):
     monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_COMPILE", "1" if eager else "0")
     a, b = _float_inputs(np_dtype)
@@ -87,7 +91,7 @@ def test_mod_floating_exact_replay(dtype, np_dtype, opset, eager, monkeypatch):
 
 @pytest.mark.parametrize("dtype,np_dtype", FLOATS)
 @pytest.mark.parametrize("shapes", [((), ()), ((), (4,)), ((4,), ()), ((2, 1, 4), (3, 1))])
-@pytest.mark.parametrize("eager", [False, True], ids=["general", "eager"])
+@pytest.mark.parametrize("eager", [False, True], ids=["default-route", "forced-eager"])
 def test_mod_scalar_multidirectional(dtype, np_dtype, shapes, eager, monkeypatch):
     monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_COMPILE", "1" if eager else "0")
     a_shape, b_shape = shapes
@@ -102,7 +106,7 @@ def test_mod_scalar_multidirectional(dtype, np_dtype, shapes, eager, monkeypatch
 
 
 @pytest.mark.parametrize("dtype,np_dtype", FLOATS)
-@pytest.mark.parametrize("eager", [False, True], ids=["general", "eager"])
+@pytest.mark.parametrize("eager", [False, True], ids=["default-route", "forced-eager"])
 def test_mod_floating_bit_patterns(dtype, np_dtype, eager, monkeypatch):
     monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_COMPILE", "1" if eager else "0")
     rng = np.random.default_rng(1907)
@@ -114,7 +118,7 @@ def test_mod_floating_bit_patterns(dtype, np_dtype, eager, monkeypatch):
 
 
 @pytest.mark.parametrize("dtype,np_dtype", FLOATS)
-@pytest.mark.parametrize("eager", [False, True], ids=["general", "eager"])
+@pytest.mark.parametrize("eager", [False, True], ids=["default-route", "forced-eager"])
 def test_mod_symbolic_empty_replay(dtype, np_dtype, eager, monkeypatch):
     monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_COMPILE", "1" if eager else "0")
     model = m.make_model(
@@ -130,7 +134,7 @@ def test_mod_symbolic_empty_replay(dtype, np_dtype, eager, monkeypatch):
         _assert_float_exact(session.run(None, {"a": a, "b": b})[0], _fmod_reference(a, b))
 
 
-@pytest.mark.parametrize("eager", [False, True], ids=["general", "eager"])
+@pytest.mark.parametrize("eager", [False, True], ids=["default-route", "forced-eager"])
 def test_mod_bfloat16_exact_replay(eager, monkeypatch, tmp_path):
     monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_COMPILE", "1" if eager else "0")
     a, b = _float_inputs(np.float32)
@@ -253,3 +257,94 @@ def test_mod_invalid_float_attribute_rejected(fmod):
     with pytest.raises(Exception, match="fmod"):
         session = m._session(model, m.EP_PROVIDERS)
         session.run(None, {"a": np.array([7, -7], np.float32), "b": np.array([3, 3], np.float32)})
+
+
+def _mixed_route_replay(case):
+    dtype, np_dtype = {
+        "float": (DT.FLOAT, np.float32),
+        "double": (DT.DOUBLE, np.float64),
+        "int64": (DT.INT64, np.int64),
+        "bfloat16": (DT.BFLOAT16, ml_dtypes.bfloat16),
+    }[case]
+    boundary_dtype = DT.FLOAT if case == "bfloat16" else dtype
+    shape = [1, "T", 4]
+    a, b, offset = [m.tensor(name, boundary_dtype, shape) for name in ("a", "b", "offset")]
+    inputs = [a, b, offset]
+    nodes = []
+    if case == "bfloat16":
+        a, b, offset = [m.tensor(name, dtype, shape) for name in ("a_bf", "b_bf", "offset_bf")]
+        for source, dest in zip(inputs, (a, b, offset), strict=True):
+            nodes.append(ir.node("Cast", [source], attributes={"to": int(dtype)}, outputs=[dest]))
+    added, remainder, result = [m.tensor(name, dtype, shape) for name in ("added", "mod", "result")]
+    nodes.extend([
+        ir.node("Add", [a, offset], outputs=[added]),
+        ir.node("Mod", [added, b], attributes={"fmod": 0 if case == "int64" else 1}, outputs=[remainder]),
+        ir.node("Add", [remainder, offset], outputs=[result]),
+    ])
+    if case == "bfloat16":
+        out = m.tensor("out", DT.FLOAT, shape)
+        nodes.append(ir.node("Cast", [result], attributes={"to": int(DT.FLOAT)}, outputs=[out]))
+    else:
+        out = result
+    graph = ir.Graph(inputs, [out], nodes=nodes, opset_imports={"": 13})
+    model = ir.to_proto(ir.Model(graph, ir_version=11)).SerializeToString()
+    session = m._session(model, m.EP_PROVIDERS)
+    session.disable_fallback()
+    calls = [(1, 10000), (1, -10000), (3, 7777)] if case == "int64" else [
+        (1, 10000), (3, -10000), (1, 7777),
+    ]
+    for index, (length, value) in enumerate(calls):
+        x = np.full((1, length, 4), value, dtype=np_dtype)
+        y = np.full(x.shape, 3, dtype=np_dtype)
+        z = np.full(x.shape, 1, dtype=np_dtype)
+        expected = (
+            _integer_reference(x + z, y, False)
+            if case == "int64" else _fmod_reference(x + z, y)
+        ) + z
+        feeds = {"a": x, "b": y, "offset": z}
+        if case == "bfloat16":
+            feeds = {name: array.astype(np.float32) for name, array in feeds.items()}
+            expected = expected.astype(np.float32)
+        actual = session.run(None, feeds)[0]
+        assert actual.dtype == expected.dtype
+        np.testing.assert_array_equal(actual, expected)
+        if case == "int64" and index == 0:
+            with pytest.raises(Exception, match="Mod integer divisor must not contain zero"):
+                session.run(None, {**feeds, "b": np.zeros_like(y)})
+
+
+@pytest.mark.parametrize("case", ["float", "double", "int64", "bfloat16"])
+def test_mod_actual_route_and_mixed_graph(case, tmp_path):
+    trace = tmp_path / "mod_route.json"
+    code = (
+        "import os; import onnxruntime as ort; "
+        "ort.register_execution_provider_library('MLXExecutionProvider', "
+        "os.environ['ONNXRUNTIME_MLX_EP_LIB']); "
+        "from test_mod_contracts import _mixed_route_replay; "
+        f"_mixed_route_replay({case!r})"
+    )
+    subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=Path(__file__).parent,
+        env={
+            **os.environ, "ONNXRUNTIME_EP_MLX_TRACE": str(trace),
+            "ONNXRUNTIME_EP_MLX_NO_COMPILE": "0",
+            "ONNXRUNTIME_EP_MLX_NO_GENERAL_COMPILE": "0",
+            "ORT_DISABLE_TELEMETRY": "1",
+        },
+        check=True,
+        timeout=120,
+    )
+    events = json.loads(trace.read_text())
+    paths = [
+        event["args"]["path"] for event in events
+        if event.get("cat") == "ep.path" and "Mod" in event.get("args", {}).get("ops", "").split(",")
+    ]
+    assert len(paths) == 3, paths
+    assert set(paths) == {"eager"}, paths
+    add_paths = [
+        event["args"]["path"] for event in events
+        if event.get("cat") == "ep.path" and "Add" in event.get("args", {}).get("ops", "").split(",")
+    ]
+    assert len(add_paths) == (7 if case == "int64" else 6), add_paths
+    assert set(add_paths) == ({"eager"} if case == "double" else {"general"}), add_paths

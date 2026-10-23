@@ -862,19 +862,6 @@ fn mod_type_claimable(version: i32, fmod: i64, dtype: ort::ONNXTensorElementData
         }
 }
 
-fn mod_compile_shape_safety(node: &NodeView) -> CompileShapeSafety {
-    if node
-        .input_info(0)
-        .is_some_and(|input| is_signed_integer(input.dtype) || is_unsigned_integer(input.dtype))
-    {
-        CompileShapeSafety::EagerOnly {
-            reason: "integer Mod validates divisor values on every execution",
-        }
-    } else {
-        CompileShapeSafety::Shapeless
-    }
-}
-
 /// Mod10 permits integer fmod; Mod13 restricts fmod=0 to integers and fmod=1 to floats.
 fn mod_claim(node: &NodeView) -> ClaimResult {
     require!(
@@ -1140,7 +1127,7 @@ pub fn register(registry: &mut OpRegistry) {
     shapeless_since(registry, "IsNaN", 9, is_nan_op, float_predicate_claim);
 
     // Misc elementwise.
-    registry.register_shape_classified(
+    registry.register_eager(
         OpRegistration {
             domain: "",
             op_type: "Mod",
@@ -1149,7 +1136,7 @@ pub fn register(registry: &mut OpRegistry) {
             handler: mod_op,
             claim: mod_claim,
         },
-        mod_compile_shape_safety,
+        "Mod requires eager CPU floating primitives or per-execution integer divisor validation",
     );
     shapeless_since(registry, "BitShift", 11, bitshift_op, bitshift_claim);
 }
