@@ -90,7 +90,9 @@ independent (`fp16`/`fp32`/`fp64`, plus `bf16` from opset 22). Float64 stays on 
 Nearest uses ties-to-even and exact gathers for all supported integer/bool payloads, without
 lossy float conversions. Symbolic geometry, empty batch/channel/output axes, singleton input
 axes and changed live payload/grid values use checked shape-keyed execution. Input spatial
-axes must be positive; flattened counts and separable intermediates must fit int32 indexing.
+axes must be positive; nonempty flattened counts and separable intermediates must fit int32 indexing.
+Empty outputs read only input metadata, so an empty batch can retain large spatial extents
+without constructing a sampling-point count or importing unused payloads; output strides are checked.
 Higher-rank interpolation contracts spatial axes rather than allocating an exponential map.
 Reflection reduces normalized coordinates periodically before they can overflow or lose pixel
 offsets. Axes longer than float32's exact integer range use binary-rational integer indexing and

@@ -276,6 +276,7 @@ def test_grid_sample_dynamic_empty_singleton_and_recovery(mode, padding, align, 
         ((1, 2, 1, 5), (1, 3, 2, 2)),
         ((2, 0, 3, 1), (2, 1, 4, 2)),
         ((0, 2, 3, 4), (0, 3, 4, 2)),
+        ((0, 1, 2, 2), (0, 65536, 65536, 2)),
         ((2, 1, 1, 1), (2, 0, 3, 2)),
         ((2, 1, 1, 1), (2, 2, 0, 2)),
         ((2, 1, 1, 1), (2, 2, 2, 2)),
@@ -293,6 +294,22 @@ def test_grid_sample_dynamic_empty_singleton_and_recovery(mode, padding, align, 
         x, grid = _inputs(2)
         _assert(session.run(None, {"x": x, "grid": grid})[0],
                 _expected(x, grid, mode=mode, padding=padding, align=align))
+
+
+def test_grid_sample_large_empty_output_geometry(execution_mode):
+    for static in [False, True]:
+        x = np.ones((1, 1, 2, 2, 2), np.float32)
+        grid = np.empty((1, 65536, 65536, 0, 3), np.float32)
+        session = _session(_model(
+            3, mode="cubic", padding="reflection", align=1,
+            x_shape=list(x.shape) if static else None,
+            grid_shape=list(grid.shape) if static else None))
+        _assert(session.run(None, {"x": x, "grid": grid})[0],
+                _expected(x, grid, mode="cubic", padding="reflection", align=1))
+        if not static:
+            x, grid = _inputs(3)
+            _assert(session.run(None, {"x": x, "grid": grid})[0],
+                    _expected(x, grid, mode="cubic", padding="reflection", align=1))
 
 
 @pytest.mark.parametrize("mode", ["linear", "nearest", "cubic"])

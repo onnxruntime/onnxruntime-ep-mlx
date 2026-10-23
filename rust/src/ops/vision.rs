@@ -308,10 +308,13 @@ fn out_dtype(n: &NodeDesc) -> mlx::mlx_dtype {
 // =================================================================================================
 
 fn gs_product(dims: &[i32]) -> Result<i32, MlxError> {
+    if dims.iter().any(|&d| d < 0) {
+        return Err("GridSample: dimensions must be nonnegative".into());
+    }
+    if dims.contains(&0) {
+        return Ok(0);
+    }
     dims.iter().try_fold(1i32, |a, &b| {
-        if b < 0 {
-            return Err("GridSample: dimensions must be nonnegative".into());
-        }
         a.checked_mul(b)
             .ok_or_else(|| "GridSample: element count exceeds int32 indexing".into())
     })
@@ -329,11 +332,18 @@ fn gs_shape(x: &[i32], grid: &[i32]) -> Result<Vec<i32>, MlxError> {
     if x[2..].iter().any(|&d| d <= 0) {
         return Err("GridSample: input spatial dimensions must be positive".into());
     }
-    gs_product(x)?;
-    gs_product(grid)?;
     let mut out = vec![x[0], x[1]];
     out.extend_from_slice(&grid[1..grid.len() - 1]);
-    gs_product(&out)?;
+    let count = gs_product(&out)?;
+    out.iter().rev().try_fold(1i64, |stride, &dim| {
+        stride
+            .checked_mul(i64::from(dim))
+            .ok_or("GridSample: output strides exceed int64")
+    })?;
+    if count != 0 {
+        gs_product(x)?;
+        gs_product(grid)?;
+    }
     Ok(out)
 }
 
@@ -729,14 +739,19 @@ fn gs_gather(
 }
 
 fn grid_sample_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
-    let x = ctx.resolve(&n.inputs[0])?;
-    let grid = ctx.resolve(&n.inputs[1])?;
-    let xs = ctx.shape_of(x);
-    let gs = ctx.shape_of(grid);
+    let mut shapes = Vec::with_capacity(2);
+    for input in &n.inputs {
+        let shape = ctx.tensor_shape(input)?;
+        let shape: Vec<i32> = shape
+            .into_iter()
+            .map(|d| i32::try_from(d).map_err(|_| "GridSample: dimension exceeds int32"))
+            .collect::<Result<_, _>>()?;
+        shapes.push(shape);
+    }
+    let (xs, gs) = (&shapes[0], &shapes[1]);
     let out_shape = gs_shape(&xs, &gs)?;
     let rank = xs.len() - 2;
     let (nn, cc) = (xs[0], xs[1]);
-    let p = gs_product(&gs[1..gs.len() - 1])?;
     if gs_product(&out_shape)? == 0 {
         let out = ctx.emit(|res, s| unsafe {
             mlx::mlx_zeros(res, out_shape.as_ptr(), out_shape.len(), out_dtype(n), s)
@@ -744,6 +759,9 @@ fn grid_sample_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxE
         ctx.bind(&n.outputs[0], out);
         return Ok(());
     }
+    let p = gs_product(&gs[1..gs.len() - 1])?;
+    let x = ctx.resolve(&n.inputs[0])?;
+    let grid = ctx.resolve(&n.inputs[1])?;
     let mode = n
         .strings
         .get("mode")
@@ -2518,8 +2536,18 @@ mod tests {
             gs_shape(&[2, 0, 1, 2, 3], &[2, 0, 7, 8, 3]).unwrap(),
             [2, 0, 0, 7, 8]
         );
+        assert_eq!(
+            gs_shape(&[0, 1, 2, 2], &[0, 65536, 65536, 2]).unwrap(),
+            [0, 1, 65536, 65536]
+        );
+        assert_eq!(
+            gs_shape(&[1, 1, 2, 2, 2], &[1, 65536, 65536, 0, 3]).unwrap(),
+            [1, 1, 65536, 65536, 0]
+        );
+        assert_eq!(gs_product(&[i32::MAX, i32::MAX, 0]).unwrap(), 0);
         assert!(gs_product(&[2, i32::MAX]).is_err());
         assert!(gs_product(&[-1, 2]).is_err());
+        assert!(gs_product(&[0, -1]).is_err());
         for (x, grid) in [
             (vec![1, 2], vec![1, 2]),
             (vec![1, 2, 3], vec![1, 2, 2]),
@@ -2530,6 +2558,10 @@ mod tests {
             (vec![1, 1, 3, 4], vec![1, -1, 3, 2]),
             (vec![1, 2, i32::MAX, 2], vec![1, 1, 1, 2]),
             (vec![1, 2, 3, 4], vec![1, i32::MAX, 2, 2]),
+            (
+                vec![0, 1, 1, 1, 1, 1],
+                vec![0, i32::MAX, i32::MAX, i32::MAX, 1, 4],
+            ),
         ] {
             assert!(gs_shape(&x, &grid).is_err(), "{x:?} / {grid:?}");
         }
