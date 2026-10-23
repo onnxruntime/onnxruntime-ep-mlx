@@ -197,6 +197,25 @@ element. Boundary values use the existing bounded general-capture keys, while
 unguarded interior controls execute eagerly. Scalar inputs and known input
 dimensions beyond MLX's int32 array geometry remain unclaimed.
 
+`Pad` handles version-1 `paddings` and version-2 size/value attributes, modern
+int64 `pads`, and optional int32/int64 axes. Constant and live boundary
+parameters use the existing bounded full-value general-cache keys; interior
+data-dependent pads/axes stay eager. The fill value remains live graph data,
+not a host specialization parameter. Signed pads crop before edge, wrap and
+reflection padding. Constant mode preserves original-coordinate overlap,
+including removal beyond an edge compensated by padding at the other edge.
+Empty/scalar outputs, exact numeric/Boolean payloads, and float64 CPU movement
+retain their types and bits. Reflection composes repeated folds and singleton
+broadcasts where native padding kernels reject wider pads. Dimensions,
+products, vector/scalar ranks and normalized unique axes are checked before
+native allocation; nonconstant modes cannot extend an empty cropped axis.
+Wrap requires schema 19 or newer. String, complex and encoded element formats
+remain outside this tensor materialization path, not proven impossible
+backend operations.
+ORT 1.31's shape inference rejects constant int32 axes before provider
+selection; int64 initializers and int32 graph values avoid that frontend
+limitation.
+
 `InstanceNormalization`, `LpNormalization`, and `LRN` support their legacy
 schemas, live numeric payloads, symbolic/unknown ranks, and empty dimensions.
 Instance normalization requires rank at least three and exact channel vectors;
