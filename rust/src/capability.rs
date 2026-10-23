@@ -158,9 +158,8 @@ pub(crate) unsafe fn get_capability(
                 if crate::registry::requires_random_eager_boundary(&view)
                     || crate::registry::requires_unique_eager_boundary(&view)
                     || crate::registry::requires_elementary_contrib_eager_boundary(&view)
+                    || crate::registry::requires_float64_metadata_eager_boundary(&view)
                 {
-                    CompilePartitionClass::Eager
-                } else if crate::registry::requires_float64_metadata_eager_boundary(&view) {
                     CompilePartitionClass::Eager
                 } else if decoder_graph || mod_boundary || nonzero_boundary {
                     crate::registry::compile_shape_safety(&view).partition_class()
