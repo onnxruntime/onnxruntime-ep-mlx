@@ -3,8 +3,9 @@
 
 use crate::engine::{MlxError, NodeDesc, TranslationContext, mlx_dtype_from_onnx};
 use crate::registry::{
-    ClaimResult, K_ANY_OPSET, NodeView, OpRegistration, OpRegistry, is_mlx_cpu_float, is_mlx_float,
-    is_signed_integer, scalar_or_suffix_broadcast,
+    ClaimResult, CompileShapeSafety, K_ANY_OPSET, NodeView, OpRegistration, OpRegistry,
+    is_mlx_cpu_float, is_mlx_float, is_signed_integer, is_unsigned_integer,
+    scalar_or_suffix_broadcast,
 };
 use crate::sys::mlx;
 use crate::{deny, require};
@@ -45,20 +46,125 @@ fn div_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
     Ok(())
 }
 
-/// Pow: `base ** exp`. ONNX allows a differently-typed exponent (output keeps the base dtype), so we
-/// cast the exponent up to the base dtype before `mlx_power`. Only float bases are claimed (see
-/// `pow_claim`), which lets the EP serve type/opset combinations ORT's CPU kernel does not implement
-/// (e.g. `float32 ** uint32`, legacy opset-6 `Pow-1`).
-fn pow_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
-    let a = ctx.resolve(&n.inputs[0])?;
-    let mut b = ctx.resolve(&n.inputs[1])?;
-    let at = ctx.dtype_of(a);
-    if ctx.dtype_of(b) != at {
-        b = ctx.astype(b, at)?;
+/// Keep every integer exponent bit without a 64-step multiplication graph. Each chunk has at most
+/// 24 significant bits, so its power-of-two-scaled floating exponent is exact even in float32.
+/// All factors have exponents of the same sign: no overflow/underflow cancellation is introduced.
+fn pow_integer_exponent(
+    ctx: &mut TranslationContext,
+    a: mlx::mlx_array,
+    b: mlx::mlx_array,
+) -> Result<mlx::mlx_array, MlxError> {
+    let signed = matches!(
+        ctx.dtype_of(b),
+        mlx::mlx_dtype__MLX_INT8
+            | mlx::mlx_dtype__MLX_INT16
+            | mlx::mlx_dtype__MLX_INT32
+            | mlx::mlx_dtype__MLX_INT64
+    );
+    let integer_type = if signed {
+        mlx::mlx_dtype__MLX_INT64
+    } else {
+        mlx::mlx_dtype__MLX_UINT64
+    };
+    let b = ctx.astype(b, integer_type)?;
+    let zero = ctx.scalar_i64(0);
+    let zero = ctx.astype(zero, integer_type)?;
+    let one = ctx.scalar_i64(1);
+    let one = ctx.astype(one, integer_type)?;
+    let negative = ctx.binary(mlx::mlx_less, b, zero)?;
+    // For negative n, ~n is |n|-1, including INT64_MIN without signed overflow.
+    let magnitude = if signed {
+        let complement = ctx.unary(mlx::mlx_bitwise_invert, b)?;
+        ctx.where_(negative, complement, b)?
+    } else {
+        b
+    };
+    let abs_a = ctx.unary(mlx::mlx_abs, a)?;
+    let float_one = scalar_like(ctx, a, 1.0)?;
+    let inverse = ctx.binary(mlx::mlx_divide, float_one, abs_a)?;
+    let mut result = ctx.where_(negative, inverse, float_one)?;
+    let mask = ctx.scalar_i64((1 << 24) - 1);
+    let mask = ctx.astype(mask, integer_type)?;
+    for shift in [0, 24, 48] {
+        let shift_array = ctx.scalar_i64(shift);
+        let shift_array = ctx.astype(shift_array, integer_type)?;
+        let chunk = ctx.binary(mlx::mlx_right_shift, magnitude, shift_array)?;
+        let chunk = ctx.binary(mlx::mlx_bitwise_and, chunk, mask)?;
+        let empty = ctx.binary(mlx::mlx_equal, chunk, zero)?;
+        let exponent = ctx.astype(chunk, ctx.dtype_of(a))?;
+        let scale = scalar_like(ctx, a, 2.0f64.powi(shift as i32))?;
+        let exponent = ctx.binary(mlx::mlx_multiply, exponent, scale)?;
+        let negated = ctx.unary(mlx::mlx_negative, exponent)?;
+        let exponent = ctx.where_(negative, negated, exponent)?;
+        let factor = ctx.binary(mlx::mlx_power, abs_a, exponent)?;
+        let factor = ctx.where_(empty, float_one, factor)?;
+        result = ctx.binary(mlx::mlx_multiply, result, factor)?;
     }
-    let r = ctx.binary(mlx::mlx_power, a, b)?;
-    ctx.bind(&n.outputs[0], r);
-    Ok(())
+    let parity = ctx.binary(mlx::mlx_bitwise_and, b, one)?;
+    let odd = ctx.binary(mlx::mlx_not_equal, parity, zero)?;
+    let float_zero = scalar_like(ctx, a, 0.0)?;
+    let below_zero = ctx.binary(mlx::mlx_less, a, float_zero)?;
+    // Reciprocal distinguishes -0 from +0; a<0 also covers -infinity.
+    let reciprocal = ctx.binary(mlx::mlx_divide, float_one, a)?;
+    let negative_zero = ctx.binary(mlx::mlx_less, reciprocal, float_zero)?;
+    let negative_base = ctx.binary(mlx::mlx_logical_or, below_zero, negative_zero)?;
+    let negative_result = ctx.binary(mlx::mlx_logical_and, negative_base, odd)?;
+    let negated = ctx.unary(mlx::mlx_negative, result)?;
+    ctx.where_(negative_result, negated, result)
+}
+
+/// ONNX keeps the base dtype, but never requires rounding the exponent to that dtype.
+fn pow_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
+    let mut a = ctx.resolve(&n.inputs[0])?;
+    let mut b = ctx.resolve(&n.inputs[1])?;
+    if n.since_version < 7 {
+        let rank = ctx.ndim(a);
+        let bshape = ctx.shape_of(b);
+        if *n.ints.get("broadcast").unwrap_or(&0) == 0 {
+            if ctx.shape_of(a) != bshape {
+                return Err("Pow-1 without broadcast requires equal runtime shapes".to_string());
+            }
+        } else {
+            let Some(last_axis) = rank.checked_sub(bshape.len()) else {
+                return Err("Pow-1 exponent rank exceeds base rank".to_string());
+            };
+            let axis = *n.ints.get("axis").unwrap_or(&(last_axis as i64));
+            if axis < 0 || axis as usize > last_axis {
+                return Err("Pow-1 broadcast axis is outside the base rank".to_string());
+            }
+            let mut shape = vec![1; rank];
+            shape[axis as usize..axis as usize + bshape.len()].copy_from_slice(&bshape);
+            if ctx
+                .shape_of(a)
+                .iter()
+                .zip(&shape)
+                .any(|(a, b)| a != b && *b != 1)
+            {
+                return Err("Pow-1 exponent does not broadcast to the base".to_string());
+            }
+            b = ctx.reshape(b, &shape)?;
+        }
+    }
+    let bt = ctx.dtype_of(b);
+    let r = if is_mlx_float_dtype(bt) {
+        // Both half formats embed exactly in float32, but neither embeds in the other.
+        let working = if ctx.dtype_of(a) == mlx::mlx_dtype__MLX_FLOAT64
+            || bt == mlx::mlx_dtype__MLX_FLOAT64
+        {
+            mlx::mlx_dtype__MLX_FLOAT64
+        } else {
+            mlx::mlx_dtype__MLX_FLOAT32
+        };
+        a = ctx.astype(a, working)?;
+        b = ctx.astype(b, working)?;
+        ctx.binary(mlx::mlx_power, a, b)?
+    } else {
+        if ctx.dtype_of(a) != mlx::mlx_dtype__MLX_FLOAT64 {
+            a = ctx.astype(a, mlx::mlx_dtype__MLX_FLOAT32)?;
+        }
+        pow_integer_exponent(ctx, a, b)?
+    };
+    bind_as_out(ctx, n, r)
 }
 
 fn relu_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
@@ -703,48 +809,8 @@ fn tanh_claim(node: &NodeView) -> ClaimResult {
     fp64_unary_claim(node)
 }
 
-/// Element byte width, for the Pow exponent-narrowing check. 0 for types we do not size here.
-fn dtype_byte_width(t: crate::sys::ort::ONNXTensorElementDataType) -> usize {
-    use crate::sys::ort as o;
-    match t {
-        x if x == o::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_DOUBLE
-            || x == o::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64
-            || x == o::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT64 =>
-        {
-            8
-        }
-        x if x == o::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT
-            || x == o::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32
-            || x == o::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT32 =>
-        {
-            4
-        }
-        x if x == o::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16
-            || x == o::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16
-            || x == o::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT16
-            || x == o::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT16 =>
-        {
-            2
-        }
-        x if x == o::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8
-            || x == o::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8
-            || x == o::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL =>
-        {
-            1
-        }
-        _ => 0,
-    }
-}
-
-/// Pow: float base (fp32/fp16/bf16/fp64), output keeps the base dtype, exponent may be any numeric
-/// type *no wider than the base*, scalar-or-suffix broadcast. Integer bases are left to ORT CPU
-/// (which serves them correctly).
-///
-/// The width rule matters because the handler casts the exponent to the base dtype before
-/// `mlx_power`. A wider exponent loses information in that cast, and for Pow the loss is not a
-/// rounding difference but a different answer: a small positive float64 exponent against a float16
-/// base rounds to exactly 0, turning `0 ** tiny` (== 0) into `0 ** 0` (== 1). Those combinations go
-/// to ORT CPU, which evaluates them in the exponent's own precision.
+/// Floating bases with every legal numeric exponent. Integer-base overflow and negative-exponent
+/// behavior is not shared by MLX integer power and ORT's floating power followed by an integer cast.
 fn pow_claim(node: &NodeView) -> ClaimResult {
     require!(
         node.num_inputs() == 2 && node.num_outputs() == 1,
@@ -767,15 +833,47 @@ fn pow_claim(node: &NodeView) -> ClaimResult {
         crate::registry::ort_dtype_name(a.dtype),
         crate::registry::ort_dtype_name(out.dtype)
     );
-    let (base_width, exp_width) = (dtype_byte_width(a.dtype), dtype_byte_width(b.dtype));
     require!(
-        base_width > 0 && exp_width > 0 && exp_width <= base_width,
-        "exponent dtype {} is wider than the base dtype {}; casting it down to the base would \
-         change the result (a tiny positive exponent rounds to 0, turning `0 ** tiny` into \
-         `0 ** 0`), so this combination is left to ORT CPU",
-        crate::registry::ort_dtype_name(b.dtype),
-        crate::registry::ort_dtype_name(a.dtype)
+        is_mlx_cpu_float(b.dtype) || is_signed_integer(b.dtype) || is_unsigned_integer(b.dtype),
+        "exponent must be a real floating-point or integer tensor"
     );
+    use crate::sys::ort as o;
+    let bf16 = o::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16;
+    let version = node.since_version();
+    require!(
+        (version >= 12 || a.dtype == b.dtype)
+            && (version >= 13 || a.dtype != bf16)
+            && (version >= 15 || b.dtype != bf16),
+        "input dtype combination is not legal for Pow-{version}"
+    );
+    if version < 7 {
+        let broadcast = node.int_attr("broadcast", 0);
+        require!(broadcast == 0 || broadcast == 1, "broadcast must be 0 or 1");
+        if broadcast == 0 {
+            require!(
+                a.shape == b.shape,
+                "Pow-1 without broadcast requires equal input shapes"
+            );
+        } else {
+            require!(
+                b.shape.len() <= a.shape.len(),
+                "Pow-1 exponent rank must not exceed base rank"
+            );
+            let axis = node.int_attr("axis", (a.shape.len() - b.shape.len()) as i64);
+            require!(
+                axis >= 0 && axis as usize <= a.shape.len() - b.shape.len(),
+                "Pow-1 axis must align the exponent within the base rank"
+            );
+            require!(
+                b.shape
+                    .iter()
+                    .zip(&a.shape[axis as usize..])
+                    .all(|(b, a)| { *b < 0 || *a < 0 || a == b || *b == 1 }),
+                "Pow-1 exponent must broadcast to the base at axis {axis}"
+            );
+        }
+        return Ok(());
+    }
     require!(
         scalar_or_suffix_broadcast(&a.shape, &b.shape),
         "only scalar or trailing-suffix broadcast is supported (shapes {:?} vs {:?})",
@@ -783,6 +881,16 @@ fn pow_claim(node: &NodeView) -> ClaimResult {
         b.shape
     );
     Ok(())
+}
+
+fn pow_compile_shape_safety(node: &NodeView) -> CompileShapeSafety {
+    if node.since_version() < 7 {
+        CompileShapeSafety::ShapeKeyedOnly {
+            reason: "legacy Pow validates and aligns concrete input extents",
+        }
+    } else {
+        CompileShapeSafety::Shapeless
+    }
 }
 
 /// Clip: fp32/fp16/bf16 or signed-integer input/output; any present `min`/`max` inputs must share
@@ -872,7 +980,17 @@ fn shapeless_dom(
 
 pub fn register(registry: &mut OpRegistry) {
     shapeless(registry, "Div", div_op, div_claim);
-    shapeless(registry, "Pow", pow_op, pow_claim);
+    registry.register_shape_classified(
+        OpRegistration {
+            domain: "",
+            op_type: "Pow",
+            min_opset: K_ANY_OPSET,
+            max_opset: K_ANY_OPSET,
+            handler: pow_op,
+            claim: pow_claim,
+        },
+        pow_compile_shape_safety,
+    );
     shapeless(registry, "Relu", relu_op, relu_claim);
     shapeless(registry, "Tanh", tanh_op, tanh_claim);
     shapeless(registry, "Exp", exp_op, float_unary_claim);
