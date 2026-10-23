@@ -218,6 +218,11 @@ parameters; decode and prefill reject host-read parameters unless they are
 immutable or proven shape-constant. This also protects live Reshape/Expand
 outputs when an unrelated metadata input has fully static geometry.
 
+`Loop` reads its trip count and initial condition on the host. As with `If`,
+node-produced controls are left to ORT CPU instead of being fused with their
+producers into a plan whose intermediate values cannot be read as host inputs.
+Graph-input and initializer controls retain live-value specialization.
+
 `Flatten` validates full-width axes with the schema's bounds (nonnegative before
 opset 11) and checks both folded dimensions before narrowing to MLX int32 shapes.
 Products account for zero extents before multiplication, including scalar
