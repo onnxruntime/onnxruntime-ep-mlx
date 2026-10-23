@@ -39,7 +39,7 @@ fn int_attr(n: &NodeDesc, name: &str, default: i64) -> i64 {
     n.ints.get(name).copied().unwrap_or(default)
 }
 
-/// Read a constant int64 parameter input (shape/axes/starts/...) at translate time.
+/// Read an int32/int64 parameter input (shape/axes/starts/...) at translate time.
 fn read_ints(ctx: &mut TranslationContext, n: &NodeDesc, i: usize) -> Result<Vec<i64>, MlxError> {
     ctx.read_ints_eval(&n.inputs[i])
 }
@@ -670,36 +670,84 @@ fn expand_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError>
     Ok(())
 }
 
+fn checked_slice_axes(
+    rank: usize,
+    starts: &[i64],
+    ends: &[i64],
+    axes: &[i64],
+    steps: &[i64],
+) -> Result<Vec<usize>, MlxError> {
+    if starts.len() != ends.len() || starts.len() != axes.len() || starts.len() != steps.len() {
+        return Err("MLX Slice: starts, ends, axes and steps must have equal lengths".to_string());
+    }
+    if steps.contains(&0) {
+        return Err("MLX Slice: step must not be zero".to_string());
+    }
+    let mut seen = vec![false; rank];
+    let mut normalized = Vec::with_capacity(axes.len());
+    for &axis in axes {
+        if axis < -(rank as i64) || axis >= rank as i64 {
+            return Err(format!(
+                "MLX Slice: axis {axis} is out of range for rank {rank}"
+            ));
+        }
+        let axis = norm_axis(axis, rank as i32) as usize;
+        if seen[axis] {
+            return Err(format!("MLX Slice: duplicate axis {axis}"));
+        }
+        seen[axis] = true;
+        normalized.push(axis);
+    }
+    Ok(normalized)
+}
+
+fn slice_list(
+    ctx: &mut TranslationContext,
+    n: &NodeDesc,
+    index: usize,
+    attr: &str,
+) -> Result<(bool, Vec<i64>), MlxError> {
+    if present(n, index) && ctx.tensor_shape(&n.inputs[index])?.len() != 1 {
+        return Err(format!("MLX Slice: {attr} must be a rank-one tensor"));
+    }
+    read_list_input_or_attr(ctx, n, index, attr)
+}
+
 fn slice_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
     let data = ctx.resolve(&n.inputs[0])?;
     let shape = ctx.shape_of(data);
     let rank = shape.len();
-    let starts = read_ints(ctx, n, 1)?;
-    let ends = read_ints(ctx, n, 2)?;
-    let axes: Vec<i64> = if present(n, 3) {
-        read_ints(ctx, n, 3)?
-    } else {
-        (0..starts.len() as i64).collect()
-    };
-    let steps: Vec<i64> = if present(n, 4) {
-        read_ints(ctx, n, 4)?
-    } else {
-        vec![1; starts.len()]
-    };
+    if rank == 0 {
+        return Err("MLX Slice: cannot slice a scalar".to_string());
+    }
+    let (have_starts, starts) = slice_list(ctx, n, 1, "starts")?;
+    let (have_ends, ends) = slice_list(ctx, n, 2, "ends")?;
+    if !have_starts || !have_ends {
+        return Err("MLX Slice: starts and ends are required".to_string());
+    }
+    let (have_axes, mut axes) = slice_list(ctx, n, 3, "axes")?;
+    if !have_axes {
+        axes = (0..starts.len() as i64).collect();
+    }
+    let (have_steps, mut steps) = slice_list(ctx, n, 4, "steps")?;
+    if !have_steps {
+        steps = vec![1; starts.len()];
+    }
+    let axes = checked_slice_axes(rank, &starts, &ends, &axes, &steps)?;
+    if starts.is_empty() {
+        ctx.bind(&n.outputs[0], data);
+        return Ok(());
+    }
 
     let mut start = vec![0i32; rank];
     let mut stop = shape.clone();
     let mut stride = vec![1i32; rank];
     let mut reverse_axes: Vec<(usize, i64, i64, i64)> = Vec::new();
     for i in 0..starts.len() {
-        let ax = norm_axis(axes[i], rank as i32) as usize;
+        let ax = axes[i];
         let dim = shape[ax] as i64;
-        let step = steps[i];
-        if step == 0 {
-            return Err("MLX Slice: step must not be zero".to_string());
-        }
-        let step_i32 = i32::try_from(step)
-            .map_err(|_| format!("MLX Slice: step {step} exceeds the MLX int32 index range"))?;
+        // A larger magnitude selects at most one element, so clip in integer arithmetic.
+        let step = steps[i].clamp(-dim.max(1), dim.max(1));
         let (s, e) = if step > 0 {
             let s = if starts[i] < 0 {
                 starts[i].saturating_add(dim)
@@ -728,7 +776,10 @@ fn slice_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> 
         start[ax] = s as i32;
         stop[ax] = e as i32;
         if step > 0 {
-            stride[ax] = step_i32;
+            stride[ax] = step as i32;
+        } else if s <= e {
+            start[ax] = 0;
+            stop[ax] = 0;
         } else {
             // MLX's slice wrapper re-normalizes a stop of -1, so it cannot represent ONNX's
             // reverse sentinel directly. Apply all forward axes as one view, then gather an
@@ -1946,9 +1997,14 @@ fn expand_claim(node: &NodeView) -> ClaimResult {
 
 fn slice_claim(node: &NodeView) -> ClaimResult {
     let nin = node.num_inputs();
+    let legacy = node.since_version() < 10;
     require!(
-        (3..=5).contains(&nin) && node.num_outputs() == 1,
-        "Slice expects 3-5 inputs and 1 output, got {}in/{}out",
+        (if legacy {
+            nin == 1
+        } else {
+            (3..=5).contains(&nin)
+        }) && node.num_outputs() == 1,
+        "Slice expects 1 legacy or 3-5 modern inputs and 1 output, got {}in/{}out",
         nin,
         node.num_outputs()
     );
@@ -1956,6 +2012,15 @@ fn slice_claim(node: &NodeView) -> ClaimResult {
         Some(v) => v,
         None => deny!("missing tensor type/shape info on the data input or output"),
     };
+    let data_info = node.input_info(0).ok_or("Slice: missing input metadata")?;
+    require!(
+        node.input_rank_known(0) != Some(true) || !data_info.shape.is_empty(),
+        "Slice: cannot slice a scalar"
+    );
+    require!(
+        data_info.shape.iter().all(|&dim| dim <= i32::MAX as i64),
+        "Slice: data dimensions must fit MLX int32 geometry"
+    );
     require!(
         is_movable(data),
         "data dtype {} is not a movable dtype supported on GPU",
@@ -1967,35 +2032,67 @@ fn slice_claim(node: &NodeView) -> ClaimResult {
         crate::registry::ort_dtype_name(out),
         crate::registry::ort_dtype_name(data)
     );
-    require!(
-        node.input_info(1).map(|i| i.dtype)
-            == Some(ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64)
-            && node.input_info(2).map(|i| i.dtype)
-                == Some(ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64),
-        "Slice `starts`/`ends` must be int64 (runtime shape-derived values resolve at trace time; a data-dependent value falls back to eager)"
-    );
-    if nin >= 4 && node.input_present(3) {
+    let (starts, ends, axes, steps) = if legacy {
+        let (have_starts, starts) = node.ints_attr("starts");
+        let (have_ends, ends) = node.ints_attr("ends");
         require!(
-            node.is_const_int64(3),
-            "Slice: `axes` must be a constant int64 initializer; this node's is a runtime value — stays on CPU"
+            have_starts && have_ends,
+            "Slice: starts and ends attributes are required"
         );
-    }
-    if nin >= 5 && node.input_present(4) {
-        match node.read_const_int64(4) {
-            Some(steps) => {
-                require!(
-                    steps.iter().all(|&st| st != 0),
-                    "Slice: `steps` values must not be zero"
-                );
-                require!(
-                    steps.iter().all(|&st| i32::try_from(st).is_ok()),
-                    "Slice: `steps` values must fit in int32 for MLX"
-                );
+        let (have_axes, axes) = node.ints_attr("axes");
+        let axes = if have_axes {
+            axes
+        } else {
+            (0..starts.len() as i64).collect()
+        };
+        let steps = vec![1; starts.len()];
+        (Some(starts), Some(ends), Some(axes), Some(steps))
+    } else {
+        require!(
+            node.input_present(1) && node.input_present(2),
+            "Slice: starts and ends are required"
+        );
+        let index_dtype = node.input_info(1).map(|info| info.dtype);
+        for index in 1..nin {
+            if !node.input_present(index) {
+                continue;
             }
-            None => deny!(
-                "Slice: `steps` must be a constant int64 initializer; this node's is a runtime value — stays on CPU"
-            ),
+            let info = match node.input_info(index) {
+                Some(info) if is_int_index(info.dtype) => info,
+                _ => deny!("Slice: input {index} must be an int32/int64 tensor"),
+            };
+            require!(
+                Some(info.dtype) == index_dtype,
+                "Slice: control inputs must have the same dtype"
+            );
+            require!(
+                node.input_rank_known(index) != Some(true) || info.shape.len() == 1,
+                "Slice: input {index} must have rank one"
+            );
         }
+        let starts = node.read_const_ints_any(1);
+        let ends = node.read_const_ints_any(2);
+        let axes = if node.input_present(3) {
+            node.read_const_ints_any(3)
+        } else {
+            starts
+                .as_ref()
+                .map(|starts| (0..starts.len() as i64).collect())
+        };
+        let steps = if node.input_present(4) {
+            node.read_const_ints_any(4)
+        } else {
+            starts.as_ref().map(|starts| vec![1; starts.len()])
+        };
+        if let Some(steps) = &steps {
+            require!(!steps.contains(&0), "Slice: steps must not be zero");
+        }
+        (starts, ends, axes, steps)
+    };
+    if node.input_rank_known(0) == Some(true)
+        && let (Some(starts), Some(ends), Some(axes), Some(steps)) = (starts, ends, axes, steps)
+    {
+        checked_slice_axes(data_info.shape.len(), &starts, &ends, &axes, &steps)?;
     }
     Ok(())
 }
