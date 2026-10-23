@@ -127,6 +127,7 @@ def test_parametric_softplus_forms(dtype, np_dtype, opset, shape, alpha, beta, e
     x = np.linspace(-8, 8, count, dtype=np_dtype).reshape(shape)
     with _strict(model) as session:
         for data in [x, -x, x]:
+            data = np.asarray(data, dtype=np_dtype)
             before = data.tobytes()
             _check(session.run(None, {"x": data})[0], _softplus_reference(data, alpha, beta))
             assert data.tobytes() == before
@@ -162,6 +163,7 @@ def test_legacy_live_unknown_rank(dtype, np_dtype, eager, monkeypatch):
         for shape in [(), (7,), (2, 1, 7), (0, 7), (7,)]:
             x = np.arange(int(np.prod(shape)), dtype=np_dtype).reshape(shape)
             for data in [x, -x]:
+                data = np.asarray(data, dtype=np_dtype)
                 _check(soft.run(None, {"x": data})[0], _softplus_reference(data, 1.25, -0.75))
     with _strict(_model("ImageScaler", dtype, None, {"bias": [0.25, -2.0]})) as image:
         for shape in [(1, 2, 2, 3), (3, 2, 1, 2), (0, 2, 3, 0), (1, 2, 2, 3)]:
