@@ -45,7 +45,7 @@ def _session(model, *, cpu=False):
     if not cpu:
         options.add_session_config_entry("session.disable_cpu_ep_fallback", "1")
     session = ort.InferenceSession(
-        model, options,
+        model, options, enable_fallback=False,
         providers=["CPUExecutionProvider"] if cpu else ["MLXExecutionProvider"],
     )
     session.disable_fallback()
@@ -64,7 +64,7 @@ def _reference(op, x, attributes):
         elif op == "Scale":
             result = work * attr("scale", 1.0)
         else:
-            result = attr("alpha", 1.0) * np.tanh(work * attr("beta", 1.0))
+            result = np.float32(attributes["alpha"]) * np.tanh(work * np.float32(attributes["beta"]))
         return result.astype(x.dtype)
 
 
