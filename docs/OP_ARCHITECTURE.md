@@ -103,6 +103,14 @@ image channels/rank are checked on every call, including symbolic and empty tens
 legal only when C is zero. Both operators, and control-flow parents containing them, are explicit
 eager boundaries without downgrading eligible adjacent numeric partitions.
 
+Their strict tests disable constructor retry, CPU node assignment and runtime fallback, and require
+nonempty ORT compute profiles whose kernel providers are all MLX. ORT implicitly registers CPU even
+when CPU assignment is forbidden, so the registration list alone is not execution evidence. Separate
+trace assertions retain the eager operator boundary and compiled numeric neighbors. Deprecated-schema
+loader failures are checked against identical CPU-only controls; malformed attribute types must be
+declined by the provider, with correctly typed positive controls, rather than assumed to fail loading.
+These checks describe test obligations, not proof that previously blocked numerical assertions ran.
+
 **NonZero** uses exact original representations, not float32 conversions: signed floating zeros
 are false, NaNs/infinities/subnormals are true, and large integers retain all bits. Empty tensors
 produce `[rank, 0]`. Symbolic extents and unknown rank resolve from live input metadata; in-graph
