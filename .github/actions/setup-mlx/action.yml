@@ -1,5 +1,5 @@
-name: Build pinned MLX runtime
-description: Build mlx-c against the repository's pinned MLX release without Python bindings.
+name: Set up pinned MLX runtime
+description: Cache or build mlx-c against the pinned MLX release, verifying the installed runtime.
 
 inputs:
   mlx-version:
@@ -15,15 +15,57 @@ inputs:
 runs:
   using: composite
   steps:
-    - name: Build MLX and mlx-c
+    - name: Identify MLX install and toolchain
+      id: install
+      shell: bash
+      env:
+        MLX_COMMIT: ${{ inputs.mlx-commit }}
+        MLXC_COMMIT: ${{ inputs.mlxc-commit }}
+      run: |
+        set -euo pipefail
+        cc="${CC:-$(xcrun --find clang)}"
+        cxx="${CXX:-$(xcrun --find clang++)}"
+        toolchain=$({
+          sw_vers &&
+          xcodebuild -version &&
+          xcrun --sdk macosx --show-sdk-path &&
+          xcrun --sdk macosx --show-sdk-version &&
+          "$cc" --version &&
+          "$cxx" --version &&
+          cmake --version &&
+          printf '%s\n' \
+            "CC=$cc" "CXX=$cxx" "SDKROOT=${SDKROOT:-}" \
+            "MACOSX_DEPLOYMENT_TARGET=${MACOSX_DEPLOYMENT_TARGET:-14.0}" \
+            "CFLAGS=${CFLAGS:-}" "CXXFLAGS=${CXXFLAGS:-}" \
+            "CPPFLAGS=${CPPFLAGS:-}" "LDFLAGS=${LDFLAGS:-}" \
+            "CMAKE_GENERATOR=${CMAKE_GENERATOR:-}" \
+            "CMAKE_TOOLCHAIN_FILE=${CMAKE_TOOLCHAIN_FILE:-}" &&
+          if [[ -n "${CMAKE_TOOLCHAIN_FILE:-}" ]]; then
+            shasum -a 256 "$CMAKE_TOOLCHAIN_FILE"
+          fi
+        } | shasum -a 256 | cut -d ' ' -f 1)
+        echo "toolchain=$toolchain" >> "$GITHUB_OUTPUT"
+        echo "cc=$cc" >> "$GITHUB_OUTPUT"
+        echo "cxx=$cxx" >> "$GITHUB_OUTPUT"
+        echo "prefix=$RUNNER_TEMP/mlx-${MLX_COMMIT}-${MLXC_COMMIT}/install" >> "$GITHUB_OUTPUT"
+
+    - name: Cache installed MLX and mlx-c
+      uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+      with:
+        path: ${{ steps.install.outputs.prefix }}
+        key: mlx-install-${{ runner.os }}-${{ runner.arch }}-${{ inputs.mlx-version }}-${{ inputs.mlx-commit }}-${{ inputs.mlxc-commit }}-${{ steps.install.outputs.toolchain }}-${{ hashFiles('rust/scripts/setup_mlx.sh', '.github/actions/setup-mlx/action.yml') }}
+
+    - name: Build or verify MLX and mlx-c
       shell: bash
       env:
         MLX_VERSION: ${{ inputs.mlx-version }}
         MLX_COMMIT: ${{ inputs.mlx-commit }}
         MLXC_COMMIT: ${{ inputs.mlxc-commit }}
+        CC: ${{ steps.install.outputs.cc }}
+        CXX: ${{ steps.install.outputs.cxx }}
+        PREFIX: ${{ steps.install.outputs.prefix }}
       run: |
         set -euo pipefail
-        prefix="$RUNNER_TEMP/mlx-${MLX_COMMIT}-${MLXC_COMMIT}/install"
-        "$GITHUB_ACTION_PATH/../../../rust/scripts/setup_mlx.sh" "$prefix"
-        echo "MLX_PREFIX=$prefix" >> "$GITHUB_ENV"
-        echo "MLXC_PREFIX=$prefix" >> "$GITHUB_ENV"
+        "$GITHUB_ACTION_PATH/../../../rust/scripts/setup_mlx.sh" "$PREFIX"
+        echo "MLX_PREFIX=$PREFIX" >> "$GITHUB_ENV"
+        echo "MLXC_PREFIX=$PREFIX" >> "$GITHUB_ENV"
