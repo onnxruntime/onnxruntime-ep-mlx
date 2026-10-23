@@ -363,6 +363,15 @@ The translator maps it to:
 
 The backend writes present K/V to the same ORT context outputs in `[B, kv_heads, total_seq, head]` native-float layout. This preserves the runtime-owned KV-cache handoff across the prefill→decode boundary.
 
+Standard causal `Attention` with one query and one current key can attend every
+past/current key. It omits the redundant causal array rather than capturing a
+first-call KV extent during shapeless decode. An external mask still applies,
+including its fully masked row semantics. Shapeless causal replay requires
+statically proven single-query/single-current-key geometry; other causal shapes
+retain shape-keyed eligibility and eager execution when no shape-keyed attention
+route is available. Non-square alignment still uses the actual past offset, not
+MLX's lower-right causal alignment. This does not change GQA or sliding windows.
+
 ### 3.3 Normalization
 
 Standard `RMSNormalization` and `LayerNormalization` normalize any valid suffix
