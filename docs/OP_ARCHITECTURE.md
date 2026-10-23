@@ -308,6 +308,18 @@ The explicit schema formulas are used for cases where ORT's LRN kernel only
 accepts rank four or the Python reference mishandles channel iteration or
 negative-input L1 norms.
 
+`Split` supports legacy size attributes, modern int64 size tensors, equal
+partitions, and `num_outputs` partitions with a smaller final part. Symbolic
+geometry and changing boundary sizes use shape-keyed capture with bounded
+value specialization; data-dependent interior sizes execute eagerly. Sizes
+must be nonnegative, have one entry per output, and sum exactly to the axis
+extent without integer overflow. Zero-length parts are preserved. Scalar
+inputs, native-wide dimensions, and the legacy version-1 optional floating
+size input remain unclaimed. `num_outputs` cannot accompany explicit sizes or
+produce a negative final chunk. Empty partitions follow ONNX shape inference,
+the reference, and equivalent explicit-size partitions, even where ORT 1.31's
+`num_outputs` kernel rejects them.
+
 Constant int64 `Range` bounds and values are generated with checked integer
 arithmetic, not through floating-point start/step arguments. All three bounds
 must be scalars, the output length must fit native int32 geometry, and its
