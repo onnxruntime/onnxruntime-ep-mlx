@@ -85,7 +85,7 @@ The MLX 0.32.2 audit found these missing-`output_shapes` primitives in current l
 sliding/local windows or attention bias, retain the slice-free shapeless decode configuration
 (exact data-fed RoPE cache rows plus shape-preserving cache updates). Ragged/dynamic batches,
 no-past, local/bidirectional, sliding-window, attention-bias, custom rotary position IDs,
-empty-new-KV read-only cache reuse, softcap, QK diagnostic and
+empty-new-KV read-only cache reuse, integer KV caches, softcap, QK diagnostic and
 smooth-softmax/head-sink forms remain claimed but `EagerOnly`:
 their per-batch cache writes, rotary positions and masks use live sequence lengths on every call.
 Supplied rotary caches are never replaced by frequencies inferred from a sample row.

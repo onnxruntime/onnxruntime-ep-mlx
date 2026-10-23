@@ -4,6 +4,7 @@ pub mod attention;
 pub mod conv;
 pub mod elementwise;
 pub mod image;
+mod kv_cache;
 pub mod math;
 pub mod matmul;
 pub mod norm;

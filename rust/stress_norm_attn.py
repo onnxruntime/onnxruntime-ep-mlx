@@ -24,10 +24,12 @@ lib = os.path.abspath(os.environ["ONNXRUNTIME_MLX_EP_LIB"])
 ort.register_execution_provider_library(EP_NAME, lib)
 
 
-def run(mdl, feeds):
+def run(mdl, feeds, *, strict=False):
     opts = ort.SessionOptions()
     opts.log_severity_level = 3
-    sess = ort.InferenceSession(mdl, opts, providers=[EP_NAME, "CPUExecutionProvider"])
+    if strict:
+        opts.add_session_config_entry("session.disable_cpu_ep_fallback", "1")
+    sess = ort.InferenceSession(mdl, opts, providers=[EP_NAME] if strict else [EP_NAME, "CPUExecutionProvider"])
     out = sess.run(None, feeds)
     del sess
     return out
@@ -145,3 +147,13 @@ for i in range(N):
         print(f"stress-norm-attn: skipped builder {i % len(builders)} ({type(e).__name__})")
 print(f"stress-norm-attn: {ran}/{N} sessions across {len(builders)} op families OK; last shapes "
       f"{[np.asarray(o).shape for o in last]}")
+
+# Integer cache graphs must execute on MLX, including Paged's input writeback; do not
+# let the legacy contrib-schema skips hide a new storage/teardown failure.
+from test_quantized_kv import _gqa, _paged  # noqa: E402
+
+quantized_builders = [lambda: _gqa(8), lambda: _gqa(4), lambda: _paged(8), lambda: _paged(4)]
+for i in range(N):
+    mdl, feeds = quantized_builders[i % len(quantized_builders)]()
+    last = run(mdl, feeds, strict=True)
+print(f"stress-quantized-kv: {N}/{N} strict MLX sessions OK")

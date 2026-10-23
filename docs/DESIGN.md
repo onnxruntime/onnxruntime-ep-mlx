@@ -200,8 +200,8 @@ Each sliding member's live total must cover the query step; ordinary first-promp
 right-padding is not a valid sliding-cache input.
 As in ORT, a rollback crossing a compaction boundary requires caller-rematerialized cache
 rows; the operator cannot recover evicted history. These forms are claimed eager without
-changing the ordinary compiled decoder guards. Sliding QK diagnostics, quantized KV
-transport and additional paged LATENT contracts remain separate limitations.
+changing the ordinary compiled decoder guards. Sliding QK diagnostics and additional
+paged LATENT contracts remain separate limitations.
 
 `PagedAttention` supports SEPARATE packed QKV as contiguous Q, K and V sections in input 0
 with inputs 1/2 absent. LATENT retains its separate key contract. Its `softcap` precedes
@@ -210,6 +210,37 @@ Positive `local_window_size=W` keeps keys at positions `key >= query-W+1`; causa
 also imposes `key <= query`, while bidirectional mode has no right bound. The pinned
 ORT v1.31.0 CUDA implementation passes `W-1` to FlashAttention; this is not a symmetric
 window. These composed forms remain eager and do not change ordinary compiled GQA.
+
+GQA and SEPARATE PagedAttention also accept INT8 caches and signed INT4 caches packed
+into UINT8. Activation and Y types stay floating; present caches retain their input
+dtype, packed width and untouched bytes. INT4 stores `q_even+8` in the low nibble and
+`q_odd+8` in the high nibble (zero byte `0x88`), not two's complement or affine weights.
+FP32 scales remain live: PER_TENSOR has one element; PER_CHANNEL has one scale per
+logical KV head/channel, reshaped from the pinned source's flattened scale contract.
+Paged scales must additionally end in `head_size`. Each K/V side may select its own
+granularity. Quantization happens after Q/K normalization and rotary, before attention.
+The attention math consumes decoded integer values, never unquantized appended rows.
+
+These paths follow ORT v1.31.0 (`402979ac1bef89dcd55add41eaa7277c407599eb`):
+MLAS `qkv_quant.cpp` uses FP32 `x * (1/scale)` for GQA, treating a zero scale's
+reciprocal as 1; CUDA `paged_attention_impl.cu` uses FP32 `x/scale`, mapping zero scale
+to zero. Both round ties to even and saturate to `[-128,127]` or `[-8,7]`.
+Dequantization multiplies signed codes by the live scale in FP32. Paged quantized
+attention reads all attended rows from the updated physical block table, including
+current positions with skipped (`-1`) or remapped writes. Its input writeback and
+optional cache aliases keep integer storage. GQA keeps its growing/fixed-capacity,
+read-only, ragged and proven sliding geometry, with bytewise compaction.
+Integer forms are eager-only; ordinary floating compiled decode is unchanged.
+
+Packed GQA requires an even logical head width because the pinned `CheckPast` byte
+geometry conflicts with odd-width MLAS packing. Sliding integer GQA additionally
+requires the upstream 16-byte row alignment (INT8 head multiple of 16, INT4 multiple
+of 32). Paged INT4 requires explicit `k_cache_dtype=v_cache_dtype="int4"`; its final
+dimension is `ceil(head_size/2)`, including a zero-code high nibble for odd widths.
+Quantized LATENT is not claimed by this batch. FLOAT8E4M3FN and packed FLOAT4E2M1
+remain **open transport work**, not an arithmetic impossibility: the EP has no
+float8 dtype mapping, and FLOAT4 requires an explicit byte encoding/decoding boundary
+distinct from biased signed INT4. No floating cache-output substitution is used.
 
 ### 3.2 Constant and initializer caching
 
