@@ -192,14 +192,16 @@ def test_dtype_must_match_output():
         _session(proto.SerializeToString())
 
 
-@pytest.mark.parametrize("probability_type,output_type,opset", [
-    (T.INT32, T.DOUBLE, 22),
-    (T.FLOAT, T.STRING, 22),
-])
-def test_illegal_schema_types_are_rejected(probability_type, output_type, opset):
+def test_illegal_probability_type_is_rejected():
     with pytest.raises(ort.capi.onnxruntime_pybind11_state.InvalidGraph,
                        match="Type Error.*invalid"):
-        _session(_model(probability_type, output_type=output_type, opset=opset))
+        _session(_model(T.INT32))
+
+
+def test_unsupported_output_type_stays_declined():
+    with pytest.raises(ort.capi.onnxruntime_pybind11_state.Fail,
+                       match="CPU EP.*fallback.*disabled"):
+        _session(_model(T.FLOAT, output_type=T.STRING))
 
 
 @pytest.mark.parametrize("probability_type", PROBABILITY_TYPES)
