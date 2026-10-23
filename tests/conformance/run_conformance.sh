@@ -134,7 +134,7 @@ for op in "${CLAIMED_OPS[@]}"; do
   "$PIXI" run python -m pytest tests -k "test_${op}_" \
     --hypothesis-max-examples="$MAX_EXAMPLES" \
     --hypothesis-seed="$SEED" \
-    -p no:cacheprovider -q > "$log" 2>&1
+    -p no:cacheprovider -q --tb=short > "$log" 2>&1
   rc=$?
   passed=$(grep -oE '[0-9]+ passed' "$log" | tail -1 | grep -oE '[0-9]+' || true)
   failed=$(grep -oE '[0-9]+ failed' "$log" | tail -1 | grep -oE '[0-9]+' || true)

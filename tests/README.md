@@ -26,6 +26,15 @@ python -m pytest tests/backend -q
 Set `ORT_HOME` to the release root from the build guide, or point
 `DYLD_LIBRARY_PATH` at the corresponding ORT `lib/` directory.
 
+CI also gates all Rust targets with `cargo clippy --release --all-targets -- -D warnings`
+after provisioning the same native dependencies. Install the lint component with
+`rustup component add clippy` to run it locally from `rust/`.
+
+The root `pytest.ini` defaults to short tracebacks (`--tb=short`), retaining assertion
+messages and captured output without lengthy source excerpts. Override with `--tb=long`
+when debugging. The conformance subprocesses use short tracebacks explicitly because
+they run in the external onnx-tests checkout.
+
 ## `tests/ops` — op-correctness (pytest)
 
 Each ONNX decoder op the EP translates to MLX (MatMulNBits, GroupQueryAttention, RMSNormalization,
