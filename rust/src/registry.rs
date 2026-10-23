@@ -261,11 +261,21 @@ pub fn compile_shape_safety(node: &NodeView) -> CompileShapeSafety {
     registry().compile_shape_safety(node)
 }
 
+/// Data-dependent host scans, including those inside an otherwise capture-safe parent.
+pub fn requires_unique_eager_boundary(node: &NodeView) -> bool {
+    (matches!(node.domain().as_str(), "" | "ai.onnx") && node.op_type() == "Unique")
+        || node
+            .subgraphs()
+            .iter()
+            .any(|(_, body)| body.nodes().iter().any(requires_unique_eager_boundary))
+}
+
 /// Populate the table with every built-in op module (wave-1: elementwise + math).
 fn register_builtin_ops(registry: &mut OpRegistry) {
     crate::ops::elementwise::register(registry);
     crate::ops::image::register(registry);
     crate::ops::nonzero::register(registry);
+    crate::ops::unique::register(registry);
     crate::ops::math::register(registry);
     crate::ops::reduction::register(registry);
     crate::ops::shape::register(registry);
