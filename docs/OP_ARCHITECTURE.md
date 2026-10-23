@@ -352,6 +352,18 @@ other forms fall back to ORT CPU. Empty/dynamic support is per-handler, not a
 blanket guarantee. Claimed control-flow nodes translate supported tensor bodies;
 other control-flow forms remain on CPU.
 
+Already-claimed nested `If` conditions and `Loop` trip counts/initial conditions
+can read bound body formal inputs eagerly, including BOOL/INT64 slices supplied
+by `Scan` and the iteration/condition formals supplied by an enclosing `Loop`.
+Reads validate exact dtype and one-element payloads; INT64 controls never pass
+through floating point. Direct graph-input/initializer controls retain their
+host-value-specialized compiled path. Intermediate controls remain ineligible
+for compiled specialization and use checked evaluated host reads only in eager
+execution. This does not widen claims for node-produced `If` conditions or change
+Loop/Scan arity, passthrough-condition, optional/dynamic termination, scan-output,
+container, or float64 restrictions. The focused nested-control fixtures are
+source coverage pending native validation, not a full control-flow audit claim.
+
 The **core Rust modules** register:
 
 | Module | Registered ops |

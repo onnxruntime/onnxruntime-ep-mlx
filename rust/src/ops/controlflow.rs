@@ -18,8 +18,10 @@
 //! Anything outside these static/foldable forms is left unclaimed and runs on ORT's CPU control-flow
 //! kernels (with the body ops still offloaded to MLX via the ordinary flat path).
 
-use crate::engine::{MlxError, NodeDesc, SubgraphDesc, TensorRef, TranslationContext};
-use crate::ops::selective_scan;
+use crate::engine::{
+    MlxError, NodeDesc, Src, SubgraphDesc, TensorRef, TranslationContext, mlx_dtype_from_onnx,
+};
+use crate::ops::{host_scan, selective_scan};
 use crate::registry::{
     ClaimPredicate, ClaimResult, GraphView, K_ANY_OPSET, NodeView, OpHandler, OpRegistration,
     OpRegistry, ValueKind, is_movable,
@@ -35,13 +37,57 @@ fn find_body<'a>(n: &'a NodeDesc, attr: &str) -> Option<&'a SubgraphDesc> {
     n.subgraphs.iter().find(|sg| sg.attr_name == attr)
 }
 
-/// Read a scalar bool from a foldable (initializer / ctx) node input.
-fn read_host_bool(ctx: &TranslationContext, r: &TensorRef) -> Result<bool, MlxError> {
-    let h = ctx.raw_host(r)?;
-    if h.data.is_null() {
-        return Ok(false);
+fn control_scalar_bytes<const N: usize>(
+    data: &[u8],
+    dtype: mlx::mlx_dtype,
+    expected: mlx::mlx_dtype,
+    op: &str,
+) -> Result<[u8; N], MlxError> {
+    if dtype != expected {
+        return Err(format!("MLX {op}: control has incorrect dtype"));
     }
-    Ok(unsafe { *(h.data as *const u8) } != 0)
+    data.try_into()
+        .map_err(|_| format!("MLX {op}: control must contain exactly one element"))
+}
+
+fn read_host_control<const N: usize>(
+    ctx: &mut TranslationContext,
+    r: &TensorRef,
+    dtype: ort::ONNXTensorElementDataType,
+    op: &str,
+) -> Result<[u8; N], MlxError> {
+    let expected = mlx_dtype_from_onnx(dtype);
+    if r.source == Src::Intermediate {
+        let host = host_scan::read_live(ctx, r, op)?;
+        return control_scalar_bytes(host.data, host.dtype, expected, op);
+    }
+    // Trace placeholders in env are not host-readable. Keep direct inputs/initializers on
+    // raw_host so ordinary If/Loop host-value specializations can still be compiled.
+    let host = ctx.raw_host(r)?;
+    if host.dtype != dtype {
+        return Err(format!("MLX {op}: control has incorrect dtype"));
+    }
+    if host.count != 1 || host_scan::layout(&host.shape, expected, op)?.0 != N {
+        return Err(format!(
+            "MLX {op}: control must contain exactly one element"
+        ));
+    }
+    if host.data.is_null() {
+        return Err(format!("MLX {op}: control has null data"));
+    }
+    // The exact dtype and single-element layout establish N readable bytes.
+    let data = unsafe { std::slice::from_raw_parts(host.data.cast::<u8>(), N) };
+    control_scalar_bytes(data, expected, expected, op)
+}
+
+fn read_host_bool(ctx: &mut TranslationContext, r: &TensorRef, op: &str) -> Result<bool, MlxError> {
+    let [value] = read_host_control(
+        ctx,
+        r,
+        ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL,
+        op,
+    )?;
+    Ok(value != 0)
 }
 
 /// Every node in a control-flow body must be MLX-translatable (recursively via the registry claim),
@@ -140,7 +186,7 @@ fn scan_attr(n: &NodeDesc, name: &str, len: usize) -> Result<Vec<i64>, MlxError>
 // ---- If -----------------------------------------------------------------------------------------
 
 fn if_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
-    let cond = read_host_bool(ctx, &n.inputs[0])?;
+    let cond = read_host_bool(ctx, &n.inputs[0], "If condition")?;
     let attr = if cond { "then_branch" } else { "else_branch" };
     let branch = find_body(n, attr)
         .ok_or_else(|| "MLX If: missing branch subgraph".to_string())?
@@ -164,11 +210,11 @@ fn if_claim(node: &NodeView) -> ClaimResult {
     );
     require_tensor_control_flow_boundary(node, "If")?;
     require!(is_bool(node, 0), "condition input must have bool dtype");
-    // The branch is selected host-side at translate time (`if_op` reads the cond via `raw_host`),
+    // The branch is selected host-side at translate time (`if_op` reads the condition),
     // so the condition MUST be host-readable: a graph input, initializer, or outer-scope value.
     // A runtime intermediate (e.g. Phi-4's long-context `Greater(total_seq_len, 4096)` rotary-cache
-    // selector) is not readable by `raw_host` — leave such If nodes to ORT's CPU control-flow
-    // kernels (their body ops still offload to MLX via the ordinary flat path).
+    // selector) remains on ORT CPU. Already-bound body formals can be read eagerly, but this
+    // does not broaden the claim to node-produced conditions.
     require!(
         node.input_is_host_readable(0),
         "condition must be a graph input/initializer (data-dependent conditions run on CPU)"
@@ -573,14 +619,13 @@ fn loop_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
         .clone();
     let num_state = n.inputs.len() - 2; // inputs = [M, cond, state...]
 
-    let trip_count: i64 = {
-        let h = ctx.raw_host(&n.inputs[0])?;
-        if h.data.is_null() {
-            return Err("MLX Loop: null trip count".to_string());
-        }
-        unsafe { *(h.data as *const i64) }
-    };
-    let cond0 = read_host_bool(ctx, &n.inputs[1])?;
+    let trip_count = i64::from_ne_bytes(read_host_control(
+        ctx,
+        &n.inputs[0],
+        ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64,
+        "Loop trip count",
+    )?);
+    let cond0 = read_host_bool(ctx, &n.inputs[1], "Loop condition")?;
     let trip = if cond0 { trip_count } else { 0 };
 
     let mut state: Vec<mlx::mlx_array> = Vec::with_capacity(num_state);
@@ -677,4 +722,88 @@ pub fn register(registry: &mut OpRegistry) {
         "emits MLX Slice and, for fused selective scans, CustomKernel; neither implements Primitive::output_shapes in MLX 0.32.2",
     );
     shapeless(registry, "Loop", loop_op, loop_claim);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::control_scalar_bytes;
+    use crate::sys::mlx;
+
+    #[test]
+    fn control_scalars_keep_exact_bytes() {
+        for value in [
+            i64::MIN,
+            -(1i64 << 53) - 1,
+            -1,
+            0,
+            1,
+            (1i64 << 53) + 1,
+            i64::MAX,
+        ] {
+            let bytes = control_scalar_bytes(
+                &value.to_ne_bytes(),
+                mlx::mlx_dtype__MLX_INT64,
+                mlx::mlx_dtype__MLX_INT64,
+                "Loop trip count",
+            )
+            .unwrap();
+            assert_eq!(i64::from_ne_bytes(bytes), value);
+        }
+        for value in [0u8, 1] {
+            assert_eq!(
+                control_scalar_bytes::<1>(
+                    &[value],
+                    mlx::mlx_dtype__MLX_BOOL,
+                    mlx::mlx_dtype__MLX_BOOL,
+                    "If condition",
+                )
+                .unwrap(),
+                [value],
+            );
+        }
+    }
+
+    #[test]
+    fn control_scalars_reject_wrong_dtype_and_element_count() {
+        for data in [&[][..], &[0u8; 7][..], &[0u8; 16][..]] {
+            assert!(
+                control_scalar_bytes::<8>(
+                    data,
+                    mlx::mlx_dtype__MLX_INT64,
+                    mlx::mlx_dtype__MLX_INT64,
+                    "Loop trip count",
+                )
+                .is_err()
+            );
+        }
+        for data in [&[][..], &[0u8; 2][..]] {
+            assert!(
+                control_scalar_bytes::<1>(
+                    data,
+                    mlx::mlx_dtype__MLX_BOOL,
+                    mlx::mlx_dtype__MLX_BOOL,
+                    "If condition",
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            control_scalar_bytes::<8>(
+                &[0; 8],
+                mlx::mlx_dtype__MLX_FLOAT64,
+                mlx::mlx_dtype__MLX_INT64,
+                "Loop trip count",
+            )
+            .is_err()
+        );
+        assert!(
+            control_scalar_bytes::<1>(
+                &[1],
+                mlx::mlx_dtype__MLX_UINT8,
+                mlx::mlx_dtype__MLX_BOOL,
+                "If condition",
+            )
+            .is_err()
+        );
+    }
 }
