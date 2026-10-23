@@ -265,6 +265,7 @@ pub fn compile_shape_safety(node: &NodeView) -> CompileShapeSafety {
 fn register_builtin_ops(registry: &mut OpRegistry) {
     crate::ops::elementwise::register(registry);
     crate::ops::image::register(registry);
+    crate::ops::nonzero::register(registry);
     crate::ops::math::register(registry);
     crate::ops::reduction::register(registry);
     crate::ops::shape::register(registry);
@@ -1730,6 +1731,18 @@ pub fn scalar_or_suffix_broadcast(a: &[i64], b: &[i64]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nonzero_is_version_gated_and_always_eager() {
+        assert!(registry().find_entry("", "NonZero", 8).is_none());
+        for version in [9, 13, 26] {
+            let index = registry().find_entry_index("", "NonZero", version).unwrap();
+            assert!(matches!(
+                registry().table[index].compile_shape_rule,
+                CompileShapeRule::Always(CompileShapeSafety::EagerOnly { .. })
+            ));
+        }
+    }
 
     #[test]
     fn suffix_broadcast_treats_unknown_extents_as_compatible() {

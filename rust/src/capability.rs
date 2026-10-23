@@ -152,7 +152,10 @@ pub(crate) unsafe fn get_capability(
             .iter()
             .map(|&node| {
                 let view = NodeView::new(ort_api, raw_nodes_by_id[&node]);
-                if decoder_graph {
+                let metadata = &snapshot.nodes[&node];
+                // NonZero cardinality cannot be captured even in an ordinary non-decoder graph.
+                // Keep its eager scan from disabling compilation of connected numeric work.
+                if decoder_graph || (metadata.domain.is_empty() && metadata.op_type == "NonZero") {
                     crate::registry::compile_shape_safety(&view).partition_class()
                 } else {
                     CompilePartitionClass::Shapeless

@@ -1,6 +1,6 @@
 //! Random / miscellaneous op handlers (ai.onnx): RandomNormal(+Like), RandomUniform(+Like),
-//! Bernoulli, Multinomial, Einsum. Faithful port of the C++ `ops/randommisc.cc`. NonZero / Unique are
-//! deliberately left to ORT CPU (mlx-c has no nonzero/unique primitive).
+//! Bernoulli, Multinomial, Einsum. Faithful port of the C++ `ops/randommisc.cc`.
+//! Provider-owned host scans live in `nonzero.rs` (NonZero) and `misc.rs` (Unique).
 
 use std::collections::{HashMap, HashSet};
 
