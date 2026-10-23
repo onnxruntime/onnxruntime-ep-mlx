@@ -7,8 +7,8 @@ use std::collections::{HashMap, HashSet};
 use crate::engine::{MlxError, NodeDesc, TranslationContext, mlx_dtype_from_onnx};
 use crate::mlx::{Array, VectorArray};
 use crate::registry::{
-    ClaimPredicate, ClaimResult, K_ANY_OPSET, NodeView, OpHandler, OpRegistration, OpRegistry,
-    is_mlx_cpu_float, is_mlx_float, is_mlx_supported,
+    ClaimPredicate, ClaimResult, CompileShapeSafety, K_ANY_OPSET, NodeView, OpHandler,
+    OpRegistration, OpRegistry, is_mlx_cpu_float, is_mlx_float, is_mlx_supported,
 };
 use crate::sys::mlx;
 use crate::sys::ort;
@@ -17,17 +17,18 @@ use crate::{deny, require};
 // ---- handlers -----------------------------------------------------------------------------------
 
 /// The MLX PRNG key from a `seed` float attribute, or an empty array (default key) when absent.
-fn random_key(ctx: &mut TranslationContext, n: &NodeDesc) -> mlx::mlx_array {
+fn random_key(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<mlx::mlx_array, MlxError> {
     match n.floats.get("seed") {
-        Some(&seed) => {
-            let raw = unsafe {
-                let mut r = mlx::mlx_array_new();
-                mlx::mlx_random_key(&mut r, seed as u64);
-                r
-            };
-            ctx.keep(Array::from_raw(raw))
+        Some(&seed) => ctx.emit(|res, _| unsafe { mlx::mlx_random_key(res, seed as u64) }),
+        None => {
+            if ctx.shapeless_compile() || ctx.shape_keyed_compile() {
+                return Err(
+                    "MLX: an unseeded random draw must consume the live default key in eager execution"
+                        .to_string(),
+                );
+            }
+            Ok(ctx.keep(Array::new()))
         }
-        None => ctx.keep(Array::new()),
     }
 }
 
@@ -43,7 +44,7 @@ fn random_normal_with_shape(
     n: &NodeDesc,
     shape: Vec<i32>,
 ) -> Result<(), MlxError> {
-    let key = random_key(ctx, n);
+    let key = random_key(ctx, n)?;
     let dtype = mlx_dtype_from_onnx(n.outputs[0].otype);
     let mean = n.floats.get("mean").copied().unwrap_or(0.0);
     let scale = n.floats.get("scale").copied().unwrap_or(1.0);
@@ -71,7 +72,7 @@ fn random_uniform_with_shape(
 ) -> Result<(), MlxError> {
     let low = ctx.scalar_f32(n.floats.get("low").copied().unwrap_or(0.0));
     let high = ctx.scalar_f32(n.floats.get("high").copied().unwrap_or(1.0));
-    let key = random_key(ctx, n);
+    let key = random_key(ctx, n)?;
     let dtype = mlx_dtype_from_onnx(n.outputs[0].otype);
     let out = ctx.emit(|res, s| unsafe {
         mlx::mlx_random_uniform(res, low, high, shape.as_ptr(), shape.len(), dtype, key, s)
@@ -93,7 +94,7 @@ fn random_uniform_like_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<
 fn bernoulli_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
     let probs = ctx.resolve(&n.inputs[0])?;
     let shape = ctx.shape_of(probs);
-    let key = random_key(ctx, n);
+    let key = random_key(ctx, n)?;
     let sampled = ctx.emit(|res, s| unsafe {
         mlx::mlx_random_bernoulli(res, probs, shape.as_ptr(), shape.len(), key, s)
     })?;
@@ -105,7 +106,7 @@ fn bernoulli_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxErr
 fn multinomial_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
     let logits = ctx.resolve(&n.inputs[0])?;
     let sample_size = n.ints.get("sample_size").copied().unwrap_or(1) as i32;
-    let key = random_key(ctx, n);
+    let key = random_key(ctx, n)?;
     let sampled = ctx.emit(|res, s| unsafe {
         mlx::mlx_random_categorical_num_samples(res, logits, -1, sample_size, key, s)
     })?;
@@ -694,6 +695,18 @@ fn shapeless(
     });
 }
 
+fn random_compile_shape_safety(node: &NodeView) -> CompileShapeSafety {
+    if node.float_attr_opt("seed").is_none() {
+        CompileShapeSafety::EagerOnly {
+            reason: "unseeded random draws consume the live default key",
+        }
+    } else {
+        CompileShapeSafety::ShapeKeyedOnly {
+            reason: crate::registry::MLX_RANDOM_BITS_SHAPE_REASON,
+        }
+    }
+}
+
 fn shape_keyed(
     registry: &mut OpRegistry,
     op_type: &'static str,
@@ -701,7 +714,7 @@ fn shape_keyed(
     handler: OpHandler,
     claim: ClaimPredicate,
 ) {
-    registry.register_shape_keyed(
+    registry.register_shape_classified(
         OpRegistration {
             domain: "",
             op_type,
@@ -710,7 +723,7 @@ fn shape_keyed(
             handler,
             claim,
         },
-        crate::registry::MLX_RANDOM_BITS_SHAPE_REASON,
+        random_compile_shape_safety,
     );
 }
 

@@ -157,7 +157,9 @@ pub(crate) unsafe fn get_capability(
                 // NonZero cardinality cannot be captured even in an ordinary non-decoder graph.
                 // Keep its eager scan from disabling compilation of connected numeric work.
                 let nonzero_boundary = metadata.domain.is_empty() && metadata.op_type == "NonZero";
-                if decoder_graph || mod_boundary || nonzero_boundary {
+                if crate::registry::requires_random_eager_boundary(&view) {
+                    CompilePartitionClass::Eager
+                } else if decoder_graph || mod_boundary || nonzero_boundary {
                     crate::registry::compile_shape_safety(&view).partition_class()
                 } else {
                     CompilePartitionClass::Shapeless

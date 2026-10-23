@@ -1557,6 +1557,30 @@ impl GraphView {
     }
 }
 
+pub(crate) fn requires_random_eager_boundary(node: &NodeView) -> bool {
+    let domain = node.domain();
+    let direct = (domain.is_empty() || domain == "ai.onnx")
+        && matches!(
+            node.op_type().as_str(),
+            "RandomNormal"
+                | "RandomNormalLike"
+                | "RandomUniform"
+                | "RandomUniformLike"
+                | "Bernoulli"
+                | "Multinomial"
+                | "Dropout"
+        )
+        && matches!(
+            compile_shape_safety(node),
+            CompileShapeSafety::EagerOnly { .. }
+        );
+    direct
+        || node
+            .subgraphs()
+            .iter()
+            .any(|(_, body)| body.nodes().iter().any(requires_random_eager_boundary))
+}
+
 // ---- Shared claim helpers (port of op_claim.h) --------------------------------------------------
 
 use ort::*;
