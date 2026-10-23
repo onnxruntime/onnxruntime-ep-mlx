@@ -8,7 +8,7 @@
 //!   * GroupNormalization (ai.onnx opset 18+)           — versioned affine and stash precision
 //!   * InstanceNormalization (ai.onnx)                   — composed spatial mean/var/affine
 //!   * LpNormalization (ai.onnx)                        — composed abs/sum or square/sum/sqrt
-//!   * BatchNormalization (ai.onnx, inference form)     — composed per-channel affine
+//!   * BatchNormalization (ai.onnx)                     — versioned affine and population statistics
 //!   * LRN (ai.onnx, across-channel)                    — composed square/window-sum/power/divide
 //!
 //! Standard norms honor stash precision and broadcast affine parameters. Their ordinary last-axis
@@ -61,9 +61,6 @@ fn divide(
     b: mlx::mlx_array,
 ) -> Result<mlx::mlx_array, MlxError> {
     ctx.binary(mlx::mlx_divide, a, b)
-}
-fn rsqrt(ctx: &mut TranslationContext, a: mlx::mlx_array) -> Result<mlx::mlx_array, MlxError> {
-    ctx.emit(|res, s| unsafe { mlx::mlx_rsqrt(res, a, s) })
 }
 fn sqrt(ctx: &mut TranslationContext, a: mlx::mlx_array) -> Result<mlx::mlx_array, MlxError> {
     ctx.emit(|res, s| unsafe { mlx::mlx_sqrt(res, a, s) })
@@ -596,31 +593,163 @@ fn lp_norm_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError
     Ok(())
 }
 
-/// BatchNormalization (ai.onnx, inference/spatial form): Y = (X - mean)/sqrt(var+eps) * scale + B,
-/// per channel. Only the single-output inference form is claimed.
+/// Legacy and modern BN modes share graph-valued population statistics and affine arithmetic.
 fn batch_norm_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
-    let x = ctx.resolve(&n.inputs[0])?;
-    let scale = ctx.resolve(&n.inputs[1])?;
-    let b = ctx.resolve(&n.inputs[2])?;
-    let mean = ctx.resolve(&n.inputs[3])?;
-    let var = ctx.resolve(&n.inputs[4])?;
-    let shape = ctx.shape_of(x);
+    let shape = normalization_shape(ctx, n, if n.since_version >= 9 { 1 } else { 2 })?;
     let rank = shape.len();
-    let c = if rank >= 2 { shape[1] } else { shape[0] };
-    let eps = epsilon(n, 1e-5);
-
-    let eps_s = scalar_like(ctx, eps, ctx.dtype_of(x))?;
-    let var_eps = add(ctx, var, eps_s)?;
-    let inv = rsqrt(ctx, var_eps)?; // [C]
-    let a = mul(ctx, scale, inv)?; // [C]
-    let mean_a = mul(ctx, mean, a)?;
-    let shift = sub(ctx, b, mean_a)?; // [C]
-    let ab = channel_broadcast(ctx, a, rank, c)?;
-    let shiftb = channel_broadcast(ctx, shift, rank, c)?;
-    let scaled = mul(ctx, x, ab)?;
-    let out = add(ctx, scaled, shiftb)?;
-    ctx.mark_composed("BatchNormalization composed (rsqrt/affine) — no fused batch-norm kernel");
-    ctx.bind(&n.outputs[0], out);
+    if n.since_version == 1 && rank != 4 {
+        return Err("BatchNormalization1: input must have rank four".into());
+    }
+    let spatial = n.since_version >= 9 || n.ints.get("spatial").copied().unwrap_or(1) != 0;
+    let training = if n.since_version < 7 {
+        if n.ints.get("is_test").copied().unwrap_or(0) == 0 {
+            return Err("BatchNormalization1/6: in-place training is unsupported".into());
+        }
+        false
+    } else if n.since_version < 14 {
+        n.outputs.len() > 1
+    } else {
+        n.ints.get("training_mode").copied().unwrap_or(0) != 0
+    };
+    let parameter_shape = if spatial {
+        vec![if rank == 1 { 1 } else { shape[1] }]
+    } else {
+        shape[1..].to_vec()
+    };
+    for input in &n.inputs[1..5] {
+        let actual = ctx.tensor_shape(input)?;
+        if actual
+            .iter()
+            .copied()
+            .ne(parameter_shape.iter().copied().map(i64::from))
+        {
+            return Err(format!(
+                "BatchNormalization: parameter shape {actual:?} must be {parameter_shape:?}"
+            ));
+        }
+    }
+    let output_dtype = crate::engine::mlx_dtype_from_onnx(n.outputs[0].otype);
+    if shape.contains(&0) && !training {
+        let output = ctx.zeros(&shape, output_dtype)?;
+        ctx.bind(&n.outputs[0], output);
+        return Ok(());
+    }
+    let inputs = n.inputs[..5]
+        .iter()
+        .map(|input| ctx.resolve(input))
+        .collect::<Result<Vec<_>, _>>()?;
+    let compute_dtype = if inputs
+        .iter()
+        .any(|&input| ctx.dtype_of(input) == mlx::mlx_dtype__MLX_FLOAT64)
+    {
+        mlx::mlx_dtype__MLX_FLOAT64
+    } else {
+        mlx::mlx_dtype__MLX_FLOAT32
+    };
+    let inputs = inputs
+        .into_iter()
+        .map(|input| ctx.astype(input, compute_dtype))
+        .collect::<Result<Vec<_>, _>>()?;
+    let [x, scale, bias, input_mean, input_var] = inputs[..] else {
+        unreachable!("five required BatchNormalization inputs were validated");
+    };
+    let mut broadcast_shape = vec![1; rank];
+    if spatial {
+        if rank > 1 {
+            broadcast_shape[1] = shape[1];
+        }
+    } else {
+        broadcast_shape[1..].copy_from_slice(&shape[1..]);
+    }
+    let (centered, mean, variance) = if training {
+        if shape.contains(&0) {
+            let nan = scalar_like(ctx, f32::NAN, compute_dtype)?;
+            let nan = ctx.emit(|res, stream| unsafe {
+                mlx::mlx_broadcast_to(
+                    res,
+                    nan,
+                    parameter_shape.as_ptr(),
+                    parameter_shape.len(),
+                    stream,
+                )
+            })?;
+            (x, nan, nan)
+        } else {
+            let axes: Vec<i32> = (0..rank as i32)
+                .filter(|&axis| !spatial || rank == 1 || axis != 1)
+                .filter(|&axis| spatial || axis == 0)
+                .collect();
+            let mean = norm_mean_axes(ctx, x, &axes, compute_dtype)?;
+            let centered = sub(ctx, x, mean)?;
+            let residual = norm_mean_axes(ctx, centered, &axes, compute_dtype)?;
+            let centered = sub(ctx, centered, residual)?;
+            let mean = add(ctx, mean, residual)?;
+            let squared = mul(ctx, centered, centered)?;
+            let variance = norm_mean_axes(ctx, squared, &axes, compute_dtype)?;
+            (
+                centered,
+                ctx.reshape(mean, &parameter_shape)?,
+                ctx.reshape(variance, &parameter_shape)?,
+            )
+        }
+    } else {
+        let mean = ctx.reshape(input_mean, &broadcast_shape)?;
+        (sub(ctx, x, mean)?, input_mean, input_var)
+    };
+    let epsilon = scalar_like(ctx, epsilon(n, 1e-5), compute_dtype)?;
+    let variance_eps = add(ctx, variance, epsilon)?;
+    let stddev = sqrt(ctx, variance_eps)?;
+    let denominator = ctx.reshape(stddev, &broadcast_shape)?;
+    let normalized = divide(ctx, centered, denominator)?;
+    let scale = ctx.reshape(scale, &broadcast_shape)?;
+    let bias = ctx.reshape(bias, &broadcast_shape)?;
+    let scaled = mul(ctx, normalized, scale)?;
+    let output = add(ctx, scaled, bias)?;
+    let output = ctx.astype(output, output_dtype)?;
+    ctx.bind(&n.outputs[0], output);
+    if training {
+        let momentum = f64::from(n.floats.get("momentum").copied().unwrap_or(0.9));
+        let (momentum, complement) = if compute_dtype == mlx::mlx_dtype__MLX_FLOAT64 {
+            (ctx.scalar_f64(momentum), ctx.scalar_f64(1.0 - momentum))
+        } else {
+            (
+                ctx.scalar_f32(momentum as f32),
+                ctx.scalar_f32((1.0 - momentum) as f32),
+            )
+        };
+        for (index, previous, current) in [(1, input_mean, mean), (2, input_var, variance)] {
+            if n.outputs
+                .get(index)
+                .is_some_and(|output| !output.name.is_empty())
+            {
+                let previous = mul(ctx, previous, momentum)?;
+                let current = mul(ctx, current, complement)?;
+                let updated = add(ctx, previous, current)?;
+                let dtype = crate::engine::mlx_dtype_from_onnx(n.outputs[index].otype);
+                let updated = ctx.astype(updated, dtype)?;
+                ctx.bind(&n.outputs[index], updated);
+            }
+        }
+        if n.outputs
+            .get(3)
+            .is_some_and(|output| !output.name.is_empty())
+        {
+            let saved = ctx.astype(mean, crate::engine::mlx_dtype_from_onnx(n.outputs[3].otype))?;
+            ctx.bind(&n.outputs[3], saved);
+        }
+        if n.outputs
+            .get(4)
+            .is_some_and(|output| !output.name.is_empty())
+        {
+            let inverse = ctx.unary(mlx::mlx_reciprocal, stddev)?;
+            let inverse = ctx.astype(
+                inverse,
+                crate::engine::mlx_dtype_from_onnx(n.outputs[4].otype),
+            )?;
+            ctx.bind(&n.outputs[4], inverse);
+        }
+    }
+    ctx.mark_composed("BatchNormalization with versioned modes and population statistics");
     Ok(())
 }
 
@@ -748,10 +877,6 @@ fn lrn_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
 }
 
 // ---- claim predicates --------------------------------------------------------------------------
-
-fn tensor_dtype(node: &NodeView, i: usize) -> Option<ort::ONNXTensorElementDataType> {
-    node.input_info(i).map(|s| s.dtype)
-}
 
 /// RMSNormalization (ai.onnx): floating input and independently typed broadcast scale.
 fn rms_norm_claim(node: &NodeView) -> ClaimResult {
@@ -1063,47 +1188,126 @@ fn lp_norm_claim(node: &NodeView) -> ClaimResult {
     Ok(())
 }
 
-/// BatchNormalization: inference (single-output) form, 5 float inputs sharing X's dtype.
+/// BatchNormalization: versioned affine/statistic types, modes, and feature geometry.
 fn batch_norm_claim(node: &NodeView) -> ClaimResult {
     require!(
-        node.num_inputs() == 5 && node.num_outputs() == 1,
-        "inference form expects 5 inputs and 1 output, got {}in/{}out",
+        node.num_inputs() == 5,
+        "expects five required inputs, got {}in/{}out",
         node.num_inputs(),
         node.num_outputs()
+    );
+    let version = node.since_version();
+    let spatial = version >= 9 || node.int_attr("spatial", 1) != 0;
+    if version < 9 {
+        require!(
+            matches!(node.int_attr("spatial", 1), 0 | 1),
+            "spatial must be zero or one"
+        );
+    }
+    let training = if version < 7 {
+        require!(
+            node.int_attr("is_test", 0) != 0,
+            "legacy training requires in-place running-statistic semantics"
+        );
+        false
+    } else if version < 14 {
+        node.num_outputs() > 1
+    } else {
+        let training = node.int_attr("training_mode", 0);
+        require!(
+            matches!(training, 0 | 1),
+            "training_mode must be zero or one"
+        );
+        training == 1
+    };
+    let outputs = if !training {
+        1
+    } else if version < 14 {
+        5
+    } else {
+        3
+    };
+    require!(
+        node.num_outputs() == outputs,
+        "this BatchNormalization mode expects {outputs} output slots"
     );
     let (x, out) = match (node.input_info(0), node.output_info(0)) {
         (Some(x), Some(o)) => (x, o),
         _ => deny!("missing tensor type/shape info on X or output"),
     };
     require!(
-        is_mlx_float(x.dtype) && out.dtype == x.dtype,
-        "X/output must be the same float dtype (fp32/fp16/bf16), got {} -> {}",
+        is_mlx_cpu_float(x.dtype) && out.dtype == x.dtype,
+        "X/output must share one supported float dtype, got {} -> {}",
         crate::registry::ort_dtype_name(x.dtype),
         crate::registry::ort_dtype_name(out.dtype)
     );
-    require!(
-        x.shape.len() >= 2,
-        "input must have rank >= 2 (got rank {})",
-        x.shape.len()
-    );
-    for i in 1..5 {
-        let dtype = match tensor_dtype(node, i) {
-            Some(dtype) => dtype,
-            None => deny!("missing tensor type/shape info on input {i}"),
-        };
+    let rank_known = node.input_rank_known(0) == Some(true);
+    if rank_known {
         require!(
-            dtype == x.dtype,
-            "input {i} must match X dtype {}, got {}",
-            crate::registry::ort_dtype_name(x.dtype),
-            crate::registry::ort_dtype_name(dtype)
+            if version == 1 {
+                x.shape.len() == 4
+            } else {
+                x.shape.len() >= if version >= 9 { 1 } else { 2 }
+            },
+            "invalid input rank {} for BatchNormalization version {version}",
+            x.shape.len()
         );
     }
-
-    let training_mode = node.int_attr("training_mode", 0);
-    require!(
-        training_mode == 0,
-        "training_mode must be 0; training outputs are unsupported (got {training_mode})"
-    );
+    let scale_type = match node.input_info(1) {
+        Some(info) => info.dtype,
+        None => deny!("missing scale type"),
+    };
+    let statistics_type = match node.input_info(3) {
+        Some(info) => info.dtype,
+        None => deny!("missing statistics type"),
+    };
+    for i in 1..5 {
+        let info = match node.input_info(i) {
+            Some(info) => info,
+            None => deny!("missing tensor type/shape info on input {i}"),
+        };
+        let dtype = if i < 3 { scale_type } else { statistics_type };
+        require!(
+            is_mlx_cpu_float(info.dtype)
+                && info.dtype == dtype
+                && (version >= 15 || i >= 3 && version >= 14 || info.dtype == x.dtype),
+            "input {i} violates the versioned affine/statistic dtype groups"
+        );
+        if node.input_rank_known(i) == Some(true) {
+            let expected = if spatial {
+                Some(vec![if rank_known && x.shape.len() > 1 {
+                    x.shape[1]
+                } else if rank_known {
+                    1
+                } else {
+                    -1
+                }])
+            } else if rank_known {
+                Some(x.shape[1..].to_vec())
+            } else {
+                None
+            };
+            if let Some(expected) = expected {
+                require!(
+                    info.shape.len() == expected.len()
+                        && info.shape.iter().zip(expected.iter()).all(
+                            |(&actual, &expected)| actual < 0 || expected < 0 || actual == expected
+                        ),
+                    "input {i} shape {:?} must match {expected:?}",
+                    info.shape
+                );
+            }
+        }
+    }
+    for i in 1..outputs {
+        if node.output_present(i) {
+            require!(
+                node.output_info(i)
+                    .is_some_and(|info| info.dtype == statistics_type),
+                "statistic output {i} must match the input statistic dtype"
+            );
+        }
+    }
     Ok(())
 }
 
@@ -1196,25 +1400,6 @@ fn spatial_norm_compile_shape_safety(node: &NodeView) -> CompileShapeSafety {
 // ---- registration ------------------------------------------------------------------------------
 
 #[allow(clippy::too_many_arguments)]
-fn shapeless(
-    registry: &mut OpRegistry,
-    domain: &'static str,
-    op_type: &'static str,
-    min_opset: i32,
-    handler: crate::registry::OpHandler,
-    claim: crate::registry::ClaimPredicate,
-) {
-    registry.register_shapeless(OpRegistration {
-        domain,
-        op_type,
-        min_opset,
-        max_opset: K_ANY_OPSET,
-        handler,
-        claim,
-    });
-}
-
-#[allow(clippy::too_many_arguments)]
 fn shape_keyed(
     registry: &mut OpRegistry,
     domain: &'static str,
@@ -1293,13 +1478,16 @@ pub fn register_norm(registry: &mut OpRegistry) {
         },
         spatial_norm_compile_shape_safety,
     );
-    shapeless(
-        registry,
-        "",
-        "BatchNormalization",
-        K_ANY_OPSET,
-        batch_norm_op,
-        batch_norm_claim,
+    registry.register_shape_classified(
+        OpRegistration {
+            domain: "",
+            op_type: "BatchNormalization",
+            min_opset: 1,
+            max_opset: K_ANY_OPSET,
+            handler: batch_norm_op,
+            claim: batch_norm_claim,
+        },
+        spatial_norm_compile_shape_safety,
     );
     shape_keyed(
         registry,
