@@ -243,32 +243,63 @@ fn log_softmax_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxE
 
 // ---- Mod / BitShift -----------------------------------------------------------------------------
 
-/// Mod: `fmod=0` → Python modulo (sign of divisor), served by `mlx_remainder`; `fmod=1` → C `fmod`
-/// (sign of dividend), computed as `a - trunc(a/b)*b`.
+/// Use a genuine remainder, not a rounded (or overflowing) floating-point quotient.
 fn mod_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
     let a = ctx.resolve(&n.inputs[0])?;
     let b = ctx.resolve(&n.inputs[1])?;
-    let fmod = n.ints.get("fmod").copied().unwrap_or(0) != 0;
-    let r = if !fmod {
-        ctx.binary(mlx::mlx_remainder, a, b)?
+    let fmod = n.ints.get("fmod").copied().unwrap_or(0) == 1;
+    let dtype = n.outputs[0].otype;
+    let integer = is_signed_integer(dtype) || is_unsigned_integer(dtype);
+    let r = if integer {
+        let zero = ctx.zeros_like(b)?;
+        let zeros = ctx.binary(mlx::mlx_equal, b, zero)?;
+        let any_zero = ctx.emit(|res, s| unsafe { mlx::mlx_any(res, zeros, false, s) })?;
+        if ctx.read_scalar_i64(any_zero)? != 0 {
+            return Err("MLX: Mod integer divisor must not contain zero".to_string());
+        }
+        let b = if is_signed_integer(dtype) {
+            // MIN % -1 is zero, but evaluating the native signed division can overflow.
+            let minus_one = ctx.scalar_i64(-1);
+            let minus_one = ctx.astype(minus_one, ctx.dtype_of(b))?;
+            let unit_divisor = ctx.binary(mlx::mlx_equal, b, minus_one)?;
+            let one = ctx.scalar_i64(1);
+            let one = ctx.astype(one, ctx.dtype_of(b))?;
+            ctx.where_(unit_divisor, one, b)?
+        } else {
+            b
+        };
+        let remainder = ctx.binary(mlx::mlx_remainder, a, b)?;
+        if fmod && is_signed_integer(dtype) {
+            let zero = ctx.zeros_like(remainder)?;
+            let a_negative = ctx.binary(mlx::mlx_less, a, zero)?;
+            let b_negative = ctx.binary(mlx::mlx_less, b, zero)?;
+            let different_signs = ctx.binary(mlx::mlx_not_equal, a_negative, b_negative)?;
+            let nonzero = ctx.binary(mlx::mlx_not_equal, remainder, zero)?;
+            let adjust = ctx.binary(mlx::mlx_logical_and, different_signs, nonzero)?;
+            let truncated = ctx.binary(mlx::mlx_subtract, remainder, b)?;
+            ctx.where_(adjust, truncated, remainder)?
+        } else {
+            remainder
+        }
     } else {
-        let q = ctx.binary(mlx::mlx_divide, a, b)?;
-        let fl = ctx.unary(mlx::mlx_floor, q)?;
-        let cl = ctx.unary(mlx::mlx_ceil, q)?;
-        let dt = ctx.dtype_of(q);
-        let zero = ctx.scalar_f32(0.0);
-        let zero = ctx.astype(zero, dt)?;
-        let nonneg = ctx.binary(mlx::mlx_greater_equal, q, zero)?;
-        let trunc = ctx.where_(nonneg, fl, cl)?;
-        let prod = ctx.binary(mlx::mlx_multiply, trunc, b)?;
-        let computed = ctx.binary(mlx::mlx_subtract, a, prod)?;
-        // `0 * +/-inf` is NaN, but C fmod(x, +/-inf) is x for finite x.
-        // Preserve NaN and infinite dividends by only selecting this fast edge.
-        let b_inf = ctx.unary(mlx::mlx_isinf, b)?;
-        let a_inf = ctx.unary(mlx::mlx_isinf, a)?;
-        let finite_a = ctx.unary(mlx::mlx_logical_not, a_inf)?;
-        let infinity_divisor = ctx.binary(mlx::mlx_logical_and, b_inf, finite_a)?;
-        ctx.where_(infinity_divisor, a, computed)?
+        let dt = if is_float64(dtype) {
+            mlx::mlx_dtype__MLX_FLOAT64
+        } else {
+            mlx::mlx_dtype__MLX_FLOAT32
+        };
+        let a = ctx.astype(a, dt)?;
+        let b = ctx.astype(b, dt)?;
+        let magnitude_a = ctx.unary(mlx::mlx_abs, a)?;
+        let magnitude_b = ctx.unary(mlx::mlx_abs, b)?;
+        let magnitude = ctx.binary(mlx::mlx_remainder, magnitude_a, magnitude_b)?;
+        let zero = ctx.zeros_like(magnitude)?;
+        let negative = ctx.binary(mlx::mlx_less, a, zero)?;
+        let negated = ctx.unary(mlx::mlx_negative, magnitude)?;
+        let signed = ctx.where_(negative, negated, magnitude)?;
+        let a_zero = ctx.binary(mlx::mlx_equal, a, zero)?;
+        let r_zero = ctx.binary(mlx::mlx_equal, magnitude, zero)?;
+        let preserve_zero = ctx.binary(mlx::mlx_logical_and, a_zero, r_zero)?;
+        ctx.where_(preserve_zero, a, signed)?
     };
     bind_as_out(ctx, n, r)
 }
@@ -812,8 +843,33 @@ fn log_softmax_claim(node: &NodeView) -> ClaimResult {
     Ok(())
 }
 
-/// Mod: two same-dtype inputs, scalar-or-suffix broadcast. `fmod=0` (Python modulo) serves float and
-/// integer; `fmod=1` (C fmod) is float-only (the truncation composition needs float floor/ceil).
+fn mod_type_claimable(version: i32, fmod: i64, dtype: ort::ONNXTensorElementDataType) -> bool {
+    let integer = is_signed_integer(dtype) || is_unsigned_integer(dtype);
+    let float = is_mlx_cpu_float(dtype)
+        && (version >= 13
+            || dtype != ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16);
+    (10..28).contains(&version)
+        && match fmod {
+            0 => integer,
+            1 => float || (version < 13 && integer),
+            _ => false,
+        }
+}
+
+fn mod_compile_shape_safety(node: &NodeView) -> CompileShapeSafety {
+    if node
+        .input_info(0)
+        .is_some_and(|input| is_signed_integer(input.dtype) || is_unsigned_integer(input.dtype))
+    {
+        CompileShapeSafety::EagerOnly {
+            reason: "integer Mod validates divisor values on every execution",
+        }
+    } else {
+        CompileShapeSafety::Shapeless
+    }
+}
+
+/// Mod10 permits integer fmod; Mod13 restricts fmod=0 to integers and fmod=1 to floats.
 fn mod_claim(node: &NodeView) -> ClaimResult {
     require!(
         node.num_inputs() == 2 && node.num_outputs() == 1,
@@ -834,7 +890,7 @@ fn mod_claim(node: &NodeView) -> ClaimResult {
     );
     require!(
         scalar_or_suffix_broadcast(&a.shape, &b.shape),
-        "only scalar or trailing-suffix broadcast is supported (shapes {:?} vs {:?})",
+        "inputs must support multidirectional broadcasting (shapes {:?} vs {:?})",
         a.shape,
         b.shape
     );
@@ -843,19 +899,12 @@ fn mod_claim(node: &NodeView) -> ClaimResult {
         fmod == 0 || fmod == 1,
         "fmod must be 0 (floor quotient) or 1 (truncation quotient), got {fmod}"
     );
-    if fmod == 1 {
-        require!(
-            is_mlx_cpu_float(a.dtype),
-            "fmod=1 (C fmod) is float-only; integer dtype {} stays on CPU",
-            crate::registry::ort_dtype_name(a.dtype)
-        );
-    } else {
-        require!(
-            is_mlx_float(a.dtype) || is_signed_integer(a.dtype) || is_unsigned_integer(a.dtype),
-            "dtype {} not supported for Mod",
-            crate::registry::ort_dtype_name(a.dtype)
-        );
-    }
+    require!(
+        mod_type_claimable(node.since_version(), fmod, a.dtype),
+        "Mod schema {} does not support fmod={fmod} with dtype {}",
+        node.since_version(),
+        crate::registry::ort_dtype_name(a.dtype)
+    );
     Ok(())
 }
 
@@ -1085,13 +1134,63 @@ pub fn register(registry: &mut OpRegistry) {
     shapeless_since(registry, "IsNaN", 9, is_nan_op, float_predicate_claim);
 
     // Misc elementwise.
-    shapeless_since(registry, "Mod", 10, mod_op, mod_claim);
+    registry.register_shape_classified(
+        OpRegistration {
+            domain: "",
+            op_type: "Mod",
+            min_opset: 10,
+            max_opset: 27,
+            handler: mod_op,
+            claim: mod_claim,
+        },
+        mod_compile_shape_safety,
+    );
     shapeless_since(registry, "BitShift", 11, bitshift_op, bitshift_claim);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mod_versioned_type_contract() {
+        use ort::*;
+        for version in [10, 11, 12, 13, 26, 27] {
+            for dtype in [
+                ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8,
+                ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT16,
+                ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32,
+                ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64,
+                ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8,
+                ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT16,
+                ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT32,
+                ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT64,
+            ] {
+                assert!(mod_type_claimable(version, 0, dtype));
+                assert_eq!(mod_type_claimable(version, 1, dtype), version < 13);
+                assert!(!mod_type_claimable(version, 2, dtype));
+            }
+            for dtype in [
+                ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
+                ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16,
+                ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_DOUBLE,
+                ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16,
+            ] {
+                assert!(!mod_type_claimable(version, 0, dtype));
+                assert_eq!(
+                    mod_type_claimable(version, 1, dtype),
+                    version >= 13
+                        || dtype
+                            != ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16
+                );
+            }
+        }
+        assert!(!mod_type_claimable(
+            28,
+            1,
+            ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT
+        ));
+    }
 
     #[test]
     fn legacy_suffix_softmax_never_enters_shapeless_replay() {
