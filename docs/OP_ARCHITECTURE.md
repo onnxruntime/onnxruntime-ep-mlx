@@ -155,6 +155,22 @@ cannot materialize their results:
 | String tensors | RegexFullMatch, StringConcat, StringNormalizer, StringSplit |
 | Optional value | Optional |
 
+`Shape` and `Size` read tensor geometry without converting payloads into MLX
+arrays. This includes string and encoded float8/float4/int4/uint4 tensors that ORT
+can materialize, string initializers, changing ranks, scalar tensors, and empty
+tensors with dimensions beyond MLX's int32 shape range. `Shape` honors clipped
+positive/negative `start` and `end`; `Size` returns a checked int64 element count
+and zero for any empty dimension. Non-MLX payloads use eager metadata reads;
+dynamic or intermediate numeric geometry uses shape-keyed compilation. This does not enable
+string/encoded payload outputs or control-flow array boundaries.
+Fully static graph-input/initializer metadata retains shapeless eligibility.
+Existing host-value specialization and eager fences still protect geometry
+controlled by changing parameter values; root input shapes alone are not a
+sufficient cache key. General capture value-specializes supported boundary
+parameters; decode and prefill reject host-read parameters unless they are
+immutable or proven shape-constant. This also protects live Reshape/Expand
+outputs when an unrelated metadata input has fully static geometry.
+
 Sequence **inputs** are supported by `SequenceLength`, `SequenceAt`, and
 `ConcatFromSequence` from opset 11 onward. These handlers execute eagerly and
 re-read the live ORT sequence on every invocation. Element copies own their MLX
