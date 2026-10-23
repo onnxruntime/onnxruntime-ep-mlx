@@ -286,6 +286,15 @@ pub fn requires_elementary_contrib_eager_boundary(node: &NodeView) -> bool {
         })
 }
 
+/// CDist host reductions, including those inside otherwise capture-safe parents.
+pub fn requires_cdist_eager_boundary(node: &NodeView) -> bool {
+    (node.domain() == "com.microsoft" && node.op_type() == "CDist")
+        || node
+            .subgraphs()
+            .iter()
+            .any(|(_, body)| body.nodes().iter().any(requires_cdist_eager_boundary))
+}
+
 /// Populate the table with every built-in op module (wave-1: elementwise + math).
 fn register_builtin_ops(registry: &mut OpRegistry) {
     crate::ops::elementwise::register(registry);
