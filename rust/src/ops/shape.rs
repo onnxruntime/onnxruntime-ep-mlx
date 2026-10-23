@@ -947,77 +947,287 @@ fn tile_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
     Ok(())
 }
 
+struct PadGeometry {
+    axes: Vec<i32>,
+    output: Vec<i32>,
+    start: Vec<i32>,
+    stop: Vec<i32>,
+    low: Vec<i32>,
+    high: Vec<i32>,
+    empty_source: bool,
+    elements: usize,
+}
+
+fn checked_pad_axes(rank: usize, axes: &[i64], pad_count: usize) -> Result<Vec<i32>, MlxError> {
+    if axes.len().checked_mul(2) != Some(pad_count) {
+        return Err("MLX Pad: pads length must be twice the axes length".to_string());
+    }
+    let rank = i32::try_from(rank).map_err(|_| "MLX Pad: rank exceeds native int32 geometry")?;
+    let mut seen = vec![false; rank as usize];
+    let mut normalized = Vec::with_capacity(axes.len());
+    for &axis in axes {
+        if axis < -i64::from(rank) || axis >= i64::from(rank) {
+            return Err(format!(
+                "MLX Pad: axis {axis} is out of range for rank {rank}"
+            ));
+        }
+        let axis = norm_axis(axis, rank);
+        if seen[axis as usize] {
+            return Err(format!("MLX Pad: duplicate axis {axis}"));
+        }
+        seen[axis as usize] = true;
+        normalized.push(axis);
+    }
+    Ok(normalized)
+}
+
+fn checked_pad_geometry(
+    shape: &[i64],
+    axes: &[i64],
+    pads: &[i64],
+    mode: &str,
+) -> Result<PadGeometry, MlxError> {
+    if !matches!(mode, "constant" | "reflect" | "edge" | "wrap") {
+        return Err(format!("MLX Pad: unsupported mode {mode:?}"));
+    }
+    let axes = checked_pad_axes(shape.len(), axes, pads.len())?;
+    let axis_count = axes.len();
+    let dimensions: Vec<i32> = shape
+        .iter()
+        .map(|&dimension| {
+            if !(0..=i64::from(i32::MAX)).contains(&dimension) {
+                return Err("MLX Pad: input dimensions must fit native int32 geometry".to_string());
+            }
+            Ok(dimension as i32)
+        })
+        .collect::<Result<_, _>>()?;
+    let mut geometry = PadGeometry {
+        axes,
+        output: dimensions.clone(),
+        start: vec![0; shape.len()],
+        stop: dimensions,
+        low: Vec::with_capacity(axis_count),
+        high: Vec::with_capacity(axis_count),
+        empty_source: shape.contains(&0),
+        elements: 0,
+    };
+    for (i, &axis) in geometry.axes.iter().enumerate() {
+        let axis = axis as usize;
+        let extent = i128::from(shape[axis]);
+        let before = i128::from(pads[i]);
+        let after = i128::from(pads[i + geometry.axes.len()]);
+        let output = extent + before + after;
+        if !(0..=i128::from(i32::MAX)).contains(&output) {
+            return Err("MLX Pad: output dimensions must fit native int32 geometry".to_string());
+        }
+        // Preserve the original-coordinate overlap even when removal exceeds an input edge.
+        let start = (-before).clamp(0, extent);
+        let stop = (extent + after).clamp(0, extent);
+        let copied = (stop - start).max(0);
+        if mode != "constant"
+            && (extent - (-before).max(0) - (-after).max(0) < 0 || (copied == 0 && output != 0))
+        {
+            return Err(
+                "MLX Pad: nonconstant padding requires a nonempty cropped axis".to_string(),
+            );
+        }
+        geometry.output[axis] = output as i32;
+        geometry.start[axis] = start as i32;
+        geometry.stop[axis] = stop as i32;
+        let low = before.clamp(0, output);
+        geometry.low.push(low as i32);
+        geometry.high.push((output - low - copied) as i32);
+        geometry.empty_source |= copied == 0;
+    }
+    if !geometry.output.contains(&0) {
+        geometry.elements = geometry
+            .output
+            .iter()
+            .try_fold(1usize, |count, &dimension| {
+                count
+                    .checked_mul(dimension as usize)
+                    .ok_or("MLX Pad: output element count overflows usize")
+            })?;
+    }
+    Ok(geometry)
+}
+
 fn pad_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
-    let data = ctx.resolve(&n.inputs[0])?;
-    let rank = ctx.ndim(data) as i32;
-    let pads = read_ints(ctx, n, 1)?;
-    let axes: Vec<i64> = if present(n, 3) {
+    let shape = ctx.tensor_shape(&n.inputs[0])?;
+    let legacy = n.since_version < 11;
+    let pads = if legacy {
+        let attribute = if n.since_version == 1 {
+            "paddings"
+        } else {
+            "pads"
+        };
+        n.int_arrays
+            .get(attribute)
+            .cloned()
+            .ok_or_else(|| format!("MLX Pad: missing {attribute} attribute"))?
+    } else {
+        if ctx.tensor_shape(&n.inputs[1])?.len() != 1 {
+            return Err("MLX Pad: pads must be a rank-one int64 tensor".to_string());
+        }
+        read_ints(ctx, n, 1)?
+    };
+    let axes = if present(n, 3) {
+        if ctx.tensor_shape(&n.inputs[3])?.len() != 1 {
+            return Err("MLX Pad: axes must be a rank-one integer tensor".to_string());
+        }
         read_ints(ctx, n, 3)?
     } else {
-        (0..rank as i64).collect()
+        (0..shape.len() as i64).collect()
     };
-    let naxes = axes.len();
-    let mut ax = vec![0i32; naxes];
-    let mut low = vec![0i32; naxes];
-    let mut high = vec![0i32; naxes];
-    for i in 0..naxes {
-        ax[i] = norm_axis(axes[i], rank);
-        low[i] = pads[i] as i32;
-        high[i] = pads[i + naxes] as i32;
+    if present(n, 2) && !ctx.tensor_shape(&n.inputs[2])?.is_empty() {
+        return Err("MLX Pad: constant_value must be a scalar".to_string());
     }
-    let dt = ctx.dtype_of(data);
-    let pad_value = if present(n, 2) {
-        let cv = ctx.resolve(&n.inputs[2])?;
-        ctx.astype(cv, dt)?
-    } else {
-        let z = ctx.scalar_i64(0);
-        ctx.astype(z, dt)?
-    };
     let mode = n
         .strings
         .get("mode")
         .map(String::as_str)
         .unwrap_or("constant");
+    let geometry = checked_pad_geometry(&shape, &axes, &pads, mode)?;
+    let dt = mlx_dtype_from_onnx(n.outputs[0].otype);
+    if geometry.output.contains(&0) {
+        let result = ctx.zeros(&geometry.output, dt)?;
+        ctx.bind(&n.outputs[0], result);
+        return Ok(());
+    }
+    let pad_value = if mode == "constant" && present(n, 2) {
+        ctx.resolve(&n.inputs[2])?
+    } else if mode == "constant" && legacy {
+        ctx.scalar_f32(n.floats.get("value").copied().unwrap_or(0.0))
+    } else {
+        ctx.scalar_i64(0)
+    };
+    let pad_value = ctx.astype(pad_value, dt)?;
+    geometry
+        .elements
+        .checked_mul(unsafe { mlx::mlx_array_itemsize(pad_value) })
+        .ok_or("MLX Pad: output byte count overflows usize")?;
+    if geometry.empty_source {
+        let result = ctx.emit(|res, s| unsafe {
+            mlx::mlx_broadcast_to(
+                res,
+                pad_value,
+                geometry.output.as_ptr(),
+                geometry.output.len(),
+                s,
+            )
+        })?;
+        ctx.bind(&n.outputs[0], result);
+        return Ok(());
+    }
+    let data = ctx.resolve(&n.inputs[0])?;
+    let data = if geometry.start.iter().any(|&start| start != 0)
+        || geometry
+            .stop
+            .iter()
+            .zip(&shape)
+            .any(|(&stop, &extent)| i64::from(stop) != extent)
+    {
+        ctx.slice(data, &geometry.start, &geometry.stop)?
+    } else {
+        data
+    };
+    if geometry
+        .low
+        .iter()
+        .chain(&geometry.high)
+        .all(|&pad| pad == 0)
+    {
+        ctx.bind(&n.outputs[0], data);
+        return Ok(());
+    }
+    let PadGeometry {
+        axes: ax,
+        low,
+        high,
+        ..
+    } = geometry;
     let r = match mode {
-        // MLX implements these two modes directly.
-        "constant" | "reflect" => {
-            let mode = if mode == "constant" {
-                c"constant"
-            } else {
-                c"reflect"
-            };
-            ctx.emit(|res, s| unsafe {
-                mlx::mlx_pad(
-                    res,
-                    data,
-                    ax.as_ptr(),
-                    ax.len(),
-                    low.as_ptr(),
-                    low.len(),
-                    high.as_ptr(),
-                    high.len(),
-                    pad_value,
-                    mode.as_ptr(),
-                    s,
-                )
-            })?
-        }
+        "constant" => ctx.emit(|res, s| unsafe {
+            mlx::mlx_pad(
+                res,
+                data,
+                ax.as_ptr(),
+                ax.len(),
+                low.as_ptr(),
+                low.len(),
+                high.as_ptr(),
+                high.len(),
+                pad_value,
+                c"constant".as_ptr(),
+                s,
+            )
+        })?,
+        "reflect" => reflect_pad(ctx, data, &ax, &low, &high, pad_value)?,
         // MLX's built-in edge path aborts for multi-axis input and it has no wrap mode. Express
         // both through stable slice/broadcast/take primitives instead.
         "edge" => edge_pad(ctx, data, &ax, &low, &high)?,
         "wrap" => wrap_pad(ctx, data, &ax, &low, &high)?,
         mode => return Err(format!("Pad: unsupported mode {mode:?}")),
     };
-    // A zero-sized pad result has no backing buffer; re-materialise as clean zeros for CopyOut.
-    if ctx.size_of(r) == 0 {
-        let shp = ctx.shape_of(r);
-        let rdt = ctx.dtype_of(r);
-        let z = ctx.zeros(&shp, rdt)?;
-        ctx.bind(&n.outputs[0], z);
-        return Ok(());
-    }
     ctx.bind(&n.outputs[0], r);
     Ok(())
+}
+
+fn reflect_pad(
+    ctx: &mut TranslationContext,
+    data: mlx::mlx_array,
+    axes: &[i32],
+    low: &[i32],
+    high: &[i32],
+    pad_value: mlx::mlx_array,
+) -> Result<mlx::mlx_array, MlxError> {
+    let mut result = data;
+    for ((&axis, &before), &after) in axes.iter().zip(low).zip(high) {
+        if before == 0 && after == 0 {
+            continue;
+        }
+        let extent = ctx.dim(result, axis);
+        if extent == 1 {
+            let mut shape = ctx.shape_of(result);
+            shape[axis as usize] = extent + before + after;
+            result = ctx.emit(|res, s| unsafe {
+                mlx::mlx_broadcast_to(res, result, shape.as_ptr(), shape.len(), s)
+            })?;
+        } else if before < extent && after < extent {
+            result = ctx.emit(|res, s| unsafe {
+                mlx::mlx_pad(
+                    res,
+                    result,
+                    &axis,
+                    1,
+                    &before,
+                    1,
+                    &after,
+                    1,
+                    pad_value,
+                    c"reflect".as_ptr(),
+                    s,
+                )
+            })?;
+        } else {
+            let period = (extent - 1)
+                .checked_mul(2)
+                .ok_or("MLX Pad: reflection period exceeds native int32 indexing")?;
+            let indices = ctx.arange(
+                -f64::from(before),
+                f64::from(extent + after),
+                1.0,
+                mlx::mlx_dtype__MLX_INT32,
+            )?;
+            let period = ctx.scalar_i32(period);
+            let indices = ctx.binary(mlx::mlx_remainder, indices, period)?;
+            let reflected = ctx.binary(mlx::mlx_subtract, period, indices)?;
+            let indices = ctx.binary(mlx::mlx_minimum, indices, reflected)?;
+            result =
+                ctx.emit(|res, s| unsafe { mlx::mlx_take_axis(res, result, indices, axis, s) })?;
+        }
+    }
+    Ok(result)
 }
 
 fn edge_pad(
@@ -2305,9 +2515,22 @@ fn tile_claim(node: &NodeView) -> ClaimResult {
 
 fn pad_claim(node: &NodeView) -> ClaimResult {
     let nin = node.num_inputs();
+    let version = node.since_version();
+    let legacy = version < 11;
+    let max_inputs = if legacy {
+        1
+    } else if version < 18 {
+        3
+    } else {
+        4
+    };
     require!(
-        (2..=4).contains(&nin) && node.num_outputs() == 1,
-        "Pad expects 2-4 inputs and 1 output, got {}in/{}out",
+        (if legacy {
+            nin == 1
+        } else {
+            (2..=max_inputs).contains(&nin)
+        }) && node.num_outputs() == 1,
+        "Pad: wrong input/output counts for schema {version}: {}in/{}out",
         nin,
         node.num_outputs()
     );
@@ -2317,7 +2540,7 @@ fn pad_claim(node: &NodeView) -> ClaimResult {
     };
     require!(
         is_movable(data),
-        "data dtype {} is not a movable dtype supported on GPU",
+        "data dtype {} is not a supported numeric or Boolean movement dtype",
         crate::registry::ort_dtype_name(data)
     );
     require!(
@@ -2331,42 +2554,86 @@ fn pad_claim(node: &NodeView) -> ClaimResult {
         matches!(mode.as_str(), "constant" | "reflect" | "edge" | "wrap"),
         "Pad: mode must be constant, reflect, edge, or wrap"
     );
-    let pads = match node.read_const_int64(1) {
-        Some(pads) => pads,
-        None => deny!("Pad: `pads` must be a constant int64 initializer"),
-    };
     require!(
-        pads.iter().all(|&pad| (0..=i32::MAX as i64).contains(&pad)),
-        "Pad: pads must be non-negative values that fit MLX int32 extents"
+        mode != "wrap" || version >= 19,
+        "Pad: wrap mode requires schema 19 or newer"
     );
-    let rank = node.input_info(0).map_or(0, |data| data.shape.len()) as i64;
-    let axes = if nin >= 4 && node.input_present(3) {
-        match node.read_const_int64(3) {
-            Some(axes) => axes,
-            None => deny!("Pad: `axes` must be a constant int64 initializer"),
-        }
+    let data_info = node.input_info(0).ok_or("Pad: missing data metadata")?;
+    let rank = if node.input_rank_known(0) == Some(true) {
+        Some(data_info.shape.len())
     } else {
-        (0..rank).collect()
+        None
     };
     require!(
-        pads.len() == axes.len() * 2,
-        "Pad: `pads` length {} must be twice `axes` length {}",
-        pads.len(),
-        axes.len()
+        data_info
+            .shape
+            .iter()
+            .all(|&extent| extent <= i64::from(i32::MAX)),
+        "Pad: input dimensions must fit native int32 geometry"
     );
-    let mut seen = vec![false; rank as usize];
-    for axis in axes {
+    let pads = if legacy {
+        let attribute = if version == 1 { "paddings" } else { "pads" };
+        let (present, values) = node.ints_attr(attribute);
+        require!(present, "Pad: missing {attribute} attribute");
+        Some(values)
+    } else {
+        let info = node.input_info(1).ok_or("Pad: missing pads metadata")?;
         require!(
-            axis >= -rank && axis < rank,
-            "Pad: axis {axis} is out of range for rank {rank}"
+            info.dtype == ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64
+                && (node.input_rank_known(1) != Some(true) || info.shape.len() == 1),
+            "Pad: pads must be a rank-one int64 tensor"
         );
-        let axis = norm_axis(axis, rank as i32) as usize;
-        require!(!seen[axis], "Pad: axes must be unique");
-        seen[axis] = true;
+        node.read_const_int64(1)
+    };
+    let known_count = |index: usize| {
+        node.input_info(index).and_then(|info| {
+            if node.input_rank_known(index) == Some(true) && info.shape.len() == 1 {
+                usize::try_from(info.shape[0]).ok()
+            } else {
+                None
+            }
+        })
+    };
+    let pad_count = pads.as_ref().map(Vec::len).or_else(|| known_count(1));
+    if let Some(count) = pad_count {
+        require!(count % 2 == 0, "Pad: pads length must be even");
+    }
+    let axes = if node.input_present(3) {
+        let info = node.input_info(3).ok_or("Pad: missing axes metadata")?;
+        require!(
+            is_int_index(info.dtype)
+                && (node.input_rank_known(3) != Some(true) || info.shape.len() == 1),
+            "Pad: axes must be a rank-one int32 or int64 tensor"
+        );
+        node.read_const_ints_any(3)
+    } else {
+        rank.map(|rank| (0..rank as i64).collect())
+    };
+    let axis_count = axes.as_ref().map(Vec::len).or_else(|| known_count(3));
+    if let (Some(pad_count), Some(axis_count)) = (pad_count, axis_count) {
+        require!(
+            axis_count.checked_mul(2) == Some(pad_count),
+            "Pad: pads length must be twice the axes length"
+        );
+    }
+    if let (Some(rank), Some(axes)) = (rank, axes.as_ref()) {
+        let count = pad_count.unwrap_or(
+            axes.len()
+                .checked_mul(2)
+                .ok_or("Pad: axes count overflows")?,
+        );
+        checked_pad_axes(rank, axes, count)?;
+        if let Some(pads) = pads.as_ref()
+            && data_info.shape.iter().all(|&extent| extent >= 0)
+        {
+            checked_pad_geometry(&data_info.shape, axes, pads, &mode)?;
+        }
     }
     if nin >= 3 && node.input_present(2) {
         match node.input_info(2) {
-            Some(cv) if cv.dtype == data && cv.shape.is_empty() => {}
+            Some(cv)
+                if cv.dtype == data
+                    && (node.input_rank_known(2) != Some(true) || cv.shape.is_empty()) => {}
             Some(cv) => deny!(
                 "Pad: constant_value must be a scalar with dtype {} (got {} shape {:?})",
                 crate::registry::ort_dtype_name(data),
@@ -3051,7 +3318,7 @@ pub fn register(registry: &mut OpRegistry) {
 
 #[cfg(test)]
 mod tests {
-    use super::checked_split_sizes;
+    use super::{checked_pad_axes, checked_pad_geometry, checked_split_sizes};
 
     #[test]
     fn split_sizes_validate_without_known_axis_geometry() {
@@ -3089,5 +3356,41 @@ mod tests {
         assert!(checked_split_sizes(Some(5), 4, None, Some(4)).is_err());
         assert!(checked_split_sizes(Some(1), 3, None, Some(3)).is_err());
         assert!(checked_split_sizes(Some(6), 2, Some(&[2, 3]), None).is_err());
+    }
+
+    #[test]
+    fn pad_geometry_preserves_original_coordinate_overlap() {
+        for pads in [[-4, 2], [2, -4]] {
+            let geometry = checked_pad_geometry(&[3], &[0], &pads, "constant").unwrap();
+            assert_eq!(geometry.output, vec![1]);
+            assert!(geometry.empty_source);
+        }
+        for pads in [[i64::MIN, i64::MAX], [i64::MAX, i64::MIN]] {
+            let geometry = checked_pad_geometry(&[3], &[0], &pads, "constant").unwrap();
+            assert_eq!(geometry.output, vec![2]);
+            assert!(geometry.empty_source);
+        }
+        let geometry = checked_pad_geometry(&[3], &[0], &[-1, 2], "constant").unwrap();
+        assert_eq!(geometry.start, vec![1]);
+        assert_eq!(geometry.stop, vec![3]);
+        assert_eq!(geometry.low, vec![0]);
+        assert_eq!(geometry.high, vec![2]);
+        assert_eq!(geometry.output, vec![4]);
+    }
+
+    #[test]
+    fn pad_geometry_validates_axes_empty_and_native_bounds() {
+        assert!(checked_pad_axes(2, &[-1, 1], 4).is_err());
+        assert!(checked_pad_axes(2, &[i64::MIN], 2).is_err());
+        assert!(checked_pad_axes(2, &[2], 2).is_err());
+        assert!(checked_pad_axes(2, &[0], 3).is_err());
+        assert!(checked_pad_geometry(&[3], &[0], &[-4, 0], "constant").is_err());
+        assert!(checked_pad_geometry(&[3], &[0], &[i64::MAX, 0], "constant").is_err());
+        assert!(checked_pad_geometry(&[3], &[0], &[-4, 2], "edge").is_err());
+        assert!(checked_pad_geometry(&[0], &[0], &[1, 1], "wrap").is_err());
+        assert!(checked_pad_geometry(&[1 << 30; 3], &[], &[], "constant").is_err());
+        assert!(checked_pad_geometry(&[0, i64::from(i32::MAX) + 1], &[], &[], "constant").is_err());
+        let empty = checked_pad_geometry(&[0, 3], &[1], &[1, 1], "constant").unwrap();
+        assert_eq!(empty.output, vec![0, 5]);
     }
 }
