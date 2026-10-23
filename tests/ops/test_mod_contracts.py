@@ -313,15 +313,14 @@ def _mixed_route_replay(case):
                 session.run(None, {**feeds, "b": np.zeros_like(y)})
 
 
-@pytest.mark.parametrize("case", ["float", "double", "int64", "bfloat16"])
-def test_mod_actual_route_and_mixed_graph(case, tmp_path):
+def _route_events(replay, case, tmp_path):
     trace = tmp_path / "mod_route.json"
     code = (
         "import os; import onnxruntime as ort; "
         "ort.register_execution_provider_library('MLXExecutionProvider', "
         "os.environ['ONNXRUNTIME_MLX_EP_LIB']); "
-        "from test_mod_contracts import _mixed_route_replay; "
-        f"_mixed_route_replay({case!r})"
+        f"from test_mod_contracts import {replay}; "
+        f"{replay}({case!r})"
     )
     subprocess.run(
         [sys.executable, "-c", code],
@@ -335,7 +334,12 @@ def test_mod_actual_route_and_mixed_graph(case, tmp_path):
         check=True,
         timeout=120,
     )
-    events = json.loads(trace.read_text())
+    return json.loads(trace.read_text())
+
+
+@pytest.mark.parametrize("case", ["float", "double", "int64", "bfloat16"])
+def test_mod_actual_route_and_mixed_graph(case, tmp_path):
+    events = _route_events("_mixed_route_replay", case, tmp_path)
     paths = [
         event["args"]["path"] for event in events
         if event.get("cat") == "ep.path" and "Mod" in event.get("args", {}).get("ops", "").split(",")
@@ -348,3 +352,67 @@ def test_mod_actual_route_and_mixed_graph(case, tmp_path):
     ]
     assert len(add_paths) == (7 if case == "int64" else 6), add_paths
     assert set(add_paths) == ({"eager"} if case == "double" else {"general"}), add_paths
+
+
+def _shape_consumer_replay(case):
+    floating = case == "float_unsqueeze"
+    operation = "Unsqueeze" if floating else case
+    shape = [2, 3] if operation == "Unsqueeze" else [1, 2, 1] if operation == "Squeeze" else [2]
+    control_shape = shape if floating else [2] if operation == "Pad" else [1]
+    dtype = DT.FLOAT if floating else DT.INT64
+    a, b = [m.tensor(name, dtype, control_shape) for name in ("a", "b")]
+    remainder = m.tensor("remainder", dtype, control_shape)
+    nodes = [ir.node("Mod", [a, b], attributes={"fmod": int(floating)}, outputs=[remainder])]
+    inputs, initializers = [a, b], []
+    rank = len(shape) + (operation == "Unsqueeze") - (operation == "Squeeze")
+    out = m.tensor("out", DT.FLOAT, [f"D{i}" for i in range(rank)])
+    if floating:
+        axes = ir.Value(name="axes", const_value=ir.tensor(np.array([0], np.int64)))
+        initializers.append(axes)
+        nodes.append(ir.node("Unsqueeze", [remainder, axes], outputs=[out]))
+    else:
+        x = m.tensor("x", DT.FLOAT, shape)
+        inputs.append(x)
+        nodes.append(ir.node(operation, [x, remainder], outputs=[out]))
+    graph = ir.Graph(inputs, [out], nodes=nodes, initializers=initializers, opset_imports={"": 13})
+    model = ir.to_proto(ir.Model(graph, ir_version=11)).SerializeToString()
+    session = m._session(model, m.EP_PROVIDERS)
+    session.disable_fallback()
+    x = np.arange(np.prod(shape), dtype=np.float32).reshape(shape)
+    for index in range(3):
+        if floating:
+            a = np.full(shape, [1e20, -1e20, 1e20][index], np.float32)
+            b = np.full(shape, 3, np.float32)
+            expected = np.expand_dims(_fmod_reference(a, b), axis=0)
+            feeds = {"a": a, "b": b}
+        else:
+            controls = (
+                [[1, 0], [0, 1], [1, 0]] if operation == "Pad"
+                else [[0], [2], [0]]
+            )[index]
+            a = np.array(controls, np.int64)
+            b = np.full(a.shape, 2 if operation == "Pad" else 3, np.int64)
+            expected = (
+                np.pad(x, (a[0], a[1])) if operation == "Pad"
+                else np.squeeze(x, axis=int(a[0])) if operation == "Squeeze"
+                else np.expand_dims(x, axis=int(a[0]))
+            )
+            feeds = {"x": x, "a": a, "b": b}
+        actual = session.run(None, feeds)[0]
+        _assert_float_exact(actual, expected)
+        if not floating and index == 0:
+            with pytest.raises(Exception, match="Mod integer divisor must not contain zero"):
+                session.run(None, {**feeds, "b": np.zeros_like(b)})
+
+
+@pytest.mark.parametrize("case", ["Pad", "Squeeze", "Unsqueeze", "float_unsqueeze"])
+def test_mod_actual_route_with_live_shape_consumer(case, tmp_path):
+    events = _route_events("_shape_consumer_replay", case, tmp_path)
+    paths = [event["args"] for event in events if event.get("cat") == "ep.path"]
+    mod_paths = [item["path"] for item in paths if "Mod" in item["ops"].split(",")]
+    operation = "Unsqueeze" if case == "float_unsqueeze" else case
+    consumer_paths = [
+        item["path"] for item in paths if operation in item["ops"].split(",")
+    ]
+    assert mod_paths == ["eager"] * 3, mod_paths
+    assert consumer_paths == ["general"] * 3, consumer_paths

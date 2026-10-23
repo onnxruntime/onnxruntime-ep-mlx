@@ -30,6 +30,9 @@ CPU primitive chain casts back before its output can reach a GPU consumer.
 Live operands are recomputed on every call, never captured as constants.
 The eager Mod boundary is honored in non-decoder graphs as well, so adjacent
 eligible GPU operations keep their own general compiled partitions.
+Regression traces cover Add neighbors, live Mod-produced Pad/Squeeze/Unsqueeze
+controls with same-shape value changes and error recovery, and floating Mod
+feeding a compiled Unsqueeze consumer.
 
 Integer Mod checks for zero divisors on every execution and reports an EP
 error, including after a successful run of the same shape. It uses the eager
