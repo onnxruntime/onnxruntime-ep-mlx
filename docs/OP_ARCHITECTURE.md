@@ -78,6 +78,7 @@ The following table is the current support contract. Do not broaden claims witho
 | **Div** | `ai.onnx` | same-dtype float or `int32`/`int64`, scalar-or-suffix broadcast | MLX divide; integer floor quotient corrected toward zero | MLX 0.32.4 floors integer division; opposite-sign inputs with a nonzero remainder add one to preserve ONNX truncation without float conversion. Zero and correction use the input dtype, including for values beyond exact floating-point representation. Integer division by zero and unrepresentable quotients are not defined by this support contract. |
 | **Mod** | `ai.onnx` | Mod10/13, same-dtype numeric inputs with multidirectional broadcasting | magnitude remainder/sign restoration for floats; integer remainder/correction | [Versioned contracts](MOD.md): Mod10 permits integer `fmod=1`; Mod13 requires integers for `fmod=0` and floats for `fmod=1`. Floating arithmetic uses explicit MLX CPU/DOUBLE primitives to avoid Metal remainder precision loss. All forms are eager-only; integer zero divisors are validated on every call. Mod28 is not registered. |
 | **Pow** | `ai.onnx` | Version-legal floating bases and numeric exponents; legacy `broadcast`/`axis` and modern multidirectional broadcasting | typed MLX power or exact integer-exponent decomposition | Output retains the base dtype. Integer exponents are not rounded through the base's floating dtype: full-width decomposition preserves sign/parity, including large odd exponents. Float64 calculations use the isolated MLX CPU stream, not ORT fallback. Integer bases remain unclaimed pending an authoritative overflow and negative-exponent contract; this is a semantic coverage gap, not a claim that MLX lacks integer arithmetic. |
+| **ParametricSoftplus / ImageScaler** | `ai.onnx` | Deprecated experimental schema 1, before opset 10; matching fp16/fp32/fp64 input/output | provider-owned eager CPU arithmetic and MLX output arrays | ParametricSoftplus requires explicit FLOAT `alpha` and `beta` and is elementwise for any rank. ImageScaler requires rank-four NCHW and an explicit FLOATS `bias` with exactly C entries; FLOAT `scale` defaults to 1. Neither missing bias nor missing alpha/beta is assigned an invented default. |
 | **Conv** | `ai.onnx` | rank-3/4, static positive W shape; symbolic X batch/channel/spatial dimensions allowed | MLX conv1d/conv2d/conv_general | W and group determine the required input channels; concrete channels are checked at execution. |
 | **RNN / GRU / LSTM** | `ai.onnx` | layout=0, default activations, no sequence_lens; symbolic sequence length allowed | shape-keyed unrolling | Each concrete input shape gets its own trace. Empty sequences preserve initial states and produce an empty Y. |
 | **Dropout** | `ai.onnx` | Versioned floating data, optional ratio/training controls and mask; legacy `is_test` | identity/ones for inference, uniform sampling and scaled masking for training | Opsets 1/6 honor `is_test`; 7/10 retain inference behavior because they provide no per-node training selector. Mask dtype follows the schema (data dtype before opset 10, bool thereafter). Modern controls are live scalar tensors, including intermediate producers; inference ignores the ratio value. BF16 data requires opset 13 and BF16 ratio requires opset 22. Training is an eager partition boundary, preserving compiled neighbors and fresh default keys; explicit INT64 seed bits are preserved. Float64 data uses the MLX CPU stream. |
@@ -87,6 +88,20 @@ Runtime-bounded **Range** and runtime-repeat **Tile** remain on ORT CPU. Their p
 determine output extents and cannot safely be baked into a shape/dtype-keyed closure. Constant
 initializer forms remain supported. These coverage changes do not reproduce or establish a speedup
 for the Nemotron streaming workload in issue #10.
+
+The removed experimental **ParametricSoftplus** and **ImageScaler** definitions are retained in
+ORT 1.31's deprecated-operator catalog, not the modern ONNX schema catalog. Schema 10 marks them
+deprecated; this provider registers only opsets 1 through 9. Their CPU arithmetic is provider-owned,
+not ORT CPU fallback or a GPU acceleration claim. ParametricSoftplus uses a stable positive/negative
+softplus evaluation, including an exact FLOAT-attribute product for the finite positive tail when
+`beta*x` alone overflows but multiplication by alpha can rescue the result. The negative tail
+rescales the exponential before alpha multiplication can amplify premature underflow. Half inputs work in
+float32; double inputs retain double transcendental precision instead of MLX's float32-accurate
+`logaddexp`. ImageScaler performs separate multiply/add in float32 or double before its final cast.
+CPU boundary casts preserve half subnormals and FLOAT attribute precision. Live values and runtime
+image channels/rank are checked on every call, including symbolic and empty tensors; empty bias is
+legal only when C is zero. Both operators, and control-flow parents containing them, are explicit
+eager boundaries without downgrading eligible adjacent numeric partitions.
 
 **NonZero** uses exact original representations, not float32 conversions: signed floating zeros
 are false, NaNs/infinities/subnormals are true, and large integers retain all bits. Empty tensors

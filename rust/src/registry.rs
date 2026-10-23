@@ -267,6 +267,7 @@ fn register_builtin_ops(registry: &mut OpRegistry) {
     crate::ops::image::register(registry);
     crate::ops::nonzero::register(registry);
     crate::ops::math::register(registry);
+    crate::ops::legacy_math::register(registry);
     crate::ops::reduction::register(registry);
     crate::ops::shape::register(registry);
     crate::ops::matmul::register(registry);
@@ -850,6 +851,53 @@ impl NodeView {
                 self.release_status(st);
                 (false, Vec::new())
             }
+        }
+    }
+
+    /// Read a FLOATS attribute, preserving the distinction between absent and present-but-empty.
+    pub fn floats_attr(&self, name: &str) -> Option<Vec<f32>> {
+        unsafe {
+            let api = self.api();
+            let name = std::ffi::CString::new(name).ok()?;
+            let mut attr = std::ptr::null();
+            let status =
+                (api.Node_GetAttributeByName.unwrap())(self.node, name.as_ptr(), &mut attr);
+            if !status.is_null() {
+                self.release_status(status);
+                return None;
+            }
+            if attr.is_null() {
+                return None;
+            }
+            let mut kind = 0;
+            (api.OpAttr_GetType.unwrap())(attr, &mut kind);
+            if kind != ort::OrtOpAttrType_ORT_OP_ATTR_FLOATS {
+                return None;
+            }
+            let mut bytes = 0;
+            let status = (api.ReadOpAttr.unwrap())(attr, kind, std::ptr::null_mut(), 0, &mut bytes);
+            let failed = !status.is_null();
+            self.release_status(status);
+            if (failed && bytes == 0) || bytes % std::mem::size_of::<f32>() != 0 {
+                return None;
+            }
+            let mut values = vec![0.0f32; bytes / std::mem::size_of::<f32>()];
+            if bytes == 0 {
+                return Some(values);
+            }
+            let mut written = 0;
+            let status = (api.ReadOpAttr.unwrap())(
+                attr,
+                kind,
+                values.as_mut_ptr().cast(),
+                bytes,
+                &mut written,
+            );
+            if !status.is_null() {
+                self.release_status(status);
+                return None;
+            }
+            (written == bytes).then_some(values)
         }
     }
 
@@ -1755,6 +1803,21 @@ pub fn scalar_or_suffix_broadcast(a: &[i64], b: &[i64]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_math_is_schema_one_only_and_always_eager() {
+        for operation in ["ParametricSoftplus", "ImageScaler"] {
+            for version in [1, 6, 9] {
+                let index = registry().find_entry_index("", operation, version).unwrap();
+                assert!(matches!(
+                    registry().table[index].compile_shape_rule,
+                    CompileShapeRule::Always(CompileShapeSafety::EagerOnly { .. })
+                ));
+            }
+            assert!(registry().find_entry("", operation, 10).is_none());
+            assert!(registry().find_entry("", operation, 26).is_none());
+        }
+    }
 
     #[test]
     fn nonzero_is_version_gated_and_always_eager() {

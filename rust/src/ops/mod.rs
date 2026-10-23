@@ -5,6 +5,7 @@ pub mod conv;
 pub mod elementwise;
 pub mod image;
 mod kv_cache;
+pub mod legacy_math;
 pub mod math;
 pub mod matmul;
 pub mod nonzero;
