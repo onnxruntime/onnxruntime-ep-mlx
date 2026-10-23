@@ -105,6 +105,13 @@ colours. Stricter nodes remain claimed by MLX without disabling a more capable n
 partition. ShapeKeyed pays one recompile per distinct `(shape, dtype)` tuple — cheap when the shape
 set is small and repeating (prefill prompt lengths, CNN batch sizes), pathological if unbounded.
 
+`GridSample` is shape-keyed for checked sampling strides and separable intermediate geometry.
+The payload and grid are ordinary live MLX closure arguments: changing either at the same shape
+must hit the existing trace without freezing values. Small-rank interpolation uses output-sized
+corner gathers; higher ranks contract one axis at a time rather than constructing an exponential
+tensor-product graph. Empty outputs retain their complete ONNX shape. Float64 payloads or grids
+select the isolated MLX CPU stream; nearest numeric/bool payloads are never converted to floats.
+
 ### Value-guarded boundary shape parameters
 
 The general route can also specialize direct ORT boundary parameters of `Reshape`, `Expand`,

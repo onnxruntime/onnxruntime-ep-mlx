@@ -367,16 +367,20 @@ const KERNEL_SRC: &str = r#"
     for (uint n = 0; n < (uint)NSTATE; ++n) { hout[hbase + n] = h[n]; }
 "#;
 
-struct VecString(mlx::mlx_vector_string);
+pub(crate) struct VecString(mlx::mlx_vector_string);
 
 impl VecString {
-    fn new(items: &[&str]) -> Result<Self, MlxError> {
+    pub(crate) fn new(items: &[&str]) -> Result<Self, MlxError> {
         let raw = unsafe { mlx::mlx_vector_string_new() };
         for it in items {
             let s = CString::new(*it).map_err(|_| "MLX SelectiveScan: bad name".to_string())?;
             unsafe { mlx::mlx_vector_string_append_value(raw, s.as_ptr()) };
         }
         Ok(VecString(raw))
+    }
+
+    pub(crate) fn as_raw(&self) -> mlx::mlx_vector_string {
+        self.0
     }
 }
 

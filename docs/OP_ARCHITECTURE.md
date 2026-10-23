@@ -83,6 +83,32 @@ determine output extents and cannot safely be baked into a shape/dtype-keyed clo
 initializer forms remain supported. These coverage changes do not reproduce or establish a speedup
 for the Nemotron streaming workload in issue #10.
 
+**GridSample** supports opset-16 2D `bilinear`/`nearest`/`bicubic` and opset-20+
+general-N `linear`/`nearest`/`cubic`, all three padding modes (`zeros`, `border`,
+`reflection`), and either `align_corners` value. Floating payload and coordinate types are
+independent (`fp16`/`fp32`/`fp64`, plus `bf16` from opset 22). Float64 stays on the MLX CPU stream.
+Nearest uses ties-to-even and exact gathers for all supported integer/bool payloads, without
+lossy float conversions. Symbolic geometry, empty batch/channel/output axes, singleton input
+axes and changed live payload/grid values use checked shape-keyed execution. Input spatial
+axes must be positive; nonempty flattened counts and separable intermediates must fit int32 indexing.
+Empty outputs read only input metadata, so an empty batch can retain large spatial extents
+without constructing a sampling-point count or importing unused payloads; output strides are checked.
+Higher-rank interpolation contracts spatial axes rather than allocating an exponential map.
+Reflection reduces normalized coordinates periodically before they can overflow or lose pixel
+offsets. Axes longer than float32's exact integer range use binary-rational integer indexing and
+ties-to-even, rather than rounding image bounds or nearest indices through float32.
+Ordinary axes retain fp32 coordinate arithmetic (fp64 if either tensor is double), matching
+ORT's accumulation-precision denormalization: a perturbation smaller than that arithmetic can
+round away before nearest-even. Standard even-axis subnormal controls distinguish this from
+Metal flushing and from exact-real binary-rational indexing; they do not claim exact-real
+coordinate arithmetic for every ordinary-axis grid.
+Non-floating linear/cubic remains an **open semantic-contract gap**, not a backend impossibility:
+the schema admits these types but specifies no intermediate precision/cast rule, ORT 1.31
+has no corresponding CPU kernel, and ONNX's reference casts interpolation coefficients to the
+payload type. String/complex payloads lack the EP's end-to-end dtype mapping and remain unclaimed.
+The numerical oracle is independently derived and cross-checked against ORT's implemented forms
+and ONNX's general-N reference, not inferred from successful registration.
+
 Cast/CastLike integer narrowing discards high bits, floating-to-integer conversions truncate toward
 zero for representable values, and numeric-to-bool uses zero/nonzero (including signed floating
 zeros, infinities and NaNs). Floating-to-integer out-of-range values are undefined by ONNX and are
@@ -189,6 +215,26 @@ backend operations.
 ORT 1.31's shape inference rejects constant int32 axes before provider
 selection; int64 initializers and int32 graph values avoid that frontend
 limitation.
+
+`InstanceNormalization`, `LpNormalization`, and `LRN` support their legacy
+schemas, live numeric payloads, symbolic/unknown ranks, and empty dimensions.
+Instance normalization requires rank at least three and exact channel vectors;
+Lp normalization checks its full-width axis before narrowing and supports
+orders one and two, including zero norms. LRN applies the schema's channel
+window to general `[N,C,...]` tensors, including asymmetric even windows.
+Full-width positive window sizes are clipped to contributing channel offsets
+without changing the original `alpha/size` coefficient or allocating padding
+proportional to the requested size. Windows covering every channel reduce once.
+Narrow inputs accumulate and apply affine parameters in float32 before the
+final cast; float64 computes on MLX CPU. Instance statistics compensate the
+residual mean to avoid cancellation for small variance around a large offset.
+Dynamic rank/channel/empty dispatch
+uses shape-keyed capture, retaining shapeless eligibility for the existing
+fully static positive Instance/Lp forms. Runtime channel-vector, rank, axis,
+and native-dimension errors are explicit and do not poison later valid runs.
+The explicit schema formulas are used for cases where ORT's LRN kernel only
+accepts rank four or the Python reference mishandles channel iteration or
+negative-input L1 norms.
 
 Metal has no float64 kernels; supported float64 forms run through MLX CPU, while
 other forms fall back to ORT CPU. Empty/dynamic support is per-handler, not a
