@@ -851,7 +851,7 @@ const LINEAR_ATTENTION_SCAN_WIDE_SRC: &str = r#"
                     readout += query[qt + ki] * state[j];
                 }
             }
-            O result = O(simd_sum(readout) * scale[0]);
+            O result = O(simd_sum(readout) * scale);
             if (lane == 0) {
                 output[((size_t(bi) * TIME + t) * HQ + qh) * DV + vi] = result;
             }
