@@ -4,8 +4,8 @@ Each registered op is exercised through the MLX EP (with ORT CPU fallback availa
 against ORT's CPU EP, tolerance-gated:
 
   * GridSample — X[N,C,H,W] sampled at grid[N,Hout,Wout,2]; parametrized over mode
-    (linear/nearest) x padding_mode (zeros/border) x align_corners (0/1). The forms the EP leaves to
-    CPU (padding_mode="reflection", mode="cubic", the 5-D volumetric form) are not exercised here.
+    (linear/nearest) x padding_mode (zeros/border) x align_corners (0/1). Strict placement,
+    reflection/cubic/general-N, independent dtypes and live geometry are in test_grid_sample.py.
   * AffineGrid — the 2-D form (theta[N,2,3] + constant size[4]); parametrized over align_corners.
     The full 2D/3D, live-size, dtype, and compile-route matrix is in test_affine_grid.py.
   * Col2Im — the static (constant image_shape / block_shape) 2-D form; parametrized over
