@@ -278,3 +278,71 @@ def test_flatten_transposed_strides(axis, eager, monkeypatch):
     expected = _expected("Flatten", data.transpose(2, 0, 1), axis)
     _exact(_session(model).run(None, {"x": data})[0], expected)
     _exact(_session(model, cpu=True).run(None, {"x": data})[0], expected)
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.float64, np.int64, np.uint64, np.bool_])
+@pytest.mark.parametrize("eager", [False, True])
+def test_squeeze_flatten_transpose_replay(dtype, eager, monkeypatch):
+    monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_COMPILE", "1" if eager else "0")
+    tensor_type = numpy_helper.from_array(np.array(0, dtype)).data_type
+    model = helper.make_model(
+        helper.make_graph(
+            [helper.make_node("Squeeze", ["x", "axes"], ["squeezed"]),
+             helper.make_node("Flatten", ["squeezed"], ["flat"], axis=1),
+             helper.make_node("Transpose", ["flat"], ["y"])],
+            "squeeze_flatten_transpose",
+            [helper.make_tensor_value_info("x", tensor_type, [1, 3, 1]),
+             helper.make_tensor_value_info("axes", T.INT64, [1])],
+            [helper.make_tensor_value_info("y", tensor_type, None)]),
+        opset_imports=[helper.make_opsetid("", 26)], ir_version=11)
+    if dtype == np.float32:
+        values = np.array([0, 0x80000000, 0x7FC01234], np.uint32).view(dtype)
+    elif dtype == np.float64:
+        values = np.array([0, 0x8000000000000000, 0x7FF8000000001234],
+                          np.uint64).view(dtype)
+    elif dtype == np.int64:
+        values = np.array([-(2**63), 2**63 - 1, 2**53 + 1], dtype)
+    elif dtype == np.uint64:
+        values = np.array([0, 2**64 - 1, 2**63 + 1], dtype)
+    else:
+        values = np.array([False, True, False], dtype)
+    session = _session(model)
+    cpu = _session(model, cpu=True)
+    for invocation, axis in enumerate([0, 0, 2, 2, 0, 2]):
+        data = np.roll(values, invocation).reshape(1, 3, 1)
+        axes = np.array([axis], np.int64)
+        original_data, original_axes = data.copy(), axes.copy()
+        squeezed = np.squeeze(data, axis=axis)
+        expected = squeezed.reshape(squeezed.shape[0], -1).transpose()
+        feeds = {"x": data, "axes": axes}
+        if invocation == 5:
+            with pytest.raises(Exception, match="MLX.*Squeeze"):
+                session.run(None, {"x": data, "axes": np.array([1], np.int64)})
+        _exact(session.run(None, feeds)[0], expected)
+        _exact(cpu.run(None, feeds)[0], expected)
+        _exact(data, original_data)
+        _exact(axes, original_axes)
+
+
+def test_squeeze_flatten_transpose_actual_routes(tmp_path):
+    trace = tmp_path / "rank_view_trace.json"
+    subprocess.run(
+        [sys.executable, "-m", "pytest", Path(__file__).name,
+         "-k", "squeeze_flatten_transpose_replay and float32",
+         "-q", "-p", "no:cacheprovider"],
+        cwd=Path(__file__).parent,
+        env={**os.environ, "ONNXRUNTIME_EP_MLX_TRACE": str(trace),
+             "ONNXRUNTIME_EP_MLX_NO_GENERAL_COMPILE": "0"},
+        check=True, timeout=120)
+    paths = [event["args"] for event in json.loads(trace.read_text())
+             if event.get("cat") == "ep.path"
+             and {"Squeeze", "Flatten", "Transpose"}.issubset(
+                 event["args"].get("ops", "").split(","))]
+    general = [event for event in paths if event["path"] == "general"]
+    assert [event["cache"] for event in general[:5]] == [
+        "MISS", "HIT", "RETRACE", "HIT", "HIT"]
+    keys = [event["shape_key"] for event in general[:5]]
+    assert keys[0] == keys[1] == keys[4]
+    assert keys[2] == keys[3] != keys[0]
+    assert len(paths) == 12
+    assert sum(event["path"] == "eager" for event in paths) >= 6
