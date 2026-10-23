@@ -109,6 +109,21 @@ payload type. String/complex payloads lack the EP's end-to-end dtype mapping and
 The numerical oracle is independently derived and cross-checked against ORT's implemented forms
 and ONNX's general-N reference, not inferred from successful registration.
 
+**RoiAlign** supports default/adaptive `sampling_ratio=0` and positive fixed ratios,
+`avg`/`max`, both coordinate modes, and the opset-10/16 default transition. X, ROIs and
+output share one floating dtype (`fp16`/`fp32`/`fp64`, plus `bf16` from opset 22);
+batch indices are int64. Adaptive sampling reads current ROI values on every eager
+invocation and schedules each ROI's ceiling-sized grid independently. Fixed grids
+retain shape-keyed compilation, with live boundary-coordinate and batch-index checks
+before every compiled apply; interior controls execute eagerly. Float64 uses actual
+double-precision host arithmetic on the isolated CPU route, not a float32 round trip.
+Max pooling reduces weighted corners as specified by the pinned ONNX reference and
+ORT implementation, rather than reducing bilinear sums. Nonpositive adaptive grids
+produce zero; `output_half_pixel` first clamps ROI extents to at least one.
+Empty ROI/channel outputs are supported; spatial axes remain positive. Coordinates
+and spatial scale must be finite, batch indices must be in range, and nonempty
+grids/output counts must fit checked int32 indexing.
+
 Cast/CastLike integer narrowing discards high bits, floating-to-integer conversions truncate toward
 zero for representable values, and numeric-to-bool uses zero/nonzero (including signed floating
 zeros, infinities and NaNs). Floating-to-integer out-of-range values are undefined by ONNX and are

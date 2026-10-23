@@ -652,6 +652,20 @@ pub fn try_compiled(
         let nodes: Vec<_> = unsafe { &*plan_ptr }
             .nodes
             .iter()
+            .filter(|n| crate::ops::vision::needs_roi_validation(n))
+            .cloned()
+            .collect();
+        if !nodes.is_empty() {
+            let mut ctx = TranslationContext::new(unsafe { &mut *plan_ptr }, api, kctx, stream);
+            if !crate::ops::vision::validate_compiled_rois(&mut ctx, &nodes)? {
+                return Ok(false);
+            }
+        }
+    }
+    {
+        let nodes: Vec<_> = unsafe { &*plan_ptr }
+            .nodes
+            .iter()
             .filter(|n| crate::ops::attention::needs_rotary_position_validation(n))
             .cloned()
             .collect();
