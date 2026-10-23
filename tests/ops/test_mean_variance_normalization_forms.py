@@ -111,8 +111,10 @@ def test_mean_variance_empty_axes_replays_actual_rank_and_empty_shapes(dtype, ea
     session = _session(_model(dtype, axes=[]))
     for shape in [(2, 3), (3, 2), (), (0, 4), (4, 0), (2, 1, 3), (2, 3)]:
         size = int(np.prod(shape))
-        data = np.arange(size, dtype=np.float32).reshape(shape) * 0.125
-        data = data.astype(np.float32 if dtype == T.BFLOAT16 else TYPES[dtype])
+        data = np.asarray(
+            np.arange(size, dtype=np.float32).reshape(shape) * 0.125,
+            dtype=np.float32 if dtype == T.BFLOAT16 else TYPES[dtype],
+        )
         expected = data.copy() if size == 0 else _reference(data, dtype, [])
         _check(session.run(None, {"x": data})[0], expected, dtype)
 
