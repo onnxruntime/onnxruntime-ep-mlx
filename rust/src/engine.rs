@@ -1080,7 +1080,16 @@ impl<'a> TranslationContext<'a> {
 
             Src::CtxInput => {
                 let (data, shape, dtype) = self.read_ctx_input(r.ctx_index)?;
-                let count = shape.iter().map(|&d| d as usize).product::<usize>();
+                let count = if shape.contains(&0) {
+                    0
+                } else {
+                    shape.iter().try_fold(1usize, |count, &dim| {
+                        usize::try_from(dim)
+                            .ok()
+                            .and_then(|dim| count.checked_mul(dim))
+                            .ok_or_else(|| "MLX: invalid host tensor element count".to_string())
+                    })?
+                };
                 Ok(HostBytes {
                     data,
                     shape,

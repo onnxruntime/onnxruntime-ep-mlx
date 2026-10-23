@@ -220,9 +220,10 @@ violates one falls back to eager (or, for attention, to the growing-concat route
    silently baked into later calls. (This is exactly why runtime-bounded `Range` is deferred — see
    `OP_ARCHITECTURE`/README Range note.)
 
-3. **No host-computed / data-dependent-output-shape ops** — `Det`, `NonZero`, `Unique` GPU-eval their
-   input data mid-translate and/or emit a shape known only at runtime (`is_general_compile_unsafe`,
-   `compiled.rs:61-73`).
+3. **No host-computed / data-dependent-output-shape ops** — `Det`, `NonZero`, `Unique` materialize
+   input data mid-translate and/or emit a shape known only at runtime. NonZero and Unique are
+   registered eager-only; Unique-containing control-flow parents also receive eager boundaries
+   recursively, preserving separately compiled neighbors. See [Unique contracts](UNIQUE.md).
 
 4. **Attention uses the shared-buffer (fixed-capacity) KV contract, not growing concat.** With a
    runtime-owned max KV length, `past_k`'s seq axis is a **fixed capacity** every step, so **all shapes

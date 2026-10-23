@@ -1,44 +1,13 @@
 //! Exact provider-owned host scanning for data-dependent ai.onnx NonZero.
 
-use crate::engine::{MlxError, NodeDesc, Src, TranslationContext, dim_i32, mlx_dtype_from_onnx};
+use super::host_scan::{layout as host_layout, read_live};
+use crate::engine::{MlxError, NodeDesc, TranslationContext, dim_i32};
 use crate::registry::{ClaimResult, K_ANY_OPSET, NodeView, OpRegistration, OpRegistry, is_movable};
 use crate::sys::{mlx, ort};
 use crate::{deny, require};
 
 fn layout(shape: &[i64], dtype: mlx::mlx_dtype) -> Result<(usize, usize), MlxError> {
-    let width = match dtype {
-        mlx::mlx_dtype__MLX_BOOL | mlx::mlx_dtype__MLX_INT8 | mlx::mlx_dtype__MLX_UINT8 => 1,
-        mlx::mlx_dtype__MLX_INT16
-        | mlx::mlx_dtype__MLX_UINT16
-        | mlx::mlx_dtype__MLX_FLOAT16
-        | mlx::mlx_dtype__MLX_BFLOAT16 => 2,
-        mlx::mlx_dtype__MLX_INT32 | mlx::mlx_dtype__MLX_UINT32 | mlx::mlx_dtype__MLX_FLOAT32 => 4,
-        mlx::mlx_dtype__MLX_INT64 | mlx::mlx_dtype__MLX_UINT64 | mlx::mlx_dtype__MLX_FLOAT64 => 8,
-        _ => return Err("MLX NonZero: expected a real numeric or bool tensor".into()),
-    };
-    for &extent in shape {
-        if extent < 0 {
-            return Err("MLX NonZero: negative runtime extent".into());
-        }
-        dim_i32(extent)?;
-    }
-    let count = if shape.contains(&0) {
-        0
-    } else {
-        shape.iter().try_fold(1usize, |count, &extent| {
-            count
-                .checked_mul(extent as usize)
-                .filter(|&count| count <= i32::MAX as usize)
-                .ok_or_else(|| {
-                    "MLX NonZero: input element count exceeds int32 indexing".to_string()
-                })
-        })?
-    };
-    let bytes = count
-        .checked_mul(width)
-        .filter(|&bytes| bytes <= isize::MAX as usize)
-        .ok_or_else(|| "MLX NonZero: input byte count overflow".to_string())?;
-    Ok((bytes, width))
+    host_layout(shape, dtype, "NonZero")
 }
 
 fn coordinates(
@@ -97,36 +66,8 @@ fn coordinates(
 }
 
 fn nonzero_op(ctx: &mut TranslationContext, node: &NodeDesc) -> Result<(), MlxError> {
-    if ctx.shapeless_compile() || ctx.shape_keyed_compile() {
-        return Err("MLX NonZero: data-dependent cardinality requires eager execution".into());
-    }
-    let input = &node.inputs[0];
-    let (data, shape, dtype) =
-        if input.source == Src::Intermediate || ctx.env_get(&input.name).is_some() {
-            let array = ctx.resolve(input)?;
-            let array = ctx.contiguous_eval(array)?;
-            (
-                ctx.host_ptr(array).cast::<std::ffi::c_void>(),
-                ctx.shape_of(array).into_iter().map(i64::from).collect(),
-                ctx.dtype_of(array),
-            )
-        } else {
-            let host = ctx.raw_host(input)?;
-            if !is_movable(host.dtype) {
-                return Err("MLX NonZero: live input is not real numeric or bool".into());
-            }
-            (host.data, host.shape, mlx_dtype_from_onnx(host.dtype))
-        };
-    let (bytes, _) = layout(&shape, dtype)?;
-    let payload = if bytes == 0 {
-        &[]
-    } else {
-        if data.is_null() {
-            return Err("MLX NonZero: nonempty input has null data".into());
-        }
-        unsafe { std::slice::from_raw_parts(data.cast::<u8>(), bytes) }
-    };
-    let (indices, shape) = coordinates(&shape, payload, dtype)?;
+    let host = read_live(ctx, &node.inputs[0], "NonZero")?;
+    let (indices, shape) = coordinates(&host.shape, host.data, host.dtype)?;
     let output = ctx.from_host_i64(&indices, &shape);
     ctx.bind(&node.outputs[0], output);
     Ok(())

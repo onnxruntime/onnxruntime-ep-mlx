@@ -68,6 +68,7 @@ The following table is the current support contract. Do not broaden claims witho
 | **GatherBlockQuantized** | `com.microsoft` | int4 embedding, symmetric (3-input, `zp=8`) **and** asymmetric (4-input `zero_points`) | gather + int4 dequant | Symmetric: `w=(q-8)·scale`. Asymmetric: `w=(q-zp)·scale`. |
 | **Softmax** | `ai.onnx` | any valid axis; `fp32`/`fp16`/`bf16` | `mlx_softmax_axis` / `mlx_softmax_axes` | Opset <13 normalizes the complete suffix starting at `axis` (default 1); opset >=13 normalizes one axis (default -1). Legacy multi-axis suffixes use shape-keyed compilation because MLX selects the lowering using singleton extents; single-axis forms retain shapeless compilation. |
 | **NonZero** | `ai.onnx` | schema 9/13; bool, all 8/16/32/64-bit signed/unsigned integers, fp16/fp32/fp64 and (schema 13) bf16 | provider-owned exact eager host scan + int64 MLX output | Live payload determines row-major coordinates and `[rank, count]` shape on every call. Scalar output is `[0, count]` per ONNX, unlike ORT 1.31 CPU's `[1, count]`. |
+| **Unique** | `ai.onnx` | schema 11; bool, all 8/16/32/64-bit signed/unsigned integers, fp16/fp32/fp64; flat or axis slices, scalar/unknown rank/empty shapes, all optional outputs | provider-owned exact eager host sort/group + byte-preserving MLX outputs | [Contracts and authority limits](UNIQUE.md). Live cardinality and exact metadata; recursive eager parent boundaries. Legal NaNs use deterministic NaN-last sorting; NumPy half-axis ordering disagreement is explicit. Future28 dispatch is preserved; bf16 Unique28 remains unclaimed/unvalidated. Native validation pending. |
 | **Affine / Scale** | legacy empty-domain schema 1, before schema-10 deprecation | `fp16`/`fp32`/`fp64`; scalar, empty, symbolic and unknown-rank tensors | multiply, then optional affine add | `Affine` defaults to `alpha=1, beta=0`; `Scale` defaults to `scale=1`. Half inputs use float32 arithmetic so FLOAT attributes are not prematurely narrowed. Float64 uses the existing isolated CPU stream. |
 | **ScaledTanh** | legacy empty-domain schema 1, before schema-10 deprecation | `fp16`/`fp32`/`fp64`; explicit `alpha` and `beta` | `alpha * tanh(beta * X)` | Both attributes must be present: the historical schema marks them optional but defines no defaults, and ORT's kernel requires them. Missing values stay unclaimed rather than inventing a convention. Half arithmetic uses float32; float64 uses the existing CPU stream. |
 | **MatMul** | `ai.onnx` | rank >=1 floating operands, including vector-vector, vector-matrix and batched vector forms | `mlx_matmul` | ONNX vector promotion/squeezing and batch broadcasting are native MLX semantics. Empty contraction dimensions, empty batches and symbolic extents are supported. Float64 uses the isolated MLX CPU stream; integer MatMul stays on ORT CPU. |
@@ -102,7 +103,8 @@ Complex64/complex128 and string forms admitted by the ONNX schemas remain **unim
 coverage gaps**, not backend impossibilities; they need end-to-end provider dtype/host-value
 support and dedicated oracles. ORT 1.31 CPU itself implements only bool/uint8/int32/int64/fp32
 NonZero and disagrees with ONNX on scalar output rank. No tolerance or fallback is used to
-hide these differences. Unique's existing support is unchanged.
+hide these differences. Unique shares the checked exact live host reader, without changing
+NonZero's coordinate/equality rules; see [Unique contracts](UNIQUE.md).
 
 **GridSample** supports opset-16 2D `bilinear`/`nearest`/`bicubic` and opset-20+
 general-N `linear`/`nearest`/`cubic`, all three padding modes (`zeros`, `border`,
@@ -367,7 +369,8 @@ The **core Rust modules** register:
 | `ssm.rs` | TensorScatter (opset 24), CausalConvWithState, LinearAttention (linear/gated/delta/gated_delta, GQA) |
 | `selective_scan.rs` | Mamba-1 selective scan: recognises the `Scan` body and replaces the per-timestep unroll with one custom Metal kernel (state kept in registers) |
 | `nonzero.rs` | Exact eager NonZero host scan with live cardinality and int64 coordinates |
-| `misc.rs` / `image.rs` | Constants, losses, Unique/Det, sequence-to-tensor consumers, numeric TF-IDF, and image decoding |
+| `unique.rs` / `host_scan.rs` | Exact eager Unique grouping/axis slices; shared checked live host payload access |
+| `misc.rs` / `image.rs` | Constants, losses, Det, sequence-to-tensor consumers, numeric TF-IDF, and image decoding |
 | `random.rs` / `signal.rs` / `recurrent.rs` / `vision.rs` / `controlflow.rs` | Random, signal/FFT/window, RNN/GRU/LSTM, vision/detection, and recursive control-flow translations |
 
 Reductions accept scalar inputs. `ReduceMax` and `ReduceMin` also claim Boolean
