@@ -245,7 +245,10 @@ fn scaled_silu(kind: Float, x: f64, scale: f32) -> f64 {
 
 fn execute(ctx: &mut TranslationContext, node: &NodeDesc) -> Result<(), MlxError> {
     if ctx.shapeless_compile() || ctx.shape_keyed_compile() {
-        return Err(format!("MLX {}: requires eager host arithmetic", node.op_type));
+        return Err(format!(
+            "MLX {}: requires eager host arithmetic",
+            node.op_type
+        ));
     }
     let mut values = Vec::new();
     let mut shapes = Vec::new();
