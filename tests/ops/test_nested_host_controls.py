@@ -163,25 +163,38 @@ def _assert_owned_profile(events: list[dict]) -> None:
     ), kernels
 
 
-def _check_replays(model: bytes, cases: list[tuple[dict, list]], profile: Path) -> None:
+def _assert_exact_outputs(outputs: list, expected: list) -> None:
+    assert len(outputs) == len(expected)
+    for got, manual in zip(outputs, expected, strict=True):
+        assert got.dtype == manual.dtype
+        assert got.shape == manual.shape
+        np.testing.assert_array_equal(got, manual)
+
+
+def _check_replays(
+    model: bytes,
+    cases: list[tuple[dict, list]],
+    profile: Path,
+    *,
+    manual_empty_scan: bool = False,
+) -> None:
     cpu = _session(model, cpu=True)
     mlx = _session(model, cpu=False, profile=profile)
     try:
         for feeds, expected in cases:
-            cpu_outputs = cpu.run(None, feeds)
-            mlx_outputs = mlx.run(None, feeds)
-            assert len(cpu_outputs) == len(mlx_outputs) == len(expected)
-            for got, reference, manual in zip(mlx_outputs, cpu_outputs, expected, strict=True):
-                assert got.dtype == reference.dtype == manual.dtype
-                assert got.shape == reference.shape == manual.shape
-                np.testing.assert_array_equal(reference, manual)
-                np.testing.assert_array_equal(got, manual)
+            # Scan-16 defines zero-trip outputs, but ORT 1.31 CPU and ONNX 1.23.2's
+            # reference Scan reject them. Only this explicit feed uses the schema oracle.
+            empty_scan = manual_empty_scan and feeds["conditions"].shape == (0,)
+            if not empty_scan:
+                _assert_exact_outputs(cpu.run(None, feeds), expected)
+            _assert_exact_outputs(mlx.run(None, feeds), expected)
     finally:
         profile_path = Path(mlx.end_profiling())
-    try:
-        _assert_owned_profile(json.loads(profile_path.read_text()))
-    finally:
-        profile_path.unlink()
+        try:
+            events = json.loads(profile_path.read_text())
+        finally:
+            profile_path.unlink()
+    _assert_owned_profile(events)
 
 
 @pytest.fixture(params=["default", "eager"])
@@ -240,7 +253,24 @@ def test_scan_bound_controls_live_replays(control_mode, tmp_path, kind) -> None:
             feeds["trips"] = counts
             expected.append(counts)
         cases.append((feeds, expected))
-    _check_replays(scan_control_model(kind), cases, tmp_path / f"scan_{kind}")
+    _check_replays(
+        scan_control_model(kind), cases, tmp_path / f"scan_{kind}", manual_empty_scan=True,
+    )
+
+
+@pytest.mark.parametrize("kind", ["If", "Loop"])
+def test_empty_scan_bound_controls_are_owned(control_mode, tmp_path, kind) -> None:
+    """Empty-only profiles cannot borrow ownership evidence from nonempty replays."""
+    state = np.array([11, -7], FLOAT)
+    feeds = {"state": state, "conditions": np.empty(0, np.bool_)}
+    expected = [state.copy(), np.empty((0, 2), FLOAT), np.empty(0, np.bool_)]
+    if kind == "Loop":
+        feeds["trips"] = np.empty(0, np.int64)
+        expected.append(np.empty(0, np.int64))
+    _check_replays(
+        scan_control_model(kind), [(feeds, expected)], tmp_path / f"empty_scan_{kind}",
+        manual_empty_scan=True,
+    )
 
 
 def test_direct_host_controls_live_replays(control_mode, tmp_path) -> None:

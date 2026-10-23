@@ -316,8 +316,8 @@ fn scan_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
         if num_scan_out == 0 {
             return Ok(());
         }
-        // Infer each body output's element shape from one symbolic dummy iteration, then construct
-        // the required zero-length accumulated output. The dummy graph is never bound or evaluated.
+        // Derive output templates from dummy slices; nested host controls may be evaluated.
+        // Temporary body state updates are discarded; only scan-output shapes/dtypes are used.
         let mut bin = state.clone();
         for (i, &scan) in scans.iter().enumerate() {
             let mut element_shape = scan_shapes[i].clone();
