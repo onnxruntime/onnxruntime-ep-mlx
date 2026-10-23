@@ -5,7 +5,8 @@ The MLX provider claims `com.microsoft::CDist` v1 for **`sqeuclidean`**
 homogeneous FLOAT or DOUBLE rank-two tensors: A[M,N], B[K,N]. The one required
 output is C[M,K] of the same type. Feature dimensions must agree, including on
 every live replay; symbolic extents are not frozen. `metric` must be STRING.
-Unknown metrics, wrong attribute types, missing slots, extra inputs/outputs,
+Present metrics must decode exactly to a supported name; invalid UTF-8 is not
+treated as absence or default. Unknown metrics, wrong types, missing slots, extra inputs/outputs,
 mixed dtypes, FLOAT16/BFLOAT16 and invalid geometry are not claimed.
 
 The retained ORT 1.31.0 runtime schema describes these types, ranks and the
@@ -65,3 +66,9 @@ checkouts, JUnit case outcomes and source-only review must be bound separately;
 provider ownership does not establish physical GPU or CPU execution. No local
 native, scientific import, model/checker, collection, build, inference or
 benchmark execution is implied by this source addition.
+
+Nested runtime fixtures exercise If at depths one and two, not Loop or Scan.
+Recursive fencing of other parent bodies is a source contract, not independently
+observed per-parent execution. Default/eager environment variants and strict
+provider profiles are not exported eager-route traces. Large-allocation
+feasibility and performance have not been demonstrated.

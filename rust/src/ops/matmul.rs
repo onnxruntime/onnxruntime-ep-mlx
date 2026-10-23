@@ -76,11 +76,13 @@ fn cdist_claim(node: &NodeView) -> ClaimResult {
             || node.attr_type("metric") == ort::OrtOpAttrType_ORT_OP_ATTR_STRING,
         "CDist metric must be STRING"
     );
+    let metric = if node.has_attr("metric") {
+        node.string_attr("metric", "")
+    } else {
+        "sqeuclidean".into()
+    };
     require!(
-        matches!(
-            node.string_attr("metric", "sqeuclidean").as_str(),
-            "sqeuclidean" | "euclidean"
-        ),
+        matches!(metric.as_str(), "sqeuclidean" | "euclidean"),
         "CDist supports only sqeuclidean and euclidean"
     );
     Ok(())

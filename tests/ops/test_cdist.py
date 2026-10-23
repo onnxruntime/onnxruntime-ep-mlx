@@ -156,7 +156,7 @@ def test_cdist_typed_overflow_and_nonfinite(dtype, metric, tmp_path):
     _placement(session)
 
 
-@pytest.mark.parametrize("metric", ["", "cosine", "minkowski", "SQEUCLIDEAN", 1, 1.0])
+@pytest.mark.parametrize("metric", ["", "cosine", "minkowski", "SQEUCLIDEAN", b"\xff", 1, 1.0])
 def test_cdist_invalid_metric(metric, tmp_path):
     with pytest.raises(ERRORS):
         _session(_model(np.float32, [[2, 3], [4, 3]], metric), tmp_path / "metric")
