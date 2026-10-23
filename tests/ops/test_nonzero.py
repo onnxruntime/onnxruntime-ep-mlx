@@ -255,7 +255,10 @@ def test_nonzero_schema_history_and_rejected_forms():
     for dtype in [T.STRING, T.COMPLEX64, T.COMPLEX128]:
         model = _model(shape=[2])
         model.graph.input[0].type.tensor_type.elem_type = dtype
-        with pytest.raises(Exception, match="fallback|explicitly assigned|not supported|NOT_IMPLEMENTED"):
+        with pytest.raises(
+            Exception,
+            match="fallback|explicitly assigned|not supported|not currently registered or supported|NOT_IMPLEMENTED",
+        ):
             _session(model)
     model = _model(shape=[2], opset=9)
     model.graph.input[0].type.tensor_type.elem_type = T.BFLOAT16
