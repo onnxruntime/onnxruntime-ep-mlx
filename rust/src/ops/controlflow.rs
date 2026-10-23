@@ -81,7 +81,7 @@ fn is_int64(node: &NodeView, i: usize) -> bool {
         if info.dtype == ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64)
 }
 
-fn normalized_axis(axis: i64, rank: usize) -> Option<usize> {
+pub(super) fn normalized_axis(axis: i64, rank: usize) -> Option<usize> {
     let rank = rank as i64;
     let axis = if axis < 0 { axis + rank } else { axis };
     (0..rank).contains(&axis).then_some(axis as usize)

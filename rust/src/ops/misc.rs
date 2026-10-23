@@ -1,14 +1,11 @@
 //! Misc op handlers: Constant (scalar/list value forms), TfIdfVectorizer, OneHot, Trilu, Scatter
-//! (opset 9/10), Det, Unique, sequence consumers, OptionalHasElement/GetElement and the loss ops
+//! (opset 9/10), Det, sequence consumers, OptionalHasElement/GetElement and the loss ops
 //! (NegativeLogLikelihoodLoss / SoftmaxCrossEntropyLoss). Faithful port of the C++ `ops/misc2.cc`
-//! (plus OneHot/Trilu from `math.cc` and Constant from `shape.cc`). Host-computed ops (Det /
-//! Unique) materialise their input, compute on the host, and wrap the result back as a
-//! fresh MLX array (mlx-c exposes no det / argwhere / unique primitive). Only statically
+//! (plus OneHot/Trilu from `math.cc` and Constant from `shape.cc`). Det materialises its input,
+//! computes on the host, and wraps the result back as a fresh MLX array. Only statically
 //! translatable, MLX-supported forms are claimed; every other form is left to ORT CPU.
 
 use std::collections::HashMap;
-use std::collections::hash_map::Entry;
-use std::hash::Hash;
 use std::os::raw::c_void;
 
 use crate::engine::{MlxError, NodeDesc, Src, TensorRef, TranslationContext};
@@ -23,7 +20,6 @@ use crate::{deny, require};
 
 const F32: mlx::mlx_dtype = mlx::mlx_dtype__MLX_FLOAT32;
 const I32: mlx::mlx_dtype = mlx::mlx_dtype__MLX_INT32;
-const I64: mlx::mlx_dtype = mlx::mlx_dtype__MLX_INT64;
 
 const T_FLOAT: ort::ONNXTensorElementDataType =
     ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT;
@@ -801,165 +797,6 @@ fn det_claim(node: &NodeView) -> ClaimResult {
 }
 
 // =============================================================================================
-// Unique — flattened unique elements (+ optional indices / inverse / counts). Host-computed.
-// =============================================================================================
-fn unique_groups<T: Copy + PartialOrd + Eq + Hash>(
-    p: &[T],
-    sorted: bool,
-) -> (Vec<i32>, Vec<i64>, Vec<i64>) {
-    let n = p.len();
-    let mut pos: HashMap<T, usize> = HashMap::new();
-    let mut vals: Vec<T> = Vec::new();
-    let mut first: Vec<i32> = Vec::new();
-    let mut cnt: Vec<i64> = Vec::new();
-    let mut group_of = vec![0usize; n];
-    for (i, &v) in p.iter().enumerate() {
-        let g = match pos.entry(v) {
-            Entry::Occupied(e) => *e.get(),
-            Entry::Vacant(e) => {
-                let g = vals.len();
-                e.insert(g);
-                vals.push(v);
-                first.push(i as i32);
-                cnt.push(0);
-                g
-            }
-        };
-        group_of[i] = g;
-        cnt[g] += 1;
-    }
-    finalize_groups(vals.len(), &first, &cnt, &group_of, n, sorted, |a, b| {
-        vals[a]
-            .partial_cmp(&vals[b])
-            .unwrap_or(std::cmp::Ordering::Equal)
-    })
-}
-
-/// Common ordering/emit stage shared by the int and float grouping paths.
-fn finalize_groups<F: Fn(usize, usize) -> std::cmp::Ordering>(
-    k: usize,
-    first: &[i32],
-    cnt: &[i64],
-    group_of: &[usize],
-    n: usize,
-    sorted: bool,
-    cmp: F,
-) -> (Vec<i32>, Vec<i64>, Vec<i64>) {
-    let mut order: Vec<usize> = (0..k).collect();
-    if sorted {
-        order.sort_by(|&a, &b| cmp(a, b));
-    }
-    let mut rank_of = vec![0usize; k];
-    for (r, &o) in order.iter().enumerate() {
-        rank_of[o] = r;
-    }
-    let mut first_idx = vec![0i32; k];
-    let mut counts = vec![0i64; k];
-    for r in 0..k {
-        first_idx[r] = first[order[r]];
-        counts[r] = cnt[order[r]];
-    }
-    let mut inverse = vec![0i64; n];
-    for i in 0..n {
-        inverse[i] = rank_of[group_of[i]] as i64;
-    }
-    (first_idx, inverse, counts)
-}
-
-/// Float grouping keyed on exact bit pattern, but ordered by numeric value when `sorted`.
-fn unique_groups_f32(vals: &[f32], sorted: bool) -> (Vec<i32>, Vec<i64>, Vec<i64>) {
-    let n = vals.len();
-    let mut pos: HashMap<u32, usize> = HashMap::new();
-    let mut uvals: Vec<f32> = Vec::new();
-    let mut first: Vec<i32> = Vec::new();
-    let mut cnt: Vec<i64> = Vec::new();
-    let mut group_of = vec![0usize; n];
-    for i in 0..n {
-        let key = vals[i].to_bits();
-        let g = match pos.entry(key) {
-            Entry::Occupied(e) => *e.get(),
-            Entry::Vacant(e) => {
-                let g = uvals.len();
-                e.insert(g);
-                uvals.push(vals[i]);
-                first.push(i as i32);
-                cnt.push(0);
-                g
-            }
-        };
-        group_of[i] = g;
-        cnt[g] += 1;
-    }
-    finalize_groups(uvals.len(), &first, &cnt, &group_of, n, sorted, |a, b| {
-        uvals[a]
-            .partial_cmp(&uvals[b])
-            .unwrap_or(std::cmp::Ordering::Equal)
-    })
-}
-
-fn unique_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
-    let x = ctx.resolve(&n.inputs[0])?;
-    let ev = ctx.contiguous_eval(x)?;
-    let total = ctx.size_of(ev);
-    let sorted = !matches!(n.ints.get("sorted"), Some(&0));
-
-    let (first_idx, inverse, counts) = match ctx.dtype_of(ev) {
-        d if d == F32 => {
-            let p = unsafe { std::slice::from_raw_parts(mlx::mlx_array_data_float32(ev), total) };
-            unique_groups_f32(p, sorted)
-        }
-        d if d == I32 => {
-            let p = unsafe { std::slice::from_raw_parts(mlx::mlx_array_data_int32(ev), total) };
-            unique_groups(p, sorted)
-        }
-        d if d == I64 => {
-            let p = unsafe { std::slice::from_raw_parts(mlx::mlx_array_data_int64(ev), total) };
-            unique_groups(p, sorted)
-        }
-        _ => return Err("MLX: Unique unsupported dtype".to_string()),
-    };
-    let k = first_idx.len() as i32;
-
-    let idx = ctx.from_host(first_idx.as_ptr() as *const c_void, &[k], I32);
-    let y = ctx.emit(|res, s| unsafe { mlx::mlx_take(res, ev, idx, s) })?;
-    ctx.bind(&n.outputs[0], y);
-
-    let first_i64: Vec<i64> = first_idx.iter().map(|&v| v as i64).collect();
-    bind_i64_opt(ctx, n, 1, &first_i64, k);
-    bind_i64_opt(ctx, n, 2, &inverse, inverse.len() as i32);
-    bind_i64_opt(ctx, n, 3, &counts, k);
-    Ok(())
-}
-
-fn bind_i64_opt(ctx: &mut TranslationContext, n: &NodeDesc, slot: usize, data: &[i64], len: i32) {
-    if slot < n.outputs.len() && !n.outputs[slot].name.is_empty() {
-        let a = ctx.from_host_i64(data, &[len]);
-        ctx.bind(&n.outputs[slot], a);
-    }
-}
-
-fn unique_claim(node: &NodeView) -> ClaimResult {
-    let no = node.num_outputs();
-    require!(
-        node.num_inputs() == 1 && (1..=4).contains(&no),
-        "Unique: data-dependent output shape with no MLX primitive — stays on CPU"
-    );
-    require!(
-        !node.has_attr("axis"),
-        "Unique: data-dependent output shape with no MLX primitive — stays on CPU"
-    );
-    let x = match node.input_info(0) {
-        Some(i) if !i.shape.is_empty() => i,
-        _ => deny!("Unique: data-dependent output shape with no MLX primitive — stays on CPU"),
-    };
-    require!(
-        x.dtype == T_FLOAT || x.dtype == T_INT32 || x.dtype == T_INT64,
-        "Unique: data-dependent output shape with no MLX primitive — stays on CPU"
-    );
-    Ok(())
-}
-
-// =============================================================================================
 // Optional family.
 // =============================================================================================
 fn optional_has_element_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
@@ -1469,14 +1306,6 @@ pub fn register(registry: &mut OpRegistry) {
         crate::registry::MLX_SCATTER_SHAPE_REASON,
     );
     shapeless(registry, "Det", K_ANY_OPSET, K_ANY_OPSET, det_op, det_claim);
-    shapeless(
-        registry,
-        "Unique",
-        K_ANY_OPSET,
-        K_ANY_OPSET,
-        unique_op,
-        unique_claim,
-    );
     shapeless(
         registry,
         "Optional",
