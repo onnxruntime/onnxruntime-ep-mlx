@@ -2,9 +2,15 @@ Be succinct, robust and elegant.
 
 ## Operator scope and semantics
 
-- Default-domain operators must follow official ONNX definitions. Unofficial
-  default-domain extensions need not be implemented; deprecated but officially
-  defined ONNX operators are not excluded by this rule.
+- Operator audits and implementation are inference-only. Optimizer, autodiff, and
+  training operators (such as Adam, Adagrad, Momentum, and Gradient), as well as
+  training-only modes, are outside the required scope. Inference RNG, control
+  flow, and stateful SSM remain in scope.
+- Default-domain operators must follow official ONNX definitions. Neither
+  unofficial default-domain extensions nor officially deprecated ONNX operators
+  require new support. An older opset alone does not imply deprecation; use the
+  official ONNX deprecation status. Preserve existing behavior and regression
+  coverage.
 - For `com.microsoft` operators, prefer simpler, mathematically well-defined
   generalizations (such as scalar/rank-0 inputs) over needless CPU-kernel
   restrictions. Preserve real backend, dtype, safety, and unambiguous semantic
