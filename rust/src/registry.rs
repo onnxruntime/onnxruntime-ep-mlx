@@ -275,9 +275,21 @@ pub fn requires_unique_eager_boundary(node: &NodeView) -> bool {
             .any(|(_, body)| body.nodes().iter().any(requires_unique_eager_boundary))
 }
 
+/// Explicitly rounded contrib activations and live finite scans must not be captured.
+pub fn requires_elementary_contrib_eager_boundary(node: &NodeView) -> bool {
+    (node.domain() == "com.microsoft"
+        && crate::ops::elementary_contrib::is_elementary(&node.op_type()))
+        || node.subgraphs().iter().any(|(_, body)| {
+            body.nodes()
+                .iter()
+                .any(requires_elementary_contrib_eager_boundary)
+        })
+}
+
 /// Populate the table with every built-in op module (wave-1: elementwise + math).
 fn register_builtin_ops(registry: &mut OpRegistry) {
     crate::ops::elementwise::register(registry);
+    crate::ops::elementary_contrib::register(registry);
     crate::ops::image::register(registry);
     crate::ops::nonzero::register(registry);
     crate::ops::unique::register(registry);

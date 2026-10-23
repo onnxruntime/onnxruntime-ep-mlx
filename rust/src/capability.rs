@@ -157,6 +157,7 @@ pub(crate) unsafe fn get_capability(
                 let nonzero_boundary = metadata.domain.is_empty() && metadata.op_type == "NonZero";
                 if crate::registry::requires_random_eager_boundary(&view)
                     || crate::registry::requires_unique_eager_boundary(&view)
+                    || crate::registry::requires_elementary_contrib_eager_boundary(&view)
                 {
                     CompilePartitionClass::Eager
                 } else if crate::registry::requires_float64_metadata_eager_boundary(&view) {
