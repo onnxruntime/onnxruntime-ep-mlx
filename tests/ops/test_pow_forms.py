@@ -78,6 +78,17 @@ def _exact(actual, expected):
     np.testing.assert_array_equal(np.signbit(actual[finite]), np.signbit(expected[finite]))
 
 
+def _ordinary_float_fixture(actual, expected):
+    exact = ~np.isfinite(expected) | (expected == 0) | (np.abs(expected) == 1)
+    _exact(actual[exact], expected[exact])
+    finite = ~exact
+    np.testing.assert_allclose(actual[finite], expected[finite], rtol=1e-5, atol=0)
+    # Pristine 77edffd and c2a3da4 produce bitwise-identical native arrays for these fixtures.
+    # Their finite Metal Pow error is at most two ULPs and relative 2**-23.
+    np.testing.assert_allclose(actual[finite], expected[finite], rtol=2**-23, atol=0)
+    np.testing.assert_array_max_ulp(actual[finite], expected[finite], maxulp=2)
+
+
 @pytest.mark.parametrize("base_dtype", [np.float16, np.float32])
 @pytest.mark.parametrize("eager", [False, True])
 def test_pow_baseline_integer_parity(base_dtype, eager, monkeypatch):
@@ -140,7 +151,8 @@ def test_pow_float_types_and_special_values(base_dtype, exponent_dtype, eager, m
     with np.errstate(all="ignore"):
         expected = np.power(base.astype(np.float64), exponent.astype(np.float64)).astype(base.dtype)
     model = _model(base_dtype, exponent_dtype, list(base.shape), list(exponent.shape))
-    _exact(_session(model).run(None, {"base": base, "exponent": exponent})[0], expected)
+    _ordinary_float_fixture(
+        _session(model).run(None, {"base": base, "exponent": exponent})[0], expected)
 
 
 @pytest.mark.parametrize("base_dtype", FLOATS)
@@ -237,7 +249,7 @@ def test_pow_schema_versions_and_initializers(opset, constant):
                    if constant else None)
     feeds = {name: value for name, value in [("base", base), ("exponent", exponent)]
              if name != constant}
-    _exact(_session(model).run(None, feeds)[0], np.power(base, exponent))
+    _ordinary_float_fixture(_session(model).run(None, feeds)[0], np.power(base, exponent))
 
 
 @pytest.mark.parametrize("shape,exponent_shape,attrs", [

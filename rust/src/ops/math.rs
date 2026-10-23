@@ -54,6 +54,9 @@ fn pow_float(
     b: mlx::mlx_array,
 ) -> Result<mlx::mlx_array, MlxError> {
     let power = ctx.binary(mlx::mlx_power, a, b)?;
+    if ctx.dtype_of(a) == mlx::mlx_dtype__MLX_FLOAT64 {
+        return Ok(power);
+    }
     let magnitude = ctx.unary(mlx::mlx_abs, a)?;
     let half = scalar_like(ctx, a, 0.5)?;
     let two = scalar_like(ctx, a, 2.0)?;
