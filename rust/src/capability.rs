@@ -153,9 +153,11 @@ pub(crate) unsafe fn get_capability(
             .map(|&node| {
                 let view = NodeView::new(ort_api, raw_nodes_by_id[&node]);
                 let metadata = &snapshot.nodes[&node];
+                let mod_boundary = metadata.domain.is_empty() && metadata.op_type == "Mod";
                 // NonZero cardinality cannot be captured even in an ordinary non-decoder graph.
                 // Keep its eager scan from disabling compilation of connected numeric work.
-                if decoder_graph || (metadata.domain.is_empty() && metadata.op_type == "NonZero") {
+                let nonzero_boundary = metadata.domain.is_empty() && metadata.op_type == "NonZero";
+                if decoder_graph || mod_boundary || nonzero_boundary {
                     crate::registry::compile_shape_safety(&view).partition_class()
                 } else {
                     CompilePartitionClass::Shapeless

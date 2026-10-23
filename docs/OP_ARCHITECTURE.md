@@ -76,6 +76,7 @@ The following table is the current support contract. Do not broaden claims witho
 | **Sigmoid** | `ai.onnx`, `com.microsoft` | `fp32`/`fp16`/`bf16` | MLX elementwise sigmoid | Standalone `SiLU`/`Swish` are not claimed. |
 | **Cast / CastLike** | `ai.onnx` | all pairs among bool, signed/unsigned 8/16/32/64-bit integers, `fp16`/`bf16`/`fp32`/`fp64` (13 types, including same-type) | MLX astype | Float64 conversions use the isolated MLX CPU stream; other types use Metal. CastLike reads only the target's declared dtype, not its values or shape. |
 | **Div** | `ai.onnx` | same-dtype float or `int32`/`int64`, scalar-or-suffix broadcast | MLX divide; integer floor quotient corrected toward zero | MLX 0.32.4 floors integer division; opposite-sign inputs with a nonzero remainder add one to preserve ONNX truncation without float conversion. Zero and correction use the input dtype, including for values beyond exact floating-point representation. Integer division by zero and unrepresentable quotients are not defined by this support contract. |
+| **Mod** | `ai.onnx` | Mod10/13, same-dtype numeric inputs with multidirectional broadcasting | magnitude remainder/sign restoration for floats; integer remainder/correction | [Versioned contracts](MOD.md): Mod10 permits integer `fmod=1`; Mod13 requires integers for `fmod=0` and floats for `fmod=1`. Floating arithmetic uses explicit MLX CPU/DOUBLE primitives to avoid Metal remainder precision loss. All forms are eager-only; integer zero divisors are validated on every call. Mod28 is not registered. |
 | **Conv** | `ai.onnx` | rank-3/4, static positive W shape; symbolic X batch/channel/spatial dimensions allowed | MLX conv1d/conv2d/conv_general | W and group determine the required input channels; concrete channels are checked at execution. |
 | **RNN / GRU / LSTM** | `ai.onnx` | layout=0, default activations, no sequence_lens; symbolic sequence length allowed | shape-keyed unrolling | Each concrete input shape gets its own trace. Empty sequences preserve initial states and produce an empty Y. |
 
@@ -124,6 +125,21 @@ payload type. String/complex payloads lack the EP's end-to-end dtype mapping and
 The numerical oracle is independently derived and cross-checked against ORT's implemented forms
 and ONNX's general-N reference, not inferred from successful registration.
 
+**RoiAlign** supports default/adaptive `sampling_ratio=0` and positive fixed ratios,
+`avg`/`max`, both coordinate modes, and the opset-10/16 default transition. X, ROIs and
+output share one floating dtype (`fp16`/`fp32`/`fp64`, plus `bf16` from opset 22);
+batch indices are int64. Adaptive sampling reads current ROI values on every eager
+invocation and schedules each ROI's ceiling-sized grid independently. Fixed grids
+retain shape-keyed compilation, with live boundary-coordinate and batch-index checks
+before every compiled apply; interior controls execute eagerly. Float64 uses actual
+double-precision host arithmetic on the isolated CPU route, not a float32 round trip.
+Max pooling reduces weighted corners as specified by the pinned ONNX reference and
+ORT implementation, rather than reducing bilinear sums. Nonpositive adaptive grids
+produce zero; `output_half_pixel` first clamps ROI extents to at least one.
+Empty ROI/channel outputs are supported; spatial axes remain positive. Coordinates
+and spatial scale must be finite, batch indices must be in range, and nonempty
+grids/output counts must fit checked int32 indexing.
+
 Cast/CastLike integer narrowing discards high bits, floating-to-integer conversions truncate toward
 zero for representable values, and numeric-to-bool uses zero/nonzero (including signed floating
 zeros, infinities and NaNs). Floating-to-integer out-of-range values are undefined by ONNX and are
@@ -162,6 +178,15 @@ QLinearMatMul/QLinearConv), random, signal/FFT (DFT/STFT/windows/MelWeightMatrix
 vision/detection, **recurrent (RNN/GRU/LSTM and
 com.microsoft LinearAttention via static unrolling)**, **control flow (If/Scan/Loop via recursive
 subgraph-body translation)**, and host-computed data-dependent operators.
+
+`MeanVarianceNormalization` follows the schema-9/13 second-moment expression:
+the epsilon is added after the square root, not inside it. Default axes are
+exactly `[0, 2, 3]`; explicit empty axes reduce all dimensions, including scalar
+inputs. Axes are checked at full integer width before native reduction. Narrow
+floating inputs use float32 arithmetic and round the result back to the input
+type; float64 uses MLX CPU. Empty outputs are built from live metadata without
+reading payloads. Dynamic ranks and empty geometry use shape-keyed compilation,
+so replay cannot freeze a first-call axis list or empty-output branch.
 
 These value-kind forms remain on ORT CPU because the current array-only EP boundary
 cannot materialize their results:
@@ -265,6 +290,16 @@ and native-dimension errors are explicit and do not poison later valid runs.
 The explicit schema formulas are used for cases where ORT's LRN kernel only
 accepts rank four or the Python reference mishandles channel iteration or
 negative-input L1 norms.
+
+Constant int64 `Range` bounds and values are generated with checked integer
+arithmetic, not through floating-point start/step arguments. All three bounds
+must be scalars, the output length must fit native int32 geometry, and its
+exact count must agree with ORT's inferred extent. Full-width bounds with small
+spans follow the ONNX function, including cases where ORT 1.31's native kernel
+incorrectly returns empty. Forms whose exact count disagrees with the inferred
+extent remain unclaimed rather than capturing an incorrect shape. Runtime
+bounds and float64 `Range` remain open coverage partitions, not proven backend
+limitations.
 
 `BatchNormalization` implements versioned inference and training, including
 legacy version-7 nonspatial features and version-9 rank-one inputs (`C=1`).
