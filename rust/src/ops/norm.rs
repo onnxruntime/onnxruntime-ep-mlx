@@ -8,7 +8,7 @@
 //!   * GroupNormalization (ai.onnx opset 18+)           — versioned affine and stash precision
 //!   * InstanceNormalization (ai.onnx)                   — composed spatial mean/var/affine
 //!   * LpNormalization (ai.onnx)                        — composed abs/sum or square/sum/sqrt
-//!   * BatchNormalization (ai.onnx, inference form)     — composed per-channel affine
+//!   * BatchNormalization (ai.onnx)                     — versioned affine and population statistics
 //!   * LRN (ai.onnx, across-channel)                    — composed square/window-sum/power/divide
 //!
 //! Standard norms honor stash precision and broadcast affine parameters. Their ordinary last-axis
@@ -62,9 +62,6 @@ fn divide(
 ) -> Result<mlx::mlx_array, MlxError> {
     ctx.binary(mlx::mlx_divide, a, b)
 }
-fn rsqrt(ctx: &mut TranslationContext, a: mlx::mlx_array) -> Result<mlx::mlx_array, MlxError> {
-    ctx.emit(|res, s| unsafe { mlx::mlx_rsqrt(res, a, s) })
-}
 fn sqrt(ctx: &mut TranslationContext, a: mlx::mlx_array) -> Result<mlx::mlx_array, MlxError> {
     ctx.emit(|res, s| unsafe { mlx::mlx_sqrt(res, a, s) })
 }
@@ -116,29 +113,80 @@ fn present(n: &NodeDesc, i: usize) -> bool {
     i < n.inputs.len() && n.inputs[i].source != Src::Absent
 }
 
+fn normalization_shape(
+    ctx: &mut TranslationContext,
+    n: &NodeDesc,
+    minimum_rank: usize,
+) -> Result<Vec<i32>, MlxError> {
+    let shape = ctx.tensor_shape(&n.inputs[0])?;
+    if shape.len() < minimum_rank {
+        return Err(format!(
+            "{}: input rank must be at least {minimum_rank}, got {}",
+            n.op_type,
+            shape.len()
+        ));
+    }
+    shape
+        .into_iter()
+        .map(|dim| {
+            i32::try_from(dim)
+                .ok()
+                .filter(|&dim| dim >= 0)
+                .ok_or_else(|| format!("{}: dimension {dim} exceeds native bounds", n.op_type))
+        })
+        .collect()
+}
+
+fn normalization_compute_dtype(dtype: mlx::mlx_dtype) -> mlx::mlx_dtype {
+    if dtype == mlx::mlx_dtype__MLX_FLOAT64 {
+        dtype
+    } else {
+        mlx::mlx_dtype__MLX_FLOAT32
+    }
+}
+
 // ---- handlers ----------------------------------------------------------------------------------
 
 fn instance_norm_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
+    let shape = normalization_shape(ctx, n, 3)?;
+    for input in &n.inputs[1..3] {
+        let affine_shape = ctx.tensor_shape(input)?;
+        if affine_shape != [i64::from(shape[1])] {
+            return Err(format!(
+                "InstanceNormalization: affine shape {affine_shape:?} must be [{}]",
+                shape[1]
+            ));
+        }
+    }
+    let dtype = crate::engine::mlx_dtype_from_onnx(n.outputs[0].otype);
+    if shape.contains(&0) {
+        let out = ctx.zeros(&shape, dtype)?;
+        ctx.bind(&n.outputs[0], out);
+        return Ok(());
+    }
     let x = ctx.resolve(&n.inputs[0])?;
     let scale = ctx.resolve(&n.inputs[1])?;
     let bias = ctx.resolve(&n.inputs[2])?;
-    let shape = ctx.shape_of(x);
+    let compute_dtype = normalization_compute_dtype(dtype);
+    let x = ctx.astype(x, compute_dtype)?;
+    let scale = ctx.astype(scale, compute_dtype)?;
+    let bias = ctx.astype(bias, compute_dtype)?;
     let axes: Vec<i32> = (2..shape.len() as i32).collect();
-    let mean = ctx.emit(|res, stream| unsafe {
-        mlx::mlx_mean_axes(res, x, axes.as_ptr(), axes.len(), true, stream)
-    })?;
-    let variance = ctx.emit(|res, stream| unsafe {
-        mlx::mlx_var_axes(res, x, axes.as_ptr(), axes.len(), true, 0, stream)
-    })?;
-    let eps = scalar_like(ctx, epsilon(n, 1e-5), ctx.dtype_of(x))?;
-    let variance_eps = add(ctx, variance, eps)?;
-    let inv_std = rsqrt(ctx, variance_eps)?;
+    let mean = norm_mean_axes(ctx, x, &axes, compute_dtype)?;
     let centered = sub(ctx, x, mean)?;
-    let normalized = mul(ctx, centered, inv_std)?;
+    let residual_mean = norm_mean_axes(ctx, centered, &axes, compute_dtype)?;
+    let centered = sub(ctx, centered, residual_mean)?;
+    let square = mul(ctx, centered, centered)?;
+    let variance = norm_mean_axes(ctx, square, &axes, compute_dtype)?;
+    let eps = scalar_like(ctx, epsilon(n, 1e-5), compute_dtype)?;
+    let variance_eps = add(ctx, variance, eps)?;
+    let stddev = sqrt(ctx, variance_eps)?;
+    let normalized = divide(ctx, centered, stddev)?;
     let scale = channel_broadcast(ctx, scale, shape.len(), shape[1])?;
     let bias = channel_broadcast(ctx, bias, shape.len(), shape[1])?;
     let scaled = mul(ctx, normalized, scale)?;
     let out = add(ctx, scaled, bias)?;
+    let out = ctx.astype(out, dtype)?;
     ctx.bind(&n.outputs[0], out);
     Ok(())
 }
@@ -171,11 +219,7 @@ fn norm_mean_axes(
     dtype: mlx::mlx_dtype,
 ) -> Result<mlx::mlx_array, MlxError> {
     // Avoid narrow-type accumulation error, but round each statistic to the requested precision.
-    let accumulation_dtype = if dtype == mlx::mlx_dtype__MLX_FLOAT64 {
-        dtype
-    } else {
-        mlx::mlx_dtype__MLX_FLOAT32
-    };
+    let accumulation_dtype = normalization_compute_dtype(dtype);
     let input = ctx.astype(input, accumulation_dtype)?;
     let mean = ctx.emit(|res, stream| unsafe {
         mlx::mlx_mean_axes(res, input, axes.as_ptr(), axes.len(), true, stream)
@@ -507,14 +551,27 @@ fn group_norm_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxEr
 
 /// LpNormalization (ai.onnx): Y = X / ||X||_p along `axis` (p in {1,2}, default 2; axis default -1).
 fn lp_norm_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
-    let x = ctx.resolve(&n.inputs[0])?;
-    let rank = ctx.ndim(x) as i64;
-    let mut axis = n.ints.get("axis").copied().unwrap_or(-1);
-    if axis < 0 {
-        axis += rank;
+    let shape = normalization_shape(ctx, n, 1)?;
+    let rank = shape.len() as i64;
+    let axis = n.ints.get("axis").copied().unwrap_or(-1);
+    if axis < -rank || axis >= rank {
+        return Err(format!(
+            "LpNormalization: axis {axis} is invalid for rank {rank}"
+        ));
     }
+    let axis = if axis < 0 { axis + rank } else { axis } as i32;
     let p = n.ints.get("p").copied().unwrap_or(2);
-    let axis = axis as i32;
+    if p != 1 && p != 2 {
+        return Err(format!("LpNormalization: p must be 1 or 2, got {p}"));
+    }
+    let dtype = crate::engine::mlx_dtype_from_onnx(n.outputs[0].otype);
+    if shape.contains(&0) {
+        let out = ctx.zeros(&shape, dtype)?;
+        ctx.bind(&n.outputs[0], out);
+        return Ok(());
+    }
+    let x = ctx.resolve(&n.inputs[0])?;
+    let x = ctx.astype(x, normalization_compute_dtype(dtype))?;
 
     let norm = if p == 1 {
         let a = abs(ctx, x)?;
@@ -530,36 +587,169 @@ fn lp_norm_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError
     let zero = scalar_like(ctx, 0.0, ctx.dtype_of(x))?;
     let is_zero = ctx.binary(mlx::mlx_equal, norm, zero)?;
     let out = ctx.where_(is_zero, zero, quot)?;
+    let out = ctx.astype(out, dtype)?;
     ctx.mark_composed("LpNormalization composed (abs/sum/sqrt/divide) — no fused norm kernel");
     ctx.bind(&n.outputs[0], out);
     Ok(())
 }
 
-/// BatchNormalization (ai.onnx, inference/spatial form): Y = (X - mean)/sqrt(var+eps) * scale + B,
-/// per channel. Only the single-output inference form is claimed.
+/// Legacy and modern BN modes share graph-valued population statistics and affine arithmetic.
 fn batch_norm_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
-    let x = ctx.resolve(&n.inputs[0])?;
-    let scale = ctx.resolve(&n.inputs[1])?;
-    let b = ctx.resolve(&n.inputs[2])?;
-    let mean = ctx.resolve(&n.inputs[3])?;
-    let var = ctx.resolve(&n.inputs[4])?;
-    let shape = ctx.shape_of(x);
+    let shape = normalization_shape(ctx, n, if n.since_version >= 9 { 1 } else { 2 })?;
     let rank = shape.len();
-    let c = if rank >= 2 { shape[1] } else { shape[0] };
-    let eps = epsilon(n, 1e-5);
-
-    let eps_s = scalar_like(ctx, eps, ctx.dtype_of(x))?;
-    let var_eps = add(ctx, var, eps_s)?;
-    let inv = rsqrt(ctx, var_eps)?; // [C]
-    let a = mul(ctx, scale, inv)?; // [C]
-    let mean_a = mul(ctx, mean, a)?;
-    let shift = sub(ctx, b, mean_a)?; // [C]
-    let ab = channel_broadcast(ctx, a, rank, c)?;
-    let shiftb = channel_broadcast(ctx, shift, rank, c)?;
-    let scaled = mul(ctx, x, ab)?;
-    let out = add(ctx, scaled, shiftb)?;
-    ctx.mark_composed("BatchNormalization composed (rsqrt/affine) — no fused batch-norm kernel");
-    ctx.bind(&n.outputs[0], out);
+    if n.since_version == 1 && rank != 4 {
+        return Err("BatchNormalization1: input must have rank four".into());
+    }
+    let spatial = n.since_version >= 9 || n.ints.get("spatial").copied().unwrap_or(1) != 0;
+    let training = if n.since_version < 7 {
+        if n.ints.get("is_test").copied().unwrap_or(0) == 0 {
+            return Err("BatchNormalization1/6: in-place training is unsupported".into());
+        }
+        false
+    } else if n.since_version < 14 {
+        n.outputs.len() > 1
+    } else {
+        n.ints.get("training_mode").copied().unwrap_or(0) != 0
+    };
+    let parameter_shape = if spatial {
+        vec![if rank == 1 { 1 } else { shape[1] }]
+    } else {
+        shape[1..].to_vec()
+    };
+    for input in &n.inputs[1..5] {
+        let actual = ctx.tensor_shape(input)?;
+        if actual
+            .iter()
+            .copied()
+            .ne(parameter_shape.iter().copied().map(i64::from))
+        {
+            return Err(format!(
+                "BatchNormalization: parameter shape {actual:?} must be {parameter_shape:?}"
+            ));
+        }
+    }
+    let output_dtype = crate::engine::mlx_dtype_from_onnx(n.outputs[0].otype);
+    if shape.contains(&0) && !training {
+        let output = ctx.zeros(&shape, output_dtype)?;
+        ctx.bind(&n.outputs[0], output);
+        return Ok(());
+    }
+    let inputs = n.inputs[..5]
+        .iter()
+        .map(|input| ctx.resolve(input))
+        .collect::<Result<Vec<_>, _>>()?;
+    let compute_dtype = if inputs
+        .iter()
+        .any(|&input| ctx.dtype_of(input) == mlx::mlx_dtype__MLX_FLOAT64)
+    {
+        mlx::mlx_dtype__MLX_FLOAT64
+    } else {
+        mlx::mlx_dtype__MLX_FLOAT32
+    };
+    let inputs = inputs
+        .into_iter()
+        .map(|input| ctx.astype(input, compute_dtype))
+        .collect::<Result<Vec<_>, _>>()?;
+    let [x, scale, bias, input_mean, input_var] = inputs[..] else {
+        unreachable!("five required BatchNormalization inputs were validated");
+    };
+    let mut broadcast_shape = vec![1; rank];
+    if spatial {
+        if rank > 1 {
+            broadcast_shape[1] = shape[1];
+        }
+    } else {
+        broadcast_shape[1..].copy_from_slice(&shape[1..]);
+    }
+    let (centered, mean, variance) = if training {
+        if shape.contains(&0) {
+            let nan = scalar_like(ctx, f32::NAN, compute_dtype)?;
+            let nan = ctx.emit(|res, stream| unsafe {
+                mlx::mlx_broadcast_to(
+                    res,
+                    nan,
+                    parameter_shape.as_ptr(),
+                    parameter_shape.len(),
+                    stream,
+                )
+            })?;
+            (x, nan, nan)
+        } else {
+            let axes: Vec<i32> = (0..rank as i32)
+                .filter(|&axis| !spatial || rank == 1 || axis != 1)
+                .filter(|&axis| spatial || axis == 0)
+                .collect();
+            let mean = norm_mean_axes(ctx, x, &axes, compute_dtype)?;
+            let centered = sub(ctx, x, mean)?;
+            let residual = norm_mean_axes(ctx, centered, &axes, compute_dtype)?;
+            let centered = sub(ctx, centered, residual)?;
+            let mean = add(ctx, mean, residual)?;
+            let squared = mul(ctx, centered, centered)?;
+            let variance = norm_mean_axes(ctx, squared, &axes, compute_dtype)?;
+            (
+                centered,
+                ctx.reshape(mean, &parameter_shape)?,
+                ctx.reshape(variance, &parameter_shape)?,
+            )
+        }
+    } else {
+        let mean = ctx.reshape(input_mean, &broadcast_shape)?;
+        (sub(ctx, x, mean)?, input_mean, input_var)
+    };
+    let epsilon = scalar_like(ctx, epsilon(n, 1e-5), compute_dtype)?;
+    let variance_eps = add(ctx, variance, epsilon)?;
+    let stddev = sqrt(ctx, variance_eps)?;
+    let denominator = ctx.reshape(stddev, &broadcast_shape)?;
+    let normalized = divide(ctx, centered, denominator)?;
+    let scale = ctx.reshape(scale, &broadcast_shape)?;
+    let bias = ctx.reshape(bias, &broadcast_shape)?;
+    let scaled = mul(ctx, normalized, scale)?;
+    let output = add(ctx, scaled, bias)?;
+    let output = ctx.astype(output, output_dtype)?;
+    ctx.bind(&n.outputs[0], output);
+    if training {
+        let momentum = f64::from(n.floats.get("momentum").copied().unwrap_or(0.9));
+        let (momentum, complement) = if compute_dtype == mlx::mlx_dtype__MLX_FLOAT64 {
+            (ctx.scalar_f64(momentum), ctx.scalar_f64(1.0 - momentum))
+        } else {
+            (
+                ctx.scalar_f32(momentum as f32),
+                ctx.scalar_f32((1.0 - momentum) as f32),
+            )
+        };
+        for (index, previous, current) in [(1, input_mean, mean), (2, input_var, variance)] {
+            if n.outputs
+                .get(index)
+                .is_some_and(|output| !output.name.is_empty())
+            {
+                let previous = mul(ctx, previous, momentum)?;
+                let current = mul(ctx, current, complement)?;
+                let updated = add(ctx, previous, current)?;
+                let dtype = crate::engine::mlx_dtype_from_onnx(n.outputs[index].otype);
+                let updated = ctx.astype(updated, dtype)?;
+                ctx.bind(&n.outputs[index], updated);
+            }
+        }
+        if n.outputs
+            .get(3)
+            .is_some_and(|output| !output.name.is_empty())
+        {
+            let saved = ctx.astype(mean, crate::engine::mlx_dtype_from_onnx(n.outputs[3].otype))?;
+            ctx.bind(&n.outputs[3], saved);
+        }
+        if n.outputs
+            .get(4)
+            .is_some_and(|output| !output.name.is_empty())
+        {
+            let inverse = ctx.unary(mlx::mlx_reciprocal, stddev)?;
+            let inverse = ctx.astype(
+                inverse,
+                crate::engine::mlx_dtype_from_onnx(n.outputs[4].otype),
+            )?;
+            ctx.bind(&n.outputs[4], inverse);
+        }
+    }
+    ctx.mark_composed("BatchNormalization with versioned modes and population statistics");
     Ok(())
 }
 
@@ -630,49 +820,63 @@ fn slice_channel(
 /// LRN (ai.onnx, across-channel): for input X=[N,C,*S],
 ///   square_sum[n,c,*] = sum over the `size`-wide channel window centered at c (clamped to [0,C-1]),
 ///   Y[n,c,*] = X[n,c,*] / (bias + (alpha/size) * square_sum[n,c,*])^beta.
-/// The window sum is computed by zero-padding X^2 along the channel axis (so out-of-range channels
-/// contribute 0, matching ONNX's clamped window) then summing `size` shifted channel slices.
+/// Only offsets intersecting the channel axis contribute, even when `size` exceeds native bounds.
 fn lrn_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
-    let x = ctx.resolve(&n.inputs[0])?;
-    let shape = ctx.shape_of(x);
+    let shape = normalization_shape(ctx, n, 2)?;
     let c = shape[1];
-    let size = n.ints.get("size").copied().unwrap_or(1).max(1) as i32;
+    let size = n.ints.get("size").copied().unwrap_or(0);
+    if size < 1 {
+        return Err(format!("LRN: size must be positive, got {size}"));
+    }
+    let dtype = crate::engine::mlx_dtype_from_onnx(n.outputs[0].otype);
+    if shape.contains(&0) {
+        let out = ctx.zeros(&shape, dtype)?;
+        ctx.bind(&n.outputs[0], out);
+        return Ok(());
+    }
+    let x = ctx.resolve(&n.inputs[0])?;
+    let dt = normalization_compute_dtype(dtype);
+    let x = ctx.astype(x, dt)?;
     let alpha = n.floats.get("alpha").copied().unwrap_or(1e-4);
     let beta = n.floats.get("beta").copied().unwrap_or(0.75);
     let bias = n.floats.get("bias").copied().unwrap_or(1.0);
-    let dt = ctx.dtype_of(x);
 
     let x2 = mul(ctx, x, x)?;
-    // Window [c - floor((size-1)/2), c + ceil((size-1)/2)] clamped to [0, C-1].
-    let pad_before = (size - 1) / 2;
-    let pad_after = size - 1 - pad_before;
-    let zero = scalar_like(ctx, 0.0, dt)?;
-    let xp = pad_channel(ctx, x2, pad_before, pad_after, zero)?; // channel length C + size - 1
-
-    // square_sum[:, c] = sum_{k=0}^{size-1} xp[:, c + k]
-    let mut square_sum = slice_channel(ctx, xp, 0, c)?;
-    for k in 1..size {
-        let s = slice_channel(ctx, xp, k, k + c)?;
-        square_sum = add(ctx, square_sum, s)?;
-    }
-
-    let scale = scalar_like(ctx, alpha / size as f32, dt)?;
+    let before = ((size - 1) / 2).min(i64::from(c - 1)) as i32;
+    let after = (size - 1 - (size - 1) / 2).min(i64::from(c - 1)) as i32;
+    let square_sum = if before == c - 1 && after == c - 1 {
+        sum_axis(ctx, x2, 1, true)?
+    } else {
+        let zero = scalar_like(ctx, 0.0, dt)?;
+        let mut sum = x2;
+        for offset in -before..=after {
+            if offset == 0 {
+                continue;
+            }
+            let slice = slice_channel(ctx, x2, offset.max(0), c + offset.min(0))?;
+            let shifted = pad_channel(ctx, slice, (-offset).max(0), offset.max(0), zero)?;
+            sum = add(ctx, sum, shifted)?;
+        }
+        sum
+    };
+    let scale = if dt == mlx::mlx_dtype__MLX_FLOAT64 {
+        ctx.scalar_f64(f64::from(alpha) / size as f64)
+    } else {
+        ctx.scalar_f32(alpha / size as f32)
+    };
     let bias_s = scalar_like(ctx, bias, dt)?;
     let beta_s = scalar_like(ctx, beta, dt)?;
     let scaled = mul(ctx, square_sum, scale)?;
     let base = add(ctx, scaled, bias_s)?;
     let denom = ctx.binary(mlx::mlx_power, base, beta_s)?;
     let out = divide(ctx, x, denom)?;
+    let out = ctx.astype(out, dtype)?;
     ctx.mark_composed("LRN composed (square/window-sum/power/divide) — no fused LRN kernel");
     ctx.bind(&n.outputs[0], out);
     Ok(())
 }
 
 // ---- claim predicates --------------------------------------------------------------------------
-
-fn tensor_dtype(node: &NodeView, i: usize) -> Option<ort::ONNXTensorElementDataType> {
-    node.input_info(i).map(|s| s.dtype)
-}
 
 /// RMSNormalization (ai.onnx): floating input and independently typed broadcast scale.
 fn rms_norm_claim(node: &NodeView) -> ClaimResult {
@@ -962,61 +1166,148 @@ fn lp_norm_claim(node: &NodeView) -> ClaimResult {
         _ => deny!("missing tensor type/shape info on input or output"),
     };
     require!(
-        is_mlx_float(x.dtype) && out.dtype == x.dtype,
-        "input/output must be the same float dtype (fp32/fp16/bf16), got {} -> {}",
+        is_mlx_cpu_float(x.dtype) && out.dtype == x.dtype,
+        "input/output must share one supported float dtype, got {} -> {}",
         crate::registry::ort_dtype_name(x.dtype),
         crate::registry::ort_dtype_name(out.dtype)
     );
     require!(
-        !x.shape.is_empty(),
+        node.input_rank_known(0) != Some(true) || !x.shape.is_empty(),
         "input must have rank >= 1 (got a scalar)"
     );
+    if node.input_rank_known(0) == Some(true) {
+        let rank = x.shape.len() as i64;
+        let axis = node.int_attr("axis", -1);
+        require!(
+            axis >= -rank && axis < rank,
+            "axis {axis} is invalid for rank {rank}"
+        );
+    }
     let p = node.int_attr("p", 2);
     require!(p == 1 || p == 2, "only p=1 or p=2 is supported (got {p})");
     Ok(())
 }
 
-/// BatchNormalization: inference (single-output) form, 5 float inputs sharing X's dtype.
+/// BatchNormalization: versioned affine/statistic types, modes, and feature geometry.
 fn batch_norm_claim(node: &NodeView) -> ClaimResult {
     require!(
-        node.num_inputs() == 5 && node.num_outputs() == 1,
-        "inference form expects 5 inputs and 1 output, got {}in/{}out",
+        node.num_inputs() == 5,
+        "expects five required inputs, got {}in/{}out",
         node.num_inputs(),
         node.num_outputs()
+    );
+    let version = node.since_version();
+    let spatial = version >= 9 || node.int_attr("spatial", 1) != 0;
+    if version < 9 {
+        require!(
+            matches!(node.int_attr("spatial", 1), 0 | 1),
+            "spatial must be zero or one"
+        );
+    }
+    let training = if version < 7 {
+        require!(
+            node.int_attr("is_test", 0) != 0,
+            "legacy training requires in-place running-statistic semantics"
+        );
+        false
+    } else if version < 14 {
+        node.num_outputs() > 1
+    } else {
+        let training = node.int_attr("training_mode", 0);
+        require!(
+            matches!(training, 0 | 1),
+            "training_mode must be zero or one"
+        );
+        training == 1
+    };
+    let outputs = if !training {
+        1
+    } else if version < 14 {
+        5
+    } else {
+        3
+    };
+    require!(
+        node.num_outputs() == outputs,
+        "this BatchNormalization mode expects {outputs} output slots"
     );
     let (x, out) = match (node.input_info(0), node.output_info(0)) {
         (Some(x), Some(o)) => (x, o),
         _ => deny!("missing tensor type/shape info on X or output"),
     };
     require!(
-        is_mlx_float(x.dtype) && out.dtype == x.dtype,
-        "X/output must be the same float dtype (fp32/fp16/bf16), got {} -> {}",
+        is_mlx_cpu_float(x.dtype) && out.dtype == x.dtype,
+        "X/output must share one supported float dtype, got {} -> {}",
         crate::registry::ort_dtype_name(x.dtype),
         crate::registry::ort_dtype_name(out.dtype)
     );
-    require!(
-        x.shape.len() >= 2,
-        "input must have rank >= 2 (got rank {})",
-        x.shape.len()
-    );
-    for i in 1..5 {
-        let dtype = match tensor_dtype(node, i) {
-            Some(dtype) => dtype,
-            None => deny!("missing tensor type/shape info on input {i}"),
-        };
+    let rank_known = node.input_rank_known(0) == Some(true);
+    if rank_known {
         require!(
-            dtype == x.dtype,
-            "input {i} must match X dtype {}, got {}",
-            crate::registry::ort_dtype_name(x.dtype),
-            crate::registry::ort_dtype_name(dtype)
+            if version == 1 {
+                x.shape.len() == 4
+            } else {
+                x.shape.len() >= if version >= 9 { 1 } else { 2 }
+            },
+            "invalid input rank {} for BatchNormalization version {version}",
+            x.shape.len()
         );
     }
-
-    let training_mode = node.int_attr("training_mode", 0);
-    require!(
-        training_mode == 0,
-        "training_mode must be 0; training outputs are unsupported (got {training_mode})"
-    );
+    let scale_type = match node.input_info(1) {
+        Some(info) => info.dtype,
+        None => deny!("missing scale type"),
+    };
+    let statistics_type = match node.input_info(3) {
+        Some(info) => info.dtype,
+        None => deny!("missing statistics type"),
+    };
+    for i in 1..5 {
+        let info = match node.input_info(i) {
+            Some(info) => info,
+            None => deny!("missing tensor type/shape info on input {i}"),
+        };
+        let dtype = if i < 3 { scale_type } else { statistics_type };
+        require!(
+            is_mlx_cpu_float(info.dtype)
+                && info.dtype == dtype
+                && (version >= 15 || i >= 3 && version >= 14 || info.dtype == x.dtype),
+            "input {i} violates the versioned affine/statistic dtype groups"
+        );
+        if node.input_rank_known(i) == Some(true) {
+            let expected = if spatial {
+                Some(vec![if rank_known && x.shape.len() > 1 {
+                    x.shape[1]
+                } else if rank_known {
+                    1
+                } else {
+                    -1
+                }])
+            } else if rank_known {
+                Some(x.shape[1..].to_vec())
+            } else {
+                None
+            };
+            if let Some(expected) = expected {
+                require!(
+                    info.shape.len() == expected.len()
+                        && info.shape.iter().zip(expected.iter()).all(
+                            |(&actual, &expected)| actual < 0 || expected < 0 || actual == expected
+                        ),
+                    "input {i} shape {:?} must match {expected:?}",
+                    info.shape
+                );
+            }
+        }
+    }
+    for i in 1..outputs {
+        if node.output_present(i) {
+            require!(
+                node.output_info(i)
+                    .is_some_and(|info| info.dtype == statistics_type),
+                "statistic output {i} must match the input statistic dtype"
+            );
+        }
+    }
     Ok(())
 }
 
@@ -1037,32 +1328,33 @@ fn instance_norm_claim(node: &NodeView) -> ClaimResult {
         _ => deny!("missing tensor type/shape info"),
     };
     require!(
-        is_mlx_float(x.dtype)
+        is_mlx_cpu_float(x.dtype)
             && scale.dtype == x.dtype
             && bias.dtype == x.dtype
             && out.dtype == x.dtype,
         "input, scale, bias, and output must share one MLX float dtype"
     );
     require!(
-        x.shape.len() >= 3 && x.shape.iter().all(|&dim| dim > 0),
-        "input must have a static positive [N,C,spatial...] shape"
+        node.input_rank_known(0) != Some(true) || x.shape.len() >= 3,
+        "input must have rank at least 3"
     );
-    require!(
-        scale.shape == [x.shape[1]] && bias.shape == [x.shape[1]],
-        "scale and bias must have shape [C]={:?}",
-        [x.shape[1]]
-    );
-    require!(
-        out.shape == x.shape,
-        "output shape {:?} must match input shape {:?}",
-        out.shape,
-        x.shape
-    );
+    for (index, affine) in [(1, scale), (2, bias)] {
+        require!(
+            node.input_rank_known(index) != Some(true) || affine.shape.len() == 1,
+            "scale and bias must be rank-one channel vectors"
+        );
+        if node.input_rank_known(0) == Some(true) && node.input_rank_known(index) == Some(true) {
+            require!(
+                x.shape[1] < 0 || affine.shape[0] < 0 || affine.shape[0] == x.shape[1],
+                "scale and bias must have length C={}",
+                x.shape[1]
+            );
+        }
+    }
     Ok(())
 }
 
-/// LRN (ai.onnx, across-channel): single float input/output of equal dtype, static shape with a
-/// channel axis, and a valid window `size >= 1`.
+/// LRN (ai.onnx, across-channel): floating tensors with a channel axis and positive window size.
 fn lrn_claim(node: &NodeView) -> ClaimResult {
     require!(
         node.num_inputs() == 1 && node.num_outputs() == 1,
@@ -1075,46 +1367,37 @@ fn lrn_claim(node: &NodeView) -> ClaimResult {
         _ => deny!("missing tensor type/shape info on input or output"),
     };
     require!(
-        is_mlx_float(x.dtype) && out.dtype == x.dtype,
-        "input/output must be the same float dtype (fp32/fp16/bf16), got {} -> {}",
+        is_mlx_cpu_float(x.dtype) && out.dtype == x.dtype,
+        "input/output must share one supported float dtype, got {} -> {}",
         crate::registry::ort_dtype_name(x.dtype),
         crate::registry::ort_dtype_name(out.dtype)
     );
     require!(
-        x.shape.len() >= 2,
+        node.input_rank_known(0) != Some(true) || x.shape.len() >= 2,
         "input must have rank >= 2 (got rank {})",
         x.shape.len()
-    );
-    require!(
-        x.shape.iter().all(|&d| d > 0),
-        "all input dimensions must be static and positive to build channel pad/slice (got {:?})",
-        x.shape
     );
     let size = node.int_attr("size", 0);
     require!(size >= 1, "window size must be >= 1 (got {size})");
     Ok(())
 }
 
-// ---- registration ------------------------------------------------------------------------------
-
-#[allow(clippy::too_many_arguments)]
-fn shapeless(
-    registry: &mut OpRegistry,
-    domain: &'static str,
-    op_type: &'static str,
-    min_opset: i32,
-    handler: crate::registry::OpHandler,
-    claim: crate::registry::ClaimPredicate,
-) {
-    registry.register_shapeless(OpRegistration {
-        domain,
-        op_type,
-        min_opset,
-        max_opset: K_ANY_OPSET,
-        handler,
-        claim,
-    });
+fn spatial_norm_compile_shape_safety(node: &NodeView) -> CompileShapeSafety {
+    if (0..node.num_inputs()).all(|i| {
+        node.input_rank_known(i) == Some(true)
+            && node
+                .input_info(i)
+                .is_some_and(|info| info.shape.iter().all(|&dim| dim > 0))
+    }) {
+        CompileShapeSafety::Shapeless
+    } else {
+        CompileShapeSafety::ShapeKeyedOnly {
+            reason: "normalization rank, empty dispatch, and channel geometry depend on concrete shapes",
+        }
+    }
 }
+
+// ---- registration ------------------------------------------------------------------------------
 
 #[allow(clippy::too_many_arguments)]
 fn shape_keyed(
@@ -1140,13 +1423,16 @@ fn shape_keyed(
 }
 
 pub fn register_norm(registry: &mut OpRegistry) {
-    shapeless(
-        registry,
-        "",
-        "InstanceNormalization",
-        6,
-        instance_norm_op,
-        instance_norm_claim,
+    registry.register_shape_classified(
+        OpRegistration {
+            domain: "",
+            op_type: "InstanceNormalization",
+            min_opset: 1,
+            max_opset: K_ANY_OPSET,
+            handler: instance_norm_op,
+            claim: instance_norm_claim,
+        },
+        spatial_norm_compile_shape_safety,
     );
     // RMSNormalization entered ai.onnx at opset 23.
     registry.register_shape_classified(
@@ -1181,21 +1467,27 @@ pub fn register_norm(registry: &mut OpRegistry) {
         group_norm_claim,
         "conservatively shape-keyed: group reshape depends on concrete batch, channel, and spatial extents",
     );
-    shapeless(
-        registry,
-        "",
-        "LpNormalization",
-        K_ANY_OPSET,
-        lp_norm_op,
-        lp_norm_claim,
+    registry.register_shape_classified(
+        OpRegistration {
+            domain: "",
+            op_type: "LpNormalization",
+            min_opset: 1,
+            max_opset: K_ANY_OPSET,
+            handler: lp_norm_op,
+            claim: lp_norm_claim,
+        },
+        spatial_norm_compile_shape_safety,
     );
-    shapeless(
-        registry,
-        "",
-        "BatchNormalization",
-        K_ANY_OPSET,
-        batch_norm_op,
-        batch_norm_claim,
+    registry.register_shape_classified(
+        OpRegistration {
+            domain: "",
+            op_type: "BatchNormalization",
+            min_opset: 1,
+            max_opset: K_ANY_OPSET,
+            handler: batch_norm_op,
+            claim: batch_norm_claim,
+        },
+        spatial_norm_compile_shape_safety,
     );
     shape_keyed(
         registry,

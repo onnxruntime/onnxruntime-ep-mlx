@@ -265,6 +265,7 @@ pub fn compile_shape_safety(node: &NodeView) -> CompileShapeSafety {
 fn register_builtin_ops(registry: &mut OpRegistry) {
     crate::ops::elementwise::register(registry);
     crate::ops::image::register(registry);
+    crate::ops::nonzero::register(registry);
     crate::ops::math::register(registry);
     crate::ops::reduction::register(registry);
     crate::ops::shape::register(registry);
@@ -1556,6 +1557,30 @@ impl GraphView {
     }
 }
 
+pub(crate) fn requires_random_eager_boundary(node: &NodeView) -> bool {
+    let domain = node.domain();
+    let direct = (domain.is_empty() || domain == "ai.onnx")
+        && matches!(
+            node.op_type().as_str(),
+            "RandomNormal"
+                | "RandomNormalLike"
+                | "RandomUniform"
+                | "RandomUniformLike"
+                | "Bernoulli"
+                | "Multinomial"
+                | "Dropout"
+        )
+        && matches!(
+            compile_shape_safety(node),
+            CompileShapeSafety::EagerOnly { .. }
+        );
+    direct
+        || node
+            .subgraphs()
+            .iter()
+            .any(|(_, body)| body.nodes().iter().any(requires_random_eager_boundary))
+}
+
 // ---- Shared claim helpers (port of op_claim.h) --------------------------------------------------
 
 use ort::*;
@@ -1732,6 +1757,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn nonzero_is_version_gated_and_always_eager() {
+        assert!(registry().find_entry("", "NonZero", 8).is_none());
+        for version in [9, 13, 26] {
+            let index = registry().find_entry_index("", "NonZero", version).unwrap();
+            assert!(matches!(
+                registry().table[index].compile_shape_rule,
+                CompileShapeRule::Always(CompileShapeSafety::EagerOnly { .. })
+            ));
+        }
+    }
+
+    #[test]
     fn suffix_broadcast_treats_unknown_extents_as_compatible() {
         // ORT reports symbolic dims as -1; an unknown extent is not a literal
         // size and must not be compared as one.
@@ -1832,12 +1869,6 @@ mod tests {
             ("ai.onnx.ml", "SVMClassifier", 1),
             ("ai.onnx.ml", "FeatureVectorizer", 1),
             ("com.microsoft", "QMoE", 1),
-            ("", "RandomNormal", 1),
-            ("", "RandomNormalLike", 1),
-            ("", "RandomUniform", 1),
-            ("", "RandomUniformLike", 1),
-            ("", "Bernoulli", 15),
-            ("", "Multinomial", 7),
             ("", "RNN", 24),
             ("", "GRU", 24),
             ("", "LSTM", 24),
@@ -1858,7 +1889,6 @@ mod tests {
             ("", "LinearAttention", 27),
             ("", "GridSample", 24),
             ("", "Col2Im", 24),
-            ("", "RoiAlign", 24),
             ("", "MaxRoiPool", 24),
             ("", "MaxUnpool", 24),
         ];
@@ -1888,6 +1918,10 @@ mod tests {
         }
 
         assert!(matches!(
+            compile_shape_rule("", "RoiAlign", 24),
+            CompileShapeRule::Classified(_)
+        ));
+        assert!(matches!(
             compile_shape_rule("com.microsoft", "GroupQueryAttention", 1),
             CompileShapeRule::Classified(_)
         ));
@@ -1895,6 +1929,33 @@ mod tests {
             compile_shape_rule("", "Softmax", 11),
             CompileShapeRule::Classified(_)
         ));
+    }
+
+    #[test]
+    fn random_and_dropout_classify_live_keys_and_controls_per_node() {
+        for (op_type, since_version) in [
+            ("RandomNormal", 1),
+            ("RandomNormalLike", 1),
+            ("RandomUniform", 1),
+            ("RandomUniformLike", 1),
+            ("Bernoulli", 15),
+            ("Multinomial", 7),
+            ("Dropout", 1),
+            ("Dropout", 6),
+            ("Dropout", 7),
+            ("Dropout", 10),
+            ("Dropout", 12),
+            ("Dropout", 13),
+            ("Dropout", 22),
+        ] {
+            assert!(
+                matches!(
+                    compile_shape_rule("", op_type, since_version),
+                    CompileShapeRule::Classified(_)
+                ),
+                "{op_type}-{since_version} needs per-node random key/control classification"
+            );
+        }
     }
 
     #[test]

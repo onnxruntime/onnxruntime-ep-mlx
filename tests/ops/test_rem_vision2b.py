@@ -5,7 +5,8 @@ against ORT's CPU EP, tolerance-gated:
 
   * RoiAlign   — X[N,C,H,W] sampled per ROI[R,4] + batch_indices[R]; parametrized over mode
     (avg/max) x coordinate_transformation_mode (half_pixel/output_half_pixel) x sampling_ratio and
-    output size. sampling_ratio == 0 (adaptive grid) is left to CPU and not exercised here.
+    output size. Adaptive grids and strict live-value placement have dedicated regressions in
+    test_roi_align_semantics.py.
   * MaxRoiPool — X[N,C,H,W] pooled per ROI[R,5]; parametrized over pooled_shape / spatial_scale.
     ROI coordinates are integer-valued (after scaling) so the round() quantization is unambiguous.
   * MaxUnpool  — X[N,C,H,W] scattered back to a larger tensor by its flattened max indices;

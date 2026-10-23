@@ -62,7 +62,7 @@ fn read_axes(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<Vec<i64>, Mlx
     Ok(n.int_arrays.get("axes").cloned().unwrap_or_default())
 }
 
-fn normalize_axes(axes: &[i64], rank: i32) -> Result<Vec<i32>, MlxError> {
+pub(super) fn normalize_axes(axes: &[i64], rank: i32) -> Result<Vec<i32>, MlxError> {
     let mut out: Vec<i32> = Vec::with_capacity(axes.len());
     for &raw in axes {
         let axis = if raw < 0 { raw + rank as i64 } else { raw };
