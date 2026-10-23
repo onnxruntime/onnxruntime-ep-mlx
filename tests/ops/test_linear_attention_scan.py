@@ -194,7 +194,7 @@ for value in [*model.graph.input, *model.graph.output]:
     value.type.tensor_type.shape.dim[0].dim_param = "batch"
 session = strict_session(model.SerializeToString())
 rng = np.random.default_rng(2432)
-for batch, time in [(1, 5), (1, 5), (2, 7), (2, 1), (0, 3), (1, 0), (1, 5)]:
+for batch, time in [(1, 5), (1, 5), (2, 7), (2, 1), (1, 0), (1, 5)]:
     feeds = {
         "query": (rng.normal(size=(batch, time, 2 * dk)) / 8).astype(np.float32),
         "key": (rng.normal(size=(batch, time, 2 * dk)) / 16).astype(np.float32),
@@ -228,8 +228,23 @@ for batch, time in [(1, 5), (1, 5), (2, 7), (2, 1), (0, 3), (1, 0), (1, 5)]:
         assert composed
     else:
         assert fast
-        # Empty-batch applications deliberately retain the unroll.
-        assert composed
+        assert not composed
+
+
+@pytest.mark.parametrize("eager", [False, True])
+@pytest.mark.parametrize("dk", [257, 512])
+@pytest.mark.parametrize("batch,time", [(0, 3), (1, 0), (0, 0)])
+def test_linear_attention_wide_empty(monkeypatch, eager, dk, batch, time):
+    if eager:
+        monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_COMPILE", "1")
+    model, feeds = _linear_attention_model(
+        "gated_delta", B=batch, T=time, q_heads=2, kv_heads=2, d_k=dk, d_v=3,
+        with_past=True, scalar_decay=True,
+    )
+    for actual, expected in zip(strict_session(model).run(None, feeds), linear_reference(feeds), strict=True):
+        assert actual.shape == expected.shape
+        assert actual.dtype == np.float32
+        np.testing.assert_array_equal(actual, expected)
 
 
 @pytest.mark.parametrize("eager", [False, True])
