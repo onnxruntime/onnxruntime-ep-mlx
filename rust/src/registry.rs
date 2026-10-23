@@ -261,11 +261,21 @@ pub fn compile_shape_safety(node: &NodeView) -> CompileShapeSafety {
     registry().compile_shape_safety(node)
 }
 
+/// Data-dependent host scans, including those inside an otherwise capture-safe parent.
+pub fn requires_unique_eager_boundary(node: &NodeView) -> bool {
+    (matches!(node.domain().as_str(), "" | "ai.onnx") && node.op_type() == "Unique")
+        || node
+            .subgraphs()
+            .iter()
+            .any(|(_, body)| body.nodes().iter().any(requires_unique_eager_boundary))
+}
+
 /// Populate the table with every built-in op module (wave-1: elementwise + math).
 fn register_builtin_ops(registry: &mut OpRegistry) {
     crate::ops::elementwise::register(registry);
     crate::ops::image::register(registry);
     crate::ops::nonzero::register(registry);
+    crate::ops::unique::register(registry);
     crate::ops::math::register(registry);
     crate::ops::reduction::register(registry);
     crate::ops::shape::register(registry);
@@ -1763,6 +1773,17 @@ mod tests {
             let index = registry().find_entry_index("", "NonZero", version).unwrap();
             assert!(matches!(
                 registry().table[index].compile_shape_rule,
+                CompileShapeRule::Always(CompileShapeSafety::EagerOnly { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn unique_preserves_future_dispatch_and_excludes_capture() {
+        assert!(registry().find_entry("", "Unique", 10).is_none());
+        for version in [11, 26, 27, 28] {
+            assert!(matches!(
+                compile_shape_rule("", "Unique", version),
                 CompileShapeRule::Always(CompileShapeSafety::EagerOnly { .. })
             ));
         }

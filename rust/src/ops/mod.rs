@@ -3,6 +3,7 @@
 pub mod attention;
 pub mod conv;
 pub mod elementwise;
+mod host_scan;
 pub mod image;
 mod kv_cache;
 pub mod math;
@@ -23,4 +24,5 @@ pub mod selective_scan;
 pub mod signal;
 pub mod ssm;
 pub mod stragglers;
+pub mod unique;
 pub mod vision;
