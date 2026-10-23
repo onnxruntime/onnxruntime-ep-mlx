@@ -43,6 +43,14 @@ Reference indices `[5, 6, 7, 4, 0, 2, 3]` for bit patterns
 shape `[8, 1]`, axis 0), versus provider/oracle indices
 `[4, 0, 2, 3, 5, 6, 7]`. Both retain distinct NaN slices and merge signed-zero
 slices. This discrepancy does not establish an ONNX prohibition on NaN-last.
+
+| Output | NumPy 2.3.4 Reference | Provider/independent oracle |
+|---|---|---|
+| Y half bits, shape `[7, 1]` | `[7e11, fe22, 7e11, fc00, 8000, 0001, 7c00]` | `[fc00, 8000, 0001, 7c00, 7e11, fe22, 7e11]` |
+| indices, int64 `[7]` | `[5, 6, 7, 4, 0, 2, 3]` | `[4, 0, 2, 3, 5, 6, 7]` |
+| inverse, int64 `[8]` | `[4, 4, 5, 6, 3, 0, 1, 2]` | `[1, 1, 2, 3, 0, 4, 5, 6]` |
+| counts, int64 `[7]` | `[1, 1, 1, 1, 2, 1, 1]` | `[1, 2, 1, 1, 1, 1, 1]` |
+
 The EP regression keeps the unchanged independent typed oracle, checks every
 payload/metadata byte, and runs NaN-to-finite-to-NaN feeds in the same session.
 It does not turn a legal input into a claimed-node runtime error.
