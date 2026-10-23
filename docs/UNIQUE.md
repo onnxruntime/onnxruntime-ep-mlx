@@ -83,8 +83,11 @@ success must still match all exact outputs; only ORT 1.31's specific SIGABRT
 is reported as an explicit warning with retained diagnostics, not as CPU
 conformance. Other errors, signals, mismatches and timeouts remain failures.
 All MLX payload/shape/metadata checks and the independent oracle are unchanged;
-no EP form is declined, skipped or tolerance-relaxed. This diagnostic containment
-is pending execution and is not yet proof that all empty cases pass.
+no EP form is declined, skipped or tolerance-relaxed. Hosted run `39910466167`
+at `2b6606a` executed this containment: the strict scalar/empty checks passed,
+with four explicit CPU-authority warnings. That run failed a separate negative
+complex-loader message assertion, so it is not a successful full ops gate or
+proof of CPU conformance.
 
 The checked live host reader and geometry validation are shared with NonZero;
 NonZero's coordinate/equality contracts are unchanged. Empty buffers never
@@ -129,13 +132,20 @@ boundaries. The recursive neighbor regressions use claimable float32 If bodies.
 The initial investigation baseline is main `965304020994ed3da4157232102d151b64025ca5`,
 tree `044024a9a213be4eb974e6280af0076b402c69dc`; its pristine git archive SHA256 is
 `3529465d5e2569948d197c97ad869cd3017e962eb25cb027faba99e95987ed16`.
-The current integration base is actual merged main
+The RNG/Dropout integration base is actual merged main
 `bd941b6a4090ba4df0a9484459ad86fb11b7c1b0`, parent
 `965304020994ed3da4157232102d151b64025ca5`, tree
 `9fb2d55508d362f3ccf87aa472b08bce9cd41c21`; its pristine archive SHA256 is
 `c8555a826e28ff56c86aac3795e69a96afc515c87097d563ab0c3e75beb335ce`.
 RNG/Dropout handler and regression files match that main exactly; only the
 capability decision semantically unions its recursive fence with Unique.
+The subsequent actual Split main `7558995e7df55e7ec6b8ac3262b6bad63259bfa6`,
+parent `bd941b6a4090ba4df0a9484459ad86fb11b7c1b0`, tree
+`069cd3388618d356bc65c28735765ee3aeefee5c`, is also integrated; its archive SHA256
+is `a15dc8d0696af0c8f61a3037d5d559342320eaef7c2c28c023b7be1bf4fa4bd4`.
+Its Split production/tests, boundary-value specialization guards and canonical
+documentation are preserved. The coherent current-main union was independently
+reviewed source-only; this is not native candidate proof.
 The pinned manifests are `rust/Cargo.toml` blob
 `d5c2fe2742c9f9f250ea3d080477f87ce28cb471`, lockfile blob
 `f59cfd0eee7051adb51e3f7ca6c38aa820334ca4`, and `python/pyproject.toml` blob
@@ -143,11 +153,37 @@ The pinned manifests are `rust/Cargo.toml` blob
 MLX 0.32.4 commit `36969c094354086e15d2a327a9c50feb20b9cf11`, and
 mlx-c commit `57731b00e8bed710e0750e7356da9f18f8eb3e20`.
 
-Native baseline/candidate execution, focused Unique/affected suites, route/cache
-assertions, full ops/backend/leaks, wheel ABI/Python 3.13 registration and
-fresh-current-main source interaction remain **pending** until explicitly
-scheduler-granted and executed. Source/schema/oracle checks are not native
-proof. Regression route counts are expectations, not observed passes.
+Hosted run `39910466167` at `2b6606a` recorded 12,062 passes, 69 existing skips,
+four explicit CPU-authority warnings and one failed complex-loader rejection
+message assertion. Package wheel/ABI/Python 3.13 smoke passed; backend/leaks were
+not reached. The negative assertion now also accepts ORT's exact dtype-specific
+`MLDataType for: tensor(complex64) is not currently registered or supported`
+pipeline error (or `complex128`), following NonZero's prior art. Other rejection checks, positive
+oracles, payload/metadata tolerances and skip behavior are unchanged.
+
+The separately granted local Native56 baseline window failed its runtime-image
+precheck before every model: the pinned Python binding embeds ORT, so a
+standalone SDK ORT dylib was incorrectly required to be loaded. The window
+exited nonzero in 1.018 seconds, with unchanged fingerprints and an empty owned
+process group; all seven controls remain unexecuted. Corrected source-only
+instrumentation requires the active pinned binding and native version, retains
+standalone SDK/wheel dylibs as inspected artifacts, and records actual image
+paths/hashes before loaded-image assertions. It does not load an unused SDK to
+satisfy a check.
+
+The proposed reused d4-built d9 baseline is production-equivalent to historical
+bd main, not all of Split main. Relevant old Unique/registry/capability/engine/
+NonZero/dependency files are unchanged bd-to-Split-main; the seven baseline
+graphs contain no Split. This bounded reuse assessment is source-only, not an
+execution grant or successful baseline.
+
+Successful local baseline controls, a freshly built current-main candidate,
+focused Unique/affected and route/cache gates, final published-head hosted gates,
+full native ops/backend/leaks, wheel ABI/Python 3.13 registration and final
+current-main interaction proof remain **pending**. Separate explicit scheduler
+grants are required; source/schema/oracle checks and historical hosted passes do
+not replace these gates. Counts in the unexecuted local protocol are expectations,
+not observed local passes.
 
 Authorities:
 [ONNX Unique11/28](https://onnx.ai/onnx/operators/onnx__Unique.html),
