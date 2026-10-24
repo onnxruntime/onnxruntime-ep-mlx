@@ -1045,16 +1045,80 @@ fn split_to_sequence_op(_ctx: &mut TranslationContext, _n: &NodeDesc) -> Result<
     )
 }
 
+fn checked_tile_geometry(
+    shape: &[i64],
+    repeats_shape: &[i64],
+    repeats: &[i64],
+    dtype: mlx::mlx_dtype,
+    symbolic: bool,
+) -> Result<Vec<i64>, MlxError> {
+    if repeats_shape.len() != 1 {
+        return Err("MLX Tile: repeats must have rank one".to_string());
+    }
+    if repeats_shape[0] != repeats.len() as i64 || repeats.len() != shape.len() {
+        return Err("MLX Tile: repeats length must equal data rank".to_string());
+    }
+    let output = shape
+        .iter()
+        .zip(repeats)
+        .map(|(&extent, &repeat)| {
+            if repeat < 0 {
+                return Err("MLX Tile: repeats must be nonnegative".to_string());
+            }
+            if extent < 0 {
+                return if symbolic {
+                    Ok(if repeat == 0 { 0 } else { -1 })
+                } else {
+                    Err("MLX Tile: negative runtime extent".to_string())
+                };
+            }
+            let output = extent
+                .checked_mul(repeat)
+                .ok_or("MLX Tile: output extent overflows int64")?;
+            if output > i64::from(i32::MAX) {
+                return Err("MLX Tile: output extent exceeds int32".to_string());
+            }
+            Ok(output)
+        })
+        .collect::<Result<Vec<_>, MlxError>>()?;
+    if output.iter().all(|&extent| extent >= 0) {
+        super::host_scan::layout(&output, dtype, "Tile output")?;
+    }
+    Ok(output)
+}
+
 fn tile_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
-    let data = ctx.resolve(&n.inputs[0])?;
     if ctx.native_attention_decode() && ctx.rope_dynamic() && !n.inputs[1].constant {
         // The token-at-a-time decoder repeats are [1, 1]. Keep this as graph data instead of
         // forcing a host read during the shapeless compiled trace.
+        let data = ctx.resolve(&n.inputs[0])?;
         ctx.bind(&n.outputs[0], data);
         return Ok(());
     }
+    let shape = ctx.tensor_shape(&n.inputs[0])?;
+    let repeats_shape = ctx.tensor_shape(&n.inputs[1])?;
     let repeats = read_ints(ctx, n, 1)?;
-    let reps: Vec<i32> = repeats.iter().map(|&x| x as i32).collect();
+    let dtype = mlx_dtype_from_onnx(n.outputs[0].otype);
+    let output = checked_tile_geometry(&shape, &repeats_shape, &repeats, dtype, false)?;
+    if output.contains(&0) {
+        let output: Vec<_> = output
+            .iter()
+            .map(|&extent| dim_i32(extent))
+            .collect::<Result<_, _>>()?;
+        let result = ctx.zeros(&output, dtype)?;
+        ctx.bind(&n.outputs[0], result);
+        return Ok(());
+    }
+    super::host_scan::layout(&shape, dtype, "Tile input")?;
+    let reps: Vec<i32> = repeats
+        .iter()
+        .map(|&repeat| dim_i32(repeat))
+        .collect::<Result<_, _>>()?;
+    let data = ctx.resolve(&n.inputs[0])?;
+    if shape.is_empty() {
+        ctx.bind(&n.outputs[0], data);
+        return Ok(());
+    }
     let r = ctx.emit(|res, s| unsafe { mlx::mlx_tile(res, data, reps.as_ptr(), reps.len(), s) })?;
     ctx.bind(&n.outputs[0], r);
     Ok(())
@@ -2790,11 +2854,16 @@ fn split_to_sequence_claim(node: &NodeView) -> ClaimResult {
 
 fn tile_claim(node: &NodeView) -> ClaimResult {
     require!(
+        node.since_version() >= 6,
+        "Tile-1 has a distinct unsupported three-input signature"
+    );
+    require!(
         node.num_inputs() == 2 && node.num_outputs() == 1,
         "Tile expects 2 inputs and 1 output, got {}in/{}out",
         node.num_inputs(),
         node.num_outputs()
     );
+    require!(node.num_attributes() == 0, "Tile has no attributes");
     let (data, out) = match movable_io(node) {
         Some(v) => v,
         None => deny!("missing tensor type/shape info on the data input or output"),
@@ -2811,10 +2880,84 @@ fn tile_claim(node: &NodeView) -> ClaimResult {
         crate::registry::ort_dtype_name(data)
     );
     require!(
+        data != ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16
+            || node.since_version() >= 13,
+        "Tile: bfloat16 requires opset 13"
+    );
+    require!(
         node.is_const_int64(1),
         "Tile: only a constant `repeats` initializer is claimed; this node's is a runtime value — stays on CPU"
     );
+    let repeats = node
+        .read_const_int64(1)
+        .ok_or("Tile: cannot read constant repeats")?;
+    let repeats_info = node.input_info(1).ok_or("Tile: missing repeats metadata")?;
+    require!(
+        node.input_rank_known(1) == Some(true) && repeats_info.shape.len() == 1,
+        "Tile: repeats must have rank one"
+    );
+    let info = node.input_info(0).ok_or("Tile: missing data metadata")?;
+    let shape = if node.input_rank_known(0) == Some(true) {
+        info.shape
+    } else {
+        vec![-1; repeats.len()]
+    };
+    let output = checked_tile_geometry(
+        &shape,
+        &repeats_info.shape,
+        &repeats,
+        mlx_dtype_from_onnx(data),
+        true,
+    )?;
+    if node.output_rank_known(0) == Some(true) {
+        let declared = node.output_info(0).ok_or("Tile: missing output metadata")?;
+        require!(
+            declared.shape.len() == output.len(),
+            "Tile: output rank must match data rank"
+        );
+        require!(
+            declared
+                .shape
+                .iter()
+                .zip(&output)
+                .all(|(&declared, &actual)| { declared < 0 || actual < 0 || declared == actual }),
+            "Tile: declared output dimensions disagree with repeats"
+        );
+    }
     Ok(())
+}
+
+fn tile_compile_shape_safety(node: &NodeView) -> crate::registry::CompileShapeSafety {
+    // Generic live repeats remain declined. Preserve the separate native RoPE override.
+    if !node.is_const_int64(1) {
+        return crate::registry::CompileShapeSafety::Shapeless;
+    }
+    let shape = node
+        .input_info(0)
+        .filter(|_| node.input_rank_known(0) == Some(true))
+        .map(|info| info.shape);
+    tile_geometry_shape_safety(shape.as_deref(), node.read_const_int64(1).as_deref())
+}
+
+fn tile_geometry_shape_safety(
+    shape: Option<&[i64]>,
+    repeats: Option<&[i64]>,
+) -> crate::registry::CompileShapeSafety {
+    use crate::registry::CompileShapeSafety;
+    if shape.is_some_and(|shape| shape.iter().any(|&extent| extent > i64::from(i32::MAX))) {
+        return CompileShapeSafety::EagerOnly {
+            reason: "Tile metadata-only empty output must not pre-import wide input extents",
+        };
+    }
+    if shape.is_some_and(|shape| shape.iter().all(|&extent| extent > 0))
+        && repeats.is_some_and(|repeats| repeats.iter().all(|&repeat| repeat > 0))
+    {
+        CompileShapeSafety::Shapeless
+    } else {
+        CompileShapeSafety::ShapeKeyedOnly {
+            reason: "conservatively shape-keyed: Tile emits concrete reshape/broadcast and empty output geometry",
+        }
+    }
 }
 
 fn pad_claim(node: &NodeView) -> ClaimResult {
@@ -3620,7 +3763,17 @@ pub fn register(registry: &mut OpRegistry) {
         handler: split_to_sequence_op,
         claim: split_to_sequence_claim,
     });
-    shapeless(registry, "Tile", tile_op, tile_claim);
+    registry.register_shape_classified(
+        OpRegistration {
+            domain: "",
+            op_type: "Tile",
+            min_opset: 6,
+            max_opset: K_ANY_OPSET,
+            handler: tile_op,
+            claim: tile_claim,
+        },
+        tile_compile_shape_safety,
+    );
     shape_keyed(
         registry,
         "Pad",
@@ -3679,8 +3832,142 @@ pub fn register(registry: &mut OpRegistry) {
 mod tests {
     use super::{
         checked_flatten_axis, checked_flatten_shape, checked_pad_axes, checked_pad_geometry,
-        checked_rank_change_axes, checked_split_sizes, checked_transpose_perm, integer_range_count,
+        checked_rank_change_axes, checked_split_sizes, checked_tile_geometry,
+        checked_transpose_perm, integer_range_count, tile_geometry_shape_safety,
     };
+    use crate::registry::CompileShapeSafety;
+    use crate::sys::mlx;
+
+    #[test]
+    fn tile_exact_checked_geometry() {
+        let dtype = mlx::mlx_dtype__MLX_FLOAT32;
+        for (shape, repeats, expected) in [
+            (vec![], vec![], vec![]),
+            (vec![2, 3], vec![3, 2], vec![6, 6]),
+            (vec![0, 2], vec![i64::MAX, 3], vec![0, 6]),
+            (vec![0, i64::MAX], vec![1, 0], vec![0, 0]),
+            (vec![i64::MAX, 0], vec![0, i64::MAX], vec![0, 0]),
+            (vec![65536, 65536, 0], vec![1, 1, 1], vec![65536, 65536, 0]),
+            (
+                vec![i64::from(i32::MAX)],
+                vec![1],
+                vec![i64::from(i32::MAX)],
+            ),
+        ] {
+            assert_eq!(
+                checked_tile_geometry(&shape, &[repeats.len() as i64], &repeats, dtype, false)
+                    .unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn tile_rejects_each_invalid_axis_before_empty_shortcut() {
+        let dtype = mlx::mlx_dtype__MLX_UINT64;
+        for (shape, repeats, message) in [
+            (vec![0], vec![-1], "repeats must be nonnegative"),
+            (vec![0, 2], vec![1, i64::MIN], "repeats must be nonnegative"),
+            (
+                vec![1],
+                vec![(1i64 << 32) + 1],
+                "output extent exceeds int32",
+            ),
+            (vec![1], vec![i64::MAX], "output extent exceeds int32"),
+            (vec![2], vec![i64::MAX], "output extent overflows int64"),
+            (
+                vec![0, 2],
+                vec![1, i64::MAX],
+                "output extent overflows int64",
+            ),
+            (
+                vec![0, 1],
+                vec![1, i64::from(i32::MAX) + 1],
+                "output extent exceeds int32",
+            ),
+            (vec![0, i64::MAX], vec![1, 1], "output extent exceeds int32"),
+            (
+                vec![65536, 65536],
+                vec![1, 1],
+                "element count exceeds int32 indexing",
+            ),
+            (vec![-1], vec![0], "negative runtime extent"),
+        ] {
+            let error =
+                checked_tile_geometry(&shape, &[repeats.len() as i64], &repeats, dtype, false)
+                    .unwrap_err();
+            assert!(error.contains(message), "{error}");
+        }
+    }
+
+    #[test]
+    fn tile_rank_cardinality_and_symbolic_geometry() {
+        let dtype = mlx::mlx_dtype__MLX_BOOL;
+        for (shape, repeats_shape, repeats, message) in [
+            (vec![2], vec![], vec![2], "repeats must have rank one"),
+            (vec![2], vec![1, 1], vec![2], "repeats must have rank one"),
+            (
+                vec![2, 3],
+                vec![1],
+                vec![2],
+                "repeats length must equal data rank",
+            ),
+            (
+                vec![],
+                vec![1],
+                vec![],
+                "repeats length must equal data rank",
+            ),
+            (
+                vec![2],
+                vec![0],
+                vec![2],
+                "repeats length must equal data rank",
+            ),
+        ] {
+            assert!(
+                checked_tile_geometry(&shape, &repeats_shape, &repeats, dtype, false)
+                    .unwrap_err()
+                    .contains(message)
+            );
+        }
+        assert_eq!(
+            checked_tile_geometry(&[-1, 2], &[2], &[3, 2], dtype, true).unwrap(),
+            [-1, 4]
+        );
+        assert_eq!(
+            checked_tile_geometry(&[-1, 2], &[2], &[0, 2], dtype, true).unwrap(),
+            [0, 4]
+        );
+        assert!(checked_tile_geometry(&[-1], &[1], &[-1], dtype, true).is_err());
+    }
+
+    #[test]
+    fn tile_capture_is_geometry_specific() {
+        assert_eq!(
+            tile_geometry_shape_safety(Some(&[]), Some(&[])),
+            CompileShapeSafety::Shapeless
+        );
+        assert_eq!(
+            tile_geometry_shape_safety(Some(&[2, 3]), Some(&[2, 1])),
+            CompileShapeSafety::Shapeless
+        );
+        for (shape, repeats) in [
+            (None, Some(&[2, 1][..])),
+            (Some(&[-1, 3][..]), Some(&[2, 1][..])),
+            (Some(&[0, 3][..]), Some(&[2, 1][..])),
+            (Some(&[2, 3][..]), Some(&[0, 1][..])),
+        ] {
+            assert!(matches!(
+                tile_geometry_shape_safety(shape, repeats),
+                CompileShapeSafety::ShapeKeyedOnly { .. }
+            ));
+        }
+        assert!(matches!(
+            tile_geometry_shape_safety(Some(&[0, i64::MAX]), Some(&[1, 0])),
+            CompileShapeSafety::EagerOnly { .. }
+        ));
+    }
 
     #[test]
     fn split_sizes_validate_without_known_axis_geometry() {

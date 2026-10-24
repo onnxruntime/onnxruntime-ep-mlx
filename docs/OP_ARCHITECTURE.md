@@ -113,6 +113,27 @@ determine output extents and cannot safely be baked into a shape/dtype-keyed clo
 initializer forms remain supported. These coverage changes do not reproduce or establish a speedup
 for the Nemotron streaming workload in issue #10.
 
+Modern **Tile-6/13** constant-INT64 repeats use checked rank-one/cardinality, nonnegative
+full-width per-axis multiplication, native int32 output extents and checked element/byte bounds.
+Every axis is validated even when another axis is zero. Valid empty results use typed zeros
+before importing data or narrowing repeats; `0 * INT64_MAX` is zero, not an overflowing repeat.
+Scalar data requires a rank-one empty repeats vector and is an identity. Known declared output
+dimensions must agree; unknown rank/extents remain live metadata, not frozen scalar/zero values.
+Movable real numeric/bool payloads retain their dtype (BF16 since schema 13, DOUBLE on the
+existing MLX CPU stream); string, complex and encoded transports remain gaps.
+
+The pinned MLX Tile implementation constructs concrete reshape/broadcast/reshape targets.
+Fixed nonempty geometry and scalar identity are capture-safe; symbolic, unknown-rank and
+potentially empty forms are shape-keyed. Known wide input metadata canceled by zero repeats
+is eager-only so compilation cannot pre-import an unrepresentable input. Actual ORT boundary
+acceptance of extreme empty metadata is separate from the checked geometry contract.
+The existing native RoPE identity condition and Range/Tile Q8/position policies are unchanged.
+Generic live repeats are **FEASIBLE OPEN**: they require separate context-safe value-key and
+producer-guard integration, including empty vectors, without disabling the native exemption.
+Legacy Tile-1 has a distinct three-input signature and remains a separate authority/support
+gap, not a modern alias or a demonstrated backend impossibility. These are bounded source
+contracts and regression fixtures, not proof of every combination or physical GPU execution.
+
 **NonZero** uses exact original representations, not float32 conversions: signed floating zeros
 are false, NaNs/infinities/subnormals are true, and large integers retain all bits. Empty tensors
 produce `[rank, 0]`. Symbolic extents and unknown rank resolve from live input metadata; in-graph
