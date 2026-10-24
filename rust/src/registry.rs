@@ -669,6 +669,16 @@ impl NodeView {
     pub fn input_rank_known(&self, i: usize) -> Option<bool> {
         let values = self.inputs_raw();
         let &value = values.get(i)?;
+        self.value_rank_known(value)
+    }
+
+    pub fn output_rank_known(&self, i: usize) -> Option<bool> {
+        let values = self.outputs_raw();
+        let &value = values.get(i)?;
+        self.value_rank_known(value)
+    }
+
+    fn value_rank_known(&self, value: *const ort::OrtValueInfo) -> Option<bool> {
         if value.is_null() {
             return None;
         }
@@ -1024,6 +1034,13 @@ impl NodeView {
             }
             Some(result)
         }
+    }
+
+    /// Number of attributes present on this node.
+    pub fn num_attributes(&self) -> usize {
+        let mut count = 0;
+        unsafe { (self.api().Node_GetNumAttributes.unwrap())(self.node, &mut count) };
+        count
     }
 
     /// True iff the node carries a genuine (non-UNDEFINED) attribute of `name`.
@@ -2087,6 +2104,7 @@ mod tests {
             ("SwiGLU", 27, 28),
             ("DeformConv", 18, 19),
             ("GridSample", 15, 16),
+            ("Tile", 1, 6),
         ] {
             assert!(
                 registry.find_entry("", op, before).is_none(),
