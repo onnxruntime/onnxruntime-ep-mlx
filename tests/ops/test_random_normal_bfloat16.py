@@ -475,5 +475,7 @@ def test_seeded_f32_actual_routes(tmp_path):
              if event.get("cat") == "ep.path"]
     for op in OPS:
         draws = [event for event in paths if op in event.get("ops", "").split(",")]
-        assert len(draws) == 4 and all(event["path"] == "general" for event in draws), paths
-        assert [event["cache"] for event in draws] == ["MISS", "HIT", "HIT", "HIT"], paths
+        expected_path = "eager" if op == "RandomNormal" else "general"
+        assert len(draws) == 4 and all(event["path"] == expected_path for event in draws), paths
+        expected_cache = ["n/a"] * 4 if op == "RandomNormal" else ["MISS", "HIT", "HIT", "HIT"]
+        assert [event["cache"] for event in draws] == expected_cache, paths
