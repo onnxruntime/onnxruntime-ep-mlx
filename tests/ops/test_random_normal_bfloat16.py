@@ -17,7 +17,7 @@ OPS = ["RandomNormal", "RandomNormalLike"]
 
 def _model(op, *, shape=None, input_type=T.FLOAT, output_type=T.BFLOAT16,
            explicit_dtype=True, opset=22, seed=41.0, mean=0.0, scale=1.0,
-           nested=False, omit_parameters=False):
+           nested=False, omit_parameters=False, raw_bits=False):
     attrs = {"mean": mean, "scale": scale} if not omit_parameters else {}
     if explicit_dtype:
         attrs["dtype"] = output_type
@@ -55,12 +55,14 @@ def _model(op, *, shape=None, input_type=T.FLOAT, output_type=T.BFLOAT16,
     if output_type == T.BFLOAT16:
         result = "y"
         nodes.append(helper.make_node("Cast", ["draw"], [result], to=T.FLOAT))
+    outputs = [helper.make_tensor_value_info(
+        result, T.FLOAT if output_type == T.BFLOAT16 else output_type, shape,
+    )]
+    if raw_bits:
+        nodes.append(helper.make_node("BitCast", ["draw"], ["bits"], to=T.UINT16))
+        outputs.append(helper.make_tensor_value_info("bits", T.UINT16, shape))
     return helper.make_model(
-        helper.make_graph(nodes, "normal_bfloat16", inputs, [
-            helper.make_tensor_value_info(
-                result, T.FLOAT if output_type == T.BFLOAT16 else output_type, shape,
-            ),
-        ]),
+        helper.make_graph(nodes, "normal_bfloat16", inputs, outputs),
         opset_imports=[helper.make_opsetid("", opset)], ir_version=11,
     ).SerializeToString()
 
@@ -199,6 +201,49 @@ def test_affine_against_paired_f32_draw(op, eager, mean, scale, monkeypatch, tmp
     assert np.all((actual.view(np.uint32) & 0xFFFF) == 0)
     _assert_profile(session)
     _assert_affine(actual, standard, mean, scale, eager=eager)
+
+
+@pytest.mark.parametrize("op", OPS)
+@pytest.mark.parametrize("eager", [False, True])
+@pytest.mark.parametrize("mean,scale", [
+    (0.1001, 1.003), (-0.0, 0.0), (0.0, -0.0),
+    (0.0, 2.0**-120), (2.0**-120, 2.0**-120), (2.0**-140, 0.0),
+    (0.0, float.fromhex("0x1.fffffep127")),
+    (-float.fromhex("0x1.fffffep127"), float.fromhex("0x1.fffffep127")),
+])
+def test_raw_bfloat_affine_bits(op, eager, mean, scale, monkeypatch, tmp_path):
+    monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_COMPILE", "1" if eager else "0")
+    shape = (2048,)
+    feeds = _feeds(op, shape)
+    control = _session(_model(op, shape=shape, output_type=T.FLOAT, opset=26))
+    standard = control.run(None, feeds)[0]
+    session = _session(_model(op, shape=shape, mean=mean, scale=scale,
+                              opset=26, raw_bits=True), profile=tmp_path / "raw")
+    observed, raw = session.run(None, feeds)
+    assert raw.dtype == np.uint16 and raw.shape == shape
+    actual = np.left_shift(raw.astype(np.uint32), np.uint32(16)).view(np.float32)
+    _assert_profile(session)
+    _assert_affine(actual, standard, mean, scale, eager=eager)
+    np.testing.assert_array_equal(actual.view(np.uint32), observed.view(np.uint32))
+
+
+@pytest.mark.parametrize("op", OPS)
+@pytest.mark.parametrize("eager", [False, True])
+@pytest.mark.parametrize("shape", [(), (0, 3)])
+def test_raw_bfloat_scalar_and_empty(op, eager, shape, monkeypatch, tmp_path):
+    monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_COMPILE", "1" if eager else "0")
+    feeds = _feeds(op, shape)
+    standard = _session(_model(op, shape=shape, output_type=T.FLOAT,
+                               opset=26)).run(None, feeds)[0]
+    session = _session(_model(op, shape=shape, opset=26, raw_bits=True),
+                       profile=tmp_path / "raw_geometry")
+    observed, raw = session.run(None, feeds)
+    assert raw.dtype == np.uint16 and raw.shape == shape
+    actual = np.left_shift(raw.astype(np.uint32), np.uint32(16)).view(np.float32)
+    _assert_profile(session)
+    np.testing.assert_array_equal(actual.view(np.uint32),
+                                  _bf16_round(standard).view(np.uint32))
+    np.testing.assert_array_equal(actual.view(np.uint32), observed.view(np.uint32))
 
 
 @pytest.mark.parametrize("op", OPS)
@@ -364,19 +409,22 @@ def test_known_wide_geometry_stays_declined(op):
         _session(_model(op, shape=(0, 2**31 + 7), input_type=T.STRING))
 
 
-@pytest.mark.parametrize("case", ["numeric-seeded", "string-seeded", "numeric-live", "if-live"])
+@pytest.mark.parametrize("case", [
+    "numeric-seeded", "string-seeded", "numeric-live", "if-live", "if-seeded", "normal-seeded",
+])
 def test_bfloat_route_case(case, monkeypatch):
     monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_COMPILE", "0")
     monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_GENERAL_COMPILE", "0")
     monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_PREFILL_COMPILE", "0")
     input_type = T.STRING if case == "string-seeded" else T.FLOAT
     seed = None if case.endswith("live") else 41.0
-    session = _session(_model("RandomNormalLike", shape=(256,), input_type=input_type,
-                              seed=seed, nested=case == "if-live"))
+    op = "RandomNormal" if case == "normal-seeded" else "RandomNormalLike"
+    session = _session(_model(op, shape=(256,), input_type=input_type,
+                              seed=seed, nested=case.startswith("if-")))
     outputs = []
     for call in range(4):
-        feeds = _feeds("RandomNormalLike", (256,), input_type, call)
-        if case == "if-live":
+        feeds = _feeds(op, (256,), input_type, call)
+        if case.startswith("if-"):
             feeds["condition"] = np.asarray(call % 2 == 0)
         outputs.append(session.run(None, feeds)[0].copy())
     assert all(np.isfinite(output).all() for output in outputs)
@@ -395,12 +443,37 @@ def test_bfloat_actual_routes(tmp_path):
     paths = [event["args"] for event in json.loads(trace.read_text())
              if event.get("cat") == "ep.path"]
     draws = [event for event in paths
-             if "RandomNormalLike" in event.get("ops", "").split(",")]
-    # If bodies are translated inline, so their four calls have parent-only path events.
-    assert len(draws) == 12, paths
-    assert sum(event["path"] == "eager" for event in draws) == 8, paths
-    assert [event["cache"] for event in draws if event["path"] == "general"] == [
-        "MISS", "HIT", "HIT", "HIT",
-    ]
+             if set(OPS) & set(event.get("ops", "").split(","))]
+    # If bodies are translated inline, so their eight calls have parent-only path events.
+    assert len(draws) == 16 and all(event["path"] == "eager" for event in draws), paths
     parents = [event for event in paths if "If" in event.get("ops", "").split(",")]
-    assert len(parents) == 4 and all(event["path"] == "eager" for event in parents)
+    assert len(parents) == 8 and all(event["path"] == "eager" for event in parents), paths
+
+
+@pytest.mark.parametrize("op", OPS)
+def test_seeded_f32_route_case(op, monkeypatch):
+    monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_COMPILE", "0")
+    monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_GENERAL_COMPILE", "0")
+    monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_PREFILL_COMPILE", "0")
+    session = _session(_model(op, shape=(256,), output_type=T.FLOAT))
+    outputs = [session.run(None, _feeds(op, (256,), call=call))[0] for call in range(4)]
+    assert all(output.dtype == np.float32 and np.isfinite(output).all() for output in outputs)
+    for output in outputs[1:]:
+        np.testing.assert_array_equal(output, outputs[0])
+
+
+def test_seeded_f32_actual_routes(tmp_path):
+    trace = tmp_path / "normal-f32.json"
+    subprocess.run(
+        [sys.executable, "-m", "pytest", Path(__file__).name, "-k", "test_seeded_f32_route_case",
+         "-q", "-p", "no:cacheprovider"],
+        cwd=Path(__file__).parent,
+        env={**os.environ, "ONNXRUNTIME_EP_MLX_TRACE": str(trace)},
+        check=True, timeout=120,
+    )
+    paths = [event["args"] for event in json.loads(trace.read_text())
+             if event.get("cat") == "ep.path"]
+    for op in OPS:
+        draws = [event for event in paths if op in event.get("ops", "").split(",")]
+        assert len(draws) == 4 and all(event["path"] == "general" for event in draws), paths
+        assert [event["cache"] for event in draws] == ["MISS", "HIT", "HIT", "HIT"], paths

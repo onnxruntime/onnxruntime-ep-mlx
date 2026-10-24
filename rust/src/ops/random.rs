@@ -64,9 +64,28 @@ fn random_normal_with_shape(
         })?;
         let scale = ctx.scalar_f32(scale);
         let mean = ctx.scalar_f32(mean);
-        let scaled = ctx.binary(mlx::mlx_multiply, standard, scale)?;
-        let shifted = ctx.binary(mlx::mlx_add, scaled, mean)?;
-        ctx.astype(shifted, dtype)?
+        let cpu = crate::mlx::Stream::new_default_cpu();
+        let s = cpu.as_raw();
+        let affine = (|| {
+            let scaled =
+                ctx.emit(|res, _| unsafe { mlx::mlx_multiply(res, standard, scale, s) })?;
+            let shifted = ctx.emit(|res, _| unsafe { mlx::mlx_add(res, scaled, mean, s) })?;
+            let out = ctx.emit(|res, _| unsafe { mlx::mlx_astype(res, shifted, dtype, s) })?;
+            let mut outputs = VectorArray::new();
+            outputs.append(out);
+            crate::mlx::eval(&outputs)?;
+            Ok::<_, MlxError>(out)
+        })();
+        // Drain even when construction/eval fails, while all wrappers and inputs are still alive.
+        if unsafe { mlx::mlx_synchronize(s) } != 0 {
+            return Err(match affine {
+                Err(error) => {
+                    format!("{error}; BF16 Normal CPU affine synchronization also failed")
+                }
+                Ok(_) => "BF16 Normal CPU affine synchronization failed".to_string(),
+            });
+        }
+        affine?
     } else {
         ctx.emit(|res, s| unsafe {
             mlx::mlx_random_normal(res, shape.as_ptr(), shape.len(), dtype, mean, scale, key, s)
@@ -755,7 +774,15 @@ fn shapeless(
 }
 
 fn random_compile_shape_safety(node: &NodeView) -> CompileShapeSafety {
-    if node.float_attr_opt("seed").is_none() {
+    if matches!(node.op_type().as_str(), "RandomNormal" | "RandomNormalLike")
+        && node.output_info(0).is_some_and(|info| {
+            info.dtype == ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16
+        })
+    {
+        CompileShapeSafety::EagerOnly {
+            reason: "BF16 Normal completes its F32 affine transform on the MLX CPU stream",
+        }
+    } else if node.float_attr_opt("seed").is_none() {
         CompileShapeSafety::EagerOnly {
             reason: "unseeded random draws consume the live default key",
         }
