@@ -88,7 +88,8 @@ fn inverse_claim(node: &NodeView) -> ClaimResult {
         ) && x.dtype == y.dtype,
         "Inverse input and output must share float32 or float64 dtype"
     );
-    inverse_geometry(&x.shape, Some(&y.shape))
+    inverse_geometry(&x.shape, Some(&y.shape))?;
+    Ok(())
 }
 
 fn inverse_finite(data: &[u8], dtype: mlx::mlx_dtype) -> Result<(), MlxError> {
