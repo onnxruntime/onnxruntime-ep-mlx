@@ -159,6 +159,7 @@ pub(crate) unsafe fn get_capability(
                     || crate::registry::requires_unique_eager_boundary(&view)
                     || crate::registry::requires_elementary_contrib_eager_boundary(&view)
                     || crate::registry::requires_cdist_eager_boundary(&view)
+                    || crate::registry::requires_inverse_eager_boundary(&view)
                     || crate::registry::requires_float64_metadata_eager_boundary(&view)
                 {
                     CompilePartitionClass::Eager

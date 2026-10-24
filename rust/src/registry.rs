@@ -295,6 +295,15 @@ pub fn requires_cdist_eager_boundary(node: &NodeView) -> bool {
             .any(|(_, body)| body.nodes().iter().any(requires_cdist_eager_boundary))
 }
 
+/// Inverse's local CPU evaluation must not be captured, including through control-flow parents.
+pub fn requires_inverse_eager_boundary(node: &NodeView) -> bool {
+    (node.domain() == "com.microsoft" && node.op_type() == "Inverse")
+        || node
+            .subgraphs()
+            .iter()
+            .any(|(_, body)| body.nodes().iter().any(requires_inverse_eager_boundary))
+}
+
 /// Populate the table with every built-in op module (wave-1: elementwise + math).
 fn register_builtin_ops(registry: &mut OpRegistry) {
     crate::ops::elementwise::register(registry);
@@ -1023,6 +1032,19 @@ impl NodeView {
                 }
             }
             Some(result)
+        }
+    }
+
+    /// Attribute count, or None if ORT cannot provide it.
+    pub fn num_attributes(&self) -> Option<usize> {
+        unsafe {
+            let mut count = 0;
+            let status = (self.api().Node_GetNumAttributes.unwrap())(self.node, &mut count);
+            if !status.is_null() {
+                self.release_status(status);
+                return None;
+            }
+            Some(count)
         }
     }
 

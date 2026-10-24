@@ -5,6 +5,7 @@
 //! re-materialised as a clean, correctly-shaped zeros array (mlx_matmul leaves an empty result with
 //! no backing buffer, which the boundary CopyOut cannot memcpy).
 //! CDist uses provider-owned eager host arithmetic with no M*K*N temporary.
+//! Inverse uses MLX's typed LAPACK primitive on the run thread's default CPU stream.
 
 use super::host_scan::{layout, read_live};
 use crate::engine::{MlxError, NodeDesc, Src, TranslationContext, dim_i32};
@@ -30,6 +31,130 @@ fn scalar_like(
 
 const CDIST_EAGER_REASON: &str =
     "CDist uses live typed host reduction without a pairwise feature workspace";
+const INVERSE_EAGER_REASON: &str =
+    "Inverse requires checked live input and synchronous CPU inversion";
+
+fn inverse_geometry(shape: &[i64], output: Option<&[i64]>) -> Result<(), MlxError> {
+    if shape.len() < 2 {
+        return Err("Inverse: input must have rank >= 2".into());
+    }
+    let (m, n) = (shape[shape.len() - 2], shape[shape.len() - 1]);
+    if m >= 0 && n >= 0 && m != n {
+        return Err("Inverse: final two dimensions must be square".into());
+    }
+    for &extent in shape.iter().filter(|&&extent| extent >= 0) {
+        dim_i32(extent)?;
+    }
+    if shape.iter().all(|&extent| extent >= 0) {
+        // Besides storage, this bounds the kernel's signed-int N*N for nonempty inputs.
+        layout(shape, mlx::mlx_dtype__MLX_FLOAT64, "Inverse")?;
+    }
+    if let Some(y) = output
+        && (y.len() != shape.len()
+            || y.iter()
+                .zip(shape)
+                .any(|(&a, &b)| a >= 0 && b >= 0 && a != b))
+    {
+        return Err("Inverse: output must have the input shape".into());
+    }
+    Ok(())
+}
+
+fn inverse_claim(node: &NodeView) -> ClaimResult {
+    require!(
+        node.num_inputs() == 1
+            && node.num_outputs() == 1
+            && node.input_present(0)
+            && node.output_present(0),
+        "Inverse requires exactly one present input and output"
+    );
+    require!(
+        node.num_attributes() == Some(0),
+        "Inverse accepts no attributes"
+    );
+    require!(
+        node.input_rank_known(0) == Some(true),
+        "Inverse requires known input rank"
+    );
+    let (x, y) = match (node.input_info(0), node.output_info(0)) {
+        (Some(x), Some(y)) => (x, y),
+        _ => deny!("Inverse requires tensor type/shape information"),
+    };
+    require!(
+        matches!(
+            x.dtype,
+            ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT
+                | ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_DOUBLE
+        ) && x.dtype == y.dtype,
+        "Inverse input and output must share float32 or float64 dtype"
+    );
+    inverse_geometry(&x.shape, Some(&y.shape))?;
+    Ok(())
+}
+
+fn inverse_finite(data: &[u8], dtype: mlx::mlx_dtype) -> Result<(), MlxError> {
+    let finite = match dtype {
+        mlx::mlx_dtype__MLX_FLOAT32 => data
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|v| f32::from_ne_bytes(*v).is_finite()),
+        mlx::mlx_dtype__MLX_FLOAT64 => data
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .all(|v| f64::from_ne_bytes(*v).is_finite()),
+        _ => return Err("Inverse: live input must be float32 or float64".into()),
+    };
+    if !finite {
+        return Err("Inverse: nonfinite input is not supported".into());
+    }
+    Ok(())
+}
+
+fn inverse_op(ctx: &mut TranslationContext, node: &NodeDesc) -> Result<(), MlxError> {
+    if ctx.empty_scan_template() {
+        let x = ctx.resolve(&node.inputs[0])?;
+        let template = ctx.zeros(&ctx.shape_of(x), ctx.dtype_of(x))?;
+        ctx.bind(&node.outputs[0], template);
+        return Ok(());
+    }
+    let (shape, dtype, empty) = {
+        let input = read_live(ctx, &node.inputs[0], "Inverse")?;
+        inverse_geometry(&input.shape, None)?;
+        inverse_finite(input.data, input.dtype)?;
+        (input.shape, input.dtype, input.data.is_empty())
+    };
+    if empty {
+        // The native kernel divides by N*N even for a zero-sized matrix or empty batch.
+        let shape = shape
+            .into_iter()
+            .map(dim_i32)
+            .collect::<Result<Vec<_>, _>>()?;
+        let y = ctx.zeros(&shape, dtype)?;
+        ctx.bind(&node.outputs[0], y);
+        return Ok(());
+    }
+    let x = ctx.resolve(&node.inputs[0])?;
+    let cpu = crate::mlx::Stream::new_default_cpu();
+    let stream = cpu.as_raw();
+    let y = ctx
+        .emit(|res, _| unsafe {
+            let rc = mlx::mlx_linalg_inv(res, x, stream);
+            let eval_rc = if rc == 0 {
+                mlx::mlx_array_eval(*res)
+            } else {
+                rc
+            };
+            // An already-signaled array event can bypass its error check. Drain and check the
+            // selected CPU stream even when eval failed, so errors cannot leak into the next run.
+            let sync_rc = mlx::mlx_synchronize(stream);
+            if eval_rc != 0 { eval_rc } else { sync_rc }
+        })
+        .map_err(|error| format!("Inverse: CPU inversion/evaluation failed: {error}"))?;
+    ctx.bind(&node.outputs[0], y);
+    Ok(())
+}
 
 fn cdist_geometry(a: &[i64], b: &[i64], output: Option<&[i64]>) -> Result<(), MlxError> {
     if a.len() != 2 || b.len() != 2 {
@@ -395,6 +520,17 @@ pub fn register(registry: &mut OpRegistry) {
     registry.register_eager(
         OpRegistration {
             domain: "com.microsoft",
+            op_type: "Inverse",
+            min_opset: 1,
+            max_opset: 1,
+            handler: inverse_op,
+            claim: inverse_claim,
+        },
+        INVERSE_EAGER_REASON,
+    );
+    registry.register_eager(
+        OpRegistration {
+            domain: "com.microsoft",
             op_type: "CDist",
             min_opset: 1,
             max_opset: 1,
@@ -434,7 +570,77 @@ pub fn register(registry: &mut OpRegistry) {
 
 #[cfg(test)]
 mod tests {
-    use super::{CDIST_EAGER_REASON, cdist_geometry, cdist_values, fused_matmul_axes};
+    use super::{
+        CDIST_EAGER_REASON, INVERSE_EAGER_REASON, cdist_geometry, cdist_values, fused_matmul_axes,
+        inverse_finite, inverse_geometry,
+    };
+    use crate::sys::mlx;
+
+    #[test]
+    fn inverse_geometry_layout_and_empty_shapes() {
+        for shape in [
+            vec![2, 2],
+            vec![3, 1, 4, 4],
+            vec![-1, -1, -1],
+            vec![0, 0],
+            vec![2, 0, 0],
+            vec![0, 50_000, 50_000],
+        ] {
+            assert!(inverse_geometry(&shape, Some(&shape)).is_ok());
+        }
+        for shape in [
+            vec![],
+            vec![2],
+            vec![2, 3],
+            vec![50_000, 50_000],
+            vec![0, i64::from(i32::MAX) + 1, i64::from(i32::MAX) + 1],
+        ] {
+            assert!(inverse_geometry(&shape, None).is_err());
+        }
+        for output in [vec![2], vec![3, 3], vec![1, 2, 2]] {
+            assert!(inverse_geometry(&[2, 2], Some(&output)).is_err());
+        }
+    }
+
+    #[test]
+    fn inverse_finite_preserves_typed_range() {
+        assert!(inverse_finite(&f64::MAX.to_ne_bytes(), mlx::mlx_dtype__MLX_FLOAT64).is_ok());
+        assert!(inverse_finite(&f32::MAX.to_ne_bytes(), mlx::mlx_dtype__MLX_FLOAT32).is_ok());
+        assert!(inverse_finite(&f64::NAN.to_ne_bytes(), mlx::mlx_dtype__MLX_FLOAT64).is_err());
+        assert!(inverse_finite(&f32::INFINITY.to_ne_bytes(), mlx::mlx_dtype__MLX_FLOAT32).is_err());
+    }
+
+    #[test]
+    fn inverse_eager_fences_preserve_parent_stream_policy() {
+        use crate::engine::{NodeDesc, Plan, SubgraphDesc};
+        use crate::registry::CompileShapeSafety;
+        let inverse = NodeDesc::new(
+            "Inverse".into(),
+            "com.microsoft".into(),
+            1,
+            CompileShapeSafety::EagerOnly {
+                reason: INVERSE_EAGER_REASON,
+            },
+        );
+        let mut parent = NodeDesc::new("If".into(), "".into(), 21, CompileShapeSafety::Shapeless);
+        for op in ["If", "Loop", "Scan"] {
+            parent.op_type = op.into();
+            parent.subgraphs = vec![SubgraphDesc {
+                attr_name: "body".into(),
+                input_names: vec![],
+                output_names: vec![],
+                nodes: vec![inverse.clone()],
+            }];
+            let plan = Plan::new(vec![parent.clone()]);
+            assert!(!plan.requires_cpu_stream);
+            assert!(!crate::compiled::general_enabled(false, &plan.nodes));
+            assert!(!crate::compiled::decode_enabled(false, &plan.nodes));
+            assert!(!crate::compiled::prefill_enabled(false, &plan.nodes));
+        }
+        assert!(!Plan::new(vec![inverse]).requires_cpu_stream);
+        parent.subgraphs.clear();
+        assert!(!Plan::new(vec![parent]).requires_cpu_stream);
+    }
 
     #[test]
     fn cdist_geometry_and_zero_features() {
