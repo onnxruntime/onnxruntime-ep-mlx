@@ -185,8 +185,8 @@ fn binary_scales(dq: &NodeDesc) -> bool {
     if init.dtype != FLOAT || init.count == 0 || init.count.checked_mul(4) != Some(bytes.len()) {
         return false;
     }
-    bytes.chunks_exact(4).all(|b| {
-        let bits = f32::from_ne_bytes(b.try_into().expect("four-byte chunk")).to_bits();
+    bytes.as_chunks::<4>().0.iter().all(|b| {
+        let bits = u32::from_ne_bytes(*b);
         bits & 0x807fffff == 0 && (87..=167).contains(&((bits >> 23) & 0xff))
     })
 }

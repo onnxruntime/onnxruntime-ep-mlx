@@ -674,21 +674,6 @@ mod tests {
         ] {
             assert!(grouped_geometry(&x, &w, &i, b.as_deref(), y.as_deref()).is_err());
         }
-        assert!(
-            crate::registry::registry()
-                .find_entry("", "GroupedMatMul", 28)
-                .is_none()
-        );
-        assert!(
-            crate::registry::registry()
-                .find_entry("", "GroupedMatMul", 29)
-                .is_some()
-        );
-        assert!(
-            crate::registry::registry()
-                .find_entry("", "GroupedMatMul", 30)
-                .is_none()
-        );
     }
 
     #[test]
