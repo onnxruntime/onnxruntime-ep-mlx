@@ -134,7 +134,14 @@ def test_tile_exact_types(dtype, opset, eager, monkeypatch, tmp_path):
     session = _session(model, profile=tmp_path / "tile")
     _exact(session.run(None, {"x": data})[0], expected)
     _ownership(session)
-    _exact(_session(model, cpu=True).run(None, {"x": data})[0], expected)
+    cpu_expected = expected
+    if dtype == np.float16:
+        # Hosted ORT 1.31 CPU Tile canonicalizes this fixture's 0x7e01 NaN to 0x7e00.
+        # This is an oracle limitation, not the MLX/ONNX payload contract above.
+        cpu_expected = expected.copy()
+        bits = cpu_expected.view(np.uint16)
+        bits[bits == 0x7E01] = 0x7E00
+    _exact(_session(model, cpu=True).run(None, {"x": data})[0], cpu_expected)
 
 
 @pytest.mark.parametrize("shape,repeats", [
@@ -189,38 +196,30 @@ def test_tile_noncontiguous_intermediate(eager, monkeypatch, tmp_path):
 
 
 def test_tile_actual_capture_routes(tmp_path):
-    trace = tmp_path / "tile_trace.json"
-    subprocess.run(
-        [sys.executable, "-m", "pytest",
-         f"{Path(__file__).name}::test_tile_shape_replay[False-False]",
-         f"{Path(__file__).name}::test_tile_shape_replay[False-True]",
-         f"{Path(__file__).name}::test_tile_wide_input_metadata_only[False]",
-         f"{Path(__file__).name}::test_tile_noncontiguous_intermediate[False]",
-         "-q", "-p", "no:cacheprovider"],
-        cwd=Path(__file__).parent,
-        env={**os.environ, "ONNXRUNTIME_EP_MLX_TRACE": str(trace),
-             "ONNXRUNTIME_EP_MLX_NO_GENERAL_COMPILE": "0"},
-        check=True, timeout=120)
-    paths = [event["args"] for event in json.loads(trace.read_text())
-             if event.get("cat") == "ep.path" and event["args"].get("ops") == "Tile"]
-    assert [event["cache"] for event in paths if event["path"] == "general"] == [
-        "MISS", "HIT", "RETRACE", "HIT", "HIT", "HIT",
-        "MISS", "HIT", "RETRACE", "HIT", "HIT", "HIT",
+    cases = [
+        ("standalone", "test_tile_shape_replay[False-False]", "Tile",
+         ["MISS", "HIT", "RETRACE", "HIT", "HIT", "HIT"], 2),
+        ("symbolic_chain", "test_tile_shape_replay[False-True]", "Transpose,Tile,Transpose",
+         ["MISS", "HIT", "RETRACE", "HIT", "HIT", "HIT"], 2),
+        ("wide_metadata", "test_tile_wide_input_metadata_only[False]", "Tile", [], 3),
+        ("fixed_chain", "test_tile_noncontiguous_intermediate[False]",
+         "Transpose,Tile,Transpose", ["MISS", "HIT", "HIT"], 0),
     ]
-    # The existing general-route guard keeps zero-input traces eager on every call.
-    # Wide metadata-only geometry is an eager-only partition even with compilation enabled.
-    assert sum(event["path"] == "eager" for event in paths) == 7
-    neighbors = [event["args"] for event in json.loads(trace.read_text())
-                 if event.get("cat") == "ep.path"
-                 and event["args"].get("ops") == "Transpose"]
-    assert sum(event["path"] == "general" for event in neighbors) == 12
-    assert sum(event["path"] == "eager" for event in neighbors) == 4
-    fused = [event["args"] for event in json.loads(trace.read_text())
-             if event.get("cat") == "ep.path"
-             and event["args"].get("ops") == "Transpose,Tile,Transpose"]
-    assert [event["cache"] for event in fused if event["path"] == "general"] == [
-        "MISS", "HIT", "HIT"]
-    assert len(fused) == 3
+    for label, test, ops, caches, eager_calls in cases:
+        trace = tmp_path / f"{label}.json"
+        subprocess.run(
+            [sys.executable, "-m", "pytest", f"{Path(__file__).name}::{test}",
+             "-q", "-p", "no:cacheprovider"],
+            cwd=Path(__file__).parent,
+            env={**os.environ, "ONNXRUNTIME_EP_MLX_TRACE": str(trace),
+                 "ONNXRUNTIME_EP_MLX_NO_GENERAL_COMPILE": "0"},
+            check=True, timeout=120)
+        paths = [event["args"] for event in json.loads(trace.read_text())
+                 if event.get("cat") == "ep.path"]
+        assert paths and all(event["ops"] == ops for event in paths), (label, paths)
+        assert [event["cache"] for event in paths if event["path"] == "general"] == caches, label
+        assert sum(event["path"] == "eager" for event in paths) == eager_calls, label
+        assert len(paths) == len(caches) + eager_calls, label
 
 
 @pytest.mark.parametrize("repeats", [[-1], [-(2**63)]])
