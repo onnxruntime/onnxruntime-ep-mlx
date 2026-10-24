@@ -40,7 +40,7 @@ pub(crate) fn recognize(nodes: &mut [NodeDesc]) {
     for node in nodes {
         if node.domain.is_empty()
             && (node.op_type == "MatMul"
-                || (node.op_type == "GroupedMatMul" && node.since_version >= 29))
+                || (node.op_type == "GroupedMatMul" && node.since_version == 29))
             && node.inputs.len() >= 2
             && node.outputs.len() == 1
             && node.outputs[0].otype == FLOAT
@@ -218,8 +218,6 @@ const SOURCE: &str = r#"
                   + size_t(col / WD2) * WS2;
         int a = X_QUANT ? int(x[size_t(row) * K + k]) - int(xzero[X_ZERO ? xp : 0]) : 0;
         int b = int(w[(size_t(expert) * K + k) * N + col]) - int(wzero[W_ZERO ? wp : 0]);
-        isum = simd_sum(isum);
-        sum = simd_sum(sum);
         if (INTEGER) {
             isum += a * b;
         } else {
@@ -230,6 +228,8 @@ const SOURCE: &str = r#"
             sum = precise::fma(ax, bw, sum);
         }
     }
+    isum = simd_sum(isum);
+    sum = simd_sum(sum);
     if (INTEGER) {
         size_t xp = size_t(row / XD0) * XS0;
         size_t wp = size_t(expert / WD0) * WS0 + size_t(col / WD2) * WS2;
@@ -576,9 +576,11 @@ mod tests {
         assert!(nodes[2].qdq.is_none());
         nodes[1].domain.clear();
         nodes[2].op_type = "GroupedMatMul".into();
-        nodes[2].since_version = 28;
-        recognize(&mut nodes);
-        assert!(nodes[2].qdq.is_none());
+        for version in [28, 30] {
+            nodes[2].since_version = version;
+            recognize(&mut nodes);
+            assert!(nodes[2].qdq.is_none());
+        }
     }
 
     #[test]
@@ -748,113 +750,6 @@ mod tests {
                                     );
                                 }
                             }
-
-                            #[test]
-                            fn qdq_grouped_blocked_gpu_product() {
-                                let stream = Stream::new_default_gpu();
-                                let mut plan = Plan::new(vec![]);
-                                let mut ctx = TranslationContext::new(
-                                    &mut plan,
-                                    std::ptr::null(),
-                                    std::ptr::null_mut(),
-                                    stream.as_raw(),
-                                );
-                                let mut a = dq("a");
-                                a.ints.insert("axis".into(), 0);
-                                let mut w = dq("w");
-                                w.ints
-                                    .extend([("axis".into(), -2), ("block_size".into(), 32)]);
-                                let mut node = NodeDesc::new(
-                                    "GroupedMatMul".into(),
-                                    String::new(),
-                                    29,
-                                    CompileShapeSafety::EagerOnly {
-                                        reason: EAGER_REASON,
-                                    },
-                                );
-                                node.qdq = Some(Box::new(QuantizedMatMul { x: Some(a), w }));
-                                node.inputs = ["af", "wf", "indices"].map(reference).to_vec();
-                                node.outputs = vec![output("y")];
-                                let (m, k, n, groups, selections, blocks) = (2, 65, 5, 3, 2, 3);
-                                let av: Vec<i8> = (0..m * k).map(|i| (i % 17 - 8) as i8).collect();
-                                let wv: Vec<i8> =
-                                    (0..groups * k * n).map(|i| (i % 13 - 6) as i8).collect();
-                                let az = [-2i8, 3];
-                                let wz: Vec<i8> = (0..groups * blocks * n)
-                                    .map(|i| (i % 5 - 2) as i8)
-                                    .collect();
-                                let ascale = [0.25f32, 0.125];
-                                let wscale: Vec<f32> = (0..groups * blocks * n)
-                                    .map(|i| 2.0f32.powi(i % 4 - 5))
-                                    .collect();
-                                for (name, shape, data) in [
-                                    ("a", vec![m, k], av.as_slice()),
-                                    ("w", vec![groups, k, n], wv.as_slice()),
-                                    ("az", vec![m], az.as_slice()),
-                                    ("wz", vec![groups, blocks, n], wz.as_slice()),
-                                ] {
-                                    let array = ctx.keep(Array::from_data(
-                                        data.as_ptr().cast(),
-                                        &shape,
-                                        mlx::mlx_dtype__MLX_INT8,
-                                    ));
-                                    ctx.bind(&output(name), array);
-                                }
-                                for (name, shape, data) in [
-                                    ("as", vec![m], ascale.as_slice()),
-                                    ("ws", vec![groups, blocks, n], wscale.as_slice()),
-                                ] {
-                                    let array = ctx.keep(Array::from_data(
-                                        data.as_ptr().cast(),
-                                        &shape,
-                                        F32,
-                                    ));
-                                    ctx.bind(&output(name), array);
-                                }
-                                let routes = [2i32, 0, 2, 1];
-                                let array = ctx.keep(Array::from_data(
-                                    routes.as_ptr().cast(),
-                                    &[m, selections],
-                                    mlx::mlx_dtype__MLX_INT32,
-                                ));
-                                ctx.bind(&output("indices"), array);
-                                assert!(execute(&mut ctx, &node).unwrap());
-                                let y = ctx.resolve(&reference("y")).unwrap();
-                                let y = ctx.contiguous_eval(y).unwrap();
-                                let actual = unsafe {
-                                    std::slice::from_raw_parts(
-                                        mlx::mlx_array_data_float32(y),
-                                        (m * selections * n) as usize,
-                                    )
-                                };
-                                for row in 0..m as usize {
-                                    for selection in 0..selections as usize {
-                                        let g =
-                                            routes[row * selections as usize + selection] as usize;
-                                        for col in 0..n as usize {
-                                            let mut expected = 0.0f64;
-                                            for kk in 0..k as usize {
-                                                let p = (g * blocks as usize + kk / 32)
-                                                    * n as usize
-                                                    + col;
-                                                let ax = f32::from(av[row * k as usize + kk])
-                                                    - f32::from(az[row]);
-                                                let bw = f32::from(
-                                                    wv[(g * k as usize + kk) * n as usize + col],
-                                                ) - f32::from(wz[p]);
-                                                expected += f64::from(ax * ascale[row])
-                                                    * f64::from(bw * wscale[p]);
-                                            }
-                                            assert_eq!(
-                                                actual[(row * selections as usize + selection)
-                                                    * n as usize
-                                                    + col],
-                                                expected as f32
-                                            );
-                                        }
-                                    }
-                                }
-                            }
                         }
                         if grouped {
                             for invalid in [-1i64, 3, i64::MAX] {
@@ -870,6 +765,163 @@ mod tests {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn qdq_grouped_blocked_gpu_product() {
+        let stream = Stream::new_default_gpu();
+        let mut plan = Plan::new(vec![]);
+        let mut ctx = TranslationContext::new(
+            &mut plan,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            stream.as_raw(),
+        );
+        let mut a = dq("a");
+        a.ints.insert("axis".into(), 0);
+        let mut w = dq("w");
+        w.ints
+            .extend([("axis".into(), -2), ("block_size".into(), 32)]);
+        let mut node = NodeDesc::new(
+            "GroupedMatMul".into(),
+            String::new(),
+            29,
+            CompileShapeSafety::EagerOnly {
+                reason: EAGER_REASON,
+            },
+        );
+        node.qdq = Some(Box::new(QuantizedMatMul { x: Some(a), w }));
+        node.inputs = ["af", "wf", "indices"].map(reference).to_vec();
+        node.outputs = vec![output("y")];
+        let (m, k, n, groups, selections, blocks) = (2, 65, 5, 3, 2, 3);
+        let av: Vec<i8> = (0..m * k).map(|i| (i % 17 - 8) as i8).collect();
+        let wv: Vec<i8> = (0..groups * k * n).map(|i| (i % 13 - 6) as i8).collect();
+        let az = [-2i8, 3];
+        let wz: Vec<i8> = (0..groups * blocks * n)
+            .map(|i| (i % 5 - 2) as i8)
+            .collect();
+        let ascale = [0.25f32, 0.125];
+        let wscale: Vec<f32> = (0..groups * blocks * n)
+            .map(|i| 2.0f32.powi(i % 4 - 5))
+            .collect();
+        for (name, shape, data) in [
+            ("a", vec![m, k], av.as_slice()),
+            ("w", vec![groups, k, n], wv.as_slice()),
+            ("az", vec![m], az.as_slice()),
+            ("wz", vec![groups, blocks, n], wz.as_slice()),
+        ] {
+            let array = ctx.keep(Array::from_data(
+                data.as_ptr().cast(),
+                &shape,
+                mlx::mlx_dtype__MLX_INT8,
+            ));
+            ctx.bind(&output(name), array);
+        }
+        for (name, shape, data) in [
+            ("as", vec![m], ascale.as_slice()),
+            ("ws", vec![groups, blocks, n], wscale.as_slice()),
+        ] {
+            let array = ctx.keep(Array::from_data(data.as_ptr().cast(), &shape, F32));
+            ctx.bind(&output(name), array);
+        }
+        let routes = [2i32, 0, 2, 1];
+        let array = ctx.keep(Array::from_data(
+            routes.as_ptr().cast(),
+            &[m, selections],
+            mlx::mlx_dtype__MLX_INT32,
+        ));
+        ctx.bind(&output("indices"), array);
+        assert!(execute(&mut ctx, &node).unwrap());
+        let y = ctx.resolve(&reference("y")).unwrap();
+        let y = ctx.contiguous_eval(y).unwrap();
+        let actual = unsafe {
+            std::slice::from_raw_parts(
+                mlx::mlx_array_data_float32(y),
+                (m * selections * n) as usize,
+            )
+        };
+        for row in 0..m as usize {
+            for selection in 0..selections as usize {
+                let g = routes[row * selections as usize + selection] as usize;
+                for col in 0..n as usize {
+                    let mut expected = 0.0f64;
+                    for kk in 0..k as usize {
+                        let p = (g * blocks as usize + kk / 32) * n as usize + col;
+                        let ax = f32::from(av[row * k as usize + kk]) - f32::from(az[row]);
+                        let bw = f32::from(wv[(g * k as usize + kk) * n as usize + col])
+                            - f32::from(wz[p]);
+                        expected += f64::from(ax * ascale[row]) * f64::from(bw * wscale[p]);
+                    }
+                    assert_eq!(
+                        actual[(row * selections as usize + selection) * n as usize + col],
+                        expected as f32
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn qdq_simd_reduction_gpu() {
+        for k in [32, 33, 64, 65, 256, 257, 4096] {
+            for static_scales in [false, true] {
+                let stream = Stream::new_default_gpu();
+                let mut plan = Plan::new(vec![]);
+                let mut ctx = TranslationContext::new(
+                    &mut plan,
+                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                    stream.as_raw(),
+                );
+                let mut a = dq("a");
+                let mut w = dq("w");
+                if static_scales {
+                    scalar_scale(&mut a, 1.0);
+                    scalar_scale(&mut w, 1.0);
+                }
+                let mut node = NodeDesc::new(
+                    "MatMul".into(),
+                    String::new(),
+                    13,
+                    CompileShapeSafety::EagerOnly {
+                        reason: EAGER_REASON,
+                    },
+                );
+                node.inputs = vec![reference("af"), reference("wf")];
+                node.outputs = vec![output("y")];
+                node.qdq = Some(Box::new(QuantizedMatMul { x: Some(a), w }));
+                let ones = vec![1u8; k as usize];
+                for (name, shape, values) in [
+                    ("a", vec![1, k], ones.as_slice()),
+                    ("w", vec![k, 1], ones.as_slice()),
+                    ("az", vec![], &[0u8]),
+                    ("wz", vec![], &[0u8]),
+                ] {
+                    let array = ctx.keep(Array::from_data(
+                        values.as_ptr().cast(),
+                        &shape,
+                        mlx::mlx_dtype__MLX_UINT8,
+                    ));
+                    ctx.bind(&output(name), array);
+                }
+                if !static_scales {
+                    for name in ["as", "ws"] {
+                        let value = ctx.scalar_f32(1.0);
+                        ctx.bind(&output(name), value);
+                    }
+                }
+                let pattern = node.qdq.as_ref().unwrap();
+                let x = operand(&mut ctx, pattern.x.as_ref().unwrap(), false)
+                    .unwrap()
+                    .unwrap();
+                let w = operand(&mut ctx, &pattern.w, true).unwrap().unwrap();
+                assert_eq!(integer_exact(pattern, &x, &w), static_scales && k <= 256);
+                assert!(execute(&mut ctx, &node).unwrap());
+                let y = ctx.resolve(&reference("y")).unwrap();
+                let y = ctx.contiguous_eval(y).unwrap();
+                assert_eq!(unsafe { *mlx::mlx_array_data_float32(y) }, k as f32);
             }
         }
     }

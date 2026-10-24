@@ -586,7 +586,7 @@ pub fn register(registry: &mut OpRegistry) {
             domain: "",
             op_type: "GroupedMatMul",
             min_opset: 29,
-            max_opset: K_ANY_OPSET,
+            max_opset: 29,
             handler: grouped_matmul_op,
             claim: grouped_claim,
         },
@@ -683,6 +683,11 @@ mod tests {
             crate::registry::registry()
                 .find_entry("", "GroupedMatMul", 29)
                 .is_some()
+        );
+        assert!(
+            crate::registry::registry()
+                .find_entry("", "GroupedMatMul", 30)
+                .is_none()
         );
     }
 
