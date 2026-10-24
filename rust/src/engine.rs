@@ -162,6 +162,8 @@ pub struct NodeDesc {
     pub outputs: Vec<OutRef>,
     /// Body subgraphs for a control-flow node (If/Scan/Loop). Empty for every ordinary op.
     pub subgraphs: Vec<SubgraphDesc>,
+    /// Recognized DQ operands for a private quantized kernel, never a public ONNX op.
+    pub(crate) qdq: Option<Box<crate::ops::qdq::QuantizedMatMul>>,
 }
 
 impl NodeDesc {
@@ -188,6 +190,7 @@ impl NodeDesc {
             inputs: Vec::new(),
             outputs: Vec::new(),
             subgraphs: Vec::new(),
+            qdq: None,
         }
     }
 }

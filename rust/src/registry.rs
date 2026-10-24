@@ -1830,6 +1830,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn grouped_matmul_schema29_registration() {
+        assert!(registry().find_entry("", "GroupedMatMul", 28).is_none());
+        assert!(registry().find_entry("", "GroupedMatMul", 29).is_some());
+        assert!(registry().find_entry("", "GroupedMatMul", 30).is_none());
+    }
+
+    #[test]
     fn nonzero_is_version_gated_and_always_eager() {
         assert!(registry().find_entry("", "NonZero", 8).is_none());
         for version in [9, 13, 26] {
