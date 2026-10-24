@@ -7,7 +7,7 @@ import subprocess
 import sys
 
 import numpy as np
-from onnx import TensorProto as T, helper, load_model_from_string
+from onnx import AttributeProto, TensorProto as T, helper, load_model_from_string
 import onnxruntime as ort
 import pytest
 
@@ -32,7 +32,7 @@ def _model(op, *, shape=None, input_type=T.FLOAT, output_type=T.BFLOAT16,
         if input_type == T.BFLOAT16:
             nodes.append(helper.make_node("Cast", ["x"], ["bf16_x"], to=T.BFLOAT16))
             random_inputs = ["bf16_x"]
-    else:
+    elif shape:
         attrs["shape"] = list(shape)
     if nested:
         branches = [
@@ -47,6 +47,10 @@ def _model(op, *, shape=None, input_type=T.FLOAT, output_type=T.BFLOAT16,
                                       then_branch=branches[0], else_branch=branches[1]))
     else:
         nodes.append(helper.make_node(op, random_inputs, ["draw"], **attrs))
+        if not op.endswith("Like") and not shape:
+            nodes[-1].attribute.append(helper.make_attribute(
+                "shape", [], attr_type=AttributeProto.INTS,
+            ))
     result = "draw"
     if output_type == T.BFLOAT16:
         result = "y"
@@ -91,7 +95,7 @@ def _bf16_round(values):
     return np.where(np.isnan(values), np.uint32(0x7FC00000), rounded).view(np.float32)
 
 
-def _assert_affine(actual, standard, mean, scale):
+def _assert_affine(actual, standard, mean, scale, *, eager):
     mean, scale = np.float32(mean), np.float32(scale)
     with np.errstate(over="ignore", under="ignore", invalid="ignore"):
         separate = np.add(np.multiply(standard, scale, dtype=np.float32), mean,
@@ -101,7 +105,45 @@ def _assert_affine(actual, standard, mean, scale):
     # Compilation may fuse the F32 affine multiply/add. This is not an exact-real oracle.
     expected = [_bf16_round(value).view(np.uint32) for value in [separate, fused]]
     bits = actual.view(np.uint32)
-    assert np.all((bits == expected[0]) | (bits == expected[1]))
+    matches = (bits == expected[0]) | (bits == expected[1])
+    if not np.all(matches):
+        def describe(array, index):
+            value = int(array.view(np.uint32).ravel()[index])
+            exponent, fraction = (value >> 23) & 0xFF, value & 0x7FFFFF
+            if exponent == 0:
+                kind = "subnormal" if fraction else "zero"
+            elif exponent == 0xFF:
+                kind = "nan" if fraction else "infinity"
+            else:
+                kind = "normal"
+            return {
+                "bits": f"0x{value:08x}", "class": kind, "sign": value >> 31,
+                "low16": f"0x{value & 0xFFFF:04x}",
+                "distance_from_bf16_midpoint_low16": (value & 0xFFFF) - 0x8000,
+            }
+
+        indices = np.flatnonzero(~matches)[:32]
+        diagnostic = {
+            "mismatch_count": int(np.count_nonzero(~matches)),
+            "compile_disabled_flag": eager,
+            "actual_backend_route": "not measured for this case; flag is not route proof",
+            "kernel_provider": "MLXExecutionProvider asserted by ORT kernel profile",
+            "mean": describe(np.asarray(mean), 0),
+            "scale": describe(np.asarray(scale), 0),
+            "mismatches": [
+                {
+                    "index": int(index),
+                    "actual": describe(actual, index),
+                    "standard": describe(standard, index),
+                    "separate_f32": describe(separate, index),
+                    "fused_candidate_f32": describe(fused, index),
+                    "separate_bf16": describe(expected[0], index),
+                    "fused_candidate_bf16": describe(expected[1], index),
+                }
+                for index in indices
+            ],
+        }
+        pytest.fail(json.dumps(diagnostic, sort_keys=True))
 
 
 def _feeds(op, shape, input_type=T.FLOAT, call=0):
@@ -155,8 +197,8 @@ def test_affine_against_paired_f32_draw(op, eager, mean, scale, monkeypatch, tmp
     actual = session.run(None, feeds)[0]
     assert actual.dtype == np.float32 and actual.shape == shape
     assert np.all((actual.view(np.uint32) & 0xFFFF) == 0)
-    _assert_affine(actual, standard, mean, scale)
     _assert_profile(session)
+    _assert_affine(actual, standard, mean, scale, eager=eager)
 
 
 @pytest.mark.parametrize("op", OPS)
@@ -248,9 +290,13 @@ def test_distribution_not_only_paired_prng(op):
 @pytest.mark.parametrize("op", OPS)
 @pytest.mark.parametrize("opset", [1, 21])
 def test_bfloat_output_before_22_is_rejected(op, opset):
-    with pytest.raises(ort.capi.onnxruntime_pybind11_state.InvalidGraph,
-                       match="Type.*bfloat16.*invalid"):
-        _session(_model(op, shape=(256,), opset=opset))
+    proto = load_model_from_string(_model(op, shape=(256,), opset=opset))
+    del proto.graph.node[-1]
+    proto.graph.output[0].name = "draw"
+    proto.graph.output[0].type.tensor_type.elem_type = T.BFLOAT16
+    with pytest.raises(ort.capi.onnxruntime_pybind11_state.Fail,
+                       match="CPU EP.*fallback.*disabled"):
+        _session(proto.SerializeToString())
 
 
 @pytest.mark.parametrize("op", OPS)
@@ -350,7 +396,9 @@ def test_bfloat_actual_routes(tmp_path):
              if event.get("cat") == "ep.path"]
     draws = [event for event in paths
              if "RandomNormalLike" in event.get("ops", "").split(",")]
-    assert sum(event["path"] == "eager" for event in draws) == 12
+    # If bodies are translated inline, so their four calls have parent-only path events.
+    assert len(draws) == 12, paths
+    assert sum(event["path"] == "eager" for event in draws) == 8, paths
     assert [event["cache"] for event in draws if event["path"] == "general"] == [
         "MISS", "HIT", "HIT", "HIT",
     ]
