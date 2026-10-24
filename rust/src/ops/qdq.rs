@@ -585,9 +585,6 @@ mod tests {
 
     #[test]
     fn qdq_integer_bound_and_scale_guards() {
-        const {
-            assert!(256_i64 * 255 * 255 < 1 << 24);
-        }
         for a in [-255_i32, -1, 0, 1, 255] {
             for b in [-255_i32, -1, 0, 1, 255] {
                 for ea in [-40, 0, 40] {
@@ -598,6 +595,7 @@ mod tests {
                         let mut floating = 0.0f32;
                         for _ in 0..256 {
                             integer += a * b;
+                            assert!(i64::from(integer).abs() < 1 << 24);
                             floating = (a as f32 * sa).mul_add(b as f32 * sb, floating);
                             assert_eq!((integer as f32 * sa) * sb, floating);
                             assert!(floating == 0.0 || floating.is_normal());

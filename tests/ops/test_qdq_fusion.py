@@ -301,6 +301,6 @@ def test_ort131_groupedmatmul29_loader_limit():
     ).SerializeToString()
     with pytest.raises(
         Fail,
-        match=r"(?s)opset 29.*Current official support for domain ai.onnx is till opset 2[0-8]",
+        match=r"(?s)Opset 29.*Current official support for domain ai.onnx is till opset 2[0-8]",
     ):
         ort.InferenceSession(model, providers=["MLXExecutionProvider"])
