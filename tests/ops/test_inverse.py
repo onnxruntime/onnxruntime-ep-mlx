@@ -1,8 +1,10 @@
 """Inverse v1: typed CPU primitive, independent references and strict live contracts."""
 
+import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import threading
@@ -19,6 +21,8 @@ ERRORS = (ort.capi.onnxruntime_pybind11_state.InvalidGraph,
           ort.capi.onnxruntime_pybind11_state.InvalidArgument,
           ort.capi.onnxruntime_pybind11_state.Fail)
 EPFAIL = ort.capi.onnxruntime_pybind11_state.EPFail
+LEAK_ENV_KEYS = ("PATH", "MallocStackLogging", "DYLD_INSERT_LIBRARIES",
+                 "DYLD_LIBRARY_PATH", "DYLD_FRAMEWORK_PATH")
 
 
 def _model(dtype, shape, *, constant=None, crossing=False):
@@ -245,19 +249,40 @@ def _session_churn(dtype_name, directory):
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
-def test_inverse_session_churn_leaks_subprocess(dtype, tmp_path):
+def test_inverse_session_churn_leaks_subprocess(dtype, tmp_path, capsys):
+    env = {**os.environ, "MallocStackLogging": "1"}
+    tool = shutil.which("leaks", path=env.get("PATH"))
+    assert tool is not None, "macOS leaks executable not found on PATH"
+    tool_hash = hashlib.sha256(Path(tool).read_bytes()).hexdigest()
     child = subprocess.run(
-        ["leaks", "--atExit", "--", sys.executable, "-c",
-         "import os,resource,runpy,sys,onnxruntime as ort; "
+        [tool, "--atExit", "--", sys.executable, "-c",
+         f"import json,os,sys; keys={LEAK_ENV_KEYS!r}; "
+         "print(json.dumps({'record_kind':'inverse_leaks_child_environment',"
+         "'pid':os.getpid(),'executable':sys.executable,"
+         "'environment':{k:os.environ.get(k) for k in keys}}),flush=True); "
+         "import resource,runpy,onnxruntime as ort; "
          "resource.setrlimit(resource.RLIMIT_CORE,(0,0)); "
          "ort.register_execution_provider_library('MLXExecutionProvider', "
          "os.environ['ONNXRUNTIME_MLX_EP_LIB']); "
          "d=runpy.run_path(sys.argv[1]); d['_session_churn'](sys.argv[2],sys.argv[3])",
          str(Path(__file__).resolve()), np.dtype(dtype).name, str(tmp_path)],
-        env={**os.environ, "MallocStackLogging": "1"},
+        env=env,
         capture_output=True, text=True, timeout=120)
     (tmp_path / "churn.stdout").write_text(child.stdout)
     (tmp_path / "churn.stderr").write_text(child.stderr)
+    with capsys.disabled():
+        print(json.dumps({
+            "record_kind": "inverse_leaks_launcher",
+            "dtype": np.dtype(dtype).name,
+            "resolved_tool": tool,
+            "tool_realpath": str(Path(tool).resolve()),
+            "tool_sha256": tool_hash,
+            "argv": child.args,
+            "launcher_environment": {k: env.get(k) for k in LEAK_ENV_KEYS},
+            "returncode": child.returncode,
+            "stdout": child.stdout,
+            "stderr": child.stderr,
+        }, indent=2), flush=True)
     assert child.returncode == 0, (child.returncode, child.stdout, child.stderr)
     assert "INVERSE_SESSION_CHURN_RECOVERY_OK" in child.stdout
     assert "0 leaks for 0 total leaked bytes." in child.stdout + child.stderr, (
