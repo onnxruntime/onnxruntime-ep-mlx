@@ -260,7 +260,8 @@ def test_inverse_session_churn_leaks_subprocess(dtype, tmp_path):
     (tmp_path / "churn.stderr").write_text(child.stderr)
     assert child.returncode == 0, (child.returncode, child.stdout, child.stderr)
     assert "INVERSE_SESSION_CHURN_RECOVERY_OK" in child.stdout
-    assert "0 leaks for 0 total leaked bytes." in child.stdout
+    assert "0 leaks for 0 total leaked bytes." in child.stdout + child.stderr, (
+        child.stdout, child.stderr)
 
 
 @pytest.mark.parametrize("shape", [[], [1], [2, 3], [2, 3, 2], None])
