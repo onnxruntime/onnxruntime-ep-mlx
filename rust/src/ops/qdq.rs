@@ -585,7 +585,9 @@ mod tests {
 
     #[test]
     fn qdq_integer_bound_and_scale_guards() {
-        assert!(256_i64 * 255 * 255 < 1 << 24);
+        const {
+            assert!(256_i64 * 255 * 255 < 1 << 24);
+        }
         for a in [-255_i32, -1, 0, 1, 255] {
             for b in [-255_i32, -1, 0, 1, 255] {
                 for ea in [-40, 0, 40] {

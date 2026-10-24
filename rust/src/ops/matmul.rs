@@ -766,7 +766,15 @@ mod tests {
                     let y = ctx.contiguous_eval(y).unwrap();
                     let actual =
                         unsafe { std::slice::from_raw_parts(mlx::mlx_array_data_float32(y), 8) };
-                    assert_eq!(actual, [33.5, 36.25, 7.5, 10.25, 73.5, 80.25, 44.5, 51.25]);
+                    let mut expected = [33.5f32, 36.25, 7.5, 10.25, 73.5, 80.25, 44.5, 51.25];
+                    if dtype == mlx::mlx_dtype__MLX_BFLOAT16 {
+                        // BF16 rounds the exact 80.25 tie to even 80.0.
+                        expected[5] = 80.0;
+                    }
+                    assert_eq!(
+                        actual, expected,
+                        "cpu={cpu}, dtype={dtype}, index_dtype={index_dtype}"
+                    );
                 }
                 for (m, k, s, n, g) in [
                     (0, 3, 2, 4, 2),
