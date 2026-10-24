@@ -48,9 +48,49 @@ fn random_normal_with_shape(
     let dtype = mlx_dtype_from_onnx(n.outputs[0].otype);
     let mean = n.floats.get("mean").copied().unwrap_or(0.0);
     let scale = n.floats.get("scale").copied().unwrap_or(1.0);
-    let out = ctx.emit(|res, s| unsafe {
-        mlx::mlx_random_normal(res, shape.as_ptr(), shape.len(), dtype, mean, scale, key, s)
-    })?;
+    let out = if dtype == mlx::mlx_dtype__MLX_BFLOAT16 {
+        // Keep FLOAT attributes and affine intermediates in F32 until the final BF16 rounding.
+        let standard = ctx.emit(|res, s| unsafe {
+            mlx::mlx_random_normal(
+                res,
+                shape.as_ptr(),
+                shape.len(),
+                mlx::mlx_dtype__MLX_FLOAT32,
+                0.0,
+                1.0,
+                key,
+                s,
+            )
+        })?;
+        let scale = ctx.scalar_f32(scale);
+        let mean = ctx.scalar_f32(mean);
+        let cpu = crate::mlx::Stream::new_default_cpu();
+        let s = cpu.as_raw();
+        let affine = (|| {
+            let scaled =
+                ctx.emit(|res, _| unsafe { mlx::mlx_multiply(res, standard, scale, s) })?;
+            let shifted = ctx.emit(|res, _| unsafe { mlx::mlx_add(res, scaled, mean, s) })?;
+            let out = ctx.emit(|res, _| unsafe { mlx::mlx_astype(res, shifted, dtype, s) })?;
+            let mut outputs = VectorArray::new();
+            outputs.append(out);
+            crate::mlx::eval(&outputs)?;
+            Ok::<_, MlxError>(out)
+        })();
+        // Drain even when construction/eval fails, while all wrappers and inputs are still alive.
+        if unsafe { mlx::mlx_synchronize(s) } != 0 {
+            return Err(match affine {
+                Err(error) => {
+                    format!("{error}; BF16 Normal CPU affine synchronization also failed")
+                }
+                Ok(_) => "BF16 Normal CPU affine synchronization failed".to_string(),
+            });
+        }
+        affine?
+    } else {
+        ctx.emit(|res, s| unsafe {
+            mlx::mlx_random_normal(res, shape.as_ptr(), shape.len(), dtype, mean, scale, key, s)
+        })?
+    };
     ctx.bind(&n.outputs[0], out);
     Ok(())
 }
@@ -201,8 +241,12 @@ fn random_shape_claim(node: &NodeView, normal: bool) -> ClaimResult {
         None => deny!("missing tensor type/shape info on output"),
     };
     require!(
-        is_random_float(out.dtype),
-        "output dtype must be float32 or float16, got {}",
+        is_random_float(out.dtype)
+            || (normal
+                && node.since_version() >= 22
+                && out.dtype
+                    == ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16),
+        "output dtype must be float32 or float16 (also bfloat16 for Normal since schema 22), got {}",
         crate::registry::ort_dtype_name(out.dtype)
     );
     let dtype_attr = node.int_attr(
@@ -289,8 +333,12 @@ fn random_like_claim(node: &NodeView, normal: bool) -> ClaimResult {
         crate::registry::ort_dtype_name(inp.dtype)
     );
     require!(
-        is_random_float(out.dtype),
-        "output dtype must be float32 or float16, got {}",
+        is_random_float(out.dtype)
+            || (normal
+                && node.since_version() >= 22
+                && out.dtype
+                    == ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16),
+        "output dtype must be float32 or float16 (also bfloat16 for Normal since schema 22), got {}",
         crate::registry::ort_dtype_name(out.dtype)
     );
     let dtype_attr = node.int_attr("dtype", inp.dtype as i64);
@@ -726,7 +774,15 @@ fn shapeless(
 }
 
 fn random_compile_shape_safety(node: &NodeView) -> CompileShapeSafety {
-    if node.float_attr_opt("seed").is_none() {
+    if matches!(node.op_type().as_str(), "RandomNormal" | "RandomNormalLike")
+        && node.output_info(0).is_some_and(|info| {
+            info.dtype == ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16
+        })
+    {
+        CompileShapeSafety::EagerOnly {
+            reason: "BF16 Normal completes its F32 affine transform on the MLX CPU stream",
+        }
+    } else if node.float_attr_opt("seed").is_none() {
         CompileShapeSafety::EagerOnly {
             reason: "unseeded random draws consume the live default key",
         }
