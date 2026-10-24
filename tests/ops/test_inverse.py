@@ -5,6 +5,8 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 from onnx import TensorProto as T, helper, numpy_helper
@@ -188,6 +190,79 @@ def test_inverse_singular_error_and_same_session_recovery_subprocess(dtype, tmp_
     assert "SINGULAR_ERROR_AND_SAME_SESSION_RECOVERY_OK" in child.stdout
 
 
+def _concurrent_owner_threads(dtype_name, directory):
+    dtype = np.dtype(dtype_name).type
+    barrier = threading.Barrier(2, timeout=30)
+
+    def worker(singular):
+        session = _session(_model(dtype, [2, 2]), Path(directory) / str(singular))
+        for offset in range(12):
+            barrier.wait()
+            x = _matrix((2, 2), dtype, offset)
+            if singular:
+                with pytest.raises(EPFAIL, match="Inverse: CPU inversion/evaluation failed"):
+                    session.run(None, {"x": np.zeros((2, 2), dtype)})
+            _compare(session.run(None, {"x": x})[0], x)
+        _placement(session)
+        return threading.get_ident()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(worker, singular) for singular in [False, True]]
+        owners = [future.result() for future in futures]
+    assert len(set(owners)) == 2, owners
+    print("INVERSE_TWO_OWNER_THREADS_RECOVERY_OK", owners, flush=True)
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_inverse_concurrent_owner_threads_subprocess(dtype, tmp_path):
+    child = subprocess.run(
+        [sys.executable, "-c",
+         "import os,resource,runpy,sys,onnxruntime as ort; "
+         "resource.setrlimit(resource.RLIMIT_CORE,(0,0)); "
+         "ort.register_execution_provider_library('MLXExecutionProvider', "
+         "os.environ['ONNXRUNTIME_MLX_EP_LIB']); "
+         "d=runpy.run_path(sys.argv[1]); d['_concurrent_owner_threads'](sys.argv[2],sys.argv[3])",
+         str(Path(__file__).resolve()), np.dtype(dtype).name, str(tmp_path)],
+        capture_output=True, text=True, timeout=90)
+    (tmp_path / "concurrent.stdout").write_text(child.stdout)
+    (tmp_path / "concurrent.stderr").write_text(child.stderr)
+    assert child.returncode == 0, (child.returncode, child.stdout, child.stderr)
+    assert "INVERSE_TWO_OWNER_THREADS_RECOVERY_OK" in child.stdout
+
+
+def _session_churn(dtype_name, directory):
+    dtype = np.dtype(dtype_name).type
+    for index in range(12):
+        session = _session(_model(dtype, [2, 2]), Path(directory) / f"churn_{index}")
+        x = _matrix((2, 2), dtype, index)
+        _compare(session.run(None, {"x": x})[0], x)
+        with pytest.raises(EPFAIL, match="Inverse: CPU inversion/evaluation failed"):
+            session.run(None, {"x": np.zeros((2, 2), dtype)})
+        _compare(session.run(None, {"x": x})[0], x)
+        _placement(session)
+        del session
+    print("INVERSE_SESSION_CHURN_RECOVERY_OK", flush=True)
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_inverse_session_churn_leaks_subprocess(dtype, tmp_path):
+    child = subprocess.run(
+        ["leaks", "--atExit", "--", sys.executable, "-c",
+         "import os,resource,runpy,sys,onnxruntime as ort; "
+         "resource.setrlimit(resource.RLIMIT_CORE,(0,0)); "
+         "ort.register_execution_provider_library('MLXExecutionProvider', "
+         "os.environ['ONNXRUNTIME_MLX_EP_LIB']); "
+         "d=runpy.run_path(sys.argv[1]); d['_session_churn'](sys.argv[2],sys.argv[3])",
+         str(Path(__file__).resolve()), np.dtype(dtype).name, str(tmp_path)],
+        env={**os.environ, "MallocStackLogging": "1"},
+        capture_output=True, text=True, timeout=120)
+    (tmp_path / "churn.stdout").write_text(child.stdout)
+    (tmp_path / "churn.stderr").write_text(child.stderr)
+    assert child.returncode == 0, (child.returncode, child.stdout, child.stderr)
+    assert "INVERSE_SESSION_CHURN_RECOVERY_OK" in child.stdout
+    assert "0 leaks for 0 total leaked bytes." in child.stdout
+
+
 @pytest.mark.parametrize("shape", [[], [1], [2, 3], [2, 3, 2], None])
 def test_inverse_invalid_geometry_and_unknown_rank(shape, tmp_path):
     with pytest.raises(ERRORS):
@@ -260,7 +335,7 @@ def test_inverse_double_body_payload_remains_rejected(tmp_path):
         _session(model, tmp_path / "double_body")
 
 
-@pytest.mark.parametrize("flow", ["Loop", "Scan"])
+@pytest.mark.parametrize("flow", ["Loop", "Scan", "ScanIf"])
 @pytest.mark.parametrize("eager", [False, True])
 def test_inverse_loop_scan_cpu_eager_live(flow, eager, monkeypatch, tmp_path):
     monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_COMPILE", "1" if eager else "0")
@@ -283,9 +358,17 @@ def test_inverse_loop_scan_cpu_eager_live(flow, eager, monkeypatch, tmp_path):
             helper.make_node("Identity", ["next_state"], ["element_out"]),
         ], "inverse_scan", [state, helper.make_tensor_value_info("element", T.FLOAT, [2, 2])],
             [next_state, helper.make_tensor_value_info("element_out", T.FLOAT, [2, 2])])
+        if flow == "ScanIf":
+            branch = helper.make_graph(list(body.node), "inverse_branch", [], list(body.output))
+            del body.node[:]
+            body.node.append(helper.make_node(
+                "If", ["template_condition"], ["next_state", "element_out"],
+                then_branch=branch, else_branch=branch))
         node = helper.make_node("Scan", ["initial", "x"], ["final", "y"],
                                 body=body, num_scan_inputs=1)
         initializers = [numpy_helper.from_array(np.eye(2, dtype=np.float32), "initial")]
+        if flow == "ScanIf":
+            initializers.append(numpy_helper.from_array(np.asarray(True), "template_condition"))
         shape = [None, 2, 2]
         outputs = [helper.make_tensor_value_info("final", T.FLOAT, [2, 2]),
                    helper.make_tensor_value_info("y", T.FLOAT, shape)]
@@ -296,12 +379,16 @@ def test_inverse_loop_scan_cpu_eager_live(flow, eager, monkeypatch, tmp_path):
         opset_imports=[helper.make_opsetid("", 21), helper.make_opsetid("com.microsoft", 1)],
         ir_version=10)
     session = _session(model, tmp_path / flow)
-    for count, offset in [(3, 0), (1, 2), (3, 0)]:
+    for count, offset in [(3, 0), (1, 2), (0, 0), (3, 0)]:
         x = _matrix((2, 2) if flow == "Loop" else (count, 2, 2), np.float32, offset)
         actual = session.run(None, {"x": x})
         _compare(actual[-1], x)
-        if flow == "Scan":
-            _compare(actual[0], x[-1])
+        if flow != "Loop":
+            if count:
+                _compare(actual[0], x[-1])
+            else:
+                np.testing.assert_array_equal(actual[0], np.eye(2, dtype=np.float32))
+                assert actual[-1].shape == (0, 2, 2)
     _placement(session)
 
 

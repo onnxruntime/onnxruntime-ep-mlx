@@ -788,6 +788,8 @@ pub struct TranslationContext<'a> {
     shape_keyed_compile: bool,
     /// True only while translating any compiled closure; eager translation leaves this false.
     in_compiled_trace: bool,
+    /// Shape templates for a zero-trip Scan are not real body iterations.
+    empty_scan_template: bool,
 }
 
 impl<'a> TranslationContext<'a> {
@@ -817,6 +819,7 @@ impl<'a> TranslationContext<'a> {
             compiled_kv_present: Vec::new(),
             shape_keyed_compile: false,
             in_compiled_trace: false,
+            empty_scan_template: false,
         }
     }
 
@@ -856,6 +859,10 @@ impl<'a> TranslationContext<'a> {
     #[allow(dead_code)]
     pub fn stream(&self) -> mlxsys::mlx_stream {
         self.stream
+    }
+
+    pub(crate) fn empty_scan_template(&self) -> bool {
+        self.empty_scan_template
     }
 
     /// Register a freshly produced array for teardown at end of run; returns its raw handle.
@@ -1870,6 +1877,17 @@ impl<'a> TranslationContext<'a> {
         })
     }
 
+    pub(crate) fn run_empty_scan_template(
+        &mut self,
+        body: &SubgraphDesc,
+        inputs: &[mlxsys::mlx_array],
+    ) -> Result<Vec<mlxsys::mlx_array>, MlxError> {
+        let previous = std::mem::replace(&mut self.empty_scan_template, true);
+        let result = self.run_subgraph(body, inputs);
+        self.empty_scan_template = previous;
+        result
+    }
+
     /// Translate a control-flow body subgraph inline: bind its formal inputs to `inputs` (positional),
     /// dispatch every body node through the registry (implicit inputs fall through to the enclosing
     /// env), collect + return the arrays bound to the body's formal outputs, then restore the env.
@@ -2475,6 +2493,40 @@ pub(crate) fn copy_out_raw_delta(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn empty_context(plan: &mut Plan) -> TranslationContext<'_> {
+        TranslationContext::new(
+            plan,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            mlxsys::mlx_stream {
+                ctx: std::ptr::null_mut(),
+            },
+        )
+    }
+
+    #[test]
+    fn empty_scan_template_restores_scope_on_success_and_error() {
+        let mut plan = Plan::new(vec![]);
+        let mut ctx = empty_context(&mut plan);
+        let mut body = SubgraphDesc {
+            attr_name: "body".into(),
+            input_names: vec![],
+            output_names: vec![],
+            nodes: vec![],
+        };
+        assert!(ctx.run_empty_scan_template(&body, &[]).is_ok());
+        assert!(!ctx.empty_scan_template());
+        body.input_names.push("missing".into());
+        assert!(ctx.run_empty_scan_template(&body, &[]).is_err());
+        assert!(!ctx.empty_scan_template());
+        ctx.empty_scan_template = true;
+        assert!(ctx.run_empty_scan_template(&body, &[]).is_err());
+        assert!(ctx.empty_scan_template());
+        body.input_names.clear();
+        assert!(ctx.run_empty_scan_template(&body, &[]).is_ok());
+        assert!(ctx.empty_scan_template());
+    }
 
     #[test]
     fn owned_initializer_cache_keys_preserve_storage_identity() {

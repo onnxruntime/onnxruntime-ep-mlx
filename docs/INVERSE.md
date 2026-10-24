@@ -8,15 +8,29 @@ extra/missing slots and incompatible output geometry/types are declined.
 
 ## Execution and errors
 
-Nonempty matrices use `mlx_linalg_inv` on an **explicit operator-local MLX CPU
-stream**, including FLOAT inputs. This is provider-owned MLX/LAPACK execution,
+Nonempty matrices use `mlx_linalg_inv` on the **actual run thread's default MLX
+CPU stream**, including FLOAT inputs. This is provider-owned MLX/LAPACK execution,
 not GPU acceleration or ORT CPU fallback. The context and its other operations
 keep their existing stream policy; an F32 control-flow body is not moved wholesale
 to CPU. Recursive eager boundaries prevent capture of Inverse or its parents.
 The existing F64 plan policy and DOUBLE-body payload rejection remain unchanged.
 Live host access completes input producers before inversion. Arrays are retained
-in the context arena, the local stream handle lives through evaluation and
-synchronization, and only a completed result is bound for surrounding consumers.
+in the context arena, and only a completed result is bound for surrounding consumers.
+The existing default CPU wrapper is obtained inside the handler on the actual
+run-owner thread, never cached from an EP-construction thread. Core MLX defaults
+are thread-local per device and reused across sessions on that thread. The local
+C handle lives through evaluation/draining and is then freed. This avoids a new
+native queue/worker per plan: MLX retains explicit new streams and their workers
+for process lifetime, so a dedicated stream per new session would accumulate
+resources even after its C handle was freed. Native worker growth from thread
+churn is not solved here.
+
+This is **not exclusive queue ownership**. The existing run gate serializes a
+plan and enforces its owner thread; unrelated asynchronous external MLX work on
+that same thread may share its CPU error queue and is an unsupported/unverified
+integration boundary. No preexisting stream error is silently cleared or retried.
+Cross-thread behavior requires the bounded hosted regression described below,
+not an all-concurrency guarantee.
 MLX's existing cross-stream array dependencies handle subsequent GPU consumption;
 no default stream is mutated and no captured placeholder is evaluated.
 
@@ -47,6 +61,15 @@ signed-int N*N arithmetic. These checks are not a guarantee that an allocation
 fits available RAM. No new solver, tiling, dependency or CPU-policy framework is
 introduced.
 
+Zero-trip Scan already translates a dummy body solely to derive scan-output
+shape templates. An explicit saved/restored context scope marks only that path.
+Inside it, Inverse returns a same-shape typed zero **template without reading
+values or invoking inversion**. This is not a numerical inverse, an actual body
+iteration, a replacement for any real input, or a singular-input fallback.
+The template scope propagates through nested bodies and restores its previous
+value on success and error; other body errors remain errors. Initial Scan states
+are unchanged and scan outputs retain their zero-length sequence dimension.
+
 ## Authority and coverage limits
 
 The retained authorized ORT v1 schema specifies homogeneous FLOAT16/FLOAT/DOUBLE
@@ -64,7 +87,12 @@ Implementation evidence is pinned MLX
 Pinned mlx-c
 [`57731b00`](https://github.com/ml-explore/mlx-c/tree/57731b00e8bed710e0750e7356da9f18f8eb3e20):
 `mlx/c/linalg.h:65`, `linalg.cpp:137-148`, `array.cpp:348-355` and
-`stream.cpp:135-142` expose the explicit stream and report C++ exceptions.
+`stream.cpp:23-33,105-112,135-142` expose explicit stream creation and report
+C++ exceptions. Core `mlx/stream.cpp:18-26,41-50` defines thread-local defaults
+and their reuse; `71-82` retains explicit new stream indices.
+`mlx/scheduler.cpp:50,149-172` creates workers lazily and retains the scheduler;
+mlx-c `mlx/c/private/stream.h:12-22,43-54` documents owning handles, not native
+worker reclamation.
 These are retained source artifacts, not installed-symbol or binary-identity
 proof, and do not establish ORT CUDA execution or bitwise equivalence.
 
@@ -74,7 +102,15 @@ DOUBLE exponent discriminator. They cover live repeated values, batches,
 symbolic/empty/singleton geometry, initializer/intermediate inputs, strict
 negative forms, explicit nonfinite errors/recovery, and isolated singular
 errors/recovery. Nested runtime fixtures cover If depths 1/2, constant-trip Loop
-and live sequence-length Scan; recursive descriptor fixtures cover their fences.
+and live sequence-length Scan (including zero, nested If, original-state
+preservation and subsequent recovery); recursive descriptor fixtures cover their
+fences. Template scope restoration has a focused Rust fixture. A fresh subprocess
+also exercises simultaneous successful
+and singular plans, requiring every numerical/error/recovery assertion and
+exit0; this is bounded concurrency coverage, not proof of all possible schedules.
+A separate fresh child repeatedly creates/runs/drops sessions on one thread
+under the existing macOS `leaks --atExit` zero-leak gate. That gate does not count
+globally retained worker threads or certify native resource reclamation.
 Provider profiles are required to contain actual nonempty all-MLX kernel events;
 they do not identify a physical CPU stream. Separate trace assertions cover eager
 Inverse/If execution and compiled neighbor cache reuse, not CPU/GPU hardware

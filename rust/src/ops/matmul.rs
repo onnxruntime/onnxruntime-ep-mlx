@@ -5,7 +5,7 @@
 //! re-materialised as a clean, correctly-shaped zeros array (mlx_matmul leaves an empty result with
 //! no backing buffer, which the boundary CopyOut cannot memcpy).
 //! CDist uses provider-owned eager host arithmetic with no M*K*N temporary.
-//! Inverse uses MLX's typed LAPACK primitive on an explicit operator-local CPU stream.
+//! Inverse uses MLX's typed LAPACK primitive on the run thread's default CPU stream.
 
 use super::host_scan::{layout, read_live};
 use crate::engine::{MlxError, NodeDesc, Src, TranslationContext, dim_i32};
@@ -113,6 +113,12 @@ fn inverse_finite(data: &[u8], dtype: mlx::mlx_dtype) -> Result<(), MlxError> {
 }
 
 fn inverse_op(ctx: &mut TranslationContext, node: &NodeDesc) -> Result<(), MlxError> {
+    if ctx.empty_scan_template() {
+        let x = ctx.resolve(&node.inputs[0])?;
+        let template = ctx.zeros(&ctx.shape_of(x), ctx.dtype_of(x))?;
+        ctx.bind(&node.outputs[0], template);
+        return Ok(());
+    }
     let (shape, dtype, empty) = {
         let input = read_live(ctx, &node.inputs[0], "Inverse")?;
         inverse_geometry(&input.shape, None)?;
@@ -568,6 +574,7 @@ mod tests {
         CDIST_EAGER_REASON, INVERSE_EAGER_REASON, cdist_geometry, cdist_values, fused_matmul_axes,
         inverse_finite, inverse_geometry,
     };
+    use crate::sys::mlx;
 
     #[test]
     fn inverse_geometry_layout_and_empty_shapes() {

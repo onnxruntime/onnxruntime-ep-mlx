@@ -325,7 +325,7 @@ fn scan_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
             let dtype = ctx.dtype_of(scan);
             bin.push(ctx.zeros(&element_shape, dtype)?);
         }
-        let templates = ctx.run_subgraph(&body, &bin)?;
+        let templates = ctx.run_empty_scan_template(&body, &bin)?;
         for i in 0..num_scan_out {
             let template = templates[num_state + i];
             let mut shape = ctx.shape_of(template);
