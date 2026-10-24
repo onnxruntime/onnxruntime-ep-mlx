@@ -1,15 +1,17 @@
-//! Dense linear-algebra op handlers (MatMul, Gemm, com.microsoft::FusedMatMul).
+//! Dense linear algebra and eager com.microsoft::CDist pairwise distances.
 //!
-//! These use MLX's dense GEMM (`mlx_matmul`) with numpy/ONNX batch-dim broadcasting.
+//! Matrix products use MLX's dense GEMM (`mlx_matmul`) with numpy/ONNX broadcasting.
 //! FusedMatMul widens scaled fp16/bf16 products to avoid premature output rounding. An empty product is
 //! re-materialised as a clean, correctly-shaped zeros array (mlx_matmul leaves an empty result with
 //! no backing buffer, which the boundary CopyOut cannot memcpy).
+//! CDist uses provider-owned eager host arithmetic with no M*K*N temporary.
 
-use crate::engine::{MlxError, NodeDesc, Src, TranslationContext};
+use super::host_scan::{layout, read_live};
+use crate::engine::{MlxError, NodeDesc, Src, TranslationContext, dim_i32};
 use crate::registry::{
     ClaimResult, K_ANY_OPSET, NodeView, OpRegistration, OpRegistry, is_mlx_cpu_float,
 };
-use crate::sys::mlx;
+use crate::sys::{mlx, ort};
 use crate::{deny, require};
 
 fn present(n: &NodeDesc, i: usize) -> bool {
@@ -24,6 +26,161 @@ fn scalar_like(
 ) -> Result<mlx::mlx_array, MlxError> {
     let s = ctx.scalar_f32(value);
     ctx.astype(s, dt)
+}
+
+const CDIST_EAGER_REASON: &str =
+    "CDist uses live typed host reduction without a pairwise feature workspace";
+
+fn cdist_geometry(a: &[i64], b: &[i64], output: Option<&[i64]>) -> Result<(), MlxError> {
+    if a.len() != 2 || b.len() != 2 {
+        return Err("CDist: A and B must have rank 2".into());
+    }
+    if a[1] >= 0 && b[1] >= 0 && a[1] != b[1] {
+        return Err("CDist: A and B feature dimensions must match".into());
+    }
+    if let Some(y) = output
+        && (y.len() != 2
+            || (y[0] >= 0 && a[0] >= 0 && y[0] != a[0])
+            || (y[1] >= 0 && b[0] >= 0 && y[1] != b[0]))
+    {
+        return Err("CDist: output must have shape [M,K]".into());
+    }
+    Ok(())
+}
+
+fn cdist_claim(node: &NodeView) -> ClaimResult {
+    require!(
+        node.num_inputs() == 2
+            && node.num_outputs() == 1
+            && node.input_present(0)
+            && node.input_present(1)
+            && node.output_present(0),
+        "CDist requires exactly two present inputs and one present output"
+    );
+    let (a, b, y) = match (node.input_info(0), node.input_info(1), node.output_info(0)) {
+        (Some(a), Some(b), Some(y)) => (a, b, y),
+        _ => deny!("CDist requires tensor type/shape information"),
+    };
+    require!(
+        matches!(
+            a.dtype,
+            ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT
+                | ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_DOUBLE
+        ) && a.dtype == b.dtype
+            && a.dtype == y.dtype,
+        "CDist A, B and C must share float32 or float64 dtype"
+    );
+    cdist_geometry(&a.shape, &b.shape, Some(&y.shape))?;
+    require!(
+        !node.has_attr("metric")
+            || node.attr_type("metric") == ort::OrtOpAttrType_ORT_OP_ATTR_STRING,
+        "CDist metric must be STRING"
+    );
+    let metric = if node.has_attr("metric") {
+        node.string_attr("metric", "")
+    } else {
+        "sqeuclidean".into()
+    };
+    require!(
+        matches!(metric.as_str(), "sqeuclidean" | "euclidean"),
+        "CDist supports only sqeuclidean and euclidean"
+    );
+    Ok(())
+}
+
+fn cdist_values<T>(
+    a: &[T],
+    b: &[T],
+    m: usize,
+    k: usize,
+    features: usize,
+    finish: impl Fn(T) -> T,
+) -> Vec<T>
+where
+    T: Copy
+        + Default
+        + std::ops::Sub<Output = T>
+        + std::ops::Mul<Output = T>
+        + std::ops::Add<Output = T>,
+{
+    let mut result = Vec::with_capacity(m * k);
+    for i in 0..m {
+        for j in 0..k {
+            let mut sum = T::default();
+            for n in 0..features {
+                let difference = a[i * features + n] - b[j * features + n];
+                sum = sum + difference * difference;
+            }
+            result.push(finish(sum));
+        }
+    }
+    result
+}
+
+fn cdist_op(ctx: &mut TranslationContext, node: &NodeDesc) -> Result<(), MlxError> {
+    let (a, a_shape, dtype) = {
+        let a = read_live(ctx, &node.inputs[0], "CDist")?;
+        (a.data.to_vec(), a.shape, a.dtype)
+    };
+    let b = read_live(ctx, &node.inputs[1], "CDist")?;
+    cdist_geometry(&a_shape, &b.shape, None)?;
+    if dtype != b.dtype
+        || !matches!(
+            dtype,
+            mlx::mlx_dtype__MLX_FLOAT32 | mlx::mlx_dtype__MLX_FLOAT64
+        )
+    {
+        return Err("CDist: live inputs must share float32 or float64 dtype".into());
+    }
+    let shape = [a_shape[0], b.shape[0]];
+    layout(&shape, dtype, "CDist")?;
+    let (m, k, features) = (
+        a_shape[0] as usize,
+        b.shape[0] as usize,
+        a_shape[1] as usize,
+    );
+    let metric = node
+        .strings
+        .get("metric")
+        .map(String::as_str)
+        .unwrap_or("sqeuclidean");
+    if !matches!(metric, "sqeuclidean" | "euclidean") {
+        return Err(format!("CDist: unsupported metric {metric}"));
+    }
+    let euclidean = metric == "euclidean";
+    let bytes: Vec<u8> = if dtype == mlx::mlx_dtype__MLX_FLOAT64 {
+        let decode = |data: &[u8]| {
+            data.as_chunks::<8>()
+                .0
+                .iter()
+                .map(|v| f64::from_ne_bytes(*v))
+                .collect::<Vec<_>>()
+        };
+        cdist_values(&decode(&a), &decode(b.data), m, k, features, |sum| {
+            if euclidean { sum.sqrt() } else { sum }
+        })
+        .into_iter()
+        .flat_map(f64::to_ne_bytes)
+        .collect()
+    } else {
+        let decode = |data: &[u8]| {
+            data.as_chunks::<4>()
+                .0
+                .iter()
+                .map(|v| f32::from_ne_bytes(*v))
+                .collect::<Vec<_>>()
+        };
+        cdist_values(&decode(&a), &decode(b.data), m, k, features, |sum| {
+            if euclidean { sum.sqrt() } else { sum }
+        })
+        .into_iter()
+        .flat_map(f32::to_ne_bytes)
+        .collect()
+    };
+    let shape = [dim_i32(shape[0])?, dim_i32(shape[1])?];
+    let output = ctx.from_host(bytes.as_ptr().cast(), &shape, dtype);
+    ctx.bind(&node.outputs[0], output);
+    Ok(())
 }
 
 fn matmul_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
@@ -235,6 +392,17 @@ fn fused_matmul_claim(node: &NodeView) -> ClaimResult {
 }
 
 pub fn register(registry: &mut OpRegistry) {
+    registry.register_eager(
+        OpRegistration {
+            domain: "com.microsoft",
+            op_type: "CDist",
+            min_opset: 1,
+            max_opset: 1,
+            handler: cdist_op,
+            claim: cdist_claim,
+        },
+        CDIST_EAGER_REASON,
+    );
     registry.register_shape_keyed(
         OpRegistration {
             domain: "com.microsoft",
@@ -266,7 +434,78 @@ pub fn register(registry: &mut OpRegistry) {
 
 #[cfg(test)]
 mod tests {
-    use super::fused_matmul_axes;
+    use super::{CDIST_EAGER_REASON, cdist_geometry, cdist_values, fused_matmul_axes};
+
+    #[test]
+    fn cdist_geometry_and_zero_features() {
+        assert!(cdist_geometry(&[2, 3], &[4, 3], Some(&[2, 4])).is_ok());
+        assert!(cdist_geometry(&[-1, -1], &[-1, -1], Some(&[-1, -1])).is_ok());
+        assert!(cdist_geometry(&[2, 3], &[4, 2], None).is_err());
+        assert!(cdist_geometry(&[3], &[4, 3], None).is_err());
+        for output in [vec![2], vec![7, 4], vec![2, 7]] {
+            assert!(cdist_geometry(&[2, 3], &[4, 3], Some(&output)).is_err());
+        }
+        assert_eq!(cdist_values::<f64>(&[], &[], 2, 3, 0, |x| x), vec![0.0; 6]);
+        assert!(cdist_values::<f32>(&[], &[], 0, 3, 0, |x| x).is_empty());
+    }
+
+    #[test]
+    fn cdist_direct_difference_preserves_double_and_overflow() {
+        let large = 2f64.powi(40);
+        assert_eq!(
+            cdist_values(&[large], &[large + 0.125], 1, 1, 1, |x| x),
+            [0.015625]
+        );
+        assert_eq!(
+            cdist_values(&[0.0f32, 0.0], &[3.0, 4.0], 1, 1, 2, f32::sqrt),
+            [5.0]
+        );
+        assert!(cdist_values(&[f32::MAX], &[0.0], 1, 1, 1, |x| x)[0].is_infinite());
+        assert!(cdist_values(&[f64::INFINITY], &[f64::INFINITY], 1, 1, 1, |x| x)[0].is_nan());
+    }
+
+    #[test]
+    fn cdist_eager_descriptors_block_nested_capture() {
+        use crate::engine::{NodeDesc, SubgraphDesc};
+        use crate::registry::CompileShapeSafety;
+        let node = NodeDesc::new(
+            "CDist".into(),
+            "com.microsoft".into(),
+            1,
+            CompileShapeSafety::EagerOnly {
+                reason: CDIST_EAGER_REASON,
+            },
+        );
+        assert!(!crate::compiled::decode_enabled(
+            false,
+            std::slice::from_ref(&node)
+        ));
+        assert!(!crate::compiled::general_enabled(
+            false,
+            std::slice::from_ref(&node)
+        ));
+        let mut attention = node.clone();
+        attention.op_type = "GroupQueryAttention".into();
+        attention.compile_shape_safety = CompileShapeSafety::Shapeless;
+        assert!(!crate::compiled::prefill_enabled(
+            false,
+            &[attention, node.clone()]
+        ));
+        let mut parent = node.clone();
+        parent.op_type = "If".into();
+        parent.compile_shape_safety = CompileShapeSafety::Shapeless;
+        parent.subgraphs.push(SubgraphDesc {
+            attr_name: "then_branch".into(),
+            input_names: vec![],
+            output_names: vec![],
+            nodes: vec![node],
+        });
+        assert!(!crate::compiled::decode_enabled(
+            false,
+            std::slice::from_ref(&parent)
+        ));
+        assert!(!crate::compiled::general_enabled(false, &[parent]));
+    }
 
     #[test]
     fn fused_transpose_order() {
