@@ -408,6 +408,7 @@ fn build_graph(
         nodes.push(node);
     }
     mark_shape_constants(&mut nodes, &inits.keys().cloned().collect());
+    crate::ops::qdq::recognize(&mut nodes);
     Ok(nodes)
 }
 
