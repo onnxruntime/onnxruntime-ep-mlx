@@ -1,14 +1,18 @@
 """MulInteger v1 source regressions; runtime results require separately authorized CI."""
 
+import base64
+import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
+import traceback
 
 import numpy as np
 import onnxruntime as ort
-from onnx import TensorProto as T, helper, numpy_helper
+from onnx import TensorProto as T, helper, load_model_from_string, numpy_helper
 import pytest
 
 
@@ -107,6 +111,121 @@ def _expected(arrays, form):
     a, b, az, bz = arrays
     return _oracle(a, b, az if "az" in FORMS[form] else None,
                    bz if "bz" in FORMS[form] else None)
+
+
+def test_constructor_serialization_diagnostic(record_property, tmp_path):
+    def value_info(value):
+        tensor = value.type.tensor_type
+        rank_known = tensor.HasField("shape")
+        return {
+            "name": value.name,
+            "has_tensor_type": value.type.HasField("tensor_type"),
+            "element_type": tensor.elem_type,
+            "element_type_name": T.DataType.Name(tensor.elem_type),
+            "rank_known": rank_known,
+            "rank": len(tensor.shape.dim) if rank_known else None,
+            "dimensions": [
+                {"kind": dim.WhichOneof("value"),
+                 "value": (dim.dim_value if dim.HasField("dim_value")
+                           else dim.dim_param if dim.HasField("dim_param") else None)}
+                for dim in tensor.shape.dim
+            ] if rank_known else None,
+        }
+
+    arrays = [np.asarray([[-128], [127]], np.int8),
+              np.asarray([[127, 0, 1]], np.int8),
+              np.asarray(-128, np.int8), np.asarray(127, np.int8)]
+    payloads, models, results = {}, [], []
+    for form in FORMS:
+        model, _ = _model(*arrays, form=form)
+        payload = model.SerializeToString()
+        decoded = load_model_from_string(payload)
+        metadata = {
+            "form": form,
+            "model_base64": base64.b64encode(payload).decode("ascii"),
+            "model_sha256": hashlib.sha256(payload).hexdigest(),
+            "model_bytes": len(payload),
+            "ir_version": decoded.ir_version,
+            "opset_imports": [
+                {"domain": v.domain, "version": v.version} for v in decoded.opset_import
+            ],
+            "nodes": [
+                {"name": n.name, "domain": n.domain, "op_type": n.op_type,
+                 "inputs": list(n.input), "input_count": len(n.input),
+                 "outputs": list(n.output), "output_count": len(n.output),
+                 "attributes": [{"name": a.name, "type": a.type} for a in n.attribute]}
+                for n in decoded.graph.node
+            ],
+            "graph_inputs": [value_info(v) for v in decoded.graph.input],
+            "graph_outputs": [value_info(v) for v in decoded.graph.output],
+            "intermediate_value_info": [value_info(v) for v in decoded.graph.value_info],
+            "initializers": [
+                {"name": v.name, "element_type": v.data_type,
+                 "element_type_name": T.DataType.Name(v.data_type),
+                 "dimensions": list(v.dims)}
+                for v in decoded.graph.initializer
+            ],
+        }
+        record_property(f"mulinteger_constructor_model_{form}", json.dumps(metadata))
+        models.append(metadata)
+        payloads[form] = payload
+
+    # Record all six actual payloads before attempting any constructor.
+    for form, payload in payloads.items():
+        options = ort.SessionOptions()
+        options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+        options.add_session_config_entry("session.disable_cpu_ep_fallback", "1")
+        options.enable_profiling = True
+        options.profile_file_prefix = str(tmp_path / f"constructor_{form}")
+        result = {
+            "form": form,
+            "stage": "constructor",
+            "settings": {
+                "graph_optimization_level": "ORT_DISABLE_ALL",
+                "session.disable_cpu_ep_fallback": "1",
+                "providers": ["MLXExecutionProvider"],
+                "enable_fallback": False,
+                "enable_profiling": True,
+            },
+        }
+        try:
+            session = ort.InferenceSession(
+                payload, options, providers=["MLXExecutionProvider"], enable_fallback=False,
+            )
+        except Exception as exc:
+            result.update({
+                "outcome": "CONSTRUCTOR_ERROR",
+                "exception_type": f"{type(exc).__module__}.{type(exc).__qualname__}",
+                "exception_message": str(exc),
+                "exception_repr": repr(exc),
+                "traceback": traceback.format_exc(),
+            })
+        else:
+            session.disable_fallback()
+            result.update({
+                "outcome": "CONSTRUCTED",
+                "providers": session.get_providers(),
+                "profile_path": session.end_profiling(),
+            })
+            del session
+        results.append(result)
+        record_property(f"mulinteger_constructor_result_{form}", json.dumps(result))
+
+    errors = [r for r in results if r["outcome"] == "CONSTRUCTOR_ERROR"]
+    control = next(r for r in results if r["form"] == "both")
+    summary = {
+        "purpose": "Constructor diagnostic only; no inference or omission support claim",
+        "all_present_control_constructed": control["outcome"] == "CONSTRUCTED",
+        "constructor_errors": len(errors),
+        "constructed": len(results) - len(errors),
+        "inference_executed": False,
+        "outcome": ("CONTROL_CONSTRUCTOR_FAILED" if control["outcome"] != "CONSTRUCTED"
+                    else "CONSTRUCTOR_ERRORS_OBSERVED" if errors else "ALL_FORMS_CONSTRUCTED"),
+    }
+    record_property("mulinteger_constructor_summary", json.dumps(summary))
+    if errors or not summary["all_present_control_constructed"]:
+        pytest.fail(json.dumps({"summary": summary, "models": models, "results": results},
+                               indent=2), pytrace=False)
 
 
 @pytest.mark.parametrize("dtype", [np.int8, np.uint8])
@@ -240,7 +359,9 @@ def test_static_nonscalar_zero_points_declined(shape, slot):
     model, _ = _model(z, z, z, z)
     value = next(v for v in model.graph.input if v.name == slot)
     value.CopyFrom(helper.make_tensor_value_info(slot, T.UINT8, shape))
-    with pytest.raises(FAIL, match="CPU EP.*fallback.*disabled"):
+    message = ("[ONNXRuntimeError] : 1 : FAIL : Node (mulinteger_target) Op (MulInteger) "
+               "[TypeInferenceError] Scale and Zero-point must be a scalar")
+    with pytest.raises(FAIL, match=r"\A" + re.escape(message) + r"\Z"):
         _session(model)
 
 
@@ -310,7 +431,10 @@ def test_recursive_bad_zero_point_metadata_declines_parent():
     model.graph.node.append(helper.make_node("If", ["condition"], ["y"],
                                              then_branch=body, else_branch=body))
     model.graph.input.append(helper.make_tensor_value_info("condition", T.BOOL, []))
-    with pytest.raises(FAIL, match="CPU EP.*fallback.*disabled"):
+    message = ("[ONNXRuntimeError] : 1 : FAIL : Node () Op (If) [TypeInferenceError] "
+               "Graph attribute inferencing failed: Node (mulinteger_target) Op (MulInteger) "
+               "[TypeInferenceError] Scale and Zero-point must be a scalar")
+    with pytest.raises(FAIL, match=r"\A" + re.escape(message) + r"\Z"):
         _session(model)
 
 
