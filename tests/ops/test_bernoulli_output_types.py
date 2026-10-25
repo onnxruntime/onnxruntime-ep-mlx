@@ -16,7 +16,7 @@ PROBABILITY_TYPES = [T.FLOAT, T.FLOAT16, T.BFLOAT16]
 
 
 def _model(probability_type, *, output_type=T.DOUBLE, opset=22, seed=41.0,
-           shape=None, explicit_dtype=True, initializer=False, nested=False):
+           shape=None, explicit_dtype=True, initializer=False, nested=False, produced=False):
     source_type = T.FLOAT if probability_type == T.BFLOAT16 else probability_type
     inputs = [] if initializer else [helper.make_tensor_value_info("p", source_type, shape)]
     nodes = []
@@ -35,6 +35,9 @@ def _model(probability_type, *, output_type=T.DOUBLE, opset=22, seed=41.0,
     elif probability_type == T.BFLOAT16:
         probability = "bf16_p"
         nodes.append(helper.make_node("Cast", ["p"], [probability], to=T.BFLOAT16))
+    if produced:
+        nodes.append(helper.make_node("Identity", [probability], ["produced_p"]))
+        probability = "produced_p"
     attrs = {"dtype": output_type} if explicit_dtype else {}
     if seed is not None:
         attrs["seed"] = seed
@@ -90,7 +93,8 @@ def _assert_profile(session):
 
 
 def _probabilities(probability_type, shape, values):
-    dtype = np.float16 if probability_type == T.FLOAT16 else np.float32
+    dtype = (np.float64 if probability_type == T.DOUBLE
+             else np.float16 if probability_type == T.FLOAT16 else np.float32)
     return np.resize(np.asarray(values, dtype=dtype), shape)
 
 
@@ -178,10 +182,121 @@ def test_bfloat_probability_before_22_is_rejected(opset, initializer):
         _session(_model(T.BFLOAT16, opset=opset, initializer=initializer, shape=[256]))
 
 
-def test_double_probabilities_stay_declined():
+@pytest.mark.parametrize("opset", [15, 22, 26])
+@pytest.mark.parametrize("output_type", [
+    None, T.BOOL, T.INT8, T.INT16, T.INT32, T.INT64,
+    T.UINT8, T.UINT16, T.UINT32, T.UINT64, T.FLOAT16, T.FLOAT, T.DOUBLE, T.BFLOAT16,
+])
+@pytest.mark.parametrize("shape", [(), (32,), (0, 3)])
+@pytest.mark.parametrize("source", ["boundary", "initializer", "produced"])
+def test_double_probability_outputs(opset, output_type, shape, source, tmp_path):
+    dtype = T.DOUBLE if output_type is None else output_type
+    session = _session(_model(
+        T.DOUBLE, output_type=dtype, explicit_dtype=output_type is not None,
+        opset=opset, shape=shape, initializer=source == "initializer",
+        produced=source == "produced",
+    ), profile=tmp_path / "double_probability")
+    probabilities = _probabilities(T.DOUBLE, shape, [0, 1, 0.25, 0.5, 0.75])
+    before = probabilities.tobytes()
+    feeds = {} if source == "initializer" else {"p": probabilities}
+    first, second = [session.run(None, feeds)[0] for _ in range(2)]
+    expected_type = T.FLOAT if dtype == T.BFLOAT16 else dtype
+    assert first.dtype == helper.tensor_dtype_to_np_dtype(expected_type)
+    assert first.shape == shape
+    assert np.isin(first, [0, 1]).all()
+    np.testing.assert_array_equal(first[probabilities == 0], 0)
+    np.testing.assert_array_equal(first[probabilities == 1], 1)
+    np.testing.assert_array_equal(first, second)
+    assert probabilities.tobytes() == before
+    _assert_profile(session)
+
+
+@pytest.mark.parametrize("output_type", [None, T.BOOL, T.FLOAT, T.INT64])
+@pytest.mark.parametrize("seed", [None, 0.0, 41.0, 41.75])
+@pytest.mark.parametrize("eager", [False, True])
+def test_double_probability_live_inputs(output_type, seed, eager, monkeypatch):
+    monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_COMPILE", "1" if eager else "0")
+    dtype = T.DOUBLE if output_type is None else output_type
+    session = _session(_model(T.DOUBLE, output_type=dtype, seed=seed,
+                              explicit_dtype=output_type is not None))
+    retained = []
+    for shape in [(), (256,), (2, 128), (0, 3), (256,)]:
+        for value in [0, 1, 0]:
+            probabilities = np.full(shape, value, np.float64)
+            before = probabilities.tobytes()
+            output = session.run(None, {"p": probabilities})[0]
+            assert output.shape == shape
+            assert output.dtype == helper.tensor_dtype_to_np_dtype(dtype)
+            np.testing.assert_array_equal(output, np.full(shape, value))
+            assert probabilities.tobytes() == before
+            retained.append((output, output.copy()))
+    probabilities = np.full(256, 0.5, np.float64)
+    outputs, snapshots = [], []
+    for _ in range(4):
+        output = session.run(None, {"p": probabilities})[0]
+        outputs.append(output)
+        snapshots.append(output.copy())
+    assert all(np.isin(output, [0, 1]).all() for output in outputs)
+    assert all(np.array_equal(left, right) == (seed is not None)
+               for left, right in zip(outputs, outputs[1:]))
+    np.testing.assert_array_equal(
+        session.run(None, {"p": np.ones(256, np.float64)})[0], 1,
+    )
+    restored = session.run(None, {"p": probabilities})[0]
+    if seed is not None:
+        np.testing.assert_array_equal(restored, outputs[0])
+        truncated = _session(_model(T.DOUBLE, output_type=dtype, seed=float(int(seed)),
+                                    explicit_dtype=output_type is not None))
+        np.testing.assert_array_equal(restored, truncated.run(None, {"p": probabilities})[0])
+    for output, snapshot in retained + list(zip(outputs, snapshots)):
+        np.testing.assert_array_equal(output, snapshot)
+    np.testing.assert_array_equal(probabilities, np.full(256, 0.5, np.float64))
+
+
+@pytest.mark.parametrize("output_type", [T.BOOL, T.FLOAT, T.DOUBLE])
+@pytest.mark.parametrize("seed", [None, 41.0])
+def test_double_probability_route_case(output_type, seed, monkeypatch):
+    for flag in ["NO_COMPILE", "NO_GENERAL_COMPILE", "NO_PREFILL_COMPILE"]:
+        monkeypatch.setenv(f"ONNXRUNTIME_EP_MLX_{flag}", "0")
+    session = _session(_model(T.DOUBLE, output_type=output_type, seed=seed))
+    for shape in [(), (256,), (0, 3), (2, 128)]:
+        probabilities = np.ones(shape, np.float64)
+        output = session.run(None, {"p": probabilities})[0]
+        assert output.shape == shape
+        assert output.dtype == helper.tensor_dtype_to_np_dtype(output_type)
+        np.testing.assert_array_equal(output, np.ones(shape))
+
+
+def test_double_probability_actual_routes(tmp_path):
+    trace = tmp_path / "bernoulli-double-probability.json"
+    subprocess.run(
+        [sys.executable, "-m", "pytest", Path(__file__).name,
+         "-k", "test_double_probability_route_case", "-q", "-p", "no:cacheprovider"],
+        cwd=Path(__file__).parent,
+        env={**os.environ, "ONNXRUNTIME_EP_MLX_TRACE": str(trace)},
+        check=True, timeout=120,
+    )
+    paths = [event["args"] for event in json.loads(trace.read_text())
+             if event.get("cat") == "ep.path"
+             and "Bernoulli" in event.get("args", {}).get("ops", "").split(",")]
+    assert len(paths) == 24
+    assert all(event["path"] == "eager" for event in paths), paths
+
+
+@pytest.mark.parametrize("output_type", [T.BOOL, T.FLOAT, T.DOUBLE])
+@pytest.mark.parametrize("seed", [None, 41.0])
+def test_double_probability_inside_if_stays_declined(output_type, seed):
     with pytest.raises(ort.capi.onnxruntime_pybind11_state.Fail,
                        match="CPU EP.*fallback.*disabled"):
-        _session(_model(T.DOUBLE))
+        _session(_model(T.DOUBLE, output_type=output_type, seed=seed,
+                        shape=[256], nested=True))
+
+
+@pytest.mark.parametrize("seed", [-1.0, float("nan"), float("inf"), -float("inf"), 2.0**64])
+def test_double_probability_invalid_seed_stays_declined(seed):
+    with pytest.raises(ort.capi.onnxruntime_pybind11_state.Fail,
+                       match="CPU EP.*fallback.*disabled"):
+        _session(_model(T.DOUBLE, output_type=T.FLOAT, seed=seed))
 
 
 def test_dtype_must_match_output():
