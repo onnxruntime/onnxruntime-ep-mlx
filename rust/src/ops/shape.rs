@@ -2879,19 +2879,20 @@ fn split_to_sequence_claim(node: &NodeView) -> ClaimResult {
     }
 }
 
-fn tile_claim(node: &NodeView) -> ClaimResult {
-    require!(
-        node.since_version() >= 6,
-        "Tile-1 has a distinct unsupported three-input signature"
-    );
-    require!(
-        node.num_inputs() == 2 && node.num_outputs() == 1,
-        "Tile expects 2 inputs and 1 output, got {}in/{}out",
-        node.num_inputs(),
-        node.num_outputs()
-    );
-    require!(node.num_attributes() == 0, "Tile has no attributes");
-    let (data, out) = match movable_io(node) {
+pub(crate) fn tile_payload_dtype(
+    node: &NodeView,
+) -> Result<ort::ONNXTensorElementDataType, std::borrow::Cow<'static, str>> {
+    validate_tile_payload(movable_io(node), node.since_version())
+}
+
+pub(crate) fn validate_tile_payload(
+    types: Option<(
+        ort::ONNXTensorElementDataType,
+        ort::ONNXTensorElementDataType,
+    )>,
+    since_version: i32,
+) -> Result<ort::ONNXTensorElementDataType, std::borrow::Cow<'static, str>> {
+    let (data, out) = match types {
         Some(v) => v,
         None => deny!("missing tensor type/shape info on the data input or output"),
     };
@@ -2908,9 +2909,25 @@ fn tile_claim(node: &NodeView) -> ClaimResult {
     );
     require!(
         data != ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16
-            || node.since_version() >= 13,
+            || since_version >= 13,
         "Tile: bfloat16 requires opset 13"
     );
+    Ok(data)
+}
+
+fn tile_claim(node: &NodeView) -> ClaimResult {
+    require!(
+        node.since_version() >= 6,
+        "Tile-1 has a distinct unsupported three-input signature"
+    );
+    require!(
+        node.num_inputs() == 2 && node.num_outputs() == 1,
+        "Tile expects 2 inputs and 1 output, got {}in/{}out",
+        node.num_inputs(),
+        node.num_outputs()
+    );
+    require!(node.num_attributes() == 0, "Tile has no attributes");
+    let data = tile_payload_dtype(node)?;
     let repeats_info = node.input_info(1).ok_or("Tile: missing repeats metadata")?;
     require!(
         repeats_info.dtype == ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64,

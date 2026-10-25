@@ -1000,6 +1000,10 @@ mod tests {
             "positions"
         };
         nodes.push(test_node("Tile", &[positions, "repeats"], "tiled"));
+        for node in &mut nodes {
+            node.outputs[0].otype =
+                ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64;
+        }
         nodes.push(test_node(
             "MultiHeadAttention",
             &["q", "k", "v"],
@@ -1020,8 +1024,24 @@ mod tests {
 
     #[test]
     fn only_unchanged_exact_native_position_proof_exempts_live_tile() {
-        for exact in [true, false] {
-            let mut plan = Plan::new(native_position_nodes(exact));
+        for (exact, source, shape_const) in [
+            (true, Src::CtxInput, false),
+            (true, Src::CtxInput, true),
+            (true, Src::Intermediate, false),
+            (true, Src::Intermediate, true),
+            (false, Src::CtxInput, false),
+            (false, Src::CtxInput, true),
+            (false, Src::Intermediate, false),
+            (false, Src::Intermediate, true),
+        ] {
+            let mut nodes = native_position_nodes(exact);
+            let tile = nodes
+                .iter_mut()
+                .find(|node| node.op_type == "Tile")
+                .unwrap();
+            tile.inputs[1].source = source;
+            tile.inputs[1].shape_const = shape_const;
+            let mut plan = Plan::new(nodes);
             assert_eq!(plan.native_attention_decode, exact);
             let previous_routes = (
                 crate::compiled::decode_enabled(false, &plan.nodes),
@@ -1034,6 +1054,10 @@ mod tests {
                 .iter_mut()
                 .find(|node| node.op_type == "Tile")
                 .unwrap();
+            assert_eq!(
+                tile.outputs[0].otype,
+                ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64
+            );
             tile.compile_shape_safety = crate::registry::CompileShapeSafety::EagerOnly {
                 reason: "live Tile before native context",
             };
