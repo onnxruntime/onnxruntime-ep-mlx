@@ -129,6 +129,7 @@ struct Operand {
     zero: mlx::mlx_array,
     shape: Vec<i32>,
     parameters: Parameters,
+    packed: i32,
 }
 
 fn integer8(dtype: mlx::mlx_dtype) -> bool {
@@ -140,10 +141,16 @@ fn operand(
     dq: &NodeDesc,
     weight: bool,
 ) -> Result<Option<Operand>, MlxError> {
-    let data = ctx.resolve(&dq.inputs[0])?;
+    super::quant::validate_packed_dq(ctx, dq)?;
+    let packed = ctx.resolve_packed4(&dq.inputs[0])?;
+    let (data, shape, packing) = if let Some(packed) = packed {
+        (packed.data, packed.shape, if packed.signed { 2 } else { 1 })
+    } else {
+        let data = ctx.resolve(&dq.inputs[0])?;
+        (data, ctx.shape_of(data), 0)
+    };
     let scale = ctx.resolve(&dq.inputs[1])?;
-    let shape = ctx.shape_of(data);
-    if !integer8(ctx.dtype_of(data))
+    if (packing == 0 && !integer8(ctx.dtype_of(data)))
         || ctx.dtype_of(scale) != F32
         || !(shape.len() == 2 || (weight && shape.len() == 3))
     {
@@ -154,11 +161,23 @@ fn operand(
         return Ok(None);
     };
     let zero = if dq.inputs.get(2).is_some_and(|r| r.source != Src::Absent) {
-        let zero = ctx.resolve(&dq.inputs[2])?;
-        if ctx.dtype_of(zero) != ctx.dtype_of(data) || ctx.shape_of(zero) != scale_shape {
-            return Ok(None);
+        if packing != 0 {
+            let Some(zero) = ctx.resolve_packed4(&dq.inputs[2])? else {
+                return Err("QDQ MatMul: packed zero point must match data type".into());
+            };
+            if zero.signed != (packing == 2) || zero.shape != scale_shape {
+                return Err(
+                    "QDQ MatMul: packed zero point must match data type and scale shape".into(),
+                );
+            }
+            zero.data
+        } else {
+            let zero = ctx.resolve(&dq.inputs[2])?;
+            if ctx.dtype_of(zero) != ctx.dtype_of(data) || ctx.shape_of(zero) != scale_shape {
+                return Ok(None);
+            }
+            zero
         }
-        zero
     } else {
         ctx.scalar_i32(0)
     };
@@ -168,6 +187,7 @@ fn operand(
         zero: ctx.contiguous(zero)?,
         shape,
         parameters,
+        packed: packing,
     }))
 }
 
@@ -216,8 +236,27 @@ const SOURCE: &str = r#"
         size_t xp = size_t(row / XD0) * XS0 + size_t(k / XD1) * XS1;
         size_t wp = size_t(expert / WD0) * WS0 + size_t(k / WD1) * WS1
                   + size_t(col / WD2) * WS2;
-        int a = X_QUANT ? int(x[size_t(row) * K + k]) - int(xzero[X_ZERO ? xp : 0]) : 0;
-        int b = int(w[(size_t(expert) * K + k) * N + col]) - int(wzero[W_ZERO ? wp : 0]);
+        size_t xi = size_t(row) * K + k;
+        size_t wi = (size_t(expert) * K + k) * N + col;
+        int aq = 0;
+        int az = 0;
+        if (X_QUANT) {
+            aq = X_PACKED ? ((int(x[xi / 2]) >> (4 * (xi % 2))) & 15) : int(x[xi]);
+            aq = X_PACKED == 2 ? (aq ^ 8) - 8 : aq;
+            if (X_ZERO) {
+                az = X_PACKED ? ((int(xzero[xp / 2]) >> (4 * (xp % 2))) & 15) : int(xzero[xp]);
+                az = X_PACKED == 2 ? (az ^ 8) - 8 : az;
+            }
+        }
+        int bq = W_PACKED ? ((int(w[wi / 2]) >> (4 * (wi % 2))) & 15) : int(w[wi]);
+        bq = W_PACKED == 2 ? (bq ^ 8) - 8 : bq;
+        int bz = 0;
+        if (W_ZERO) {
+            bz = W_PACKED ? ((int(wzero[wp / 2]) >> (4 * (wp % 2))) & 15) : int(wzero[wp]);
+            bz = W_PACKED == 2 ? (bz ^ 8) - 8 : bz;
+        }
+        int a = aq - az;
+        int b = bq - bz;
         if (INTEGER) {
             isum += a * b;
         } else {
@@ -275,6 +314,7 @@ pub(super) fn execute(ctx: &mut TranslationContext, node: &NodeDesc) -> Result<b
             zero: ctx.scalar_i32(0),
             shape,
             parameters: Parameters::scalar(),
+            packed: 0,
         }
     };
     let grouped = node.op_type == "GroupedMatMul";
@@ -380,6 +420,8 @@ pub(super) fn execute(ctx: &mut TranslationContext, node: &NodeDesc) -> Result<b
             ("S", selections),
             ("GROUPED", i32::from(grouped)),
             ("X_QUANT", i32::from(pattern.x.is_some())),
+            ("X_PACKED", x.packed),
+            ("W_PACKED", w.packed),
             ("INTEGER", i32::from(exact)),
             (
                 "X_ZERO",
@@ -454,7 +496,11 @@ pub(super) fn execute(ctx: &mut TranslationContext, node: &NodeDesc) -> Result<b
         y = ctx.binary(mlx::mlx_add, y, selected)?;
     }
     if total != 0 && k != 0 {
-        ctx.mark_fast(if exact {
+        ctx.mark_fast(if (x.packed != 0 || w.packed != 0) && exact {
+            "mlx_qdq_packed4_integer_matmul"
+        } else if x.packed != 0 || w.packed != 0 {
+            "mlx_qdq_packed4_matmul"
+        } else if exact {
             "mlx_qdq_integer_matmul"
         } else {
             "mlx_qdq_matmul"
@@ -514,6 +560,184 @@ mod tests {
             count: 1,
             owned: Some(owned),
         });
+    }
+
+    fn quantized_reference(
+        name: &str,
+        values: &[i32],
+        shape: &[i64],
+        dtype: ort::ONNXTensorElementDataType,
+    ) -> TensorRef {
+        let bytes = if crate::engine::packed4_signed(dtype).is_some() {
+            let mut bytes = vec![0u8; values.len().div_ceil(2)];
+            for (index, &value) in values.iter().enumerate() {
+                bytes[index / 2] |= ((value & 15) as u8) << ((index % 2) * 4);
+            }
+            if !values.len().is_multiple_of(2) {
+                *bytes.last_mut().unwrap() |= 0xa0;
+            }
+            bytes
+        } else {
+            values.iter().map(|&v| v as u8).collect()
+        };
+        let owned = Arc::new(bytes);
+        let mut input = reference(name);
+        input.source = Src::Initializer;
+        input.init = Some(InitData {
+            data: owned.as_ptr().cast(),
+            shape: shape.to_vec(),
+            dtype,
+            count: values.len(),
+            owned: Some(owned),
+        });
+        input
+    }
+
+    #[test]
+    fn packed4_transport_keeps_logical_metadata_and_checks_bounds() {
+        let stream = Stream::new_default_gpu();
+        let mut plan = Plan::new(vec![]);
+        let mut ctx = TranslationContext::new(
+            &mut plan,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            stream.as_raw(),
+        );
+        let values: Vec<i32> = (-8..7).collect();
+        for dtype in [
+            ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT4,
+            ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT4,
+        ] {
+            let input = quantized_reference("packed", &values, &[3, 5], dtype);
+            let packed = ctx.resolve_packed4(&input).unwrap().unwrap();
+            assert_eq!(packed.shape, [3, 5]);
+            assert_eq!(ctx.shape_of(packed.data), [8]);
+            assert_eq!(Some(packed.signed), crate::engine::packed4_signed(dtype));
+            assert_eq!(ctx.tensor_shape(&input).unwrap(), [3, 5]);
+            assert!(ctx.resolve(&input).is_err());
+            assert!(!crate::registry::is_movable(dtype));
+            let mut bad = input.clone();
+            bad.init.as_mut().unwrap().count = 14;
+            assert!(ctx.resolve_packed4(&bad).is_err());
+            bad.init.as_mut().unwrap().shape = vec![2, 7];
+            assert!(ctx.resolve_packed4(&bad).is_err());
+            bad.init.as_mut().unwrap().shape = vec![-1, 14];
+            assert!(ctx.resolve_packed4(&bad).is_err());
+        }
+    }
+
+    #[test]
+    fn qdq_packed_direct_gpu_products() {
+        use ort::*;
+        let types = [
+            ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT4,
+            ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT4,
+            ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8,
+            ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8,
+        ];
+        for grouped in [false, true] {
+            for &at in &types {
+                for &wt in &types {
+                    if crate::engine::packed4_signed(at).is_none()
+                        && crate::engine::packed4_signed(wt).is_none()
+                    {
+                        continue;
+                    }
+                    for k in [0, 1, 33, 256, 1025] {
+                        let stream = Stream::new_default_gpu();
+                        let mut plan = Plan::new(vec![]);
+                        let mut ctx = TranslationContext::new(
+                            &mut plan,
+                            std::ptr::null(),
+                            std::ptr::null_mut(),
+                            stream.as_raw(),
+                        );
+                        let (m, n, groups, selections) = (3, 5, if grouped { 3 } else { 1 }, 1);
+                        let signed = |dtype| dtype == types[0] || dtype == types[2];
+                        let av: Vec<i32> = (0..m * k)
+                            .map(|i| i % 16 - if signed(at) { 8 } else { 0 })
+                            .collect();
+                        let wv: Vec<i32> = (0..groups * k * n)
+                            .map(|i| (i * 3) % 16 - if signed(wt) { 8 } else { 0 })
+                            .collect();
+                        let az = if signed(at) { -3 } else { 5 };
+                        let wz = if signed(wt) { -2 } else { 7 };
+                        let mut a = dq("a");
+                        let mut w = dq("w");
+                        a.inputs[0] = quantized_reference("a", &av, &[m.into(), k.into()], at);
+                        w.inputs[0] = quantized_reference(
+                            "w",
+                            &wv,
+                            &if grouped {
+                                vec![groups.into(), k.into(), n.into()]
+                            } else {
+                                vec![k.into(), n.into()]
+                            },
+                            wt,
+                        );
+                        a.inputs[2] = quantized_reference("az", &[az], &[], at);
+                        w.inputs[2] = quantized_reference("wz", &[wz], &[], wt);
+                        scalar_scale(&mut a, 0.25);
+                        scalar_scale(&mut w, 0.125);
+                        let mut node = NodeDesc::new(
+                            if grouped { "GroupedMatMul" } else { "MatMul" }.into(),
+                            String::new(),
+                            if grouped { 29 } else { 13 },
+                            CompileShapeSafety::EagerOnly {
+                                reason: EAGER_REASON,
+                            },
+                        );
+                        node.inputs = vec![reference("af"), reference("wf")];
+                        node.outputs = vec![output("y")];
+                        node.qdq = Some(Box::new(QuantizedMatMul { x: Some(a), w }));
+                        let routes = [2i32, 0, 1];
+                        if grouped {
+                            let indices = ctx.keep(Array::from_data(
+                                routes.as_ptr().cast(),
+                                &[m, selections],
+                                mlx::mlx_dtype__MLX_INT32,
+                            ));
+                            ctx.bind(&output("indices"), indices);
+                            node.inputs.push(reference("indices"));
+                        }
+                        assert!(execute(&mut ctx, &node).unwrap());
+                        let y = ctx.resolve(&reference("y")).unwrap();
+                        let y = ctx.contiguous_eval(y).unwrap();
+                        assert_eq!(
+                            ctx.shape_of(y),
+                            if grouped {
+                                vec![m, selections, n]
+                            } else {
+                                vec![m, n]
+                            }
+                        );
+                        if k != 0 {
+                            let actual = unsafe {
+                                std::slice::from_raw_parts(
+                                    mlx::mlx_array_data_float32(y),
+                                    (m * n) as usize,
+                                )
+                            };
+                            for row in 0..m {
+                                let group = if grouped { routes[row as usize] } else { 0 };
+                                for col in 0..n {
+                                    let expected: i32 = (0..k)
+                                        .map(|kk| {
+                                            (av[(row * k + kk) as usize] - az)
+                                                * (wv[((group * k + kk) * n + col) as usize] - wz)
+                                        })
+                                        .sum();
+                                    assert_eq!(
+                                        actual[(row * n + col) as usize],
+                                        expected as f32 / 32.0
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -771,93 +995,125 @@ mod tests {
 
     #[test]
     fn qdq_grouped_blocked_gpu_product() {
-        let stream = Stream::new_default_gpu();
-        let mut plan = Plan::new(vec![]);
-        let mut ctx = TranslationContext::new(
-            &mut plan,
-            std::ptr::null(),
-            std::ptr::null_mut(),
-            stream.as_raw(),
-        );
-        let mut a = dq("a");
-        a.ints.insert("axis".into(), 0);
-        let mut w = dq("w");
-        w.ints
-            .extend([("axis".into(), -2), ("block_size".into(), 32)]);
-        let mut node = NodeDesc::new(
-            "GroupedMatMul".into(),
-            String::new(),
-            29,
-            CompileShapeSafety::EagerOnly {
-                reason: EAGER_REASON,
-            },
-        );
-        node.qdq = Some(Box::new(QuantizedMatMul { x: Some(a), w }));
-        node.inputs = ["af", "wf", "indices"].map(reference).to_vec();
-        node.outputs = vec![output("y")];
-        let (m, k, n, groups, selections, blocks) = (2, 65, 5, 3, 2, 3);
-        let av: Vec<i8> = (0..m * k).map(|i| (i % 17 - 8) as i8).collect();
-        let wv: Vec<i8> = (0..groups * k * n).map(|i| (i % 13 - 6) as i8).collect();
-        let az = [-2i8, 3];
-        let wz: Vec<i8> = (0..groups * blocks * n)
-            .map(|i| (i % 5 - 2) as i8)
-            .collect();
-        let ascale = [0.25f32, 0.125];
-        let wscale: Vec<f32> = (0..groups * blocks * n)
-            .map(|i| 2.0f32.powi(i % 4 - 5))
-            .collect();
-        for (name, shape, data) in [
-            ("a", vec![m, k], av.as_slice()),
-            ("w", vec![groups, k, n], wv.as_slice()),
-            ("az", vec![m], az.as_slice()),
-            ("wz", vec![groups, blocks, n], wz.as_slice()),
+        for packed_type in [
+            None,
+            Some(ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT4),
+            Some(ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT4),
         ] {
-            let array = ctx.keep(Array::from_data(
-                data.as_ptr().cast(),
-                &shape,
-                mlx::mlx_dtype__MLX_INT8,
-            ));
-            ctx.bind(&output(name), array);
-        }
-        for (name, shape, data) in [
-            ("as", vec![m], ascale.as_slice()),
-            ("ws", vec![groups, blocks, n], wscale.as_slice()),
-        ] {
-            let array = ctx.keep(Array::from_data(data.as_ptr().cast(), &shape, F32));
-            ctx.bind(&output(name), array);
-        }
-        let routes = [2i32, 0, 2, 1];
-        let array = ctx.keep(Array::from_data(
-            routes.as_ptr().cast(),
-            &[m, selections],
-            mlx::mlx_dtype__MLX_INT32,
-        ));
-        ctx.bind(&output("indices"), array);
-        assert!(execute(&mut ctx, &node).unwrap());
-        let y = ctx.resolve(&reference("y")).unwrap();
-        let y = ctx.contiguous_eval(y).unwrap();
-        let actual = unsafe {
-            std::slice::from_raw_parts(
-                mlx::mlx_array_data_float32(y),
-                (m * selections * n) as usize,
-            )
-        };
-        for row in 0..m as usize {
-            for selection in 0..selections as usize {
-                let g = routes[row * selections as usize + selection] as usize;
-                for col in 0..n as usize {
-                    let mut expected = 0.0f64;
-                    for kk in 0..k as usize {
-                        let p = (g * blocks as usize + kk / 32) * n as usize + col;
-                        let ax = f32::from(av[row * k as usize + kk]) - f32::from(az[row]);
-                        let bw = f32::from(wv[(g * k as usize + kk) * n as usize + col])
-                            - f32::from(wz[p]);
-                        expected += f64::from(ax * ascale[row]) * f64::from(bw * wscale[p]);
-                    }
-                    assert_eq!(
-                        actual[(row * selections as usize + selection) * n as usize + col],
-                        expected as f32
+            let stream = Stream::new_default_gpu();
+            let mut plan = Plan::new(vec![]);
+            let mut ctx = TranslationContext::new(
+                &mut plan,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                stream.as_raw(),
+            );
+            let mut a = dq("a");
+            a.ints.insert("axis".into(), 0);
+            let mut w = dq("w");
+            w.ints
+                .extend([("axis".into(), -2), ("block_size".into(), 32)]);
+            let mut node = NodeDesc::new(
+                "GroupedMatMul".into(),
+                String::new(),
+                29,
+                CompileShapeSafety::EagerOnly {
+                    reason: EAGER_REASON,
+                },
+            );
+            node.qdq = Some(Box::new(QuantizedMatMul { x: Some(a), w }));
+            node.inputs = ["af", "wf", "indices"].map(reference).to_vec();
+            node.outputs = vec![output("y")];
+            let (m, k, n, groups, selections, blocks) = (2, 65, 5, 3, 2, 3);
+            let unsigned = packed_type
+                .is_some_and(|dtype| crate::engine::packed4_signed(dtype) == Some(false));
+            let av: Vec<i8> = (0..m * k)
+                .map(|i| {
+                    (i % if packed_type.is_some() { 16 } else { 17 } - if unsigned { 0 } else { 8 })
+                        as i8
+                })
+                .collect();
+            let wv: Vec<i8> = (0..groups * k * n)
+                .map(|i| (i % 13 - if unsigned { 0 } else { 6 }) as i8)
+                .collect();
+            let az = [if unsigned { 2i8 } else { -2 }, 3];
+            let wz: Vec<i8> = (0..groups * blocks * n)
+                .map(|i| (i % 5 - if unsigned { 0 } else { 2 }) as i8)
+                .collect();
+            let ascale = [0.25f32, 0.125];
+            let wscale: Vec<f32> = (0..groups * blocks * n)
+                .map(|i| 2.0f32.powi(i % 4 - 5))
+                .collect();
+            for (name, shape, data) in [
+                ("a", vec![m, k], av.as_slice()),
+                ("w", vec![groups, k, n], wv.as_slice()),
+                ("az", vec![m], az.as_slice()),
+                ("wz", vec![groups, blocks, n], wz.as_slice()),
+            ] {
+                if let Some(dtype) = packed_type {
+                    let input = quantized_reference(
+                        name,
+                        &data.iter().copied().map(i32::from).collect::<Vec<_>>(),
+                        &shape.iter().copied().map(i64::from).collect::<Vec<_>>(),
+                        dtype,
                     );
+                    let pattern = node.qdq.as_mut().unwrap();
+                    match name {
+                        "a" => pattern.x.as_mut().unwrap().inputs[0] = input,
+                        "az" => pattern.x.as_mut().unwrap().inputs[2] = input,
+                        "w" => pattern.w.inputs[0] = input,
+                        "wz" => pattern.w.inputs[2] = input,
+                        _ => unreachable!(),
+                    }
+                    continue;
+                }
+                let array = ctx.keep(Array::from_data(
+                    data.as_ptr().cast(),
+                    &shape,
+                    mlx::mlx_dtype__MLX_INT8,
+                ));
+                ctx.bind(&output(name), array);
+            }
+            for (name, shape, data) in [
+                ("as", vec![m], ascale.as_slice()),
+                ("ws", vec![groups, blocks, n], wscale.as_slice()),
+            ] {
+                let array = ctx.keep(Array::from_data(data.as_ptr().cast(), &shape, F32));
+                ctx.bind(&output(name), array);
+            }
+            let routes = [2i32, 0, 2, 1];
+            let array = ctx.keep(Array::from_data(
+                routes.as_ptr().cast(),
+                &[m, selections],
+                mlx::mlx_dtype__MLX_INT32,
+            ));
+            ctx.bind(&output("indices"), array);
+            assert!(execute(&mut ctx, &node).unwrap());
+            let y = ctx.resolve(&reference("y")).unwrap();
+            let y = ctx.contiguous_eval(y).unwrap();
+            let actual = unsafe {
+                std::slice::from_raw_parts(
+                    mlx::mlx_array_data_float32(y),
+                    (m * selections * n) as usize,
+                )
+            };
+            for row in 0..m as usize {
+                for selection in 0..selections as usize {
+                    let g = routes[row * selections as usize + selection] as usize;
+                    for col in 0..n as usize {
+                        let mut expected = 0.0f64;
+                        for kk in 0..k as usize {
+                            let p = (g * blocks as usize + kk / 32) * n as usize + col;
+                            let ax = f32::from(av[row * k as usize + kk]) - f32::from(az[row]);
+                            let bw = f32::from(wv[(g * k as usize + kk) * n as usize + col])
+                                - f32::from(wz[p]);
+                            expected += f64::from(ax * ascale[row]) * f64::from(bw * wscale[p]);
+                        }
+                        assert_eq!(
+                            actual[(row * selections as usize + selection) * n as usize + col],
+                            expected as f32
+                        );
+                    }
                 }
             }
         }

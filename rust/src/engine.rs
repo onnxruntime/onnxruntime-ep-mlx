@@ -36,6 +36,21 @@ pub struct InitData {
     pub owned: Option<std::sync::Arc<Vec<u8>>>,
 }
 
+pub(crate) fn packed4_signed(dtype: ort::ONNXTensorElementDataType) -> Option<bool> {
+    match dtype {
+        ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT4 => Some(true),
+        ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT4 => Some(false),
+        _ => None,
+    }
+}
+
+/// Packed storage is never an ordinary MLX tensor of the logical ONNX shape.
+pub(crate) struct Packed4 {
+    pub data: mlxsys::mlx_array,
+    pub shape: Vec<i32>,
+    pub signed: bool,
+}
+
 /// A single node input reference.
 #[derive(Clone)]
 pub struct TensorRef {
@@ -1061,6 +1076,100 @@ impl<'a> TranslationContext<'a> {
             }
             Src::Absent => Err("MLX: absent input".to_string()),
         }
+    }
+
+    pub(crate) fn packed4_host(&self, r: &TensorRef) -> Result<Option<HostBytes>, MlxError> {
+        if !matches!(r.source, Src::Initializer | Src::CtxInput) {
+            return Ok(None);
+        }
+        if self.in_general_trace || self.in_compiled_trace {
+            if r.init
+                .as_ref()
+                .is_some_and(|init| packed4_signed(init.dtype).is_some())
+            {
+                return Err("MLX: packed tensor transport cannot be captured".into());
+            }
+            return Ok(None);
+        }
+        let host = self.raw_host(r)?;
+        Ok(packed4_signed(host.dtype).map(|_| host))
+    }
+
+    pub(crate) fn resolve_packed4(&mut self, r: &TensorRef) -> Result<Option<Packed4>, MlxError> {
+        let Some(host) = self.packed4_host(r)? else {
+            return Ok(None);
+        };
+        let Some(signed) = packed4_signed(host.dtype) else {
+            return Err("MLX: packed tensor metadata lost its logical type".into());
+        };
+        let shape = host
+            .shape
+            .iter()
+            .map(|&d| dim_i32(d))
+            .collect::<Result<Vec<_>, _>>()?;
+        let count = if shape.contains(&0) {
+            0
+        } else {
+            shape.iter().try_fold(1usize, |n, &d| {
+                n.checked_mul(d as usize)
+                    .ok_or("MLX: packed tensor element count overflows")
+            })?
+        };
+        if count != host.count || count > (i32::MAX - 1) as usize {
+            return Err(
+                "MLX: packed tensor logical count is inconsistent or exceeds int32 limits".into(),
+            );
+        }
+        let bytes = onnx_runtime_ir::DataType::from_onnx(host.dtype as i32)
+            .and_then(|dtype| dtype.checked_storage_bytes(count))
+            .ok_or("MLX: packed tensor byte count overflows")?;
+        if r.source == Src::CtxInput {
+            let value = read_ctx_input_value(self.ort_api, self.kctx, r.ctx_index)?;
+            let api = unsafe { &*self.ort_api };
+            let mut actual_bytes = 0;
+            let size_in_bytes = api
+                .GetTensorSizeInBytes
+                .ok_or("MLX: packed tensors require ORT GetTensorSizeInBytes")?;
+            ort_status(
+                api,
+                unsafe { size_in_bytes(value, &mut actual_bytes) },
+                "GetTensorSizeInBytes",
+            )?;
+            if actual_bytes != bytes {
+                return Err("MLX: packed ORT storage size does not match logical shape".into());
+            }
+        }
+        if let Some(owned) = r.init.as_ref().and_then(|init| init.owned.as_ref())
+            && owned.len() != bytes
+        {
+            return Err("MLX: packed initializer byte count does not match logical shape".into());
+        }
+        if bytes != 0 && host.data.is_null() {
+            return Err("MLX: nonempty packed tensor has no payload".into());
+        }
+        let storage_shape = [bytes as i32];
+        let cache_key = format!("{}\0packed4", r.cache_key());
+        let data = if let Some(array) = self.plan.cache.get(&cache_key) {
+            array.as_raw()
+        } else if bytes == 0 {
+            self.zeros(&storage_shape, mlxsys::mlx_dtype__MLX_UINT8)?
+        } else if r.source == Src::Initializer || r.constant {
+            let array = Array::from_data(host.data, &storage_shape, mlxsys::mlx_dtype__MLX_UINT8);
+            let raw = array.as_raw();
+            self.plan.cache.insert(cache_key, array);
+            raw
+        } else {
+            self.keep(Array::from_data_managed(
+                host.data,
+                &storage_shape,
+                mlxsys::mlx_dtype__MLX_UINT8,
+            ))
+        };
+        Ok(Some(Packed4 {
+            data,
+            shape,
+            signed,
+        }))
     }
 
     /// Read a constant/parameter input's HOST bytes at translate time (shape/axes/indices operands).

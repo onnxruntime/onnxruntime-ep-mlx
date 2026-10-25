@@ -24,7 +24,7 @@
 
 use std::os::raw::c_void;
 
-use crate::engine::{MlxError, NodeDesc, Src, TranslationContext};
+use crate::engine::{MlxError, NodeDesc, Src, TranslationContext, packed4_signed};
 use crate::mlx::{Array, VectorArray};
 use crate::registry::{
     ClaimResult, CompileShapeSafety, K_ANY_OPSET, NodeView, OpRegistration, OpRegistry,
@@ -1380,7 +1380,8 @@ fn quantize_linear_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), 
 // ---- DequantizeLinear ---------------------------------------------------------------------------
 
 fn dequantize_linear_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
-    let x0 = ctx.resolve(&n.inputs[0])?;
+    validate_packed_dq(ctx, n)?;
+    let x0 = dequant_input(ctx, &n.inputs[0])?;
     let mut x = ctx.astype(x0, mlx::mlx_dtype__MLX_FLOAT32)?;
     let s0 = ctx.resolve(&n.inputs[1])?;
     let data_shape = ctx.shape_of(x);
@@ -1391,7 +1392,7 @@ fn dequantize_linear_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<()
     let scale = ctx.astype(s0, output_dtype)?;
 
     if present(n, 2) {
-        let z0 = ctx.resolve(&n.inputs[2])?;
+        let z0 = dequant_input(ctx, &n.inputs[2])?;
         if ctx.shape_of(z0) != ctx.shape_of(s0) {
             return Err("Q/DQ: scale and zero_point shapes must match".to_string());
         }
@@ -1416,6 +1417,64 @@ fn dequantize_linear_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<()
     let out = mul(ctx, x, scale)?;
     ctx.bind(&n.outputs[0], out);
     Ok(())
+}
+
+pub(super) fn validate_packed_dq(
+    ctx: &mut TranslationContext,
+    node: &NodeDesc,
+) -> Result<(), MlxError> {
+    let Some(data) = ctx.packed4_host(&node.inputs[0])? else {
+        return Ok(());
+    };
+    let scale = ctx.tensor_shape(&node.inputs[1])?;
+    let block = node.ints.get("block_size").copied().unwrap_or(0);
+    let axis = claim_quant_axis(
+        data.shape.len(),
+        node.ints.get("axis").copied().unwrap_or(1),
+        &scale,
+    )
+    .ok_or("DequantizeLinear: packed input axis is outside its logical rank")?;
+    if node.since_version < 21 || !quant_param_shape_ok(&data.shape, &scale, axis, block) {
+        return Err("DequantizeLinear: invalid packed scale/axis/block geometry".into());
+    }
+    if present(node, 2) {
+        let zero = ctx.raw_host(&node.inputs[2])?;
+        if zero.dtype != data.dtype || zero.shape != scale {
+            return Err(
+                "DequantizeLinear: packed zero point must match input type and scale shape".into(),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn dequant_input(
+    ctx: &mut TranslationContext,
+    input: &crate::engine::TensorRef,
+) -> Result<mlx::mlx_array, MlxError> {
+    let Some(packed) = ctx.resolve_packed4(input)? else {
+        return ctx.resolve(input);
+    };
+    let count = if packed.shape.contains(&0) {
+        0
+    } else {
+        packed.shape.iter().map(|&d| i64::from(d)).product::<i64>()
+    };
+    if count == 0 {
+        return ctx.zeros(&packed.shape, mlx::mlx_dtype__MLX_INT32);
+    }
+    let bytes = ctx.size_of(packed.data) as i32;
+    let storage = ctx.reshape(packed.data, &[1, bytes])?;
+    let values = unpack_nibbles(ctx, storage)?;
+    let values = ctx.reshape(values, &[bytes * 2])?;
+    let values = ctx.slice(values, &[0], &[count as i32])?;
+    let mut values = ctx.astype(values, mlx::mlx_dtype__MLX_INT32)?;
+    if packed.signed {
+        let eight = ctx.scalar_i32(8);
+        values = ctx.binary(mlx::mlx_bitwise_xor, values, eight)?;
+        values = sub(ctx, values, eight)?;
+    }
+    ctx.reshape(values, &packed.shape)
 }
 
 // ---- DynamicQuantizeLinear ----------------------------------------------------------------------
@@ -1789,7 +1848,9 @@ fn is_quant_output(t: ort::ONNXTensorElementDataType) -> bool {
         || t == ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT16
 }
 fn is_dequant_input(t: ort::ONNXTensorElementDataType) -> bool {
-    is_quant_output(t) || t == ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32
+    is_quant_output(t)
+        || packed4_signed(t).is_some()
+        || t == ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32
 }
 
 fn block_shape_ok(data: &[i64], param: &[i64], axis: usize, block_size: i64) -> bool {
@@ -1858,7 +1919,16 @@ fn quantize_linear_compile_shape_safety(node: &NodeView) -> crate::registry::Com
 }
 
 fn dequantize_linear_compile_shape_safety(node: &NodeView) -> crate::registry::CompileShapeSafety {
-    quantize_linear_compile_shape_safety(node)
+    if node
+        .input_info(0)
+        .is_some_and(|info| packed4_signed(info.dtype).is_some())
+    {
+        CompileShapeSafety::EagerOnly {
+            reason: "packed Q/DQ keeps logical ONNX metadata separate from byte storage",
+        }
+    } else {
+        quantize_linear_compile_shape_safety(node)
+    }
 }
 
 /// A zero-point / scale parameter is claimable when absent, or present with dtype `want` and shape
@@ -2250,11 +2320,31 @@ fn dequantize_linear_claim(node: &NodeView) -> ClaimResult {
     };
     if !is_dequant_input(x.dtype) || !is_float(s.dtype) || !is_float(o.dtype) {
         deny!(
-            "input dtype {} must be int8, uint8, int16, uint16, or int32; scale/output must be float32, float16, or bfloat16 (got {} -> {})",
+            "input dtype {} must be int4, uint4, int8, uint8, int16, uint16, or int32; scale/output must be float32, float16, or bfloat16 (got {} -> {})",
             crate::registry::ort_dtype_name(x.dtype),
             crate::registry::ort_dtype_name(s.dtype),
             crate::registry::ort_dtype_name(o.dtype)
         );
+    }
+    if packed4_signed(x.dtype).is_some() {
+        require!(
+            node.since_version() >= 21,
+            "packed DQ requires opset 21 or later"
+        );
+        require!(
+            x.shape.iter().all(|&d| d <= i32::MAX as i64),
+            "packed DQ dimensions must fit int32"
+        );
+        if x.shape.iter().all(|&d| d >= 0) {
+            require!(
+                x.shape.contains(&0)
+                    || x.shape
+                        .iter()
+                        .try_fold(1i64, |n, &d| n.checked_mul(d))
+                        .is_some_and(|count| count <= i64::from(i32::MAX - 1)),
+                "packed DQ logical element count must fit int32 unpack indexing"
+            );
+        }
     }
     let axis = match claim_quant_axis(x.shape.len(), node.int_attr("axis", 1), &s.shape) {
         Some(axis) => axis,
@@ -3289,6 +3379,54 @@ mod compile_shape_safety_tests {
     };
     use crate::registry::{CompileShapeSafety, NodeView};
     use crate::sys::ort;
+
+    #[test]
+    fn packed_dq_never_enters_capture_even_inside_a_parent() {
+        use crate::engine::{NodeDesc, SubgraphDesc};
+        let node = NodeDesc::new(
+            "DequantizeLinear".into(),
+            String::new(),
+            21,
+            CompileShapeSafety::EagerOnly {
+                reason: "packed Q/DQ keeps logical ONNX metadata separate from byte storage",
+            },
+        );
+        assert!(!crate::compiled::decode_enabled(
+            false,
+            std::slice::from_ref(&node)
+        ));
+        assert!(!crate::compiled::general_enabled(
+            false,
+            std::slice::from_ref(&node)
+        ));
+        let attention = NodeDesc::new(
+            "GroupQueryAttention".into(),
+            "com.microsoft".into(),
+            1,
+            CompileShapeSafety::Shapeless,
+        );
+        assert!(!crate::compiled::prefill_enabled(
+            false,
+            &[attention, node.clone()]
+        ));
+        let mut parent = NodeDesc::new(
+            "If".into(),
+            String::new(),
+            13,
+            CompileShapeSafety::Shapeless,
+        );
+        parent.subgraphs.push(SubgraphDesc {
+            attr_name: "then_branch".into(),
+            input_names: vec![],
+            output_names: vec![],
+            nodes: vec![node],
+        });
+        assert!(!crate::compiled::decode_enabled(
+            false,
+            std::slice::from_ref(&parent)
+        ));
+        assert!(!crate::compiled::general_enabled(false, &[parent]));
+    }
 
     #[test]
     fn block_quantized_matmul_is_shapeless_only_without_trim_slice() {

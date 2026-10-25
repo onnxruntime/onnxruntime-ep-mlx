@@ -817,6 +817,9 @@ pub fn try_compiled(
                 continue;
             }
             let (data, shape, dtype) = read_ctx_input_raw(api, kctx, di.ctx_index)?;
+            if crate::engine::packed4_signed(dtype).is_some() {
+                return Ok(false);
+            }
             // Empty boundaries can become read-only K/V through intermediate elementwise ops.
             // Never replay the decoder trace's total-S append or delta writeback for that call.
             if has_gqa && shape.contains(&0) {
