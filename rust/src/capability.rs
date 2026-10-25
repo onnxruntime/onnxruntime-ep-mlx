@@ -166,14 +166,23 @@ pub(crate) unsafe fn get_capability(
                 let metadata = &snapshot.nodes[&node];
                 let mod_boundary = metadata.domain.is_empty() && metadata.op_type == "Mod";
                 let nonzero_boundary = metadata.domain.is_empty() && metadata.op_type == "NonZero";
+                let live_tile_boundary = crate::registry::requires_live_tile_eager_boundary(&view);
+                let native_live_tile = live_tile_boundary
+                    && native_q8_attention_graph
+                    && matches!(view.domain().as_str(), "" | "ai.onnx")
+                    && view.op_type() == "Tile"
+                    && view.subgraphs().is_empty();
                 if packed_qdq_nodes.contains(&node)
                     || crate::registry::requires_random_eager_boundary(&view)
                     || crate::registry::requires_unique_eager_boundary(&view)
                     || crate::registry::requires_elementary_contrib_eager_boundary(&view)
                     || crate::registry::requires_cdist_eager_boundary(&view)
+                    || (live_tile_boundary && !native_live_tile)
                     || crate::registry::requires_float64_metadata_eager_boundary(&view)
                 {
                     CompilePartitionClass::Eager
+                } else if native_live_tile {
+                    CompilePartitionClass::Shapeless
                 } else if decoder_graph || mod_boundary || nonzero_boundary {
                     crate::registry::compile_shape_safety(&view).partition_class()
                 } else {

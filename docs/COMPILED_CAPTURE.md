@@ -159,8 +159,12 @@ after that limit use eager translation; previously cached values remain reusable
 parameters also use eager translation. Runtime-valued **intermediates** still require proven
 shape-constant provenance; the compiler never evaluates a data-dependent tracer.
 
-Claim rules are unchanged: runtime `Range`/`Tile` remain on CPU, and dynamic Slice axes/steps are
-not newly claimed. The shapeless decode and specialized attention configurations are unchanged.
+Runtime `Range` remains on CPU, and dynamic Slice axes/steps are not newly claimed.
+Modern live-repeat `Tile` is claimed eagerly, including boundary and produced INT64 repeats.
+It and recursively containing parents are capture barriers, not new host-value specializations.
+The existing exact native-attention position proof alone restores the sole owned top-level
+Tile's previous shapeless policy before route selection; broad Q8 candidates and nested Tiles
+receive no such permission. The native shortcut and specialized attention proofs are unchanged.
 
 Signal controls must be rank-zero host-readable int32/int64 tensors (DFT axis is int64).
 Lengths and steps are checked in the positive int32 range before narrowing. FFT signal shapes and

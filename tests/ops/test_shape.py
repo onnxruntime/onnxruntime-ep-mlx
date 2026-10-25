@@ -2,9 +2,9 @@
 
 Each op is exercised through the MLX EP (with ORT CPU fallback available) and compared against
 ORT's CPU EP, tolerance-gated. Data-movement ops are dtype-agnostic, so they are parametrized over
-float/half/int/bool to cover the dtype-generic translate path. Shape parameters (shape, axes,
-starts/ends/steps, pads, repeats, split) are supplied as constant initializers — the only forms the
-EP claims — mirroring how a constant-folded real model presents them.
+float/half/int/bool to cover the dtype-generic translate path. Shape parameters are generally
+supplied as constant initializers, mirroring a constant-folded model. Dedicated live-parameter
+cases also check eager runtime freshness.
 """
 
 from __future__ import annotations
@@ -475,7 +475,7 @@ def test_split_to_sequence_v24_declines_container_output(
 # --- Tile -------------------------------------------------------------------------------------
 
 
-def test_tile_runtime_repeats_stay_on_cpu():
+def test_tile_runtime_repeats_are_claimed_and_fresh():
     model = m.make_model(
         "Tile",
         [m.tensor("x", DT.FLOAT, [2, 2]), m.tensor("repeats", DT.INT64, [2])],
@@ -485,8 +485,12 @@ def test_tile_runtime_repeats_stay_on_cpu():
         "x": np.arange(4, dtype=np.float32).reshape(2, 2),
         "repeats": np.array([1, 2], dtype=np.int64),
     }
-    m.assert_op_declined(model, feeds, "Tile")
-    session = m._session(model, m.EP_PROVIDERS)
+    options = ort.SessionOptions()
+    options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+    options.add_session_config_entry("session.disable_cpu_ep_fallback", "1")
+    session = ort.InferenceSession(
+        model, options, providers=["MLXExecutionProvider"], enable_fallback=False)
+    session.disable_fallback()
     for repeats in [[1, 2], [2, 1], [0, 3], [1, 2]]:
         feeds["repeats"] = np.array(repeats, dtype=np.int64)
         np.testing.assert_array_equal(session.run(None, feeds)[0], np.tile(feeds["x"], repeats))

@@ -258,12 +258,32 @@ fn registry() -> &'static OpRegistry {
 
 /// Compile-shape capability declared by the registered lowering for one concrete node.
 pub fn compile_shape_safety(node: &NodeView) -> CompileShapeSafety {
+    if requires_live_tile_eager_boundary(node) {
+        return CompileShapeSafety::EagerOnly {
+            reason: "Tile live repeats, including nested bodies, must be reread eagerly",
+        };
+    }
     if requires_float64_metadata_eager_boundary(node) {
         return CompileShapeSafety::EagerOnly {
             reason: "float64 metadata reads must not import payloads into a compiled GPU closure",
         };
     }
     registry().compile_shape_safety(node)
+}
+
+/// Modern live Tile and every containing control-flow parent require eager translation.
+pub fn requires_live_tile_eager_boundary(node: &NodeView) -> bool {
+    (matches!(node.domain().as_str(), "" | "ai.onnx")
+        && node.op_type() == "Tile"
+        && node.since_version() >= 6
+        && node.num_inputs() == 2
+        && node.num_outputs() == 1
+        && node.num_attributes() == 0
+        && !node.is_const_int64(1))
+        || node
+            .subgraphs()
+            .iter()
+            .any(|(_, body)| body.nodes().iter().any(requires_live_tile_eager_boundary))
 }
 
 /// Data-dependent host scans, including those inside an otherwise capture-safe parent.
