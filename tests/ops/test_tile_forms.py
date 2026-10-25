@@ -419,9 +419,9 @@ def test_tile_live_unknown_metadata_scalar_replay(live, eager, monkeypatch, tmp_
 
 @pytest.mark.parametrize("live", ["boundary", "produced"])
 @pytest.mark.parametrize("repeats,error,message", [
-    (np.array(2, np.int64), FAIL, "ShapeInferenceError"),
-    (np.ones((1, 2), np.int64), FAIL, "ShapeInferenceError"),
-    (np.ones(1, np.int64), FAIL, "ShapeInferenceError"),
+    (np.array(2, np.int64), FAIL, "CPU EP.*fallback.*disabled"),
+    (np.ones((1, 2), np.int64), FAIL, "CPU EP.*fallback.*disabled"),
+    (np.ones(1, np.int64), FAIL, "CPU EP.*fallback.*disabled"),
     (np.ones(2, np.int32), INVALID_GRAPH, "tensor\\(int32\\)"),
 ])
 def test_tile_live_invalid_metadata_rejected(live, repeats, error, message):
