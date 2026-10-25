@@ -80,13 +80,14 @@ def _values(shape, dtype, offset=0):
     return ((np.arange(count) + offset) % width + low).astype(dt).reshape(shape)
 
 
-def _matrix_model(xdtype, wdtype, layout, initializers, missing_zero=False, k=None):
+def _matrix_model(xdtype, wdtype, layout, initializers, missing_zero=False, k=None,
+                  decoder=False, vector=False):
     if k is None:
         k = 256 if layout == "integer" else 65 if layout == "blocked" else 1025
-    n = 5
+    n = 8 if decoder else 5
     wshape = (k, n)
     scale_shape = () if layout == "integer" else ((k + 31) // 32, n) if layout == "blocked" else (n,)
-    values = {"a": _values((3, k), xdtype), "w": _values(wshape, wdtype)}
+    values = {"a": _values((k,) if vector else (3, k), xdtype), "w": _values(wshape, wdtype)}
     types = {"a": xdtype, "w": wdtype, "ws": TensorProto.FLOAT, "wz": wdtype}
     ws = np.full(scale_shape, 0.125, np.float32) if layout == "integer" else (
         np.linspace(0.015, 0.04, max(1, int(np.prod(scale_shape))), dtype=np.float32)
@@ -108,37 +109,62 @@ def _matrix_model(xdtype, wdtype, layout, initializers, missing_zero=False, k=No
         helper.make_node("MatMul", ["a" if xdtype == TensorProto.FLOAT else "af", "wf"], ["y"]),
         helper.make_node("Add", ["wf", "wf"], ["shared"]),
     ])
+    extra_initializers = []
+    if decoder:
+        for name in ("pk", "pv"):
+            values[name] = _values((1, 1, 2, n), TensorProto.FLOAT)
+            types[name] = TensorProto.FLOAT
+        extra_initializers = [
+            numpy_helper.from_array(np.array([0, 1] if vector else [0], np.int64), "query_axes"),
+            numpy_helper.from_array(np.array(1 / 1024, np.float32), "query_scale"),
+        ]
+        nodes.extend([
+            helper.make_node("Mul", ["y", "query_scale"], ["small_y"]),
+            helper.make_node("Unsqueeze", ["small_y", "query_axes"], ["query"]),
+            helper.make_node("Attention", ["query", "query", "query", "", "pk", "pv"],
+                             ["attention", "present_k", "present_v"],
+                             q_num_heads=1, kv_num_heads=1),
+        ])
     # Binary initializer scales enable the existing exact integer subset, not a new policy.
     constants = {name for name in values
                  if (initializers and name != "a")
                  or (layout == "integer" and name in ("as", "ws"))}
     info = lambda name, dtype, shape: helper.make_tensor_value_info(name, dtype, shape)
-    outputs = [info("y", TensorProto.FLOAT, ["m", n]),
+    outputs = [info("y", TensorProto.FLOAT, [n] if vector else ["m", n]),
                info("wf", TensorProto.FLOAT, wshape),
                info("shared", TensorProto.FLOAT, wshape)]
     if xdtype != TensorProto.FLOAT:
         outputs.append(info("af", TensorProto.FLOAT, ["m", k]))
+    if decoder:
+        outputs.extend([
+            info("attention", TensorProto.FLOAT, [1, 1 if vector else "m", n]),
+            info("present_k", TensorProto.FLOAT, [1, 1, "total", n]),
+            info("present_v", TensorProto.FLOAT, [1, 1, "total", n]),
+        ])
     model = helper.make_model(
         helper.make_graph(
             nodes, "packed_qdq",
-            [info(name, types[name], ["m", k] if name == "a" else list(value.shape))
+            [info(name, types[name], (list(value.shape) if vector else ["m", k])
+                  if name == "a" else list(value.shape))
              for name, value in values.items() if name not in constants],
             outputs,
-            [_initializer(name, values[name], types[name]) for name in sorted(constants)],
+            [_initializer(name, values[name], types[name]) for name in sorted(constants)]
+            + extra_initializers,
         ),
         opset_imports=[helper.make_opsetid("", 24)], ir_version=11,
     )
     return model.SerializeToString(), values, types, constants
 
 
-def _matrix_replay(tmp_path, xdtype, wdtype, layout, initializers, missing_zero=False, k=None):
+def _matrix_replay(tmp_path, xdtype, wdtype, layout, initializers, missing_zero=False, k=None,
+                   decoder=False, vector=False):
     model, values, types, constants = _matrix_model(
-        xdtype, wdtype, layout, initializers, missing_zero, k)
+        xdtype, wdtype, layout, initializers, missing_zero, k, decoder, vector)
     session = _session(model, tmp_path)
     k = values["w"].shape[0]
     # Repeat M=3 before changing shape: a shape-keyed stale-data cache cannot pass.
-    for iteration, m in enumerate([3, 3, 1, 0, 2, 3]):
-        values["a"] = _values((m, k), xdtype, iteration)
+    for iteration, m in enumerate([3, 3, 1, 2, 3] if decoder else [3, 3, 1, 0, 2, 3]):
+        values["a"] = _values((k,) if vector else (m, k), xdtype, iteration)
         if "w" not in constants:
             values["w"] = _values(values["w"].shape, wdtype, iteration * 3)
         for name in ("az", "wz"):
@@ -147,6 +173,9 @@ def _matrix_replay(tmp_path, xdtype, wdtype, layout, initializers, missing_zero=
         for name in ("as", "ws"):
             if name in values and name not in constants:
                 values[name] = (values[name] * np.float32(0.5)).copy()
+        if decoder:
+            values["pk"] = _values(values["pk"].shape, TensorProto.FLOAT) + np.float32(iteration / 8)
+            values["pv"] = _values(values["pv"].shape, TensorProto.FLOAT) - np.float32(iteration / 8)
         feeds = {name: _ortvalue(value, types[name])
                  for name, value in values.items() if name not in constants}
         actual = [value.numpy() for value in session.run_with_ort_values(None, feeds)]
@@ -165,6 +194,17 @@ def _matrix_replay(tmp_path, xdtype, wdtype, layout, initializers, missing_zero=
         np.testing.assert_array_equal(actual[2], w + w)
         if xdtype != TensorProto.FLOAT:
             np.testing.assert_array_equal(actual[3], a)
+        if decoder:
+            query = ((a @ w) * np.float32(1 / 1024)).reshape(-1, w.shape[1])
+            keys = np.concatenate([values["pk"][0, 0], query], axis=0)
+            cached_values = np.concatenate([values["pv"][0, 0], query], axis=0)
+            scores = query.astype(np.float64) @ keys.astype(np.float64).T / np.sqrt(query.shape[1])
+            probabilities = np.exp(scores - scores.max(axis=-1, keepdims=True))
+            probabilities /= probabilities.sum(axis=-1, keepdims=True)
+            np.testing.assert_allclose(actual[-3], (probabilities @ cached_values)[None],
+                                       rtol=1e-5, atol=1e-6)
+            np.testing.assert_allclose(actual[-2], keys[None, None], rtol=1e-5, atol=1e-6)
+            np.testing.assert_allclose(actual[-1], cached_values[None, None], rtol=1e-5, atol=1e-6)
     _completed_on_mlx(session)
 
 
@@ -247,6 +287,52 @@ def test_packed_qdq_actual_dispatch(tmp_path, case, kernel):
             assert not any(name and name.startswith("mlx_qdq_") for name in kernels), kernels
 
 
+@pytest.mark.parametrize("vector", [False, True], ids=["matrix", "vector"])
+def test_packed_decoder_dispatch_case(tmp_path, vector):
+    _matrix_replay(tmp_path, TensorProto.FLOAT if vector else TensorProto.INT4,
+                   TensorProto.UINT4, "blocked", False, decoder=True, vector=vector)
+
+
+@pytest.mark.parametrize("vector", [False, True], ids=["matrix", "vector"])
+def test_packed_decoder_partition_and_dispatch(tmp_path, vector):
+    # Attention with both present-cache slots triggers capability's decoder classification.
+    for disabled in (False, True):
+        trace = tmp_path / f"packed-decoder-{disabled}.json"
+        env = {**os.environ, "ONNXRUNTIME_EP_MLX_TRACE": str(trace)}
+        if disabled:
+            env["ONNXRUNTIME_EP_MLX_NO_QDQ_FUSION"] = "1"
+        else:
+            env.pop("ONNXRUNTIME_EP_MLX_NO_QDQ_FUSION", None)
+        subprocess.run(
+            [sys.executable, "-m", "pytest",
+             f"{Path(__file__)}::test_packed_decoder_dispatch_case[{'vector' if vector else 'matrix'}]",
+             "-q", "-p", "no:cacheprovider"],
+            env=env, check=True, timeout=180,
+        )
+        events = json.loads(trace.read_text())
+        paths = [event for event in events if event.get("cat") == "ep.path"]
+        products = [event for event in paths
+                    if "MatMul" in event["args"].get("ops", "").split(",")]
+        assert products, paths
+        if vector:
+            assert all("DequantizeLinear" not in event["args"]["ops"].split(",")
+                       for event in products), products
+        else:
+            assert all(event["name"] == "mlx.compute[eager]" for event in products), products
+            assert all("DequantizeLinear" in event["args"]["ops"].split(",")
+                       for event in products), products
+        if not vector:
+            assert all("Attention" not in event["args"]["ops"].split(",")
+                       for event in products), products
+        assert len({event["args"]["partition_id"] for event in products}) == 1, products
+        assert any("Attention" in event["args"].get("ops", "").split(",") for event in paths), paths
+        kernels = {event.get("args", {}).get("kernel")
+                   for event in events if event.get("cat") == "op.fast"}
+        assert ("mlx_qdq_packed4_matmul" in kernels) is (not disabled and not vector), kernels
+        if disabled or vector:
+            assert not any(name and name.startswith("mlx_qdq_") for name in kernels), kernels
+
+
 @pytest.mark.parametrize("dtype", PACKED, ids=["i4", "u4"])
 @pytest.mark.parametrize("shape", [(), (1,), (5,), (3, 5), (3, 3, 5), (0,), (3, 0)])
 @pytest.mark.parametrize("half", [False, True], ids=["float", "half"])
@@ -299,3 +385,23 @@ def test_packed_bad_live_axis_geometry_recovers(tmp_path):
             actual = session.run_with_ort_values(None, feeds)[0].numpy()
             np.testing.assert_array_equal(actual, (x.astype(np.float32) - z) * s)
     _completed_on_mlx(session)
+
+
+@pytest.mark.parametrize("blocked", [False, True], ids=["axis", "blocked"])
+def test_packed_invalid_static_geometry_is_unclaimed(tmp_path, blocked):
+    shape = [5, 3] if blocked else [3, 5]
+    parameter = [3, 3] if blocked else [4]
+    attrs = {"axis": 0, "block_size": 4} if blocked else {"axis": -1}
+    info = lambda name, dt, dims: helper.make_tensor_value_info(name, dt, dims)
+    model = helper.make_model(
+        helper.make_graph(
+            [helper.make_node("DequantizeLinear", ["x", "s"], ["wf"], **attrs),
+             helper.make_node("MatMul", ["a", "wf"], ["y"])],
+            "invalid_packed_qdq",
+            [info("x", TensorProto.INT4, shape), info("s", TensorProto.FLOAT, parameter),
+             info("a", TensorProto.FLOAT, [2, shape[0]])],
+            [info("y", TensorProto.FLOAT, [2, shape[1]])],
+        ), opset_imports=[helper.make_opsetid("", 24)], ir_version=11,
+    ).SerializeToString()
+    with pytest.raises(ort.capi.onnxruntime_pybind11_state.Fail, match="fallback|assigned"):
+        _session(model, tmp_path)

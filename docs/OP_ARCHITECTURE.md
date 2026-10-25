@@ -155,6 +155,34 @@ including nested-body capture checks; compiled input wrapping also rejects packe
 types before treating a logical shape as a byte-array shape. Unsupported matrix
 forms still use ordinary DQ rather than reinterpreting storage or approximating it.
 
+**Decoder co-location:** capability classification ordinarily uses per-node compile
+classes when it sees any `com.microsoft::PagedAttention`, or default-domain
+`Attention` / contrib `GroupQueryAttention` / `MultiHeadAttention` with both
+present-cache output slots 1 and 2 populated. Without pattern integration, packed
+DQ's Eager class and FP32 MatMul's Shapeless class would prevent their union.
+The packed pattern now places only already-claimable, direct FP32 DQ producers
+and their eligible default MatMul / GroupedMatMul-29 consumer in the existing
+Eager class. It requires rank-two activations, rank-two/rank-three weights as
+appropriate, FP32 scales/output, INT4/UINT4/INT8/UINT8 quantized operands, and at
+least one packed operand. The signature predicates are shared with runtime
+recognition; ordinary claims validate types/parameters first, and execution
+independently revalidates live geometry and the GPU device.
+
+All surrounding compile classes, attention-anchor detection, NativeRoPE routing,
+convex/contiguous algorithms, unsupported-node barriers and explicit/inferred layer
+cuts remain unchanged. Existing eligible Eager neighbors can join under those same
+convexity/dtype rules; a class label is not a separate hard island boundary. Shared
+DQ consumers still receive their original floating results, and an explicit layer
+cut that separates the product from DQ is respected (ordinary DQ/matmul then runs).
+Vector/batched, non-FP32 and unclaimable patterns are not promoted to packed-product
+regions. Current-runtime decoder-shaped regression source connects packed MatMul
+to cached Attention-24 with both present outputs, checks repeated live packed data
+and shared results against independent references, and asserts actual eager
+DQ/product co-location plus private dispatch with fusion enabled, absence with
+fusion disabled, and no promotion for vector MatMul. This is bounded integration,
+not a claim of full quantized-MoE model coverage or a positive GroupedMatMul-29
+ORT session.
+
 **Runtime qualification:** ORT v1.31.0 pins ONNX v1.22.0 in `cmake/deps.txt`, predating
 GroupedMatMul-29. The Rust direct-handler tests exercise implementation code, not an
 ORT opset-29 session. The Python QDQ tests exercise ordinary MatMul at opset 24.

@@ -6,7 +6,7 @@ use std::ffi::CString;
 
 use crate::engine::{MlxError, NodeDesc, Src, TranslationContext};
 use crate::mlx::VectorArray;
-use crate::registry::CompileShapeSafety;
+use crate::registry::{CompileShapeSafety, NodeView};
 use crate::sys::{mlx, ort};
 
 const F32: mlx::mlx_dtype = mlx::mlx_dtype__MLX_FLOAT32;
@@ -21,13 +21,82 @@ pub(crate) struct QuantizedMatMul {
     w: NodeDesc,
 }
 
+fn dq_signature(
+    domain: &str,
+    op: &str,
+    version: i32,
+    inputs: usize,
+    outputs: usize,
+    dtype: ort::ONNXTensorElementDataType,
+) -> bool {
+    domain.is_empty()
+        && op == "DequantizeLinear"
+        && version >= 10
+        && (2..=3).contains(&inputs)
+        && outputs == 1
+        && dtype == FLOAT
+}
+
 fn dq_candidate(node: &NodeDesc) -> bool {
-    node.domain.is_empty()
-        && node.op_type == "DequantizeLinear"
-        && node.since_version >= 10
-        && (2..=3).contains(&node.inputs.len())
-        && node.outputs.len() == 1
-        && node.outputs[0].otype == FLOAT
+    node.outputs.first().is_some_and(|out| {
+        dq_signature(
+            &node.domain,
+            &node.op_type,
+            node.since_version,
+            node.inputs.len(),
+            node.outputs.len(),
+            out.otype,
+        )
+    })
+}
+
+fn product_kind(domain: &str, op: &str, version: i32) -> Option<bool> {
+    if !domain.is_empty() {
+        return None;
+    }
+    match op {
+        "MatMul" => Some(false),
+        "GroupedMatMul" if version == 29 => Some(true),
+        _ => None,
+    }
+}
+
+/// A conservative typed subset of the runtime recognizer, after ordinary claim validation.
+pub(crate) fn partition_product_candidate(node: &NodeView) -> bool {
+    let Some(grouped) = product_kind(&node.domain(), &node.op_type(), node.since_version()) else {
+        return false;
+    };
+    node.num_outputs() == 1
+        && node.output_info(0).is_some_and(|out| out.dtype == FLOAT)
+        && node
+            .input_info(0)
+            .is_some_and(|input| input.dtype == FLOAT && input.shape.len() == 2)
+        && node.input_info(1).is_some_and(|input| {
+            input.dtype == FLOAT && input.shape.len() == if grouped { 3 } else { 2 }
+        })
+}
+
+pub(crate) fn partition_dq_candidate(node: &NodeView, weight: bool) -> Option<bool> {
+    let data = node.input_info(0)?;
+    let scale = node.input_info(1)?;
+    let output = node.output_info(0)?;
+    if !dq_signature(
+        &node.domain(),
+        &node.op_type(),
+        node.since_version(),
+        node.num_inputs(),
+        node.num_outputs(),
+        output.dtype,
+    ) || scale.dtype != FLOAT
+        || !(data.shape.len() == 2 || weight && data.shape.len() == 3)
+    {
+        return None;
+    }
+    let packed = crate::engine::packed4_signed(data.dtype).is_some();
+    (packed
+        || data.dtype == ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8
+        || data.dtype == ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8)
+        .then_some(packed)
 }
 
 pub(crate) fn recognize(nodes: &mut [NodeDesc]) {
@@ -38,9 +107,7 @@ pub(crate) fn recognize(nodes: &mut [NodeDesc]) {
     }
     let mut producers: HashMap<String, NodeDesc> = HashMap::new();
     for node in nodes {
-        if node.domain.is_empty()
-            && (node.op_type == "MatMul"
-                || (node.op_type == "GroupedMatMul" && node.since_version == 29))
+        if product_kind(&node.domain, &node.op_type, node.since_version).is_some()
             && node.inputs.len() >= 2
             && node.outputs.len() == 1
             && node.outputs[0].otype == FLOAT

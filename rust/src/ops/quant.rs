@@ -2335,6 +2335,14 @@ fn dequantize_linear_claim(node: &NodeView) -> ClaimResult {
             x.shape.iter().all(|&d| d <= i32::MAX as i64),
             "packed DQ dimensions must fit int32"
         );
+        require!(
+            x.shape.len() == o.shape.len()
+                && x.shape
+                    .iter()
+                    .zip(&o.shape)
+                    .all(|(&x, &o)| x < 0 || o < 0 || x == o),
+            "packed DQ output shape must match its logical input shape"
+        );
         if x.shape.iter().all(|&d| d >= 0) {
             require!(
                 x.shape.contains(&0)
