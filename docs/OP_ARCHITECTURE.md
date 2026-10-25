@@ -102,7 +102,7 @@ a gathered [M,S,K,N] expert-weight tensor.
 
 `qdq.rs` recognizes default-domain DequantizeLinear weights feeding MatMul or
 GroupedMatMul, optionally recognizing activation DQ too. On Metal, rank-two activations
-and rank-two dense/rank-three expert int8/uint8 weights with float32 scale/output use a
+and rank-two dense/rank-three expert int4/uint4/int8/uint8 weights with float32 scale/output use a
 private direct kernel. Per-tensor, per-axis (including negative axes), and blocked
 parameters are indexed in their original ONNX layouts; live weights, scales and zero
 points are never cached as constants. Weights need not be initializers. Activation
@@ -117,15 +117,88 @@ exact normal float32 values under the exponent guard. Both final binary scalings
 exact, finite and normal (or zero). Bias is added separately after the matrix result.
 
 The general path reads quantized bytes directly, performs float32 DQ rounding in
-registers, then uses SIMD-distributed float32 FMA accumulation. It supports realistic K
-and blocked scales, but is **not integer-only ALU or broadly bit-exact**: it follows the
-existing ordinary float32 MatMul numerical policy. No expanded floating activation or
+registers, then uses SIMD-distributed float32 accumulation. With either packed operand,
+it compensates rounded products using FMA residuals and TwoSum errors, including
+the 32-lane reduction, before rounding the dot to float32. Bias is added only after
+that rounding. The original FMA/SIMD sum is retained for the entire output if any
+lane's operand, product, compensated partial/correction, or reduction becomes
+nonfinite, or if the original reduction is nonfinite. Thus it preserves the
+original exceptional arithmetic rather than promising exact-real recovery after
+intermediate overflow. Underflow can lose product residuals; Metal subnormal fidelity
+and blanket correctly-rounded dots are not claimed. Ordinary INT8/UINT8 general
+arithmetic and the proven integer subset are unchanged.
+It supports realistic K and blocked scales, but is **not integer-only ALU or broadly
+bit-exact**. Finite packed regression references independently accumulate exact
+products of the already-float32-rounded DQ operands using binary integer
+coefficients, then round the sum to float32 with ties to even. Existing
+`rtol=1e-5, atol=1e-6` thresholds are unchanged. Original NumPy float32 reductions
+remain named disagreement diagnostics: neither their reduction order nor a fitted
+output is the oracle. Exceptional regressions separately check the retained
+float32 overflow/NaN/Inf behavior. This source change still requires hosted
+qualification; earlier failing CI and numerical evidence are retained.
+No expanded floating activation or
 weight matrix is produced by this kernel. This is not MLX's affine QMM rewrite:
 that kernel's scale-after-dot/bias correction can change ONNX DQ overflow/cancellation
-semantics. Low-bit packed ONNX tensors, non-float32 DQ, vector/batched MatMul, and CPU
-streams keep their existing unfused path. `ONNXRUNTIME_EP_MLX_NO_QDQ_FUSION=1` disables
+semantics. Non-float32 DQ, vector/batched MatMul, and CPU streams use ordinary DQ
+and the existing unfused matrix-product path. `ONNXRUNTIME_EP_MLX_NO_QDQ_FUSION=1` disables
 recognition for same-binary comparisons. Nonempty dispatched products expose
-`mlx_qdq_integer_matmul` or `mlx_qdq_matmul` in `op.fast` trace events.
+`mlx_qdq_integer_matmul` or `mlx_qdq_matmul` in `op.fast` trace events; products
+with either packed operand expose `mlx_qdq_packed4_integer_matmul` or
+`mlx_qdq_packed4_matmul`, respectively. These names identify dispatch, not measured
+speedup.
+
+Packed INT4/UINT4 support starts at DequantizeLinear-21. Its
+[versioned schema](https://github.com/onnx/onnx/blob/0834d5e3a5c41e6e3c36a6853e7540e81c704d07/onnx/defs/quantization/old.cc)
+and [tensor storage definition](https://github.com/onnx/onnx/blob/0834d5e3a5c41e6e3c36a6853e7540e81c704d07/onnx/onnx.in.proto)
+define globally flattened, low-nibble-first packing with ceil(N/2) bytes; there is
+no row or expert padding. INT4 uses two's complement, not a biased unsigned code.
+The [ORT Int4x2 transport](https://github.com/microsoft/onnxruntime/blob/v1.23.0/include/onnxruntime/core/framework/int4.h)
+uses that same layout. Private kernels extract data and zero-point nibbles at their
+logical indices, including odd K, odd expert boundaries, and blocked tails, without
+an expanded integer or floating weight tensor. Packed and byte operand types may
+be mixed; missing zero points are logical zero for the original ONNX input type.
+
+Only initializers and ORT boundary inputs carry packed storage. An explicit resolver
+keeps their logical shape and signedness separate from the one-dimensional MLX byte
+array; generic dtype mapping, movement operators, QuantizeLinear packed outputs, and
+copy-out are not broadened. Live input byte counts are checked with ORT
+`GetTensorSizeInBytes`; owned initializers use the IR's checked storage size.
+Logical dimensions and unpack indexing must fit int32 (at most 2^31-2 elements).
+Ordinary DQ supports scalar, per-axis and statically valid blocked parameters,
+float32/float16/bfloat16 output, scalar data and empty per-tensor/per-axis data.
+Empty blocked geometry remains unclaimed under the existing block validator.
+It unpacks only for legitimate unfused/shared consumers. Packed DQ is eager-only,
+including nested-body capture checks; compiled input wrapping also rejects packed
+types before treating a logical shape as a byte-array shape. Unsupported matrix
+forms still use ordinary DQ rather than reinterpreting storage or approximating it.
+
+**Decoder co-location:** capability classification ordinarily uses per-node compile
+classes when it sees any `com.microsoft::PagedAttention`, or default-domain
+`Attention` / contrib `GroupQueryAttention` / `MultiHeadAttention` with both
+present-cache output slots 1 and 2 populated. Without pattern integration, packed
+DQ's Eager class and FP32 MatMul's Shapeless class would prevent their union.
+The packed pattern now places only already-claimable, direct FP32 DQ producers
+and their eligible default MatMul / GroupedMatMul-29 consumer in the existing
+Eager class. It requires rank-two activations, rank-two/rank-three weights as
+appropriate, FP32 scales/output, INT4/UINT4/INT8/UINT8 quantized operands, and at
+least one packed operand. The signature predicates are shared with runtime
+recognition; ordinary claims validate types/parameters first, and execution
+independently revalidates live geometry and the GPU device.
+
+All surrounding compile classes, attention-anchor detection, NativeRoPE routing,
+convex/contiguous algorithms, unsupported-node barriers and explicit/inferred layer
+cuts remain unchanged. Existing eligible Eager neighbors can join under those same
+convexity/dtype rules; a class label is not a separate hard island boundary. Shared
+DQ consumers still receive their original floating results, and an explicit layer
+cut that separates the product from DQ is respected (ordinary DQ/matmul then runs).
+Vector/batched, non-FP32 and unclaimable patterns are not promoted to packed-product
+regions. Current-runtime decoder-shaped regression source connects packed MatMul
+to cached Attention-24 with both present outputs, checks repeated live packed data
+and shared results against independent references, and asserts actual eager
+DQ/product co-location plus private dispatch with fusion enabled, absence with
+fusion disabled, and no promotion for vector MatMul. This is bounded integration,
+not a claim of full quantized-MoE model coverage or a positive GroupedMatMul-29
+ORT session.
 
 **Runtime qualification:** ORT v1.31.0 pins ONNX v1.22.0 in `cmake/deps.txt`, predating
 GroupedMatMul-29. The Rust direct-handler tests exercise implementation code, not an
@@ -499,7 +572,7 @@ The **core Rust modules** register:
 | `norm.rs` | RMS/Layer/Group/Instance/Batch/Lp normalization, LRN, Microsoft skip-norm variants |
 | `attention.rs` | GroupQueryAttention, Attention (opset 23 & 24), MultiHeadAttention, RotaryEmbedding |
 | `matmul.rs` | MatMul, GroupedMatMul, Gemm, com.microsoft::FusedMatMul |
-| `qdq.rs` | Private QDQ matrix-product recognition and direct int8/uint8 Metal kernels |
+| `qdq.rs` | Private QDQ matrix-product recognition and direct packed int4/uint4 and int8/uint8 Metal kernels |
 | `conv.rs` | Conv/ConvTranspose/DeformConv and local/global pooling |
 | `quant.rs` | MatMulNBits, GatherBlockQuantized, Quantize/Dequantize/DynamicQuantize, MatMulInteger, ConvInteger, QLinearMatMul, QLinearConv |
 | `ssm.rs` | TensorScatter (opset 24), CausalConvWithState, LinearAttention (linear/gated/delta/gated_delta, GQA) |

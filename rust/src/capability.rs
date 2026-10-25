@@ -148,6 +148,17 @@ pub(crate) unsafe fn get_capability(
             .filter(|node| is_decoder_attention_anchor(&snapshot.nodes[node]))
             .collect::<Vec<_>>();
         let decoder_graph = !attention_anchors.is_empty();
+        let packed_qdq_nodes = if decoder_graph {
+            packed_qdq_eager_nodes(
+                &snapshot,
+                &node_order,
+                &supported,
+                ort_api,
+                &raw_nodes_by_id,
+            )
+        } else {
+            HashSet::new()
+        };
         let compile_class: Vec<CompilePartitionClass> = node_order
             .iter()
             .map(|&node| {
@@ -155,7 +166,8 @@ pub(crate) unsafe fn get_capability(
                 let metadata = &snapshot.nodes[&node];
                 let mod_boundary = metadata.domain.is_empty() && metadata.op_type == "Mod";
                 let nonzero_boundary = metadata.domain.is_empty() && metadata.op_type == "NonZero";
-                if crate::registry::requires_random_eager_boundary(&view)
+                if packed_qdq_nodes.contains(&node)
+                    || crate::registry::requires_random_eager_boundary(&view)
                     || crate::registry::requires_unique_eager_boundary(&view)
                     || crate::registry::requires_elementary_contrib_eager_boundary(&view)
                     || crate::registry::requires_cdist_eager_boundary(&view)
@@ -282,6 +294,80 @@ pub(crate) unsafe fn get_capability(
         tr.record_claim(claimed, node_order.len(), clusters.len(), &rejected);
         ptr::null_mut()
     }
+}
+
+fn packed_qdq_eager_nodes(
+    snapshot: &OrtGraphSnapshot,
+    order: &[onnx_runtime_ir::NodeId],
+    supported: &[bool],
+    api: *const ort::OrtApi,
+    raw_nodes: &HashMap<onnx_runtime_ir::NodeId, *const ort::OrtNode>,
+) -> HashSet<onnx_runtime_ir::NodeId> {
+    let supported: HashSet<_> = order
+        .iter()
+        .copied()
+        .zip(supported.iter().copied())
+        .filter_map(|(node, ok)| ok.then_some(node))
+        .collect();
+    let producers: HashMap<_, _> = order
+        .iter()
+        .flat_map(|&node| {
+            snapshot.nodes[&node]
+                .output_slots
+                .iter()
+                .flatten()
+                .map(move |&value| (value, node))
+        })
+        .collect();
+    let mut result = HashSet::new();
+    for &product in order {
+        if !supported.contains(&product) {
+            continue;
+        }
+        let view = NodeView::new(api, raw_nodes[&product]);
+        if !crate::ops::qdq::partition_product_candidate(&view) {
+            continue;
+        }
+        let inputs = &snapshot.nodes[&product].input_slots;
+        let producer = |slot: usize| {
+            inputs
+                .get(slot)
+                .copied()
+                .flatten()
+                .and_then(|value| producers.get(&value).copied())
+        };
+        let Some(weight) = producer(1).filter(|node| supported.contains(node)) else {
+            continue;
+        };
+        let Some(weight_packed) =
+            crate::ops::qdq::partition_dq_candidate(&NodeView::new(api, raw_nodes[&weight]), true)
+        else {
+            continue;
+        };
+        let mut activation = None;
+        let mut activation_packed = false;
+        if let Some(input) = producer(0) {
+            let metadata = &snapshot.nodes[&input];
+            if metadata.domain.is_empty() && metadata.op_type == "DequantizeLinear" {
+                if !supported.contains(&input) {
+                    continue;
+                }
+                let Some(packed) = crate::ops::qdq::partition_dq_candidate(
+                    &NodeView::new(api, raw_nodes[&input]),
+                    false,
+                ) else {
+                    continue;
+                };
+                activation = Some(input);
+                activation_packed = packed;
+            }
+        }
+        if weight_packed || activation_packed {
+            result.extend([product, weight]);
+            result.extend(activation);
+        }
+    }
+    result
 }
 
 fn select_layer_partition_span(value: Option<&str>, layer_count: usize) -> Option<usize> {
