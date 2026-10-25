@@ -252,12 +252,23 @@ host-parameter value keys, and even shape-constant live repeats cannot be captur
 The existing native RoPE identity condition and Range/Tile Q8/position proofs are unchanged.
 Only the sole top-level live Tile owned by `Plan::new`'s exact native-attention proof regains
 its prior shapeless descriptor, after that proof and before route selection. The broad Q8
-capability override preserves the candidate partition, not capture permission. Near misses and
-nested live Tiles stay eager; translation defensively rejects capture after the native shortcut.
+capability override preserves the candidate partition, not capture permission. Native Tile
+admission shares the ordinary Tile payload validator: both tensor metadata records are required,
+the input must be movable, the output dtype must match, and BF16 requires effective schema 13.
+Unknown rank/extents are not missing tensor metadata. This payload-only guard does not re-run
+ordinary repeats or geometry checks or alter the Range exception or native detector/proof.
+Near misses and nested live Tiles stay eager; translation defensively rejects capture after
+the native shortcut.
 Legacy Tile-1 has a distinct three-input signature and remains a separate authority/support
 gap, not a modern alias or a demonstrated backend impossibility. These are bounded source
 contracts and regression fixtures, not proof of every combination or physical GPU execution.
 Live-repeat fixtures are source-only pending independently authorized CI qualification.
+The native-admission source regression imports opset 14 (effective Tile schema 13) and retains
+an unrelated constant-INT64-repeat string/complex Tile as a graph output with optimizations
+disabled. Its proposed capability trace assertion uses admission of the live INT64 Range,
+which ordinary claiming rejects, to establish that the unchanged broad Q8 detector fired;
+the supported baseline and additional INT64 Tile must remain admitted. These assertions have
+not been executed locally and are not device reproduction or numerical evidence.
 
 **NonZero** uses exact original representations, not float32 conversions: signed floating zeros
 are false, NaNs/infinities/subnormals are true, and large integers retain all bits. Empty tensors

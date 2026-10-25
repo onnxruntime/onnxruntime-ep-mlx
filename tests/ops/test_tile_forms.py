@@ -87,6 +87,128 @@ def _session(model, *, cpu=False, profile=None):
     return session
 
 
+def _native_candidate_model(extra):
+    """Broad Q8 candidate with an exact INT64 position chain, not a detector mock."""
+    import onnx
+    from test_matmulnbits_asym import _matmulnbits_model
+
+    quantized, _ = _matmulnbits_model(
+        M=1, K=32, N=32, block=32, asymmetric=False, bits=8)
+    model = onnx.load_from_string(quantized)
+    # Import 14 resolves to effective Tile schema 13, not a Tile-14 schema.
+    next(opset for opset in model.opset_import if opset.domain == "").version = 14
+    initializers = []
+
+    def constant(name, data):
+        value = _value(name, DT.INT64, list(np.asarray(data).shape))
+        value.const_value = ir.tensor(np.asarray(data, np.int64))
+        initializers.append(value)
+        return value
+
+    start = _value("start", DT.INT64, [])
+    length = _value("length", DT.INT64, [])
+    batch = _value("batch", DT.INT64, [1])
+    step = constant("step", np.array(1, np.int64))
+    one = constant("one", [1])
+    axes = constant("axes", [0])
+    limit = _value("limit", DT.INT64, [])
+    positions = _value("positions", DT.INT64, [None])
+    row = _value("position_row", DT.INT64, [1, None])
+    length_vector = _value("length_vector", DT.INT64, [1])
+    shape = _value("position_shape", DT.INT64, [2])
+    repeats = _value("position_repeats", DT.INT64, [2])
+    expanded = _value("expanded_positions", DT.INT64, [1, None])
+    tiled = _value("native_positions", DT.INT64, [None, None])
+    nodes = [
+        ir.node("Add", [start, length], outputs=[limit]),
+        ir.node("Range", [start, limit, step], outputs=[positions], name="native_range"),
+        ir.node("Unsqueeze", [positions, axes], outputs=[row]),
+        ir.node("Unsqueeze", [length, axes], outputs=[length_vector]),
+        ir.node("Concat", [one, length_vector], attributes={"axis": 0}, outputs=[shape]),
+        ir.node("Concat", [batch, one], attributes={"axis": 0}, outputs=[repeats]),
+        ir.node("Expand", [row, shape], outputs=[expanded]),
+        ir.node("Tile", [expanded, repeats], outputs=[tiled], name="native_tile"),
+    ]
+    quantized_out = _value("out", DT.FLOAT, [1, 1, 32])
+    query = quantized_out
+    for index in range(28):
+        output = _value(f"query_{index}", DT.FLOAT, [1, 1, 32])
+        nodes.append(ir.node("Add", [query, query], outputs=[output]))
+        query = output
+    key = _value("key", DT.FLOAT, [1, 1, 32])
+    value = _value("value", DT.FLOAT, [1, 1, 32])
+    attention = _value("attention", DT.FLOAT, [1, 1, 32])
+    nodes.append(ir.node(
+        "MultiHeadAttention", [query, key, value], outputs=[attention],
+        domain="com.microsoft", attributes={"num_heads": 4}))
+    inputs = [start, length, batch, key, value]
+    outputs = [tiled, attention]
+    if extra != "none":
+        dtype = {"int64": DT.INT64, "string": DT.STRING,
+                 "complex64": DT.COMPLEX64, "complex128": DT.COMPLEX128}[extra]
+        data = _value("unrelated_data", dtype, [2])
+        output = _value("unrelated_output", dtype, [4])
+        constant_repeats = constant("unrelated_repeats", [2])
+        nodes.append(ir.node(
+            "Tile", [data, constant_repeats], outputs=[output], name="unrelated_tile"))
+        inputs.append(data)
+        outputs.append(output)
+    extension = ir.to_proto(ir.Model(ir.Graph(
+        [quantized_out, *inputs], outputs, nodes=nodes, initializers=initializers,
+        opset_imports={"": 14, "com.microsoft": 1}, name="native_tile_admission"),
+        ir_version=11))
+    model.graph.node.extend(extension.graph.node)
+    model.graph.input.extend(item for item in extension.graph.input if item.name != "out")
+    del model.graph.output[:]
+    model.graph.output.extend(extension.graph.output)
+    model.graph.initializer.extend(extension.graph.initializer)
+    model.graph.value_info.extend(extension.graph.value_info)
+    model.graph.value_info.append(onnx.helper.make_tensor_value_info(
+        "out", onnx.TensorProto.FLOAT, [1, 1, 32]))
+    return model
+
+
+@pytest.mark.parametrize("extra", ["none", "int64", "string", "complex64", "complex128"])
+def test_native_candidate_tile_payload_session(extra):
+    """Session construction only; no device/numerical reproduction claim."""
+    model = _native_candidate_model(extra).SerializeToString()
+    if extra in {"none", "int64"}:
+        _session(model)
+    else:
+        with pytest.raises(FAIL, match="CPU EP.*fallback.*disabled"):
+            _session(model)
+
+
+def test_native_candidate_tile_payload_actual_capability(tmp_path):
+    for extra in ["none", "int64", "string", "complex64", "complex128"]:
+        trace = tmp_path / f"native_{extra}.json"
+        subprocess.run(
+            [sys.executable, "-m", "pytest",
+             f"{Path(__file__).name}::test_native_candidate_tile_payload_session[{extra}]",
+             "-q", "-p", "no:cacheprovider"],
+            cwd=Path(__file__).parent,
+            env={**os.environ, "ONNXRUNTIME_EP_MLX_TRACE": str(trace)},
+            check=True, timeout=120)
+        total = len(_native_candidate_model(extra).graph.node)
+        claims = [event["args"] for event in json.loads(trace.read_text())
+                  if event.get("cat") == "ep.claim" and event["args"]["total"] == total]
+        assert total > 32 and len(claims) == 1, (extra, claims)
+        claim = claims[0]
+        unsupported = extra not in {"none", "int64"}
+        assert claim["unclaimed"] == int(unsupported), (extra, claim)
+        assert claim["claimed"] == total - int(unsupported), (extra, claim)
+        # A live INT64 Range is rejected by the ordinary claim. Its admission in
+        # this actual GetCapability trace proves the unchanged broad detector
+        # returned true, including when the unrelated constant-repeat Tile exists.
+        assert "fallback_Range" not in claim, (extra, claim)
+        fallbacks = {key for key in claim if key.startswith("fallback_")}
+        assert fallbacks == ({"fallback_Tile"} if unsupported else set()), (extra, claim)
+        if unsupported:
+            assert claim["fallback_Tile"].startswith(
+                "x1: data dtype other is not a movable dtype supported on GPU")
+            assert "nodes: [unrelated_tile]" in claim["fallback_Tile"]
+
+
 def _ownership(session):
     profile = Path(session.end_profiling())
     try:
