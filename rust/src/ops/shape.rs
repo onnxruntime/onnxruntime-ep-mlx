@@ -1095,9 +1095,26 @@ fn tile_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
         ctx.bind(&n.outputs[0], data);
         return Ok(());
     }
+    if n.inputs[1].source != Src::Initializer && !n.inputs[1].constant && ctx.is_capturing() {
+        return Err("MLX Tile: live repeats cannot be captured".to_string());
+    }
     let shape = ctx.tensor_shape(&n.inputs[0])?;
     let repeats_shape = ctx.tensor_shape(&n.inputs[1])?;
+    checked_tile_repeats_metadata(&repeats_shape, shape.len())?;
+    let repeats_int64 = if n.inputs[1].source == Src::Intermediate {
+        let repeats = ctx.resolve(&n.inputs[1])?;
+        ctx.dtype_of(repeats) == mlx::mlx_dtype__MLX_INT64
+    } else {
+        ctx.raw_host(&n.inputs[1])?.dtype
+            == ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64
+    };
+    if !repeats_int64 {
+        return Err("MLX Tile: repeats must be int64".to_string());
+    }
     let repeats = read_ints(ctx, n, 1)?;
+    if repeats.len() as i64 != repeats_shape[0] {
+        return Err("MLX Tile: repeats data length disagrees with metadata".to_string());
+    }
     let dtype = mlx_dtype_from_onnx(n.outputs[0].otype);
     let output = checked_tile_geometry(&shape, &repeats_shape, &repeats, dtype, false)?;
     if output.contains(&0) {
@@ -1121,6 +1138,16 @@ fn tile_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
     }
     let r = ctx.emit(|res, s| unsafe { mlx::mlx_tile(res, data, reps.as_ptr(), reps.len(), s) })?;
     ctx.bind(&n.outputs[0], r);
+    Ok(())
+}
+
+fn checked_tile_repeats_metadata(shape: &[i64], data_rank: usize) -> Result<(), MlxError> {
+    if shape.len() != 1 {
+        return Err("MLX Tile: repeats must have rank one".to_string());
+    }
+    if usize::try_from(shape[0]).ok() != Some(data_rank) {
+        return Err("MLX Tile: repeats length must equal data rank".to_string());
+    }
     Ok(())
 }
 
@@ -2884,19 +2911,54 @@ fn tile_claim(node: &NodeView) -> ClaimResult {
             || node.since_version() >= 13,
         "Tile: bfloat16 requires opset 13"
     );
-    require!(
-        node.is_const_int64(1),
-        "Tile: only a constant `repeats` initializer is claimed; this node's is a runtime value — stays on CPU"
-    );
-    let repeats = node
-        .read_const_int64(1)
-        .ok_or("Tile: cannot read constant repeats")?;
     let repeats_info = node.input_info(1).ok_or("Tile: missing repeats metadata")?;
     require!(
-        node.input_rank_known(1) == Some(true) && repeats_info.shape.len() == 1,
+        repeats_info.dtype == ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64,
+        "Tile: repeats must be int64"
+    );
+    require!(
+        node.input_rank_known(1) != Some(true) || repeats_info.shape.len() == 1,
         "Tile: repeats must have rank one"
     );
     let info = node.input_info(0).ok_or("Tile: missing data metadata")?;
+    if !node.is_const_int64(1) {
+        if node.input_rank_known(0) == Some(true) {
+            if node.input_rank_known(1) == Some(true) && repeats_info.shape[0] >= 0 {
+                checked_tile_repeats_metadata(&repeats_info.shape, info.shape.len())?;
+            }
+            if node.output_rank_known(0) == Some(true) {
+                require!(
+                    node.output_info(0)
+                        .ok_or("Tile: missing output metadata")?
+                        .shape
+                        .len()
+                        == info.shape.len(),
+                    "Tile: output rank must match data rank"
+                );
+            }
+        }
+        if node.input_rank_known(1) == Some(true)
+            && repeats_info.shape[0] >= 0
+            && node.output_rank_known(0) == Some(true)
+        {
+            require!(
+                node.output_info(0)
+                    .ok_or("Tile: missing output metadata")?
+                    .shape
+                    .len() as i64
+                    == repeats_info.shape[0],
+                "Tile: output rank must match repeats length"
+            );
+        }
+        return Ok(());
+    }
+    let repeats = node
+        .read_const_int64(1)
+        .ok_or("Tile: cannot read constant repeats")?;
+    require!(
+        node.input_rank_known(1) == Some(true),
+        "Tile: repeats must have rank one"
+    );
     let shape = if node.input_rank_known(0) == Some(true) {
         info.shape
     } else {
@@ -2928,9 +2990,10 @@ fn tile_claim(node: &NodeView) -> ClaimResult {
 }
 
 fn tile_compile_shape_safety(node: &NodeView) -> crate::registry::CompileShapeSafety {
-    // Generic live repeats remain declined. Preserve the separate native RoPE override.
     if !node.is_const_int64(1) {
-        return crate::registry::CompileShapeSafety::Shapeless;
+        return crate::registry::CompileShapeSafety::EagerOnly {
+            reason: "Tile live repeats require fresh host values on every invocation",
+        };
     }
     let shape = node
         .input_info(0)
@@ -3833,10 +3896,26 @@ mod tests {
     use super::{
         checked_flatten_axis, checked_flatten_shape, checked_pad_axes, checked_pad_geometry,
         checked_rank_change_axes, checked_split_sizes, checked_tile_geometry,
-        checked_transpose_perm, integer_range_count, tile_geometry_shape_safety,
+        checked_tile_repeats_metadata, checked_transpose_perm, integer_range_count,
+        tile_geometry_shape_safety,
     };
     use crate::registry::CompileShapeSafety;
     use crate::sys::mlx;
+
+    #[test]
+    fn tile_live_metadata_is_validated_before_reading_values() {
+        for rank in [0, 1, 2, 65] {
+            assert!(checked_tile_repeats_metadata(&[rank as i64], rank).is_ok());
+            for shape in [
+                vec![],
+                vec![1, rank as i64],
+                vec![-1],
+                vec![rank as i64 + 1],
+            ] {
+                assert!(checked_tile_repeats_metadata(&shape, rank).is_err());
+            }
+        }
+    }
 
     #[test]
     fn tile_exact_checked_geometry() {

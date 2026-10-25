@@ -225,12 +225,12 @@ Tests in `tests/ops/test_fused_matmul.py` cover default/eager requests, not yet 
 or CPU-stream execution. Absence of an earlier native registration does not establish a
 baseline failure: ORT expansion/rewrites and actual placement still require admitted execution.
 
-Runtime-bounded **Range** and runtime-repeat **Tile** remain on ORT CPU. Their parameter values
-determine output extents and cannot safely be baked into a shape/dtype-keyed closure. Constant
-initializer forms remain supported. These coverage changes do not reproduce or establish a speedup
-for the Nemotron streaming workload in issue #10.
+Runtime-bounded **Range** remains on ORT CPU. Modern runtime-repeat **Tile** uses eager MLX
+translation: repeat values determine output extents and cannot safely be baked into a
+shape/dtype-keyed closure. Constant initializer forms remain supported. These coverage changes
+do not reproduce or establish a speedup for the Nemotron streaming workload in issue #10.
 
-Modern **Tile-6/13** constant-INT64 repeats use checked rank-one/cardinality, nonnegative
+Modern **Tile-6/13** INT64 repeats use checked rank-one/cardinality, nonnegative
 full-width per-axis multiplication, native int32 output extents and checked element/byte bounds.
 Every axis is validated even when another axis is zero. Valid empty results use typed zeros
 before importing data or narrowing repeats; `0 * INT64_MAX` is zero, not an overflowing repeat.
@@ -240,16 +240,24 @@ Movable real numeric/bool payloads retain their dtype (BF16 since schema 13, DOU
 existing MLX CPU stream); string, complex and encoded transports remain gaps.
 
 The pinned MLX Tile implementation constructs concrete reshape/broadcast/reshape targets.
-Fixed nonempty geometry and scalar identity are capture-safe; symbolic, unknown-rank and
-potentially empty forms are shape-keyed. Known wide input metadata canceled by zero repeats
+With constant repeats, fixed nonempty geometry and scalar identity are capture-safe; symbolic,
+unknown-rank and potentially empty forms are shape-keyed. Known wide input metadata canceled by zero repeats
 is eager-only so compilation cannot pre-import an unrepresentable input. Actual ORT boundary
 acceptance of extreme empty metadata is separate from the checked geometry contract.
-The existing native RoPE identity condition and Range/Tile Q8/position policies are unchanged.
-Generic live repeats are **FEASIBLE OPEN**: they require separate context-safe value-key and
-producer-guard integration, including empty vectors, without disabling the native exemption.
+Live boundary and produced repeats are reread on every eager invocation after rank, cardinality
+and INT64 metadata validation; the returned value count must match the metadata. Unknown metadata
+is deferred to runtime. Generic live Tiles and recursively containing parents are eager partition
+boundaries; eligible neighbors retain their own compile routes. They are not added to generic
+host-parameter value keys, and even shape-constant live repeats cannot be captured.
+The existing native RoPE identity condition and Range/Tile Q8/position proofs are unchanged.
+Only the sole top-level live Tile owned by `Plan::new`'s exact native-attention proof regains
+its prior shapeless descriptor, after that proof and before route selection. The broad Q8
+capability override preserves the candidate partition, not capture permission. Near misses and
+nested live Tiles stay eager; translation defensively rejects capture after the native shortcut.
 Legacy Tile-1 has a distinct three-input signature and remains a separate authority/support
 gap, not a modern alias or a demonstrated backend impossibility. These are bounded source
 contracts and regression fixtures, not proof of every combination or physical GPU execution.
+Live-repeat fixtures are source-only pending independently authorized CI qualification.
 
 **NonZero** uses exact original representations, not float32 conversions: signed floating zeros
 are false, NaNs/infinities/subnormals are true, and large integers retain all bits. Empty tensors

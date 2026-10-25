@@ -1,4 +1,4 @@
-"""Modern constant Tile: exact payloads, checked live geometry and capture routes."""
+"""Modern Tile: exact payloads, checked geometry and context-specific capture routes."""
 
 import json
 import math
@@ -16,6 +16,7 @@ import pytest
 DT = ir.DataType
 FAIL = ort.capi.onnxruntime_pybind11_state.Fail
 EP_FAIL = ort.capi.onnxruntime_pybind11_state.EPFail
+INVALID_GRAPH = ort.capi.onnxruntime_pybind11_state.InvalidGraph
 DTYPES = [
     np.float16, np.float32, np.float64, np.int8, np.int16, np.int32, np.int64,
     np.uint8, np.uint16, np.uint32, np.uint64, np.bool_,
@@ -28,14 +29,22 @@ def _value(name, dtype, shape):
 
 
 def _model(shape, repeats, *, dtype=np.float32, opset=13, output=None,
-           chain=False, bf16=False):
+           chain=False, bf16=False, live=None, repeats_shape="fixed",
+           repeats_dtype=np.int64):
     tensor_type = ir.tensor(np.array(0, dtype)).dtype
     x = _value("x", tensor_type, shape)
     y = _value("y", tensor_type, output)
-    repeats = np.asarray(repeats, np.int64)
-    r = ir.Value(name="repeats", type=ir.TensorType(DT.INT64),
-                 shape=ir.Shape(repeats.shape), const_value=ir.tensor(repeats))
+    repeats = np.asarray(repeats, repeats_dtype)
+    rshape = list(repeats.shape) if repeats_shape == "fixed" else repeats_shape
+    r = _value("repeats", ir.tensor(repeats).dtype, rshape)
+    if live is None:
+        r.const_value = ir.tensor(repeats)
     nodes = []
+    tile_repeats = r
+    if live == "produced":
+        tile_repeats = _value("live_repeats", ir.tensor(repeats).dtype, rshape)
+        nodes.append(ir.node("Identity", [r], outputs=[tile_repeats],
+                             name="live_repeats_producer"))
     data = x
     if bf16:
         data = _value("narrow", DT.BFLOAT16, shape)
@@ -44,17 +53,19 @@ def _model(shape, repeats, *, dtype=np.float32, opset=13, output=None,
     elif chain:
         data = _value("transposed", tensor_type, None)
         nodes.append(ir.node("Transpose", [x], attributes={"perm": [1, 0]},
-                             outputs=[data]))
+                             outputs=[data], name="live_before" if live else ""))
     tiled = _value("tiled", DT.BFLOAT16 if bf16 else tensor_type, None) if (
         chain or bf16) else y
-    nodes.append(ir.node("Tile", [data, r], outputs=[tiled]))
+    nodes.append(ir.node("Tile", [data, tile_repeats], outputs=[tiled],
+                         name="live_tile" if live else ""))
     if bf16:
         nodes.append(ir.node("Cast", [tiled], attributes={"to": int(DT.FLOAT)},
                              outputs=[y]))
     elif chain:
         nodes.append(ir.node("Transpose", [tiled], attributes={"perm": [1, 0]},
-                             outputs=[y]))
-    graph = ir.Graph([x], [y], nodes=nodes, initializers=[r],
+                             outputs=[y], name="live_after" if live else ""))
+    graph = ir.Graph([x] if live is None else [x, r], [y], nodes=nodes,
+                     initializers=[r] if live is None else [],
                      opset_imports={"": opset}, name="tile_forms")
     return ir.to_proto(ir.Model(graph, ir_version=11)).SerializeToString()
 
@@ -296,3 +307,373 @@ def test_tile_wide_input_metadata_only(eager, monkeypatch, tmp_path):
     for _ in range(3):
         _exact(session.run(None, {"x": data})[0], np.empty([0, 0], np.uint8))
     _ownership(session)
+
+
+@pytest.mark.parametrize("live", ["boundary", "produced"])
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("opset", [6, 13])
+@pytest.mark.parametrize("eager", [False, True])
+def test_tile_live_exact_types(live, dtype, opset, eager, monkeypatch, tmp_path):
+    monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_COMPILE", "1" if eager else "0")
+    data = _payload(dtype).reshape(2, 3)
+    repeats = np.array([2, 3], np.int64)
+    session = _session(_model(data.shape, repeats, dtype=dtype, opset=opset, live=live),
+                       profile=tmp_path / "live_exact")
+    _exact(session.run(None, {"x": data, "repeats": repeats})[0],
+           _expected(data, repeats))
+    _ownership(session)
+
+
+@pytest.mark.parametrize("live", ["boundary", "produced"])
+@pytest.mark.parametrize("eager", [False, True])
+def test_tile_live_bfloat16(live, eager, monkeypatch, tmp_path):
+    monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_COMPILE", "1" if eager else "0")
+    data = np.array([1.5, -2, 3.25, -4.5, 0, -0.0], np.float32).reshape(2, 3)
+    repeats = np.array([2, 3], np.int64)
+    session = _session(_model(data.shape, repeats, bf16=True, live=live),
+                       profile=tmp_path / "live_bf16")
+    _exact(session.run(None, {"x": data, "repeats": repeats})[0],
+           _expected(data, repeats))
+    _ownership(session)
+
+
+@pytest.mark.parametrize("live", ["boundary", "produced"])
+@pytest.mark.parametrize("eager", [False, True])
+def test_tile_live_repeats_freshness(live, eager, monkeypatch, tmp_path):
+    monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_COMPILE", "1" if eager else "0")
+    session = _session(_model([2, 3], [1, 2], dtype=np.int64, live=live),
+                       profile=tmp_path / "live_replay")
+    retained = []
+    for invocation, values in enumerate([[1, 2], [2, 1], [0, 3], [1, 2], [1, 2]]):
+        data = (_payload(np.int64) + invocation).reshape(2, 3)
+        repeats = np.array(values, np.int64)
+        original = data.tobytes(), repeats.tobytes()
+        expected = _expected(data, repeats)
+        actual = session.run(None, {"x": data, "repeats": repeats})[0]
+        _exact(actual, expected)
+        assert (data.tobytes(), repeats.tobytes()) == original
+        assert not np.shares_memory(actual, data)
+        retained.append((actual, expected.copy()))
+    for values in [[-1, 1], [1, -(2**63)]]:
+        with pytest.raises(EP_FAIL, match="MLX Tile: repeats must be nonnegative"):
+            session.run(None, {"x": data, "repeats": np.array(values, np.int64)})
+        _exact(session.run(None, {"x": data, "repeats": repeats})[0], expected)
+    for actual, expected in retained:
+        _exact(actual, expected)
+    _ownership(session)
+
+
+@pytest.mark.parametrize("live", ["boundary", "produced"])
+@pytest.mark.parametrize("shape,repeats", [
+    ([], []), ([0], [2**63 - 1]), ([0, 2], [2**63 - 1, 3]),
+    ([2, 0, 0], [2, 3, 4]), ([2, 3], [0, 2]),
+    ([0, 2**31 + 7], [1, 0]),
+])
+@pytest.mark.parametrize("eager", [False, True])
+def test_tile_live_scalar_and_empty(live, shape, repeats, eager, monkeypatch, tmp_path):
+    monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_COMPILE", "1" if eager else "0")
+    data = np.full(shape, 7, np.uint64)
+    session = _session(_model(shape, repeats, dtype=np.uint64, live=live),
+                       profile=tmp_path / "live_empty")
+    repeats = np.array(repeats, np.int64)
+    _exact(session.run(None, {"x": data, "repeats": repeats})[0],
+           _expected(data, repeats))
+    _ownership(session)
+
+
+@pytest.mark.parametrize("live", ["boundary", "produced"])
+@pytest.mark.parametrize("shape", [[], [6], [1, 2, 3]])
+def test_tile_live_unknown_rank_recovery(live, shape):
+    session = _session(_model(None, [1, 2], live=live, repeats_shape=None))
+    data = np.arange(6, dtype=np.float32).reshape(2, 3)
+    repeats = np.array([1, 2], np.int64)
+    for bad in [repeats.reshape(1, 2), np.array(2, np.int64), repeats[:1]]:
+        with pytest.raises(EP_FAIL, match="MLX Tile: repeats (?:must have rank one|length must equal data rank)"):
+            session.run(None, {"x": data, "repeats": bad})
+        _exact(session.run(None, {"x": data, "repeats": repeats})[0],
+               _expected(data, repeats))
+    bad_data = data.reshape(shape) if shape else np.array(7, np.float32)
+    with pytest.raises(EP_FAIL, match="MLX Tile: repeats length must equal data rank"):
+        session.run(None, {"x": bad_data, "repeats": repeats})
+    _exact(session.run(None, {"x": data, "repeats": repeats})[0],
+           _expected(data, repeats))
+
+
+@pytest.mark.parametrize("live", ["boundary", "produced"])
+@pytest.mark.parametrize("eager", [False, True])
+def test_tile_live_unknown_metadata_scalar_replay(live, eager, monkeypatch, tmp_path):
+    monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_COMPILE", "1" if eager else "0")
+    session = _session(_model(None, [], dtype=np.float64, live=live, repeats_shape=None),
+                       profile=tmp_path / "unknown_scalar")
+    for shape, values in [([], []), ([2, 3], [2, 1]), ([], []),
+                          ([0, 2], [2**63 - 1, 3]), ([], [])]:
+        data = np.full(shape, -0.0, np.float64)
+        repeats = np.array(values, np.int64)
+        _exact(session.run(None, {"x": data, "repeats": repeats})[0],
+               _expected(data, repeats))
+    with pytest.raises(EP_FAIL, match="MLX Tile: repeats length must equal data rank"):
+        session.run(None, {"x": data, "repeats": np.array([1], np.int64)})
+    _exact(session.run(None, {"x": data, "repeats": repeats})[0], data)
+    _ownership(session)
+
+
+@pytest.mark.parametrize("live", ["boundary", "produced"])
+@pytest.mark.parametrize("repeats,error,message", [
+    (np.array(2, np.int64), FAIL, "CPU EP.*fallback.*disabled"),
+    (np.ones((1, 2), np.int64), FAIL, "CPU EP.*fallback.*disabled"),
+    (np.ones(1, np.int64), FAIL, "CPU EP.*fallback.*disabled"),
+    (np.ones(2, np.int32), INVALID_GRAPH, "tensor\\(int32\\)"),
+])
+def test_tile_live_invalid_metadata_rejected(live, repeats, error, message):
+    with pytest.raises(error, match=message):
+        _session(_model([2, 3], repeats, live=live, repeats_dtype=repeats.dtype))
+
+
+@pytest.mark.parametrize("live", ["boundary", "produced"])
+def test_tile_live_bfloat16_opset6_rejected(live):
+    with pytest.raises(INVALID_GRAPH, match="tensor\\(bfloat16\\)"):
+        _session(_model([2, 3], [1, 2], live=live, bf16=True, opset=6))
+
+
+@pytest.mark.parametrize("live", ["boundary", "produced"])
+@pytest.mark.parametrize("output", [[], [None], [None, None, None]])
+def test_tile_live_inconsistent_output_rank_declined(live, output):
+    with pytest.raises(FAIL, match="CPU EP.*fallback.*disabled"):
+        _session(_model(None, [1, 2], live=live, output=output))
+
+
+@pytest.mark.parametrize("live", ["boundary", "produced"])
+@pytest.mark.parametrize("repeats,shape,message", [
+    ([2**32 + 1], [1], "output extent exceeds int32"),
+    ([2**63 - 1], [1], "output extent exceeds int32"),
+    ([2**63 - 1, 1], [2, 0], "output extent overflows int64"),
+    ([1, 2**32 + 1], [0, 1], "output extent exceeds int32"),
+    ([65536, 65536], [1, 1], "element count exceeds int32 indexing"),
+    ([0, -1], [0, 2], "repeats must be nonnegative"),
+    ([1, -(2**63)], [0, 2], "repeats must be nonnegative"),
+])
+def test_tile_live_geometry_errors_recover(live, repeats, shape, message):
+    session = _session(_model([None] * len(shape), repeats, dtype=np.uint8, live=live))
+    data = np.empty(shape, np.uint8)
+    good = np.zeros(len(shape), np.int64)
+    expected = _expected(data, good)
+    _exact(session.run(None, {"x": data, "repeats": good})[0], expected)
+    with pytest.raises(EP_FAIL, match=f"MLX Tile(?: output)?: .*{message}"):
+        session.run(None, {"x": data, "repeats": np.array(repeats, np.int64)})
+    _exact(session.run(None, {"x": data, "repeats": good})[0], expected)
+
+
+@pytest.mark.parametrize("live", ["boundary", "produced"])
+def test_tile_live_partition_fixture(live, tmp_path):
+    session = _session(_model([2, 3], [1, 2], chain=True, live=live),
+                       profile=tmp_path / "live_partition")
+    for invocation, repeats in enumerate([[1, 2], [2, 1], [0, 3], [1, 2]]):
+        data = (np.arange(6, dtype=np.float32) + invocation).reshape(2, 3)
+        _exact(session.run(None, {"x": data, "repeats": np.array(repeats, np.int64)})[0],
+               _expected(data.T, repeats).T)
+    _ownership(session)
+
+
+@pytest.mark.parametrize("live", ["boundary", "produced"])
+def test_tile_live_add_partition_fixture(live, tmp_path):
+    x = _value("x", DT.FLOAT, [2, 3])
+    repeats = _value("repeats", DT.INT64, [2])
+    one = _value("one", DT.FLOAT, [])
+    one.const_value = ir.tensor(np.array(1, np.float32))
+    before = _value("before", DT.FLOAT, [2, 3])
+    tiled = _value("tiled", DT.FLOAT, [None, None])
+    out = _value("out", DT.FLOAT, [None, None])
+    nodes = []
+    live_repeats = repeats
+    if live == "produced":
+        live_repeats = _value("live_repeats", DT.INT64, [2])
+        nodes.append(ir.node("Identity", [repeats], outputs=[live_repeats],
+                             name="live_repeats_producer"))
+    nodes.extend([
+        ir.node("Add", [x, one], outputs=[before], name="live_before"),
+        ir.node("Tile", [before, live_repeats], outputs=[tiled], name="live_tile"),
+        ir.node("Add", [tiled, one], outputs=[out], name="live_after"),
+    ])
+    model = ir.to_proto(ir.Model(ir.Graph(
+        [x, repeats], [out], nodes=nodes, initializers=[one],
+        opset_imports={"": 13}, name="live_tile_add"), ir_version=11)).SerializeToString()
+    session = _session(model, profile=tmp_path / "live_add")
+    for invocation, values in enumerate([[1, 2], [2, 1], [0, 3], [1, 2]]):
+        data = (np.arange(6, dtype=np.float32) + invocation).reshape(2, 3)
+        repeats_value = np.array(values, np.int64)
+        _exact(session.run(None, {"x": data, "repeats": repeats_value})[0],
+               _expected(data + 1, values) + 1)
+    _ownership(session)
+
+
+@pytest.mark.parametrize("fixture,neighbor", [
+    ("test_tile_live_partition_fixture", "Transpose"),
+    ("test_tile_live_add_partition_fixture", "Add"),
+])
+def test_tile_live_actual_routes(fixture, neighbor, tmp_path):
+    library = Path(os.environ["ONNXRUNTIME_MLX_EP_LIB"]).resolve(strict=True)
+    assert library.is_file()
+    for live in ["boundary", "produced"]:
+        trace = tmp_path / f"{neighbor}_{live}.json"
+        subprocess.run(
+            [sys.executable, "-m", "pytest",
+             f"{Path(__file__).resolve()}::{fixture}[{live}]",
+             "-q", "-p", "no:cacheprovider"],
+            env={**os.environ, "ONNXRUNTIME_MLX_EP_LIB": str(library),
+                 "ONNXRUNTIME_EP_MLX_TRACE": str(trace),
+                 "ONNXRUNTIME_EP_MLX_NO_COMPILE": "0",
+                 "ONNXRUNTIME_EP_MLX_NO_GENERAL_COMPILE": "0"},
+            check=True, timeout=120)
+        paths = [event["args"] for event in json.loads(trace.read_text())
+                 if event.get("cat") == "ep.path"]
+        tiles = [event for event in paths if "Tile" in event["ops"].split(",")]
+        assert len(tiles) == 4 and all(
+            event["path"] == "eager" and event["ops"] == "Tile"
+            and event["node_names"] == "live_tile" and event["cache"] == "n/a"
+            for event in tiles), paths
+        assert len({event["partition_id"] for event in tiles}) == 1, paths
+        neighbors = [event for event in paths if event["path"] == "general"
+                     and neighbor in event["ops"].split(",")]
+        assert neighbors, paths
+        before = [event for event in neighbors if "live_before" in event["node_names"].split(",")]
+        assert [event["cache"] for event in before] == ["MISS", "HIT", "HIT", "HIT"], paths
+        assert len({event["partition_id"] for event in before}) == 1, paths
+
+
+def _control_model(kind):
+    x = _value("x", DT.FLOAT, [2, 3])
+    repeats = _value("repeats", DT.INT64, [2])
+    result = _value("result", DT.FLOAT, [None, None])
+    inputs = [x, repeats]
+    outputs = [result]
+    if kind in ("If", "NestedIf"):
+        condition = _value("condition", DT.BOOL, [])
+        inputs.append(condition)
+        branches = {}
+        for branch in ["then_branch", "else_branch"]:
+            local = _value(f"{branch}_repeats", DT.INT64, [2])
+            out = _value(f"{branch}_out", DT.FLOAT, [None, None])
+            one = _value(f"{branch}_one", DT.INT64, [2])
+            one.const_value = ir.tensor(np.ones(2, np.int64))
+            producer = ir.node("Identity", [repeats], outputs=[local]) if (
+                branch == "then_branch") else ir.node("Add", [repeats, one], outputs=[local])
+            branches[branch] = ir.Graph(
+                [], [out], nodes=[producer, ir.node("Tile", [x, local], outputs=[out])],
+                initializers=[] if branch == "then_branch" else [one],
+                opset_imports={"": 13}, name=branch)
+        inner = _value("inner", DT.FLOAT, [None, None]) if kind == "NestedIf" else result
+        node = ir.node("If", [condition], outputs=[inner], attributes=branches,
+                       name="live_tile_If")
+        if kind == "NestedIf":
+            outer_condition = _value("outer_condition", DT.BOOL, [])
+            inputs.append(outer_condition)
+            then = ir.Graph([], [inner], nodes=[node], opset_imports={"": 13}, name="outer_then")
+            other = _value("outer_else_out", DT.FLOAT, [None, None])
+            otherwise = ir.Graph(
+                [], [other], nodes=[ir.node("Tile", [x, repeats], outputs=[other])],
+                opset_imports={"": 13}, name="outer_else")
+            node = ir.node("If", [outer_condition], outputs=[result],
+                           attributes={"then_branch": then, "else_branch": otherwise},
+                           name="live_tile_NestedIf")
+    elif kind == "Loop":
+        trip = _value("trip", DT.INT64, [])
+        condition = _value("condition", DT.BOOL, [])
+        inputs.extend([trip, condition])
+        iteration = _value("iteration", DT.INT64, [])
+        body_condition = _value("body_condition", DT.BOOL, [])
+        carried = _value("carried", DT.INT64, [2])
+        last = _value("last", DT.FLOAT, [None, None])
+        next_condition = _value("next_condition", DT.BOOL, [])
+        next_repeats = _value("next_repeats", DT.INT64, [2])
+        tiled = _value("body_tiled", DT.FLOAT, [None, None])
+        indices = _value("indices", DT.INT64, [2])
+        indices.const_value = ir.tensor(np.array([1, 0], np.int64))
+        body = ir.Graph(
+            [iteration, body_condition, carried, last], [next_condition, next_repeats, tiled],
+            nodes=[ir.node("Identity", [body_condition], outputs=[next_condition]),
+                   ir.node("Tile", [x, carried], outputs=[tiled]),
+                   ir.node("Gather", [carried, indices], outputs=[next_repeats])],
+            initializers=[indices], opset_imports={"": 13}, name="tile_loop")
+        final_repeats = _value("final_repeats", DT.INT64, [2])
+        outputs = [final_repeats, result]
+        node = ir.node("Loop", [trip, condition, repeats, x], outputs=outputs,
+                       attributes={"body": body}, name="live_tile_Loop")
+    else:
+        assert kind == "Scan"
+        # Every slice has the same repeat values in each invocation; no ragged outputs.
+        repeats = _value("repeats", DT.INT64, [3, 2])
+        inputs = [x, repeats]
+        body_repeats = _value("body_repeats", DT.INT64, [2])
+        tiled = _value("scan_tiled", DT.FLOAT, [None, None])
+        body = ir.Graph(
+            [body_repeats], [tiled],
+            nodes=[ir.node("Tile", [x, body_repeats], outputs=[tiled])],
+            opset_imports={"": 13}, name="tile_scan")
+        result = _value("result", DT.FLOAT, [3, None, None])
+        outputs = [result]
+        node = ir.node("Scan", [repeats], outputs=outputs,
+                       attributes={"body": body, "num_scan_inputs": 1}, name="live_tile_Scan")
+    return ir.to_proto(ir.Model(ir.Graph(
+        inputs, outputs, nodes=[node], opset_imports={"": 13}, name=f"live_tile_{kind}"),
+        ir_version=11)).SerializeToString()
+
+
+@pytest.mark.parametrize("kind", ["If", "NestedIf", "Loop", "Scan"])
+@pytest.mark.parametrize("eager", [False, True])
+def test_tile_live_recursive_freshness(kind, eager, monkeypatch, tmp_path):
+    monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_COMPILE", "1" if eager else "0")
+    session = _session(_control_model(kind), profile=tmp_path / f"tile_{kind}")
+    for invocation, values in enumerate([[1, 2], [2, 1], [1, 2], [1, 1]]):
+        data = (np.arange(6, dtype=np.float32) + invocation * 10).reshape(2, 3)
+        repeats = np.array(values, np.int64)
+        feeds = {"x": data, "repeats": repeats}
+        if kind in ("If", "NestedIf"):
+            selected = bool(invocation % 2)
+            feeds["condition"] = np.array(selected)
+            actual_repeats = repeats if selected else repeats + 1
+            if kind == "NestedIf":
+                outer_selected = invocation != 2
+                feeds["outer_condition"] = np.array(outer_selected)
+                if not outer_selected:
+                    actual_repeats = repeats
+            expected = _expected(data, actual_repeats)
+        elif kind == "Loop":
+            trip = invocation + 1
+            feeds.update(trip=np.array(trip, np.int64), condition=np.array(True))
+            last_repeats = repeats[::-1] if trip % 2 == 0 else repeats
+            expected = _expected(data, last_repeats)
+        else:
+            feeds["repeats"] = np.repeat(repeats[None], 3, axis=0)
+            expected = np.stack([_expected(data, repeats)] * 3)
+        originals = {name: value.tobytes() for name, value in feeds.items()}
+        actual = session.run(None, feeds)
+        _exact(actual[-1], expected)
+        if kind == "Loop":
+            _exact(actual[0], repeats[::-1] if trip % 2 else repeats)
+        assert all(feeds[name].tobytes() == value for name, value in originals.items())
+    _ownership(session)
+
+
+def test_tile_live_recursive_actual_routes(tmp_path):
+    library = Path(os.environ["ONNXRUNTIME_MLX_EP_LIB"]).resolve(strict=True)
+    assert library.is_file()
+    for kind in ["If", "NestedIf", "Loop", "Scan"]:
+        trace = tmp_path / f"recursive_{kind}.json"
+        subprocess.run(
+            [sys.executable, "-m", "pytest",
+             f"{Path(__file__).resolve()}::test_tile_live_recursive_freshness[False-{kind}]",
+             "-q", "-p", "no:cacheprovider"],
+            env={**os.environ, "ONNXRUNTIME_MLX_EP_LIB": str(library),
+                 "ONNXRUNTIME_EP_MLX_TRACE": str(trace),
+                 "ONNXRUNTIME_EP_MLX_NO_COMPILE": "0",
+                 "ONNXRUNTIME_EP_MLX_NO_GENERAL_COMPILE": "0"},
+            check=True, timeout=120)
+        paths = [event["args"] for event in json.loads(trace.read_text())
+                 if event.get("cat") == "ep.path"]
+        expected_op = "If" if kind == "NestedIf" else kind
+        assert len(paths) == 4 and all(event["ops"] == expected_op
+                                      and event["path"] == "eager"
+                                      and event["cache"] == "n/a"
+                                      and event["node_names"] == f"live_tile_{kind}"
+                                      for event in paths), paths
+        assert len({event["partition_id"] for event in paths}) == 1, paths

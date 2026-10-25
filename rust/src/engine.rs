@@ -2169,6 +2169,10 @@ impl<'a> TranslationContext<'a> {
         self.plan.native_attention_decode
     }
 
+    pub(crate) fn is_capturing(&self) -> bool {
+        self.in_general_trace || self.in_compiled_trace || self.rope_dynamic
+    }
+
     /// Take the shared-buffer KV `present` outputs discovered during the compiled trace, handing them
     /// to the core so it can store them on the traced `CompiledSubgraph` slot. Leaves the list empty.
     pub(crate) fn take_compiled_kv_present(&mut self) -> Vec<(String, usize)> {
