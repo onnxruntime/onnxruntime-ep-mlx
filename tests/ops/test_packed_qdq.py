@@ -7,6 +7,7 @@ GroupedMatMul-29 coverage is direct Rust handler coverage, not an ORT session.
 
 import ctypes
 import json
+import math
 import os
 from pathlib import Path
 import subprocess
@@ -40,6 +41,7 @@ def _initializer(name, values, dtype):
 
 
 def _ortvalue(values, dtype):
+    values = np.asarray(values)
     if dtype not in PACKED:
         return ort.OrtValue.ortvalue_from_numpy(values)
     result = ort.OrtValue.ortvalue_from_shape_and_type(list(values.shape), dtype)
@@ -189,7 +191,12 @@ def _matrix_replay(tmp_path, xdtype, wdtype, layout, initializers, missing_zero=
         a = values["a"].astype(np.float32)
         if xdtype != TensorProto.FLOAT:
             a = (a - values.get("az", np.float32(0))) * values["as"]
-        np.testing.assert_allclose(actual[0], a @ w, rtol=1e-5, atol=1e-6)
+        try:
+            np.testing.assert_allclose(actual[0], a @ w, rtol=1e-5, atol=1e-6)
+        except AssertionError:
+            if initializers and layout == "axis" and xdtype in PACKED and wdtype in PACKED:
+                _diagnose_projection(actual, a, w, values, xdtype, wdtype, iteration)
+            raise
         np.testing.assert_array_equal(actual[1], w)
         np.testing.assert_array_equal(actual[2], w + w)
         if xdtype != TensorProto.FLOAT:
@@ -206,6 +213,64 @@ def _matrix_replay(tmp_path, xdtype, wdtype, layout, initializers, missing_zero=
             np.testing.assert_allclose(actual[-2], keys[None, None], rtol=1e-5, atol=1e-6)
             np.testing.assert_allclose(actual[-1], cached_values[None, None], rtol=1e-5, atol=1e-6)
     _completed_on_mlx(session)
+
+
+def _diagnose_projection(actual, a, w, values, xdtype, wdtype, iteration):
+    reference = a @ w
+    coordinates = np.argwhere(~np.isclose(actual[0], reference, rtol=1e-5, atol=1e-6))
+
+    def ordered_float32(value):
+        bits = int(np.asarray(value, dtype=np.float32).view(np.uint32))
+        return 0x80000000 - (bits & 0x7FFFFFFF) if bits & 0x80000000 else 0x80000000 + bits
+
+    for row, column in coordinates:
+        # FP64 is diagnostic only: retain the original FP32 oracle and assertion above.
+        if np.isfinite(a[row]).all() and np.isfinite(w[:, column]).all():
+            independent = math.fsum(float(x) * float(y) for x, y in zip(a[row], w[:, column]))
+        else:
+            independent = float(a[row].astype(np.float64) @ w[:, column].astype(np.float64))
+        observed = float(actual[0][row, column])
+        expected = float(reference[row, column])
+        print("PACKED_QDQ_NUMERICAL_DIAGNOSTIC " + json.dumps({
+            "iteration": iteration,
+            "coordinate": [int(row), int(column)],
+            "logical_types": {"a": xdtype, "w": wdtype},
+            "shapes": {"a": list(a.shape), "w": list(w.shape)},
+            "actual": observed,
+            "original_fp32_matmul_reference": expected,
+            "independent_fp64_dot_of_fp32_dq_operands": independent,
+            "finite_product_sum_method": "math.fsum of exact binary64 products of binary32 DQ operands",
+            "absolute_difference": {
+                "actual_vs_fp32": abs(observed - expected),
+                "actual_vs_fp64": abs(observed - independent),
+                "fp32_vs_fp64": abs(expected - independent),
+            },
+            "float32_ulp_distance": {
+                "actual_vs_fp32": abs(ordered_float32(observed) - ordered_float32(expected)),
+                "actual_vs_rounded_fp64": abs(ordered_float32(observed) - ordered_float32(independent)),
+                "fp32_vs_rounded_fp64": abs(ordered_float32(expected) - ordered_float32(independent)),
+            },
+            "parameters": {
+                name: np.asarray(values[name]).tolist() if name in values else None
+                for name in ("as", "ws", "az", "wz")
+            },
+            "quantized_dot_operands": {
+                "a_row": values["a"][row].tolist(),
+                "w_column": values["w"][:, column].tolist(),
+            },
+            "fp32_dq_dot_operands": {
+                "reference_a_row": a[row].tolist(),
+                "reference_w_column": w[:, column].tolist(),
+                "actual_a_row": actual[3][row].tolist(),
+                "actual_w_column": actual[1][:, column].tolist(),
+            },
+            "dq_actual_equals_reference": {
+                "a": bool(np.array_equal(actual[3], a)),
+                "w": bool(np.array_equal(actual[1], w)),
+            },
+            "operation_order": "FP32 subtraction, FP32 DQ multiplication, then dot; no bias",
+            "bias": None,
+        }, separators=(",", ":")))
 
 
 @pytest.mark.parametrize("xdtype", [
