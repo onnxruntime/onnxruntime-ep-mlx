@@ -117,9 +117,26 @@ exact normal float32 values under the exponent guard. Both final binary scalings
 exact, finite and normal (or zero). Bias is added separately after the matrix result.
 
 The general path reads quantized bytes directly, performs float32 DQ rounding in
-registers, then uses SIMD-distributed float32 FMA accumulation. It supports realistic K
-and blocked scales, but is **not integer-only ALU or broadly bit-exact**: it follows the
-existing ordinary float32 MatMul numerical policy. No expanded floating activation or
+registers, then uses SIMD-distributed float32 accumulation. With either packed operand,
+it compensates rounded products using FMA residuals and TwoSum errors, including
+the 32-lane reduction, before rounding the dot to float32. Bias is added only after
+that rounding. The original FMA/SIMD sum is retained for the entire output if any
+lane's operand, product, compensated partial/correction, or reduction becomes
+nonfinite, or if the original reduction is nonfinite. Thus it preserves the
+original exceptional arithmetic rather than promising exact-real recovery after
+intermediate overflow. Underflow can lose product residuals; Metal subnormal fidelity
+and blanket correctly-rounded dots are not claimed. Ordinary INT8/UINT8 general
+arithmetic and the proven integer subset are unchanged.
+It supports realistic K and blocked scales, but is **not integer-only ALU or broadly
+bit-exact**. Finite packed regression references independently accumulate exact
+products of the already-float32-rounded DQ operands using binary integer
+coefficients, then round the sum to float32 with ties to even. Existing
+`rtol=1e-5, atol=1e-6` thresholds are unchanged. Original NumPy float32 reductions
+remain named disagreement diagnostics: neither their reduction order nor a fitted
+output is the oracle. Exceptional regressions separately check the retained
+float32 overflow/NaN/Inf behavior. This source change still requires hosted
+qualification; earlier failing CI and numerical evidence are retained.
+No expanded floating activation or
 weight matrix is produced by this kernel. This is not MLX's affine QMM rewrite:
 that kernel's scale-after-dot/bias correction can change ONNX DQ overflow/cancellation
 semantics. Non-float32 DQ, vector/batched MatMul, and CPU streams use ordinary DQ

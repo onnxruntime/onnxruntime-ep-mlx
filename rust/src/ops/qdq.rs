@@ -289,6 +289,17 @@ fn integer_exact(pattern: &QuantizedMatMul, x: &Operand, w: &Operand) -> bool {
         && binary_scales(&pattern.w)
 }
 
+const HEADER: &str = r#"
+inline float2 mlx_qdq_two_sum(float a, float b) {
+    float hi = precise::fma(1.0f, a, b);
+    float bv = precise::fma(-1.0f, a, hi);
+    float av = precise::fma(-1.0f, bv, hi);
+    float br = precise::fma(-1.0f, bv, b);
+    float ar = precise::fma(-1.0f, av, a);
+    return float2(hi, precise::fma(1.0f, ar, br));
+}
+"#;
+
 const SOURCE: &str = r#"
     size_t out = thread_position_in_grid.x / 32;
     uint lane = thread_position_in_grid.x % 32;
@@ -298,6 +309,9 @@ const SOURCE: &str = r#"
     uint row = route / S;
     uint expert = GROUPED ? uint(indices[route]) : 0;
     float sum = 0.0f;
+    float hi = 0.0f;
+    float lo = 0.0f;
+    bool compensated = true;
     int isum = 0;
     for (uint k = lane; k < K; k += 32) {
         size_t xp = size_t(row / XD0) * XS0 + size_t(k / XD1) * XS1;
@@ -332,10 +346,41 @@ const SOURCE: &str = r#"
                                : float(x[size_t(row) * K + k]);
             float bw = precise::fma(float(b), wscale[wp], 0.0f);
             sum = precise::fma(ax, bw, sum);
+            if ((X_PACKED || W_PACKED) && compensated) {
+                float product = precise::fma(ax, bw, 0.0f);
+                float residual = precise::fma(ax, bw, -product);
+                float2 pair = mlx_qdq_two_sum(hi, product);
+                float correction = precise::fma(1.0f, lo,
+                    precise::fma(1.0f, pair.y, residual));
+                compensated = isfinite(ax) && isfinite(bw) && isfinite(product)
+                    && isfinite(residual) && isfinite(pair.x) && isfinite(correction);
+                hi = pair.x;
+                lo = correction;
+            }
         }
     }
     isum = simd_sum(isum);
     sum = simd_sum(sum);
+    if ((X_PACKED || W_PACKED) && !INTEGER) {
+        // Retain the original IEEE path if any compensated or original partial overflows.
+        bool valid = simd_all(compensated) && isfinite(sum);
+        for (uint offset = 16; offset != 0; offset /= 2) {
+            float other_hi = simd_shuffle_down(hi, offset);
+            float other_lo = simd_shuffle_down(lo, offset);
+            if (valid && lane < offset) {
+                float2 pair = mlx_qdq_two_sum(hi, other_hi);
+                float correction = precise::fma(1.0f, lo,
+                    precise::fma(1.0f, other_lo, pair.y));
+                valid = isfinite(pair.x) && isfinite(correction);
+                hi = pair.x;
+                lo = correction;
+            }
+            valid = simd_all(valid);
+        }
+        float result = precise::fma(1.0f, hi, lo);
+        valid = simd_all(valid && isfinite(result));
+        if (valid) { sum = result; }
+    }
     if (INTEGER) {
         size_t xp = size_t(row / XD0) * XS0;
         size_t wp = size_t(expert / WD0) * WS0 + size_t(col / WD2) * WS2;
@@ -460,13 +505,14 @@ pub(super) fn execute(ctx: &mut TranslationContext, node: &NodeDesc) -> Result<b
         ])?;
         let outputs = super::selective_scan::VecString::new(&["y"])?;
         let source = CString::new(SOURCE).expect("static shader has no NUL");
+        let header = CString::new(HEADER).expect("static shader header has no NUL");
         let kernel = unsafe {
             mlx::mlx_fast_metal_kernel_new(
                 c"mlx_qdq_matmul".as_ptr(),
                 names.as_raw(),
                 outputs.as_raw(),
                 source.as_ptr(),
-                c"".as_ptr(),
+                header.as_ptr(),
                 true,
                 false,
             )
@@ -805,6 +851,66 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn qdq_packed_general_rounds_dot_before_grouped_bias() {
+        let stream = Stream::new_default_gpu();
+        let mut plan = Plan::new(vec![]);
+        let mut ctx = TranslationContext::new(
+            &mut plan,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            stream.as_raw(),
+        );
+        let x = [1.0f32, 2.0f32.powi(-24)];
+        let indices = [2i32, 0];
+        let bias = [-1.0f32; 3];
+        for (name, values, shape, dtype) in [
+            ("x", x.as_ptr().cast(), vec![1, 2], F32),
+            (
+                "indices",
+                indices.as_ptr().cast(),
+                vec![1, 2],
+                mlx::mlx_dtype__MLX_INT32,
+            ),
+            ("bias", bias.as_ptr().cast(), vec![3, 1], F32),
+        ] {
+            let array = ctx.keep(Array::from_data(values, &shape, dtype));
+            ctx.bind(&output(name), array);
+        }
+        let mut w = dq("w");
+        w.inputs[0] = quantized_reference(
+            "w",
+            &[1; 6],
+            &[3, 2, 1],
+            ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT4,
+        );
+        scalar_scale(&mut w, 1.0);
+        w.inputs[2] = TensorRef::absent();
+        let mut node = NodeDesc::new(
+            "GroupedMatMul".into(),
+            String::new(),
+            29,
+            CompileShapeSafety::EagerOnly {
+                reason: EAGER_REASON,
+            },
+        );
+        node.inputs = vec![
+            reference("x"),
+            reference("wf"),
+            reference("indices"),
+            reference("bias"),
+        ];
+        node.outputs = vec![output("y")];
+        node.qdq = Some(Box::new(QuantizedMatMul { x: None, w }));
+        assert!(execute(&mut ctx, &node).unwrap());
+        let y = ctx.resolve(&reference("y")).unwrap();
+        let y = ctx.contiguous_eval(y).unwrap();
+        assert_eq!(ctx.shape_of(y), [1, 2, 1]);
+        let actual = unsafe { std::slice::from_raw_parts(mlx::mlx_array_data_float32(y), 2) };
+        // RNE(1 + 2^-24) - 1 = 0; folding bias into the dot would instead give 2^-24.
+        assert_eq!(actual, [0.0, 0.0]);
     }
 
     #[test]

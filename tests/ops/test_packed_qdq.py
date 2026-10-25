@@ -82,6 +82,51 @@ def _values(shape, dtype, offset=0):
     return ((np.arange(count) + offset) % width + low).astype(dt).reshape(shape)
 
 
+def _binary32_coefficient(bits):
+    bits = int(bits)
+    exponent = (bits >> 23) & 255
+    if exponent == 255:
+        raise ValueError("exact finite-dot oracle requires finite binary32 operands")
+    significand = bits & 0x7FFFFF
+    if exponent:
+        significand |= 1 << 23
+    coefficient = significand << max(0, exponent - 1)
+    return -coefficient if bits >> 31 else coefficient
+
+
+def _round_product_sum(total):
+    # Each binary32 coefficient is in units of 2^-149; products are in 2^-298.
+    sign = int(total < 0) << 31
+    magnitude = abs(total)
+    shift = max(149, magnitude.bit_length() - 24)
+    significand, remainder = divmod(magnitude, 1 << shift)
+    halfway = 1 << (shift - 1)
+    significand += remainder > halfway or (remainder == halfway and significand % 2 == 1)
+    if significand == 1 << 24:
+        significand >>= 1
+        shift += 1
+    if significand < 1 << 23:
+        bits = significand
+    else:
+        exponent = shift - 148
+        bits = 0x7F800000 if exponent >= 255 else (
+            (exponent << 23) | (significand & 0x7FFFFF))
+    return np.asarray(sign | bits, dtype=np.uint32).view(np.float32)[()]
+
+
+def _exact_projection(a, w):
+    assert a.dtype == w.dtype == np.float32
+    rows = [[_binary32_coefficient(value) for value in row]
+            for row in np.atleast_2d(a).view(np.uint32)]
+    columns = [[_binary32_coefficient(value) for value in column]
+               for column in w.T.copy().view(np.uint32)]
+    result = np.empty((len(rows), len(columns)), dtype=np.float32)
+    for i, row in enumerate(rows):
+        for j, column in enumerate(columns):
+            result[i, j] = _round_product_sum(sum(x * y for x, y in zip(row, column)))
+    return result[0] if a.ndim == 1 else result
+
+
 def _matrix_model(xdtype, wdtype, layout, initializers, missing_zero=False, k=None,
                   decoder=False, vector=False):
     if k is None:
@@ -159,7 +204,7 @@ def _matrix_model(xdtype, wdtype, layout, initializers, missing_zero=False, k=No
 
 
 def _matrix_replay(tmp_path, xdtype, wdtype, layout, initializers, missing_zero=False, k=None,
-                   decoder=False, vector=False):
+                   decoder=False, vector=False, record_property=None):
     model, values, types, constants = _matrix_model(
         xdtype, wdtype, layout, initializers, missing_zero, k, decoder, vector)
     session = _session(model, tmp_path)
@@ -191,8 +236,24 @@ def _matrix_replay(tmp_path, xdtype, wdtype, layout, initializers, missing_zero=
         a = values["a"].astype(np.float32)
         if xdtype != TensorProto.FLOAT:
             a = (a - values.get("az", np.float32(0))) * values["as"]
+        reference = _exact_projection(a, w)
+        original = a @ w
+        disagreements = np.argwhere(~np.isclose(original, reference, rtol=1e-5, atol=1e-6))
+        if disagreements.size:
+            details = [{
+                "coordinate": coordinate.tolist(),
+                "original_numpy_fp32": float(original[tuple(coordinate)]),
+                "exact_sum_rounded_fp32": float(reference[tuple(coordinate)]),
+                "actual": float(actual[0][tuple(coordinate)]),
+            } for coordinate in disagreements]
+            print("PACKED_QDQ_ORIGINAL_NUMPY_DISAGREEMENT " + json.dumps({
+                "iteration": iteration, "disagreements": details,
+            }))
+            if record_property is not None:
+                record_property(f"original_numpy_fp32_disagreement_iteration_{iteration}",
+                                json.dumps(details))
         try:
-            np.testing.assert_allclose(actual[0], a @ w, rtol=1e-5, atol=1e-6)
+            np.testing.assert_allclose(actual[0], reference, rtol=1e-5, atol=1e-6)
         except AssertionError:
             if initializers and layout == "axis" and xdtype in PACKED and wdtype in PACKED:
                 _diagnose_projection(actual, a, w, values, xdtype, wdtype, iteration)
@@ -202,7 +263,7 @@ def _matrix_replay(tmp_path, xdtype, wdtype, layout, initializers, missing_zero=
         if xdtype != TensorProto.FLOAT:
             np.testing.assert_array_equal(actual[3], a)
         if decoder:
-            query = ((a @ w) * np.float32(1 / 1024)).reshape(-1, w.shape[1])
+            query = (reference * np.float32(1 / 1024)).reshape(-1, w.shape[1])
             keys = np.concatenate([values["pk"][0, 0], query], axis=0)
             cached_values = np.concatenate([values["pv"][0, 0], query], axis=0)
             scores = query.astype(np.float64) @ keys.astype(np.float64).T / np.sqrt(query.shape[1])
@@ -217,14 +278,17 @@ def _matrix_replay(tmp_path, xdtype, wdtype, layout, initializers, missing_zero=
 
 def _diagnose_projection(actual, a, w, values, xdtype, wdtype, iteration):
     reference = a @ w
-    coordinates = np.argwhere(~np.isclose(actual[0], reference, rtol=1e-5, atol=1e-6))
+    independent_reference = _exact_projection(a, w)
+    coordinates = np.argwhere(
+        ~np.isclose(actual[0], reference, rtol=1e-5, atol=1e-6)
+        | ~np.isclose(actual[0], independent_reference, rtol=1e-5, atol=1e-6))
 
     def ordered_float32(value):
         bits = int(np.asarray(value, dtype=np.float32).view(np.uint32))
         return 0x80000000 - (bits & 0x7FFFFFFF) if bits & 0x80000000 else 0x80000000 + bits
 
     for row, column in coordinates:
-        # FP64 is diagnostic only: retain the original FP32 oracle and assertion above.
+        # Keep the original NumPy reduction and hosted diagnostic evidence identifiable.
         if np.isfinite(a[row]).all() and np.isfinite(w[:, column]).all():
             independent = math.fsum(float(x) * float(y) for x, y in zip(a[row], w[:, column]))
         else:
@@ -238,6 +302,7 @@ def _diagnose_projection(actual, a, w, values, xdtype, wdtype, iteration):
             "shapes": {"a": list(a.shape), "w": list(w.shape)},
             "actual": observed,
             "original_fp32_matmul_reference": expected,
+            "independent_exact_sum_rounded_fp32": float(independent_reference[row, column]),
             "independent_fp64_dot_of_fp32_dq_operands": independent,
             "finite_product_sum_method": "math.fsum of exact binary64 products of binary32 DQ operands",
             "absolute_difference": {
@@ -279,8 +344,144 @@ def _diagnose_projection(actual, a, w, values, xdtype, wdtype, iteration):
 @pytest.mark.parametrize("wdtype", PACKED, ids=["i4", "u4"])
 @pytest.mark.parametrize("layout", ["integer", "axis", "blocked"])
 @pytest.mark.parametrize("initializers", [False, True], ids=["live", "initializer"])
-def test_packed_qdq_replay(tmp_path, xdtype, wdtype, layout, initializers):
-    _matrix_replay(tmp_path, xdtype, wdtype, layout, initializers)
+def test_packed_qdq_replay(tmp_path, record_property, xdtype, wdtype, layout, initializers):
+    _matrix_replay(tmp_path, xdtype, wdtype, layout, initializers,
+                   record_property=record_property)
+
+
+@pytest.mark.parametrize("bits,coefficient", [
+    (0, 0), (0x80000000, 0), (1, 1),
+    (0x007FFFFF, (1 << 23) - 1), (0x00800000, 1 << 23),
+    (0x3F800000, 1 << 149), (0xBF800000, -(1 << 149)),
+    (0x7F7FFFFF, ((1 << 24) - 1) << 253),
+])
+def test_packed_exact_oracle_coefficients(bits, coefficient):
+    assert _binary32_coefficient(bits) == coefficient
+
+
+@pytest.mark.parametrize("total,bits", [
+    (0, 0),
+    (1 << 148, 0),  # Half of the smallest subnormal, ties to even.
+    (-(1 << 148), 0x80000000),
+    (1 << 149, 1),
+    (3 << 148, 2),
+    (1 << 172, 0x00800000),
+    (((1 << 24) - 1) << 148, 0x00800000),
+    ((1 << 298) + (1 << 274), 0x3F800000),
+    ((1 << 298) + (1 << 274) + 1, 0x3F800001),
+    (-((1 << 298) + (1 << 274) + 1), 0xBF800001),
+    ((1 << 426) - (1 << 401) - 1, 0x7F7FFFFF),
+    ((1 << 426) - (1 << 401), 0x7F800000),
+])
+def test_packed_exact_oracle_rounding(total, bits):
+    assert int(_round_product_sum(total).view(np.uint32)) == bits
+
+
+def test_packed_exact_oracle_products():
+    e = np.float32(1 + 2**-23)
+    a = np.array([[e, -1]], np.float32)
+    w = np.array([[e], [e]], np.float32)
+    assert int(_exact_projection(a, w)[0, 0].view(np.uint32)) == 0x34000001
+    with pytest.raises(ValueError, match="finite"):
+        _exact_projection(np.array([[np.inf]], np.float32), np.ones((1, 1), np.float32))
+
+
+NUMERIC_CASES = (
+    "lane-cancellation", "tree-cancellation", "product-residual", "tiny-normal",
+    "partial-overflow", "product-overflow", "reduction-overflow", "overflow-cancellation",
+    "finite-fma-product-overflow",
+    "nan", "positive-infinity", "negative-infinity", "opposite-infinities",
+    "zero-times-infinity", "dq-overflow",
+)
+
+
+@pytest.mark.parametrize("case", NUMERIC_CASES)
+def test_packed_general_numerics(tmp_path, case):
+    a = np.zeros((1, 65), np.float32)
+    w = np.ones((65, 1), np.int8)
+    scale = np.array(1, np.float32)
+    expected = None
+    if case in ("lane-cancellation", "tree-cancellation"):
+        positions = [0, 32, 64] if case == "lane-cancellation" else [0, 1, 16]
+        a[0, positions] = [2**24, 1, -(2**24)]
+    elif case == "product-residual":
+        a[0, [0, 32]] = [1 + 2**-23, -1]
+        scale = np.array(1 + 2**-23, np.float32)
+    elif case == "tiny-normal":
+        a[0, [0, 32, 64]] = [2**-90, 2**-120, -(2**-90)]
+    elif case in ("partial-overflow", "reduction-overflow", "overflow-cancellation"):
+        positions = [0, 1] if case == "reduction-overflow" else [0, 32]
+        a[0, positions] = 2**127
+        if case == "overflow-cancellation":
+            a[0, 64] = -(2**127)
+        # Preserve the original F32 exceptional path, not exact-real overflow recovery.
+        expected = np.inf
+    elif case == "product-overflow":
+        a[0, 0] = 2**127
+        w.fill(2)
+        expected = np.inf
+    elif case == "finite-fma-product-overflow":
+        # A nonzero lane must reject its overflowing TwoProd, although the FMA is finite.
+        a[0, [17, 49]] = [-(2**126), 2**127]
+        w.fill(2)
+        expected = 2**127
+    elif case == "nan":
+        a[0, 0] = np.nan
+        expected = np.nan
+    elif case in ("positive-infinity", "negative-infinity", "opposite-infinities"):
+        a[0, 0] = -np.inf if case == "negative-infinity" else np.inf
+        expected = a[0, 0]
+        if case == "opposite-infinities":
+            a[0, 32] = -np.inf
+            expected = np.nan
+    elif case == "zero-times-infinity":
+        scale = np.array(np.inf, np.float32)
+        expected = np.nan
+    elif case == "dq-overflow":
+        a.fill(1)
+        w.fill(7)
+        scale = np.array(2**127, np.float32)
+        expected = np.inf
+    else:
+        raise AssertionError(f"unhandled numeric case {case}")
+    info = lambda name, dt, shape: helper.make_tensor_value_info(name, dt, shape)
+    model = helper.make_model(
+        helper.make_graph(
+            [helper.make_node("DequantizeLinear", ["w", "s"], ["wf"]),
+             helper.make_node("MatMul", ["a", "wf"], ["y"])],
+            "packed_general_numerics",
+            [info("a", TensorProto.FLOAT, [1, 65]), info("w", TensorProto.INT4, [65, 1])],
+            [info("y", TensorProto.FLOAT, [1, 1]), info("wf", TensorProto.FLOAT, [65, 1])],
+            [numpy_helper.from_array(scale, "s")],
+        ), opset_imports=[helper.make_opsetid("", 24)], ir_version=11,
+    ).SerializeToString()
+    session = _session(model, tmp_path)
+    actual, actual_w = [value.numpy() for value in session.run_with_ort_values(
+        None, {"a": _ortvalue(a, TensorProto.FLOAT), "w": _ortvalue(w, TensorProto.INT4)})]
+    with np.errstate(over="ignore", invalid="ignore"):
+        wf = w.astype(np.float32) * scale
+    np.testing.assert_array_equal(actual_w, wf)
+    reference = _exact_projection(a, wf) if expected is None else np.full((1, 1), expected, np.float32)
+    np.testing.assert_allclose(actual, reference, rtol=1e-5, atol=1e-6)
+    # The finite constructions are exactly representable; exceptional classes also match exactly.
+    np.testing.assert_array_equal(actual, reference)
+    _completed_on_mlx(session)
+
+
+def test_packed_general_numerics_actual_dispatch(tmp_path):
+    trace = tmp_path / "packed-general-numerics.json"
+    env = {**os.environ, "ONNXRUNTIME_EP_MLX_TRACE": str(trace)}
+    env.pop("ONNXRUNTIME_EP_MLX_NO_QDQ_FUSION", None)
+    subprocess.run(
+        [sys.executable, "-m", "pytest",
+         f"{Path(__file__)}::test_packed_general_numerics",
+         "-q", "-p", "no:cacheprovider"],
+        env=env, check=True, timeout=180,
+    )
+    events = json.loads(trace.read_text())
+    kernels = [event.get("args", {}).get("kernel")
+               for event in events if event.get("cat") == "op.fast"]
+    assert kernels.count("mlx_qdq_packed4_matmul") == len(NUMERIC_CASES), kernels
 
 
 @pytest.mark.parametrize("wdtype", [TensorProto.INT8, TensorProto.UINT8], ids=["i8", "u8"])
