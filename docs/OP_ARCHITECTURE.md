@@ -359,12 +359,50 @@ per-node claim predicate and compile policy define the implemented subset.
 The MLX array boundary carries bool/int/uint 8-64/fp16/bf16/fp32, with selective
 float64 support on isolated MLX CPU streams. Coverage includes elementwise/math/trig/activations,
 logical/bitwise, all reductions, shape/data-movement, normalizations, attention, MatMul/Gemm,
-conv/pooling, quantization (Quantize/Dequantize/DynamicQuantize/MatMulInteger/ConvInteger/
+conv/pooling, quantization (Quantize/Dequantize/DynamicQuantize/MatMulInteger/MulInteger/ConvInteger/
 QLinearMatMul/QLinearConv), random, signal/FFT (DFT/STFT/windows/MelWeightMatrix — audio),
 vision/detection, **recurrent (RNN/GRU/LSTM and
 com.microsoft LinearAttention via stable Metal prefill scans for eligible `Dk <= 512`,
 with static unrolling for single-token, larger-width, and CPU-stream calls)**, **control flow (If/Scan/Loop via recursive
 subgraph-body translation)**, and host-computed data-dependent operators.
+
+`com.microsoft::MulInteger` revision 1 uses the retained ORT 1.31.0 explicit
+schema formula `C = (A - A_zero_point) * (B - B_zero_point)`:
+positional inputs `[A, A_zero_point?, B, B_zero_point?]`, with
+3..4 slots, one INT32 output and no attributes. Every present input must share
+INT8 or UINT8 dtype. Zero points are rank-zero per-tensor scalars, defaulting to
+native INT32 zero; neither a one-element vector nor arbitrary broadcastable
+zero-point tensors are scalar forms. Interior optional holes and omitted or
+empty-name trailing slots are accepted. Known scalar metadata is distinguished
+from unknown rank; unknown payload/zero-point ranks defer validation to runtime.
+The claim gate checks static NumPy multidirectional broadcast compatibility,
+including symbolic extents. Native subtraction/multiplication errors propagate
+explicitly, and zero-point dtype/rank validation precedes arithmetic even for
+empty payloads.
+
+All operands and present zero points widen to INT32 **before** subtraction.
+Each difference is within `[-255, 255]`, and its product is within
+`[-65025, 65025]`, so the elementwise result is integer-exact without FP32,
+GEMM, reductions, host-value reads or an accumulation-length gate. Live zero
+points remain graph dependencies rather than shape-specialized constants.
+Native primitives handle empty arrays without a separate empty shortcut.
+This is not the default-domain `MatMulInteger` contract or its input ordering.
+
+The lowering is registered shapeless-safe for native casts/subtract/multiply;
+ordinary standalone graphs target eager or general shape-keyed execution.
+Decode/prefill still require the existing eligible attention-cluster framework,
+and control-flow parents retain its existing recursive policies and host-decision
+specializations. `tests/ops/test_mulinteger.py` contains independent Python-integer
+oracles, strict provider-ownership checks, optional/source/dynamic/error-recovery
+fixtures (including If/Loop/Scan), and trace assertions for eager/general and
+eligible GQA decode/prefill clusters. **These are source fixtures, not executed
+runtime evidence**: no local
+build, scientific imports, model generation, test collection/execution, CUDA
+execution or final-diff CI has qualified this addition. The retained schema
+formula is authority for this bounded implementation, not proof of CUDA kernel
+availability or execution. BiasSoftmax/ExpandDims remain authority-held rather
+than unsupported-by-design; BF16 Uniform deferral, Inverse and official opset-29
+holds are unchanged.
 
 LinearAttention preserves the original typed scan for `Dk <= 256`. The separate
 `257 <= Dk <= 512` scan includes BF16 activation/output and recurrent-state
@@ -593,7 +631,7 @@ The **core Rust modules** register:
 | `matmul.rs` | MatMul, GroupedMatMul, Gemm, com.microsoft::FusedMatMul |
 | `qdq.rs` | Private QDQ matrix-product recognition and direct packed int4/uint4 and int8/uint8 Metal kernels |
 | `conv.rs` | Conv/ConvTranspose/DeformConv and local/global pooling |
-| `quant.rs` | MatMulNBits, GatherBlockQuantized, Quantize/Dequantize/DynamicQuantize, MatMulInteger, ConvInteger, QLinearMatMul, QLinearConv |
+| `quant.rs` | MatMulNBits, GatherBlockQuantized, Quantize/Dequantize/DynamicQuantize, MatMulInteger, com.microsoft MulInteger, ConvInteger, QLinearMatMul, QLinearConv |
 | `ssm.rs` | TensorScatter (opset 24), CausalConvWithState, LinearAttention (linear/gated/delta/gated_delta, GQA) |
 | `selective_scan.rs` | Mamba-1 selective scan: recognises the `Scan` body and replaces the per-timestep unroll with one custom Metal kernel (state kept in registers) |
 | `nonzero.rs` | Exact eager NonZero host scan with live cardinality and int64 coordinates |
