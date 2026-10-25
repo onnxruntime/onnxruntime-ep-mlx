@@ -4,6 +4,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 
@@ -170,9 +171,16 @@ def _native_candidate_model(extra):
 
 @pytest.mark.parametrize("extra", ["none", "int64", "string", "complex64", "complex128"])
 def test_native_candidate_tile_payload_session(extra):
-    """Session construction only; no device/numerical reproduction claim."""
+    """Admission only; complex fixtures fail in ORT loading before provider admission."""
     model = _native_candidate_model(extra).SerializeToString()
-    if extra in {"none", "int64"}:
+    if extra in {"complex64", "complex128"}:
+        message = (
+            "[ONNXRuntimeError] : 1 : FAIL : Exception during loading: "
+            f"MLDataType for: tensor({extra}) is not currently registered or supported"
+        )
+        with pytest.raises(FAIL, match=rf"\A{re.escape(message)}\Z"):
+            _session(model)
+    elif extra in {"none", "int64"}:
         _session(model)
     else:
         with pytest.raises(FAIL, match="CPU EP.*fallback.*disabled"):
@@ -180,7 +188,7 @@ def test_native_candidate_tile_payload_session(extra):
 
 
 def test_native_candidate_tile_payload_actual_capability(tmp_path):
-    for extra in ["none", "int64", "string", "complex64", "complex128"]:
+    for extra in ["none", "int64", "string"]:
         trace = tmp_path / f"native_{extra}.json"
         subprocess.run(
             [sys.executable, "-m", "pytest",
