@@ -770,6 +770,38 @@ pub fn try_compiled(
         }
     }
 
+    if matches!(cfg.shape_mode, ShapeMode::ShapeKeyed)
+        && unsafe { &*plan_ptr }
+            .nodes
+            .iter()
+            .any(|node| matches!(node.op_type.as_str(), "GatedRMSNorm" | "MRotaryEmbedding"))
+    {
+        let key = (0..input.size())
+            .map(|index| {
+                let array = input.get(index);
+                (array.shape(), array.dtype())
+            })
+            .collect::<Vec<_>>();
+        if !slot
+            .get(unsafe { &*plan_ptr })
+            .validated_shapes
+            .contains(&key)
+        {
+            let outputs = slot.get(unsafe { &*plan_ptr }).ext_outputs.clone();
+            // Validate new geometries with real arrays before MLX enters its C trace callback.
+            // Failed callbacks use mlx-c's process-wide error handler, not ORT's error contract.
+            {
+                let mut context =
+                    TranslationContext::new(unsafe { &mut *plan_ptr }, api, kctx, stream);
+                context.set_shape_keyed_compile(true);
+                context.run_trace(&outputs, cfg.contiguous_outputs)?;
+            }
+            slot.get_mut(unsafe { &mut *plan_ptr })
+                .validated_shapes
+                .insert(key);
+        }
+    }
+
     // Take the compiled closure OUT of the plan so no `&mut Plan` field is borrowed across apply
     // (the trace thunk mutates the plan through `plan_ptr`).
     let closure = match slot.get_mut(unsafe { &mut *plan_ptr }).closure.take() {

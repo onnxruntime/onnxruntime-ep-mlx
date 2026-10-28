@@ -116,7 +116,7 @@ def _check(model: bytes, feeds: dict[str, np.ndarray], *, rtol=2e-3, atol=2e-3) 
 
 
 # --- SYMMETRIC (3-input) across the supported block sizes ---------------------------------------
-@pytest.mark.parametrize("block", [16, 32, 64, 128])
+@pytest.mark.parametrize("block", [16, 32, 64, 128, 256])
 @pytest.mark.parametrize("M", [1, 8], ids=["decode", "prefill"])
 def test_matmulnbits_symmetric(block: int, M: int) -> None:
     model, feeds = _matmulnbits_model(M=M, K=block * 2, N=32, block=block, asymmetric=False)
@@ -124,7 +124,7 @@ def test_matmulnbits_symmetric(block: int, M: int) -> None:
 
 
 # --- ASYMMETRIC (4-input packed int4 zero_points) -----------------------------------------------
-@pytest.mark.parametrize("block", [16, 32, 64, 128])
+@pytest.mark.parametrize("block", [16, 32, 64, 128, 256])
 @pytest.mark.parametrize("M", [1, 8], ids=["decode", "prefill"])
 def test_matmulnbits_asymmetric(block: int, M: int) -> None:
     model, feeds = _matmulnbits_model(M=M, K=block * 3, N=16, block=block, asymmetric=True)
@@ -141,7 +141,7 @@ def test_matmulnbits_int8(M: int, asym: bool) -> None:
 
 
 # --- fp16 activation/scales/output (q4f16 export form, e.g. gemma-4-E2B decoder) -----------------
-@pytest.mark.parametrize("block", [16, 32, 64, 128])
+@pytest.mark.parametrize("block", [16, 32, 64, 128, 256])
 @pytest.mark.parametrize("M", [1, 8], ids=["decode", "prefill"])
 @pytest.mark.parametrize("asym", [False, True], ids=["sym", "asym"])
 def test_matmulnbits_fp16(block: int, M: int, asym: bool) -> None:
@@ -159,7 +159,7 @@ def test_matmulnbits_fp16_partial_final_block() -> None:
     _check(model, feeds, rtol=6e-2, atol=6e-2)
 
 
-@pytest.mark.parametrize("block", [32, 64, 128])
+@pytest.mark.parametrize("block", [32, 64, 128, 256])
 @pytest.mark.parametrize("bits", [4, 8])
 @pytest.mark.parametrize("M", [8, 32], ids=["short", "long"])
 def test_matmulnbits_bf16_explicit_fp16_matches_native(
@@ -225,3 +225,69 @@ def test_matmulnbits_bf16_explicit_fp16_matches_native(
     else:
         assert np.any(explicit != native)
         np.testing.assert_allclose(explicit, native, rtol=5e-2, atol=8e-2)
+
+
+@pytest.mark.parametrize("bits", [4, 8])
+@pytest.mark.parametrize("asymmetric", [False, True])
+def test_matmulnbits_block256_cached_parameters_and_partial_block(bits, asymmetric):
+    model, feeds = _matmulnbits_model(
+        M=1, K=755, N=32, block=256, bits=bits, asymmetric=asymmetric, dtype=DT.FLOAT16
+    )
+    graph = onnx.load_model_from_string(model)
+    for name, value in feeds.items():
+        if name != "a":
+            graph.graph.initializer.append(numpy_helper.from_array(value, name))
+    del graph.graph.input[1:]
+    graph.graph.input[0].type.tensor_type.shape.dim[1].dim_param = "tokens"
+    graph.graph.output[0].type.tensor_type.shape.dim[1].dim_param = "tokens"
+    model = graph.SerializeToString()
+    rng = np.random.default_rng(256 + bits)
+    mlx = ort.InferenceSession(model, providers=m.EP_PROVIDERS)
+    cpu = ort.InferenceSession(model, providers=["CPUExecutionProvider"])
+    for tokens in [1, 8, 1]:
+        activation = rng.standard_normal((1, tokens, 755)).astype(np.float16)
+        expected = cpu.run(None, {"a": activation})[0]
+        actual = mlx.run(None, {"a": activation})[0]
+        np.testing.assert_allclose(actual, expected, rtol=6e-2, atol=6e-2)
+
+
+def test_matmulnbits_bf16_shared_scales_across_block_sizes(monkeypatch):
+    rng = np.random.default_rng(256)
+    rows, columns, groups = 32, 33, 3
+    nodes = [helper.make_node("Cast", ["scales"], ["scales_bf16"], to=TensorProto.BFLOAT16)]
+    initializers = [
+        numpy_helper.from_array(
+            (rng.standard_normal(columns * groups) * 0.05).astype(np.float32), "scales"
+        )
+    ]
+    inputs, outputs, feeds = [], [], {}
+    for block in [128, 256]:
+        k = block * groups
+        name = f"a{block}"
+        feeds[name] = rng.standard_normal((1, rows, k)).astype(np.float32)
+        inputs.append(helper.make_tensor_value_info(name, TensorProto.FLOAT, [1, rows, k]))
+        outputs.append(
+            helper.make_tensor_value_info(f"out{block}", TensorProto.FLOAT, [1, rows, columns])
+        )
+        weight = rng.integers(0, 16, size=(columns, groups, block), dtype=np.uint8)
+        initializers.append(numpy_helper.from_array(_pack_int4_last(weight), f"w{block}"))
+        nodes.extend([
+            helper.make_node("Cast", [name], [f"bf{block}"], to=TensorProto.BFLOAT16),
+            helper.make_node(
+                "MatMulNBits", [f"bf{block}", f"w{block}", "scales_bf16"], [f"y{block}"],
+                domain="com.microsoft", K=k, N=columns, bits=4, block_size=block,
+            ),
+            helper.make_node("Cast", [f"y{block}"], [f"out{block}"], to=TensorProto.FLOAT),
+        ])
+    graph = helper.make_graph(nodes, "shared-scales", inputs, outputs, initializers)
+    model = helper.make_model(
+        graph,
+        opset_imports=[helper.make_opsetid("", 21), helper.make_opsetid("com.microsoft", 1)],
+    )
+    model.ir_version = 10
+    monkeypatch.setenv("ONNXRUNTIME_EP_MLX_BF16_QMM_FP16", "0")
+    native = m.run_mlx(model.SerializeToString(), feeds)
+    monkeypatch.delenv("ONNXRUNTIME_EP_MLX_BF16_QMM_FP16")
+    explicit = m.run_mlx(model.SerializeToString(), feeds)
+    for actual, expected in zip(explicit, native, strict=True):
+        np.testing.assert_allclose(actual, expected, rtol=5e-2, atol=8e-2)

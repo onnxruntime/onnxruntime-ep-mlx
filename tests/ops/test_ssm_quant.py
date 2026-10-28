@@ -360,6 +360,7 @@ def test_gated_rms_norm_dynamic_rejects_mismatched_gate_shape():
         "scale": np.ones(4, dtype=np.float32),
         "gate": np.ones((1, 2, 12), dtype=np.float32),
     }
+    session.run(None, {**feeds, "gate": np.ones_like(feeds["x"])})
     with pytest.raises(EPFail, match="GatedRMSNorm: X and gate must have matching positive shapes"):
         session.run(None, feeds)
 

@@ -2791,8 +2791,8 @@ fn rotary_embedding_claim(node: &NodeView) -> ClaimResult {
 
 fn mrotary_embedding_compile_shape_safety_for(dynamic: bool) -> CompileShapeSafety {
     if dynamic {
-        CompileShapeSafety::EagerOnly {
-            reason: "validates dynamic MRotaryEmbedding shapes before MLX execution",
+        CompileShapeSafety::ShapeKeyedOnly {
+            reason: "validates MRotaryEmbedding geometry for each compiled input shape",
         }
     } else {
         CompileShapeSafety::ShapeKeyedOnly {
@@ -3133,12 +3133,45 @@ fn paged_attention_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), 
         );
     }
     let batch = cum.len() - 1;
+    if cum.first() != Some(&0)
+        || cum.last() != Some(&i64::from(qs[0]))
+        || cum.windows(2).any(|pair| pair[0] < 0 || pair[0] > pair[1])
+        || past.len() != batch
+        || bt.len() % batch != 0
+        || bt.is_empty()
+        || cshape.len() != 4
+        || cshape.iter().any(|&dim| dim <= 0)
+    {
+        return Err("PagedAttention: invalid packed sequence or block-table geometry".into());
+    }
     let max_blocks = bt.len() / batch;
     let slot_mapping = if present(n, 10) {
         Some(read_int_input(ctx, &n.inputs[10])?)
     } else {
         None
     };
+    if slot_mapping
+        .as_ref()
+        .is_some_and(|slots| slots.len() != qs[0] as usize)
+    {
+        return Err("PagedAttention: slot_mapping must contain one slot per packed token".into());
+    }
+    for b in 0..batch {
+        let total = past[b]
+            .checked_add(cum[b + 1] - cum[b])
+            .ok_or("PagedAttention: sequence length overflow")?;
+        if past[b] < 0
+            || total > i64::from(i32::MAX)
+            || total > max_blocks as i64 * i64::from(block_size)
+            || bt[b * max_blocks
+                ..b * max_blocks
+                    + ((total + i64::from(block_size) - 1) / i64::from(block_size)) as usize]
+                .iter()
+                .any(|&block| block < 0 || block >= i64::from(cshape[0]))
+        {
+            return Err("PagedAttention: sequence exceeds valid physical cache blocks".into());
+        }
+    }
     let head_sink = if present(n, 11) {
         Some(ctx.resolve(&n.inputs[11])?)
     } else {
@@ -3154,6 +3187,21 @@ fn paged_attention_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), 
         None
     };
     let mut cache_updated = false;
+    let direct_paged = !latent
+        && ctx.is_standalone_paged()
+        && head <= 256
+        && v_head <= 256
+        && n.inputs[3].source == Src::CtxInput
+        && n.inputs[4].source == Src::CtxInput
+        && n.outputs
+            .iter()
+            .skip(1)
+            .all(|out| out.name.is_empty() || out.external)
+        && !std::env::var_os("ONNXRUNTIME_EP_MLX_NO_PAGED_GQA")
+            .is_some_and(|value| value != "0" && !value.is_empty());
+    let mut pending_slots = Vec::new();
+    let mut pending_keys = None;
+    let mut pending_values = None;
 
     // Recover the fused-RoPE period array from the cos/sin caches once (fp32 fast-rope path). The
     // cache is [max_seq, rotary_dim/2], so the rotary dimension = 2 * its column count.
@@ -3223,9 +3271,70 @@ fn paged_attention_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), 
                 physical_block * block_size as i64 + (logical % block_size as usize) as i64
             };
             if slot >= 0 {
+                if slot >= i64::from(cshape[0]) * i64::from(block_size) {
+                    return Err("PagedAttention: write slot is outside the physical cache".into());
+                }
                 write_slots.push(slot as i32);
                 write_rows.push(j as i32);
             }
+        }
+        if direct_paged {
+            if !write_slots.is_empty() {
+                let row_idx = i32_host_array(ctx, &write_rows);
+                let key_rows = ctx.transpose(kh_new, &[0, 2, 1, 3])?;
+                let key_rows = ctx.reshape(key_rows, &[nq, kv_heads, head])?;
+                let key_rows = ctx.emit(|res, stream| unsafe {
+                    mlx::mlx_take_axis(res, key_rows, row_idx, 0, stream)
+                })?;
+                let key_rows = ctx.astype(key_rows, ctx.dtype_of(kcache))?;
+                let value_rows = ctx.transpose(vh_new, &[0, 2, 1, 3])?;
+                let value_rows = ctx.reshape(value_rows, &[nq, kv_heads, v_head])?;
+                let value_rows = ctx.emit(|res, stream| unsafe {
+                    mlx::mlx_take_axis(res, value_rows, row_idx, 0, stream)
+                })?;
+                let value_rows = ctx.astype(value_rows, ctx.dtype_of(vcache.unwrap()))?;
+                pending_keys = Some(match pending_keys {
+                    Some(previous) => concat2(ctx, previous, key_rows, 0)?,
+                    None => key_rows,
+                });
+                pending_values = Some(match pending_values {
+                    Some(previous) => concat2(ctx, previous, value_rows, 0)?,
+                    None => value_rows,
+                });
+                pending_slots.extend(write_slots.iter().copied());
+            }
+            let update_keys = match pending_keys {
+                Some(keys) => keys,
+                None => ctx.zeros(&[0, kv_heads, head], ctx.dtype_of(kcache))?,
+            };
+            let update_values = match pending_values {
+                Some(values) => values,
+                None => ctx.zeros(&[0, kv_heads, v_head], ctx.dtype_of(vcache.unwrap()))?,
+            };
+            let slots = i32_host_array(ctx, &pending_slots);
+            let block_ids: Vec<i32> = bt[b * max_blocks..(b + 1) * max_blocks]
+                .iter()
+                .map(|&block| block as i32)
+                .collect();
+            let blocks = i32_host_array(ctx, &block_ids);
+            let metadata = i32_host_array(ctx, &[pastb, pending_slots.len() as i32]);
+            let output = super::paged_attention::emit(
+                ctx,
+                qh,
+                kh_new,
+                vh_new,
+                kcache,
+                vcache.unwrap(),
+                blocks,
+                slots,
+                update_keys,
+                update_values,
+                metadata,
+                scale,
+                head_sink,
+            )?;
+            outs.push(ctx.astype(output, out_dt)?);
+            continue;
         }
         if !write_slots.is_empty() {
             let row_idx = i32_host_array(ctx, &write_rows);
@@ -3309,17 +3418,39 @@ fn paged_attention_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), 
             ctx.emit(|res, s| unsafe { mlx::mlx_concatenate_axis(res, vec.as_raw(), 0, s) })?
         }
     };
-    if cache_updated {
+    if direct_paged {
+        let keys = match pending_keys {
+            Some(keys) => keys,
+            None => ctx.zeros(&[0, kv_heads, head], ctx.dtype_of(kcache))?,
+        };
+        let values = match pending_values {
+            Some(values) => values,
+            None => ctx.zeros(&[0, kv_heads, v_head], ctx.dtype_of(vcache.unwrap()))?,
+        };
+        let slots: Vec<usize> = pending_slots.iter().map(|&slot| slot as usize).collect();
+        ctx.defer_paged_writeback(
+            &n.inputs[3],
+            keys,
+            slots.clone(),
+            n.outputs.get(1).filter(|out| !out.name.is_empty()),
+        )?;
+        ctx.defer_paged_writeback(
+            &n.inputs[4],
+            values,
+            slots,
+            n.outputs.get(2).filter(|out| !out.name.is_empty()),
+        )?;
+    } else if cache_updated {
         kcache = ctx.write_back_input(&n.inputs[3], kcache)?;
         if let Some(current_vcache) = vcache {
             vcache = Some(ctx.write_back_input(&n.inputs[4], current_vcache)?);
         }
     }
     ctx.bind(&n.outputs[0], output);
-    if n.outputs.len() > 1 && !n.outputs[1].name.is_empty() {
+    if !direct_paged && n.outputs.len() > 1 && !n.outputs[1].name.is_empty() {
         ctx.bind(&n.outputs[1], kcache);
     }
-    if n.outputs.len() > 2 && !n.outputs[2].name.is_empty() {
+    if !direct_paged && n.outputs.len() > 2 && !n.outputs[2].name.is_empty() {
         if let Some(vcache) = vcache {
             ctx.bind(&n.outputs[2], vcache);
         }
@@ -3561,15 +3692,16 @@ fn paged_attention_claim(node: &NodeView) -> ClaimResult {
 }
 
 pub fn register_attention(registry: &mut OpRegistry) {
-    shape_keyed(
-        registry,
-        "com.microsoft",
-        "PagedAttention",
-        K_ANY_OPSET,
-        K_ANY_OPSET,
-        paged_attention_op,
-        paged_attention_claim,
-        "emits MLX Slice and Scatter, which lack Primitive::output_shapes in MLX 0.32.2",
+    registry.register_eager(
+        OpRegistration {
+            domain: "com.microsoft",
+            op_type: "PagedAttention",
+            min_opset: K_ANY_OPSET,
+            max_opset: K_ANY_OPSET,
+            handler: paged_attention_op,
+            claim: paged_attention_claim,
+        },
+        "reads runtime sequence lengths and block mappings and mutates paged cache buffers",
     );
     // Non-sliding, no-bias GQA uses the slice-free compiled decode route. Sliding-window and
     // attention-bias forms emit Slice and remain eager; unsupported forms are conservative too.
@@ -3676,7 +3808,7 @@ mod tests {
     fn mrotary_embedding_dynamic_validation_stays_eager() {
         assert!(matches!(
             mrotary_embedding_compile_shape_safety_for(true),
-            CompileShapeSafety::EagerOnly { .. }
+            CompileShapeSafety::ShapeKeyedOnly { .. }
         ));
         assert!(matches!(
             mrotary_embedding_compile_shape_safety_for(false),

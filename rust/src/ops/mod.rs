@@ -10,6 +10,7 @@ pub mod norm;
 pub mod onnx_ml_linear;
 pub mod onnx_ml_preprocess;
 pub mod packed_ssm;
+mod paged_attention;
 pub mod quant;
 pub mod reduction;
 pub mod shape;

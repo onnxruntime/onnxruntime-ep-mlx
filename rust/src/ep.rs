@@ -2,14 +2,13 @@
 //!
 //! This module is deliberately small: it owns the `OrtEp` vtable, performs the
 //! minimal ABI casts and FFI panic guards, and delegates capability policy,
-//! compilation state, and execution to their focused modules. `MlxEp` owns the
-//! streams for the EP lifetime; individual fused plans never retain ORT pointers.
+//! compilation state, and execution to their focused modules. Compute state owns
+//! streams created on the inference thread; individual plans never retain ORT pointers.
 
 use std::ffi::{CStr, CString, c_char};
 use std::ptr;
 
 use crate::factory::ORT_API_VERSION;
-use crate::mlx::Stream;
 use crate::sys::ort;
 
 #[repr(C)]
@@ -18,10 +17,6 @@ pub struct MlxEp {
     ort_api: *const ort::OrtApi,
     ep_api: *const ort::OrtEpApi,
     name: CString,
-    stream: Stream,
-    /// MLX has no Metal float64 path, so fp64 partitions use this shared CPU
-    /// stream for their complete lifetime.
-    cpu_stream: Stream,
 }
 
 impl MlxEp {
@@ -43,8 +38,6 @@ impl MlxEp {
             ort_api,
             ep_api,
             name: name.to_owned(),
-            stream: Stream::new_default_gpu(),
-            cpu_stream: Stream::new_default_cpu(),
         })
     }
 
@@ -53,8 +46,7 @@ impl MlxEp {
     }
 }
 
-// The streams are RAII-owned by MlxEp and are dropped exactly once from
-// factory::release_ep. Trace export is process-cumulative and is finalized on EP teardown.
+// Trace export is process-cumulative and is finalized on EP teardown.
 impl Drop for MlxEp {
     fn drop(&mut self) {
         let tracer = crate::trace::tracer();
@@ -108,15 +100,7 @@ unsafe extern "C" fn compile(
     let ep = unsafe { &*this(ep) };
     unsafe {
         crate::guard_ffi_status(ep.ort_api, "compile", || {
-            crate::runtime::compile(
-                ep.ort_api,
-                ep.stream.as_raw(),
-                ep.cpu_stream.as_raw(),
-                graphs,
-                fused_nodes,
-                count,
-                node_compute_infos,
-            )
+            crate::runtime::compile(ep.ort_api, graphs, fused_nodes, count, node_compute_infos)
         })
     }
 }

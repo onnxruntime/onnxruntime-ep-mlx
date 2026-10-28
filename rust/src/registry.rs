@@ -1744,7 +1744,11 @@ mod tests {
 
     #[test]
     fn packed_state_operators_keep_runtime_metadata_out_of_compiled_traces() {
-        for op_type in ["VarlenCausalConvWithState", "GatedDeltaNet"] {
+        for op_type in [
+            "VarlenCausalConvWithState",
+            "GatedDeltaNet",
+            "PagedAttention",
+        ] {
             assert!(matches!(
                 compile_shape_rule("com.microsoft", op_type, 1),
                 CompileShapeRule::Always(CompileShapeSafety::EagerOnly { .. })
@@ -1755,7 +1759,6 @@ mod tests {
     #[test]
     fn known_missing_output_shape_emitters_cannot_be_shapeless() {
         let always_shape_keyed = [
-            ("com.microsoft", "PagedAttention", 1),
             ("com.microsoft", "Attention", 1),
             ("com.microsoft", "PackedMultiHeadAttention", 1),
             ("", "RotaryEmbedding", 23),

@@ -86,10 +86,18 @@ the slice-free shapeless decode configuration (data-fed RoPE rows plus shape-pre
 updates). Sliding-window and attention-bias forms emit `Slice` and remain `EagerOnly`; unsupported
 forms are also denied compilation conservatively.
 
-In decoder graphs, shapeless, shape-keyed-only, and eager-only nodes receive distinct partition
-colours. Stricter nodes remain claimed by MLX without disabling a more capable neighbouring
-partition. ShapeKeyed pays one recompile per distinct `(shape, dtype)` tuple — cheap when the shape
-set is small and repeating (prefill prompt lengths, CNN batch sizes), pathological if unbounded.
+In decoder graphs, compatible shapeless and shape-keyed-only nodes may share a convex partition;
+the combined partition uses shape-keyed compilation when any member requires it. Eager-only nodes
+remain a separate partition class. `PagedAttention` is eager-only because it reads runtime block
+metadata and mutates cache buffers, even though parts of its composed lowering can be traced.
+ShapeKeyed pays one recompile per distinct `(shape, dtype)` tuple — cheap when the shape set is
+small and repeating (prefill prompt lengths, CNN batch sizes), pathological if unbounded.
+
+Dynamic `GatedRMSNorm` and `MRotaryEmbedding` use shape-keyed compilation. Before the first replay
+of a new input-shape/dtype tuple, a lazy translation with real input arrays validates geometry
+outside MLX's C trace callback. Invalid geometry returns an ORT error rather than entering MLX's
+process-wide callback error handler. Previously validated geometries reuse the closure; changing
+position-ID values are still passed as data on every call.
 
 ### Two distinct senses of "dynamic"
 

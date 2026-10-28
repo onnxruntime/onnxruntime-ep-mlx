@@ -1340,8 +1340,8 @@ fn gated_rms_norm_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), M
 
 fn gated_rms_norm_compile_shape_safety_for(dynamic: bool) -> CompileShapeSafety {
     if dynamic {
-        CompileShapeSafety::EagerOnly {
-            reason: "validates dynamic GatedRMSNorm shapes before MLX execution",
+        CompileShapeSafety::ShapeKeyedOnly {
+            reason: "validates GatedRMSNorm geometry for each compiled input shape",
         }
     } else {
         CompileShapeSafety::Shapeless
@@ -1502,10 +1502,10 @@ mod gated_rms_norm_tests {
     use crate::registry::CompileShapeSafety;
 
     #[test]
-    fn dynamic_shapes_are_validated_eagerly_and_static_shapes_remain_shapeless() {
+    fn dynamic_shapes_are_validated_per_shape_and_static_shapes_remain_shapeless() {
         assert!(matches!(
             gated_rms_norm_compile_shape_safety_for(true),
-            CompileShapeSafety::EagerOnly { .. }
+            CompileShapeSafety::ShapeKeyedOnly { .. }
         ));
         assert_eq!(
             gated_rms_norm_compile_shape_safety_for(false),

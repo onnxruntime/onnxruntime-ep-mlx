@@ -5,7 +5,8 @@
 //!   * MatMulNBits — int4/int8 block-quantized weight matmul. BOTH the 3-input SYMMETRIC form
 //!     (implicit midpoint zero point) AND the 4-input ASYMMETRIC form with an explicit uint8
 //!     `zero_points` input. Dequant is w = (q - zp) * scale. For MLX-supported group sizes
-//!     (32/64/128) the weight is repacked ONCE to MLX affine uint32 words + per-block scales/biases
+//!     (32/64/128, or 256 split into shared-parameter group-128 pairs) the weight is repacked ONCE
+//!     to MLX affine uint32 words + per-block scales/biases
 //!     and run through `mlx_quantized_matmul` (weights stay compressed — the decode memory win). For
 //!     block_size 16 (which `mlx_quantized_matmul` does not support) the weight is dequantized
 //!     in-graph to fp32 [N,K] and a dense `mlx_matmul` runs.
@@ -1073,6 +1074,30 @@ fn matmulnbits_asymmetric_biases(
     mul(ctx, neg_zp, scales2d)
 }
 
+fn split_quant_groups(
+    ctx: &mut TranslationContext,
+    parameters: mlx::mlx_array,
+    key: String,
+    constant: bool,
+) -> Result<mlx::mlx_array, MlxError> {
+    if constant && let Some(cached) = ctx.cache_get(&key) {
+        return Ok(cached);
+    }
+    // Adjacent 128-element groups share the original 256-element group's affine parameters.
+    let mut raw = unsafe { mlx::mlx_array_new() };
+    let rc = unsafe { mlx::mlx_repeat_axis(&mut raw, parameters, 2, 1, ctx.stream()) };
+    let array = Array::from_raw(raw);
+    if rc != 0 {
+        return Err("MatMulNBits: splitting block-256 parameters failed".to_string());
+    }
+    if constant {
+        array.eval();
+        Ok(ctx.cache_put(key, array))
+    } else {
+        Ok(ctx.keep(array))
+    }
+}
+
 fn matmulnbits_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
     let k = *n.ints.get("K").ok_or("MatMulNBits: missing K")?;
     let big_n = *n.ints.get("N").ok_or("MatMulNBits: missing N")?;
@@ -1093,23 +1118,50 @@ fn matmulnbits_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxE
     }
     let act_dt = ctx.dtype_of(a);
 
-    let supported = block == 32 || block == 64 || block == 128;
+    let supported = matches!(block, 32 | 64 | 128 | 256);
     let y = if supported {
         // Repacked uint32 weight + per-block scales/biases, shared by the explicit-FP16 prefill
         // route and the activation-dtype `mlx_quantized_matmul` fallback.
         let w = matmulnbits_repack(ctx, n, big_n, k, block, bits)?;
-        let scales2d = matmulnbits_scales(ctx, n, big_n as i32, nblocks)?;
-        let biases = if has_zp {
+        let mut scales2d = matmulnbits_scales(ctx, n, big_n as i32, nblocks)?;
+        let mut biases = if has_zp {
             matmulnbits_asymmetric_biases(ctx, n, big_n as i32, nblocks, bits, scales2d)?
         } else {
             matmulnbits_symmetric_biases(ctx, n, big_n as i32, nblocks, bits, scales2d)?
+        };
+        let compute_block = if block == 256 {
+            let scales_constant = n.inputs[2].constant || n.inputs[2].source == Src::Initializer;
+            let biases_constant = scales_constant
+                && (!has_zp || n.inputs[3].constant || n.inputs[3].source == Src::Initializer);
+            scales2d = split_quant_groups(
+                ctx,
+                scales2d,
+                format!("{}#qs128#{big_n}x{nblocks}", n.inputs[2].name),
+                scales_constant,
+            )?;
+            biases = split_quant_groups(
+                ctx,
+                biases,
+                format!(
+                    "{}#{}#qb128#{big_n}x{nblocks}b{bits}",
+                    n.inputs[2].name,
+                    n.inputs
+                        .get(3)
+                        .map(|input| input.name.as_str())
+                        .unwrap_or("")
+                ),
+                biases_constant,
+            )?;
+            128
+        } else {
+            block
         };
 
         if explicit_fp16_qmm_eligible(
             ctx,
             ashape.len(),
             m,
-            block,
+            compute_block,
             bits,
             act_dt,
             ctx.dtype_of(scales2d),
@@ -1132,7 +1184,10 @@ fn matmulnbits_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxE
                 && (!has_zp || n.inputs[3].constant || n.inputs[3].source == Src::Initializer);
             let scales_fp16 = if scales_constant {
                 ctx.cache_astype(
-                    format!("{}#qs_fp16#{big_n}x{nblocks}", n.inputs[2].name),
+                    format!(
+                        "{}#qs_fp16#{big_n}x{nblocks}#block{block}",
+                        n.inputs[2].name
+                    ),
                     scales2d,
                     mlx::mlx_dtype__MLX_FLOAT16,
                 )?
@@ -1142,7 +1197,7 @@ fn matmulnbits_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxE
             let biases_fp16 = if biases_constant {
                 ctx.cache_astype(
                     format!(
-                        "{}#{}#qb_fp16#{big_n}x{nblocks}b{bits}",
+                        "{}#{}#qb_fp16#{big_n}x{nblocks}b{bits}#block{block}",
                         n.inputs[2].name,
                         n.inputs
                             .get(3)
@@ -1155,7 +1210,15 @@ fn matmulnbits_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxE
             } else {
                 ctx.astype_once(biases, mlx::mlx_dtype__MLX_FLOAT16)?
             };
-            let y_fp16 = quantized_matmul(ctx, a2_fp16, w, scales_fp16, biases_fp16, block, bits)?;
+            let y_fp16 = quantized_matmul(
+                ctx,
+                a2_fp16,
+                w,
+                scales_fp16,
+                biases_fp16,
+                compute_block,
+                bits,
+            )?;
             let y = ctx.astype(y_fp16, mlx::mlx_dtype__MLX_BFLOAT16)?;
             ctx.mark_fast("mlx_quantized_matmul_fp16");
             y
@@ -1163,7 +1226,7 @@ fn matmulnbits_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxE
             let a2 = ctx.reshape(a, &[m, k as i32])?;
             let a2 = pad_last_dim(ctx, a2, (padded_k - k) as i32, act_dt)?;
             ctx.mark_fast("mlx_quantized_matmul");
-            quantized_matmul(ctx, a2, w, scales2d, biases, block, bits)?
+            quantized_matmul(ctx, a2, w, scales2d, biases, compute_block, bits)?
         }
     } else {
         let a2 = ctx.reshape(a, &[m, k as i32])?;
@@ -1994,8 +2057,8 @@ fn matmulnbits_claim(node: &NodeView) -> ClaimResult {
         "only 4-bit and 8-bit weights are supported"
     );
     require!(
-        matches!(block, 16 | 32 | 64 | 128),
-        "block_size must be 16, 32, 64, or 128 (got {block})"
+        matches!(block, 16 | 32 | 64 | 128 | 256),
+        "block_size must be 16, 32, 64, 128, or 256 (got {block})"
     );
     Ok(())
 }

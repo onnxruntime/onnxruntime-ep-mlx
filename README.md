@@ -24,8 +24,11 @@ PagedAttention, RoPE, RMS and gated RMS normalization, packed causal convolution
 GatedDeltaNet, pooling, reductions, and shape operations. See
 [`docs/OP_ARCHITECTURE.md`](docs/OP_ARCHITECTURE.md) for the coverage table.
 
-Large, fully claimed regions are fastest. Dynamic shapes are generally compiled per shape key;
-operators that validate runtime-dependent shapes may execute eagerly. Autoregressive decode uses a
+Large, fully claimed regions are fastest. Compatible shapeless and shape-keyed regions can fuse,
+with the stricter shape-keyed mode selected for the combined region. Dynamic GatedRMSNorm and
+MRotaryEmbedding geometries are validated before compiled replay for each new input-shape/dtype
+tuple; runtime position tensors remain live. Host-data-dependent operators still execute eagerly.
+Autoregressive decode uses a
 shapeless path so growing KV length does not retrace. Use
 `ONNXRUNTIME_EP_MLX_VERBOSE=1` or `ONNXRUNTIME_EP_MLX_CLAIM_DEBUG=1` to diagnose fallback and
 fragmentation.
@@ -45,6 +48,21 @@ geometry, mixed-length batches, chunk tails, changing runtime shapes, and aliase
 Full-model GenAI generation has been smoke-tested and matched WebGPU token-for-token on the
 benchmark prompts below. Broader correctness against the original model and performance tuning
 have not been validated.
+
+### Quantized weights and paged-cache execution
+
+`MatMulNBits` accepts INT4/INT8 block sizes 16/32/64/128/256. Block 256 is lowered losslessly
+to two MLX group-128 blocks sharing the original scale and affine bias; constant parameters are
+expanded once and cached, and packed weights stay compressed. Block 16 retains the composed
+dequantize-and-matmul path.
+
+Standalone separate-cache `PagedAttention` with head widths up to 256 uses a direct block-table
+GQA Metal kernel with FP32 online softmax. It does not expand KV heads or gather a contiguous
+prefix. Cache updates are evaluated with attention, then only the changed physical slots are
+written back. Verified aliased `present` outputs avoid full-cache copies; non-aliased outputs
+receive the complete updated cache. Latent layouts, larger heads, and cache values used within
+another eager subgraph retain the composed path. Set `ONNXRUNTIME_EP_MLX_NO_PAGED_GQA=1` for A/B
+comparison with that path.
 
 ### Run the exported Qwen3.5 paged model
 
@@ -248,7 +266,7 @@ session; additional variants run eager), so surrounding tensor ops and the selec
 one MLX closure. Data-dependent conditions, early-exit loops, and loop scan outputs remain on ORT
 CPU.
 
-Eligible BF16 INT4/INT8 prefill matmuls (block size 32/64/128, at least 32 rows) explicitly use stock
+Eligible BF16 INT4/INT8 prefill matmuls (block size 32/64/128/256, at least 32 rows) explicitly use stock
 MLX's FP16 compute path by default. Set `ONNXRUNTIME_EP_MLX_BF16_QMM_FP16=0` to disable it.
 
 The **Foundry Local** q4f16 decoders below run on the same M1 Max, warm, MLX EP vs the ORT CPU EP
@@ -315,6 +333,8 @@ capture (0-based, default 0); for decode, eval 0 is prefill/warmup, so pick a st
 
 MLX evaluation is thread-affine. Use one `InferenceSession` per thread; do not call `Run()` on one
 shared session from multiple threads.
+Model loading may occur on a different thread: CPU/GPU streams are initialized lazily on the
+first inference thread, which remains the owner for subsequent calls.
 
 ## Numerical accuracy
 

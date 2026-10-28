@@ -334,7 +334,8 @@ def test_paged_attention_latent_layout_and_rotary_offset():
 
 
 @pytest.mark.parametrize("metadata_size", [2, 3])
-def test_paged_attention_ort129_optional_inputs_and_cache_outputs(metadata_size):
+@pytest.mark.parametrize("write_slots", [(3, 9), (-1, 9), (9, 9)])
+def test_paged_attention_ort129_optional_inputs_and_cache_outputs(metadata_size, write_slots):
     h, kv, d, nb, blk, batch = 4, 2, 8, 4, 4, 1
     hidden, kv_hidden = h * d, kv * d
     rng = np.random.default_rng(129)
@@ -346,7 +347,7 @@ def test_paged_attention_ort129_optional_inputs_and_cache_outputs(metadata_size)
     kc = rng.standard_normal((nb, blk, kv, d)).astype(np.float16)
     vc = rng.standard_normal((nb, blk, kv, d)).astype(np.float16)
     bt = np.array([[2, 0, 1, 3]], dtype=np.int32)
-    slots = np.array([3, 9], dtype=np.int32)
+    slots = np.array(write_slots, dtype=np.int32)
     sink = np.array([-0.5, 0.25, 1.0, -1.0], dtype=np.float16)
     qw = np.linspace(0.75, 1.25, d).astype(np.float16)
     kw = np.linspace(1.25, 0.75, d).astype(np.float16)
@@ -456,3 +457,155 @@ def test_paged_attention_ort129_optional_inputs_and_cache_outputs(metadata_size)
     m.run_mlx(one_output_model, one_output_feeds)
     np.testing.assert_allclose(one_output_feeds["key_cache"], expected[1], rtol=2e-3, atol=2e-3)
     np.testing.assert_allclose(one_output_feeds["value_cache"], expected[2], rtol=2e-3, atol=2e-3)
+
+
+@pytest.mark.parametrize("alias", [False, True], ids=["separate-present", "aliased-present"])
+def test_paged_attention_cache_binding_and_changing_metadata(alias):
+    h, kv, d, nb, blk = 4, 2, 16, 4, 4
+    model = m.make_model(
+        "PagedAttention",
+        [
+            m.tensor("query", DT.FLOAT16, ["nt", h * d]),
+            m.tensor("key", DT.FLOAT16, ["nt", kv * d]),
+            m.tensor("value", DT.FLOAT16, ["nt", kv * d]),
+            m.tensor("key_cache", DT.FLOAT16, [nb, blk, kv, d]),
+            m.tensor("value_cache", DT.FLOAT16, [nb, blk, kv, d]),
+            m.tensor("cum", DT.INT32, [2]),
+            m.tensor("past", DT.INT32, [1]),
+            m.tensor("blocks", DT.INT32, [1, nb]),
+        ],
+        [
+            m.tensor("output", DT.FLOAT16, ["nt", h * d]),
+            m.tensor("present_key", DT.FLOAT16, [nb, blk, kv, d]),
+            m.tensor("present_value", DT.FLOAT16, [nb, blk, kv, d]),
+        ],
+        domain="com.microsoft",
+        attributes={"num_heads": h, "kv_num_heads": kv},
+    )
+    session = ort.InferenceSession(model, providers=m.EP_PROVIDERS)
+    session.disable_fallback()
+    rng = np.random.default_rng(431)
+    kc = rng.standard_normal((nb, blk, kv, d)).astype(np.float16)
+    vc = rng.standard_normal((nb, blk, kv, d)).astype(np.float16)
+    blocks = np.array([[2, 0, 3, 1]], dtype=np.int32)
+    past = 5
+    for tokens in [3, 1, 2, 1]:
+        q = (rng.standard_normal((tokens, h * d)) * 0.3).astype(np.float16)
+        k = (rng.standard_normal((tokens, kv * d)) * 0.3).astype(np.float16)
+        v = (rng.standard_normal((tokens, kv * d)) * 0.3).astype(np.float16)
+        cum = np.array([0, tokens], dtype=np.int32)
+        lengths = np.array([past], dtype=np.int32)
+        expected = _paged_ref(
+            q, k, v, kc, vc, cum, lengths, blocks, h, kv, d, return_cache=True
+        )
+        feeds = {
+            "query": q, "key": k, "value": v, "key_cache": kc, "value_cache": vc,
+            "cum": cum, "past": lengths, "blocks": blocks,
+        }
+        values = {name: ort.OrtValue.ortvalue_from_numpy(value) for name, value in feeds.items()}
+        binding = session.io_binding()
+        for name, value in values.items():
+            binding.bind_ortvalue_input(name, value)
+        binding.bind_output("output", "cpu")
+        for output, source in [("present_key", "key_cache"), ("present_value", "value_cache")]:
+            if alias:
+                binding.bind_ortvalue_output(output, values[source])
+            else:
+                binding.bind_output(output, "cpu")
+        session.run_with_iobinding(binding)
+        actual = binding.copy_outputs_to_cpu()
+        np.testing.assert_allclose(actual[0], expected[0], rtol=2e-2, atol=2e-2)
+        for got, want in zip(actual[1:], expected[1:], strict=True):
+            np.testing.assert_array_equal(got, want)
+        np.testing.assert_array_equal(kc, expected[1])
+        np.testing.assert_array_equal(vc, expected[2])
+        past += tokens
+
+
+def test_paged_attention_empty_sequence():
+    h, kv, d, nb, blk = 4, 2, 16, 8, 4
+    model = _model(h, kv, d, nb, blk, 2, 0, 0)
+    feeds, _ = _inputs(h, kv, d, nb, blk, 2, 0, 0, 411)
+    for name in ["query", "key", "value"]:
+        feeds[name] = feeds[name][:1].copy()
+    feeds["cumulative_sequence_length"] = np.array([0, 0, 1], dtype=np.int32)
+    feeds["past_seqlens"] = np.array([0, 4], dtype=np.int32)
+    expected = _paged_ref(
+        feeds["query"], feeds["key"], feeds["value"], feeds["key_cache"], feeds["value_cache"],
+        feeds["cumulative_sequence_length"], feeds["past_seqlens"], feeds["block_table"], h, kv, d,
+    )
+    actual = m.run_mlx(model, feeds)[0]
+    np.testing.assert_allclose(actual, expected, rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.parametrize("width", [128, 256])
+def test_paged_attention_native_bf16(width):
+    import ml_dtypes
+    import onnx
+
+    h, kv, nb, blk = 4, 2, 8, 4
+    graph = onnx.load_model_from_string(_model(h, kv, width, nb, blk, 1, 0, 0))
+    for value in [*graph.graph.input, *graph.graph.output]:
+        if value.type.tensor_type.elem_type == onnx.TensorProto.FLOAT16:
+            value.type.tensor_type.elem_type = onnx.TensorProto.BFLOAT16
+    session = ort.InferenceSession(graph.SerializeToString(), providers=m.EP_PROVIDERS)
+    session.disable_fallback()
+    feeds, _ = _inputs(h, kv, width, nb, blk, 1, 0, 0, width)
+    reference = dict(feeds)
+    binding = session.io_binding()
+    buffers = {}
+    values = {}
+    for name, array in feeds.items():
+        if array.dtype == np.float16:
+            rounded = array.astype(ml_dtypes.bfloat16)
+            reference[name] = rounded.astype(np.float32)
+            buffers[name] = rounded.view(np.uint16)
+            values[name] = ort.OrtValue.ortvalue_from_numpy_with_onnx_type(
+                buffers[name], onnx.TensorProto.BFLOAT16
+            )
+        else:
+            values[name] = ort.OrtValue.ortvalue_from_numpy(array)
+        binding.bind_ortvalue_input(name, values[name])
+    output = np.zeros_like(feeds["query"], dtype=np.uint16)
+    output_value = ort.OrtValue.ortvalue_from_numpy_with_onnx_type(
+        output, onnx.TensorProto.BFLOAT16
+    )
+    binding.bind_ortvalue_output("output", output_value)
+    expected = _paged_ref(
+        reference["query"], reference["key"], reference["value"],
+        reference["key_cache"], reference["value_cache"],
+        feeds["cumulative_sequence_length"], feeds["past_seqlens"], feeds["block_table"],
+        h, kv, width, return_cache=True,
+    )
+    session.run_with_iobinding(binding)
+    np.testing.assert_allclose(
+        output.view(ml_dtypes.bfloat16).astype(np.float32), expected[0], rtol=2e-2, atol=2e-2
+    )
+    for name, want in zip(["key_cache", "value_cache"], expected[1:], strict=True):
+        np.testing.assert_array_equal(
+            buffers[name], want.astype(ml_dtypes.bfloat16).view(np.uint16)
+        )
+
+
+@pytest.mark.parametrize("past,new_tokens", [(0, 59), (0, 80), (0, 128), (128, 36), (291, 1)])
+def test_paged_attention_qwen_geometry_long_prefix(past, new_tokens):
+    heads, kv_heads, width, blocks, block_size = 24, 4, 256, 4, 256
+    model = _model(heads, kv_heads, width, blocks, block_size, 1, 0, 0)
+    rng = np.random.default_rng(past + new_tokens)
+    feeds = {
+        "query": rng.standard_normal((new_tokens, heads * width)).astype(np.float16),
+        "key": rng.standard_normal((new_tokens, kv_heads * width)).astype(np.float16),
+        "value": rng.standard_normal((new_tokens, kv_heads * width)).astype(np.float16),
+        "key_cache": rng.standard_normal((blocks, block_size, kv_heads, width)).astype(np.float16),
+        "value_cache": rng.standard_normal((blocks, block_size, kv_heads, width)).astype(np.float16),
+        "cumulative_sequence_length": np.array([0, new_tokens], np.int32),
+        "past_seqlens": np.array([past], np.int32),
+        "block_table": rng.permutation(blocks).astype(np.int32).reshape(1, blocks),
+    }
+    expected = _paged_ref(
+        feeds["query"], feeds["key"], feeds["value"], feeds["key_cache"], feeds["value_cache"],
+        feeds["cumulative_sequence_length"], feeds["past_seqlens"], feeds["block_table"],
+        heads, kv_heads, width,
+    )
+    actual = m.run_mlx(model, feeds)[0]
+    np.testing.assert_allclose(actual, expected, rtol=2e-3, atol=2e-3)

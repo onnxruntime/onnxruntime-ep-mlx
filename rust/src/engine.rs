@@ -391,6 +391,7 @@ pub struct CompiledSubgraph {
     pub stable_cross_inputs: HashMap<usize, Array>,
     /// Address of the first cross-attention K tensor for the active generation.
     pub stable_generation_key: Option<usize>,
+    pub validated_shapes: std::collections::HashSet<Vec<(Vec<i64>, u32)>>,
 }
 
 impl CompiledSubgraph {
@@ -417,6 +418,7 @@ impl CompiledSubgraph {
             kv_present_names: Vec::new(),
             stable_cross_inputs: HashMap::new(),
             stable_generation_key: None,
+            validated_shapes: std::collections::HashSet::new(),
         }
     }
 }
@@ -698,6 +700,15 @@ pub struct HostBytes {
     pub dtype: ort::ONNXTensorElementDataType,
 }
 
+struct PagedWriteback {
+    input: *mut u8,
+    shape: Vec<i64>,
+    values: mlxsys::mlx_array,
+    slots: Vec<usize>,
+    row_bytes: usize,
+    output: Option<OutRef>,
+}
+
 /// Per-Compute execution context: builds the MLX graph for one forward pass, evals once, copies out.
 /// Handlers receive `&mut TranslationContext` and use Resolve/Bind + the MLX op helpers.
 pub struct TranslationContext<'a> {
@@ -743,6 +754,7 @@ pub struct TranslationContext<'a> {
     /// Evaluated MLX arrays that must be copied back into mutable ORT input buffers for
     /// side-effecting ops such as PagedAttention's in-place KV-cache update.
     input_writebacks: Vec<(*mut c_void, mlxsys::mlx_array, usize)>,
+    paged_writebacks: Vec<PagedWriteback>,
     /// True while translating inside the GENERAL compiled-subgraph closure trace. In this mode the
     /// dynamic inputs are shapeless tracer placeholders with no host data, so any mid-graph host eval
     /// (`contiguous_eval` — the host-computed Det/NonZero/Unique ops) is illegal and must fail the
@@ -762,6 +774,7 @@ pub struct TranslationContext<'a> {
     shape_keyed_compile: bool,
     /// True only while translating any compiled closure; eager translation leaves this false.
     in_compiled_trace: bool,
+    standalone_paged: bool,
 }
 
 impl<'a> TranslationContext<'a> {
@@ -771,6 +784,7 @@ impl<'a> TranslationContext<'a> {
         kctx: *mut ort::OrtKernelContext,
         stream: mlxsys::mlx_stream,
     ) -> Self {
+        let standalone_paged = plan.nodes.len() == 1 && plan.nodes[0].op_type == "PagedAttention";
         TranslationContext {
             plan,
             ort_api,
@@ -787,10 +801,12 @@ impl<'a> TranslationContext<'a> {
             compiled_valid_past: 0,
             kv_deltas: HashMap::new(),
             input_writebacks: Vec::new(),
+            paged_writebacks: Vec::new(),
             in_general_trace: false,
             compiled_kv_present: Vec::new(),
             shape_keyed_compile: false,
             in_compiled_trace: false,
+            standalone_paged,
         }
     }
 
@@ -882,6 +898,52 @@ impl<'a> TranslationContext<'a> {
             _ => return Err("MLX: cannot write back an immutable input".to_string()),
         }
         Ok(a)
+    }
+
+    pub fn defer_paged_writeback(
+        &mut self,
+        input: &TensorRef,
+        values: mlxsys::mlx_array,
+        slots: Vec<usize>,
+        output: Option<&OutRef>,
+    ) -> Result<(), MlxError> {
+        if input.source != Src::CtxInput || self.in_compiled_trace || !self.standalone_paged {
+            return Err(
+                "PagedAttention: sparse writes require an eager mutable boundary input".into(),
+            );
+        }
+        let (data, shape, dtype) = self.read_ctx_input(input.ctx_index)?;
+        if data.is_null()
+            || shape.len() != 4
+            || shape.iter().any(|&dim| dim <= 0)
+            || self.dtype_of(values) != mlx_dtype_from_onnx(dtype)
+            || self.shape_of(values) != [slots.len() as i32, dim_i32(shape[2])?, dim_i32(shape[3])?]
+            || slots
+                .iter()
+                .any(|&slot| slot >= (shape[0] * shape[1]) as usize)
+            || output.is_some_and(|out| !out.external)
+        {
+            return Err("PagedAttention: invalid sparse cache writeback geometry".into());
+        }
+        let values = self.contiguous(values)?;
+        let array = std::mem::ManuallyDrop::new(Array::from_raw(values));
+        let row_bytes = (shape[2] as usize)
+            .checked_mul(shape[3] as usize)
+            .and_then(|size| size.checked_mul(array.itemsize()))
+            .ok_or("PagedAttention: cache row byte count overflow")?;
+        self.paged_writebacks.push(PagedWriteback {
+            input: data as *mut u8,
+            shape,
+            values,
+            slots,
+            row_bytes,
+            output: output.cloned(),
+        });
+        Ok(())
+    }
+
+    pub fn is_standalone_paged(&self) -> bool {
+        self.standalone_paged
     }
 
     /// Emit the per-op trace detail for the node just translated (only when tracing is on).
@@ -2055,10 +2117,13 @@ impl<'a> TranslationContext<'a> {
                     outs.append(casted);
                     ext.push((o.clone(), casted));
                 }
-                for &(_, a, _) in &self.input_writebacks {
-                    outs.append(a);
-                }
             }
+        }
+        for &(_, a, _) in &self.input_writebacks {
+            outs.append(a);
+        }
+        for patch in &self.paged_writebacks {
+            outs.append(patch.values);
         }
         // The single synchronous `mlx_eval` boundary: with tracing on this is wrapped
         // in the `mlx.eval` (cat "gpu") span, whose CPU wall time is the GPU-inclusive
@@ -2090,6 +2155,62 @@ impl<'a> TranslationContext<'a> {
             let arr = std::mem::ManuallyDrop::new(Array::from_raw(a));
             unsafe {
                 std::ptr::copy_nonoverlapping(arr.data_bytes(), dst as *mut u8, bytes);
+            }
+        }
+        for patch in &self.paged_writebacks {
+            let start = std::time::Instant::now();
+            let array = std::mem::ManuallyDrop::new(Array::from_raw(patch.values));
+            let source = array.data_bytes();
+            if !patch.slots.is_empty() && source.is_null() {
+                return Err("PagedAttention: evaluated cache updates have no data".into());
+            }
+            unsafe {
+                for (row, &slot) in patch.slots.iter().enumerate() {
+                    std::ptr::copy_nonoverlapping(
+                        source.add(row * patch.row_bytes),
+                        patch.input.add(slot * patch.row_bytes),
+                        patch.row_bytes,
+                    );
+                }
+                let mut copied = patch.slots.len() * patch.row_bytes;
+                let mut delta = true;
+                if let Some(output) = &patch.output {
+                    let api = &*self.ort_api;
+                    let mut value = std::ptr::null_mut();
+                    let status = (api.KernelContext_GetOutput.unwrap())(
+                        self.kctx,
+                        output.ctx_index,
+                        patch.shape.as_ptr(),
+                        patch.shape.len(),
+                        &mut value,
+                    );
+                    if !status.is_null() {
+                        (api.ReleaseStatus.unwrap())(status);
+                        return Err("PagedAttention: allocating cache output failed".into());
+                    }
+                    if value.is_null() {
+                        return Err("PagedAttention: cache output is null".into());
+                    }
+                    let mut destination: *mut c_void = std::ptr::null_mut();
+                    let status = (api.GetTensorMutableData.unwrap())(value, &mut destination);
+                    if !status.is_null() {
+                        (api.ReleaseStatus.unwrap())(status);
+                        return Err("PagedAttention: accessing cache output failed".into());
+                    }
+                    if destination.is_null() {
+                        return Err("PagedAttention: cache output data is null".into());
+                    }
+                    if destination as *mut u8 != patch.input {
+                        let bytes = (patch.shape[0] as usize)
+                            .checked_mul(patch.shape[1] as usize)
+                            .and_then(|rows| rows.checked_mul(patch.row_bytes))
+                            .ok_or("PagedAttention: cache byte count overflow")?;
+                        std::ptr::copy_nonoverlapping(patch.input, destination as *mut u8, bytes);
+                        copied += bytes;
+                        delta = false;
+                    }
+                }
+                tr.record_copyout(delta, copied as u64, start.elapsed());
             }
         }
         Ok(())

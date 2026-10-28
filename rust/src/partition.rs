@@ -6,6 +6,10 @@ use onnx_runtime_ir::{Graph, NodeId, ValueId};
 
 use crate::registry::CompilePartitionClass;
 
+fn compatible_compile_classes(left: CompilePartitionClass, right: CompilePartitionClass) -> bool {
+    matches!(left, CompilePartitionClass::Eager) == matches!(right, CompilePartitionClass::Eager)
+}
+
 pub(crate) fn build_contiguous_clusters(
     order: &[NodeId],
     supported: &[bool],
@@ -26,7 +30,7 @@ pub(crate) fn build_contiguous_clusters(
         while end < supported.len()
             && supported[end]
             && float64[end] == float64[start]
-            && compile_class[end] == compile_class[start]
+            && compatible_compile_classes(compile_class[end], compile_class[start])
         {
             end += 1;
         }
@@ -250,7 +254,7 @@ fn cluster_edges(
         for &successor in &succ[node] {
             if supported[successor]
                 && float64[node] == float64[successor]
-                && compile_class[node] == compile_class[successor]
+                && compatible_compile_classes(compile_class[node], compile_class[successor])
             {
                 edges.push((node, successor));
             }
@@ -482,7 +486,7 @@ mod tests {
                 &succ,
                 &pred,
             ),
-            vec![vec![0], vec![1], vec![2], vec![3], vec![4]]
+            vec![vec![0, 1], vec![2], vec![3, 4]]
         );
     }
 
@@ -514,7 +518,7 @@ mod tests {
     }
 
     #[test]
-    fn shape_keyed_regions_and_contiguous_fallback_preserve_boundaries() {
+    fn shape_keyed_regions_merge_with_shapeless_neighbors() {
         let (succ, pred) = chain(5);
         assert_eq!(
             cluster_edges(
@@ -524,7 +528,7 @@ mod tests {
                 &succ,
                 &pred,
             ),
-            vec![vec![0, 1], vec![2], vec![3, 4]]
+            vec![vec![0, 1, 2, 3, 4]]
         );
         let order = (0..5)
             .map(|index| onnx_runtime_ir::NodeId(index as u32))
@@ -536,11 +540,7 @@ mod tests {
                 &vec![false; 5],
                 &[Shapeless, ShapeKeyed, ShapeKeyed, Shapeless, Shapeless],
             ),
-            vec![
-                vec![onnx_runtime_ir::NodeId(0)],
-                vec![onnx_runtime_ir::NodeId(1), onnx_runtime_ir::NodeId(2)],
-                vec![onnx_runtime_ir::NodeId(3), onnx_runtime_ir::NodeId(4)]
-            ]
+            vec![order]
         );
     }
 

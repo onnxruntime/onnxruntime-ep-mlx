@@ -557,6 +557,7 @@ def test_mrotary_embedding_dynamic_rejects_mismatched_positions(position_shape):
         "cos": np.ones((4, 32), dtype=np.float32),
         "sin": np.zeros((4, 32), dtype=np.float32),
     }
+    session.run(None, {**feeds, "position_ids": np.zeros((3, 1, 3), dtype=np.int64)})
     with pytest.raises(EPFail, match="MRotaryEmbedding: position_ids must have shape"):
         session.run(None, feeds)
 

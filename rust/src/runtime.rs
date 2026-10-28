@@ -14,7 +14,7 @@ use crate::engine::{Plan, Slot, TranslationContext};
 use crate::factory::ORT_API_VERSION;
 use crate::mlx::Stream;
 use crate::plan_builder;
-use crate::sys::{mlx, ort};
+use crate::sys::ort;
 
 /// Allocate ORT compute-info callback state for compiled fused subgraphs.
 ///
@@ -23,8 +23,6 @@ use crate::sys::{mlx, ort};
 /// returned callbacks own their `Plan` until `release_node_compute_infos`.
 pub(crate) unsafe fn compile(
     ort_api: *const ort::OrtApi,
-    gpu_stream: mlx::mlx_stream,
-    cpu_stream: mlx::mlx_stream,
     graphs: *mut *const ort::OrtGraph,
     fused_nodes: *mut *const ort::OrtNode,
     count: usize,
@@ -37,13 +35,8 @@ pub(crate) unsafe fn compile(
             let fused_node = *fused_nodes.add(index);
             match plan_builder::build_plan(api, graph, fused_node) {
                 Ok(plan) => {
-                    let stream = if plan.requires_cpu_stream {
-                        cpu_stream
-                    } else {
-                        gpu_stream
-                    };
-                    *node_compute_infos.add(index) = SubgraphComputeInfo::new(ort_api, stream, plan)
-                        as *mut ort::OrtNodeComputeInfo;
+                    *node_compute_infos.add(index) =
+                        SubgraphComputeInfo::new(ort_api, plan) as *mut ort::OrtNodeComputeInfo;
                 }
                 Err(message) => {
                     let message = CString::new(message)
@@ -81,7 +74,7 @@ pub(crate) unsafe fn release_node_compute_infos(
 struct SubgraphComputeInfo {
     base: ort::OrtNodeComputeInfo,
     ort_api: *const ort::OrtApi,
-    stream: mlx::mlx_stream,
+    base_stream: Mutex<Option<Stream>>,
     decode_stream: Mutex<Option<Stream>>,
     run_gate: RunGate,
     // Held only while `run_gate` is held. This second lock makes the mutation
@@ -90,11 +83,7 @@ struct SubgraphComputeInfo {
 }
 
 impl SubgraphComputeInfo {
-    fn new(
-        ort_api: *const ort::OrtApi,
-        stream: mlx::mlx_stream,
-        plan: Plan,
-    ) -> *mut SubgraphComputeInfo {
+    fn new(ort_api: *const ort::OrtApi, plan: Plan) -> *mut SubgraphComputeInfo {
         let mut base: ort::OrtNodeComputeInfo = unsafe { std::mem::zeroed() };
         base.ort_version_supported = ORT_API_VERSION;
         base.CreateState = Some(create_state);
@@ -103,7 +92,7 @@ impl SubgraphComputeInfo {
         Box::into_raw(Box::new(Self {
             base,
             ort_api,
-            stream,
+            base_stream: Mutex::new(None),
             decode_stream: Mutex::new(None),
             run_gate: RunGate::new(),
             plan: Mutex::new(plan),
@@ -191,6 +180,20 @@ unsafe fn compute_impl(
             Err(message) => return ep_fail_status(api, message),
         };
         let mut plan = info.plan.lock().unwrap_or_else(|error| error.into_inner());
+        // Model loading and inference may use different threads; MLX stream IDs are thread-local.
+        let mut base_stream = info
+            .base_stream
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let base_stream = base_stream
+            .get_or_insert_with(|| {
+                if plan.requires_cpu_stream {
+                    Stream::new_default_cpu()
+                } else {
+                    Stream::new_default_gpu()
+                }
+            })
+            .as_raw();
         let seq_len = crate::compiled::detect_seq_len(info.ort_api, kctx, &plan);
         let generation_key =
             crate::compiled::detect_attention_generation_key(info.ort_api, kctx, &plan);
@@ -207,7 +210,7 @@ unsafe fn compute_impl(
         let stream = if use_dedicated_decode_stream(plan.dedicated_decode_stream, seq_len) {
             decode_stream.get_or_insert_with(Stream::new_gpu).as_raw()
         } else {
-            info.stream
+            base_stream
         };
 
         let tr = crate::trace::tracer();
