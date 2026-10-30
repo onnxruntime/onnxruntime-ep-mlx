@@ -33,7 +33,10 @@ If a node is unsupported, ambiguous, or only supported by the old hand-kernel pa
 
 ### 1.2 Fuse
 
-Claimed nodes are grouped into maximal convex connected ORT partitions for the plugin EP. The design goal is a fused decoder subgraph rather than a sequence of per-op custom kernel launches.
+Claimed nodes are grouped into maximal convex connected ORT partitions for the plugin EP.
+If interleaved groups create a cyclic quotient, topological contiguous runs retain every
+supported node while preserving dtype and compile-class boundaries. The resulting fused
+regions have an acyclic dependency graph.
 
 ### 1.3 Compile
 
@@ -225,10 +228,10 @@ Tests in `tests/ops/test_fused_matmul.py` cover default/eager requests, not yet 
 or CPU-stream execution. Absence of an earlier native registration does not establish a
 baseline failure: ORT expansion/rewrites and actual placement still require admitted execution.
 
-Runtime-bounded **Range** remains on ORT CPU. Modern runtime-repeat **Tile** uses eager MLX
-translation: repeat values determine output extents and cannot safely be baked into a
-shape/dtype-keyed closure. Constant initializer forms remain supported. These coverage changes
-do not reproduce or establish a speedup for the Nemotron streaming workload in issue #10.
+Runtime-bounded INT64 **Range** and modern runtime-repeat **Tile** use eager MLX
+translation: live values determine output extents and are refreshed before compiled consumers.
+Constant initializer forms remain supported. The exact native-attention position proof
+preserves its existing Range/Tile capture exception.
 
 Modern **Tile-6/13** INT64 repeats use checked rank-one/cardinality, nonnegative
 full-width per-axis multiplication, native int32 output extents and checked element/byte bounds.
@@ -265,9 +268,9 @@ contracts and regression fixtures, not proof of every combination or physical GP
 Live-repeat fixtures are source-only pending independently authorized CI qualification.
 The native-admission source regression imports opset 14 (effective Tile schema 13) and retains
 an unrelated constant-INT64-repeat string/complex Tile as a graph output with optimizations
-disabled. Its proposed capability trace assertion uses admission of the live INT64 Range,
-which ordinary claiming rejects, to establish that the unchanged broad Q8 detector fired;
-the supported baseline and additional INT64 Tile must remain admitted. These assertions have
+disabled. Capability traces require the supported live INT64 Range and Tile to remain admitted
+with an unrelated constant-repeat Tile. Rust plan tests separately guard the exact
+native-position capture exception. These assertions have
 not been executed locally and are not device reproduction or numerical evidence.
 
 **NonZero** uses exact original representations, not float32 conversions: signed floating zeros
@@ -537,15 +540,15 @@ produce a negative final chunk. Empty partitions follow ONNX shape inference,
 the reference, and equivalent explicit-size partitions, even where ORT 1.31's
 `num_outputs` kernel rejects them.
 
-Constant int64 `Range` bounds and values are generated with checked integer
-arithmetic, not through floating-point start/step arguments. All three bounds
+INT64 `Range` values are generated with checked integer arithmetic. Live bounds
+are reread in an eager partition before downstream compiled consumers. All three bounds
 must be scalars, the output length must fit native int32 geometry, and its
-exact count must agree with ORT's inferred extent. Full-width bounds with small
+exact count must agree with ORT's inferred extent for constant bounds. Full-width bounds with small
 spans follow the ONNX function, including cases where ORT 1.31's native kernel
 incorrectly returns empty. Forms whose exact count disagrees with the inferred
-extent remain unclaimed rather than capturing an incorrect shape. Runtime
-bounds and float64 `Range` remain open coverage partitions, not proven backend
-limitations.
+extent remain unclaimed. Live INT64 bounds support positive/negative steps,
+empty results, full-width values and error recovery; invalid geometry raises
+an EP error. Other Range dtypes continue to require constant scalar bounds.
 
 `BatchNormalization` implements versioned inference and training, including
 legacy version-7 nonspatial features and version-9 rank-one inputs (`C=1`).
@@ -953,3 +956,18 @@ For the data that justified the pivot, see [`docs/MLX_EVALUATION.md`](./MLX_EVAL
 | Additional decoder ops | Not claimed unless/until an MLX translation and tests are added. |
 | Further fp32 drift analysis | Current drift is accepted after the first 14 CPU-matching tokens; keep monitoring with E2E tests. |
 | Broader model-family coverage | Out of scope for the current claim table; CPU fallback remains the default. |
+
+
+## Symbolic ScatterElements geometry
+
+`ScatterElements` reduction `none` accepts compatible symbolic shape metadata.
+Known dimensions must agree; runtime shapes validate indices/update equality,
+rank, axis and non-axis bounds. Partial non-axis updates scatter into the selected
+prefix and merge it back into the original data, preserving untouched elements.
+This avoids MLX broadcasting a one-row update across multiple data rows. Empty
+updates return the original data. The existing shape-keyed compile route checks
+new geometry before reuse.
+
+Native regressions cover FP32/FP16 partial and empty updates, 4-D symbolic
+metadata, invalid geometry and recovery. Dynamic INT64 Range also covers shape-derived
+causal masks, full-width integer values and live axes consumed by reductions.

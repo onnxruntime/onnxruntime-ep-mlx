@@ -290,15 +290,61 @@ fn scatter_elements_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(),
     let data = ctx.resolve(&n.inputs[0])?;
     let indices = ctx.resolve(&n.inputs[1])?;
     let updates = ctx.resolve(&n.inputs[2])?;
-    let rank = ctx.ndim(data) as i32;
-    let axis = norm_axis(int_attr(n, "axis", 0), rank);
-    let dim = ctx.dim(data, axis);
-    let idx = normalize_indices(ctx, indices, dim)?;
-    let r =
-        ctx.emit(|res, s| unsafe { mlx::mlx_put_along_axis(res, data, idx, updates, axis, s) })?;
-    let r = ctx.contiguous(r)?;
-    ctx.bind(&n.outputs[0], r);
+    let shape = ctx.shape_of(data);
+    let index_shape = ctx.shape_of(indices);
+    let update_shape = ctx.shape_of(updates);
+    let rank = shape.len() as i64;
+    let axis = int_attr(n, "axis", 0);
+    if rank == 0 || axis < -rank || axis >= rank {
+        return Err("ScatterElements: axis is out of range".to_string());
+    }
+    if index_shape != update_shape || index_shape.len() != shape.len() {
+        return Err(
+            "ScatterElements: indices/updates must have equal shapes and data rank".to_string(),
+        );
+    }
+    let axis = norm_axis(axis, rank as i32);
+    let mut extent = shape.clone();
+    for i in 0..shape.len() {
+        if i != axis as usize {
+            if index_shape[i] > shape[i] {
+                return Err("ScatterElements: non-axis indices extent exceeds data".to_string());
+            }
+            extent[i] = index_shape[i];
+        }
+    }
+    if index_shape.contains(&0) {
+        let result = ctx.contiguous(data)?;
+        ctx.bind(&n.outputs[0], result);
+        return Ok(());
+    }
+    let start = vec![0; shape.len()];
+    let partial = extent != shape;
+    let source = if partial {
+        ctx.slice(data, &start, &extent)?
+    } else {
+        data
+    };
+    let idx = normalize_indices(ctx, indices, shape[axis as usize])?;
+    let result = ctx.emit(|res, stream| unsafe {
+        mlx::mlx_put_along_axis(res, source, idx, updates, axis, stream)
+    })?;
+    let result = if partial {
+        ctx.slice_update(data, result, &start, &extent)?
+    } else {
+        result
+    };
+    let result = ctx.contiguous(result)?;
+    ctx.bind(&n.outputs[0], result);
     Ok(())
+}
+
+fn compatible_shape(left: &[i64], right: &[i64]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|(&a, &b)| a < 0 || b < 0 || a == b)
 }
 
 fn center_crop_pad_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
@@ -1976,7 +2022,7 @@ fn scatter_elements_claim(node: &NodeView) -> ClaimResult {
         "data must have rank >= 1 (scalar data is unsupported)"
     );
     require!(
-        indices.shape == updates.shape,
+        compatible_shape(&indices.shape, &updates.shape),
         "indices shape {:?} must equal updates shape {:?}",
         indices.shape,
         updates.shape
@@ -1988,7 +2034,7 @@ fn scatter_elements_claim(node: &NodeView) -> ClaimResult {
         data.shape.len()
     );
     require!(
-        out.shape == data.shape,
+        compatible_shape(&out.shape, &data.shape),
         "output shape {:?} must equal data shape {:?}",
         out.shape,
         data.shape
@@ -2002,7 +2048,10 @@ fn scatter_elements_claim(node: &NodeView) -> ClaimResult {
     let ax = norm_axis(axis, rank as i32) as usize;
     for i in 0..data.shape.len() {
         require!(
-            i == ax || indices.shape[i] <= data.shape[i],
+            i == ax
+                || indices.shape[i] < 0
+                || data.shape[i] < 0
+                || indices.shape[i] <= data.shape[i],
             "on non-axis dim {i}, indices extent {} must be <= data extent {}",
             indices.shape[i],
             data.shape[i]
@@ -2406,7 +2455,7 @@ fn reshape_claim(node: &NodeView) -> ClaimResult {
     require!(
         node.input_info(1).map(|i| i.dtype)
             == Some(ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64),
-        "Reshape `shape` input must be int64 (runtime shape-derived values resolve at trace time; a data-dependent shape falls back to eager, and a cyclic partition is dropped to CPU)"
+        "Reshape `shape` input must be int64 (runtime shape-derived values resolve at trace time; data-dependent geometry uses eager translation and cyclic fusions are split)"
     );
     Ok(())
 }
@@ -3227,7 +3276,7 @@ fn range_claim(node: &NodeView) -> ClaimResult {
         for (i, value) in bounds.iter_mut().enumerate() {
             let values = match node.read_const_int64(i) {
                 Some(values) if values.len() == 1 => values,
-                _ => deny!("Range: integer bounds must be constant scalar initializers"),
+                _ => return Ok(()), // Live INT64 bounds are evaluated at an eager boundary.
             };
             *value = values[0];
         }

@@ -36,8 +36,8 @@ pub(crate) fn build_contiguous_clusters(
     clusters
 }
 
-/// Groups supported nodes into maximal, convex, connected clusters. A set S is convex iff no node
-/// outside S lies on a path between two members of S.
+/// Prefer maximal convex groups; use topological runs if their quotient would be cyclic.
+/// A set S is convex iff no outside node lies on a path between two members of S.
 pub(crate) fn build_convex_clusters(
     graph: &Graph,
     order: &[NodeId],
@@ -303,53 +303,59 @@ fn cluster_edges(
         })
         .collect::<Vec<_>>();
 
-    loop {
-        let mut qid = vec![usize::MAX; n];
-        for (cluster_id, cluster) in clusters.iter().enumerate() {
-            for &node in cluster {
-                qid[node] = cluster_id;
+    let mut qid = vec![usize::MAX; n];
+    for (cluster_id, cluster) in clusters.iter().enumerate() {
+        for &node in cluster {
+            qid[node] = cluster_id;
+        }
+    }
+    let mut next = clusters.len();
+    for id in &mut qid {
+        if *id == usize::MAX {
+            *id = next;
+            next += 1;
+        }
+    }
+    let mut qsucc = vec![HashSet::new(); next];
+    let mut qindeg = vec![0usize; next];
+    for node in 0..n {
+        for &successor in &succ[node] {
+            let (from, to) = (qid[node], qid[successor]);
+            if from != to && qsucc[from].insert(to) {
+                qindeg[to] += 1;
             }
         }
-        let mut next = clusters.len();
-        for id in &mut qid {
-            if *id == usize::MAX {
-                *id = next;
-                next += 1;
+    }
+    let mut stack: Vec<usize> = (0..next).filter(|&node| qindeg[node] == 0).collect();
+    let mut visited = 0usize;
+    while let Some(node) = stack.pop() {
+        visited += 1;
+        for &successor in &qsucc[node] {
+            qindeg[successor] -= 1;
+            if qindeg[successor] == 0 {
+                stack.push(successor);
             }
         }
-        let mut qsucc = vec![HashSet::new(); next];
-        let mut qindeg = vec![0usize; next];
-        for node in 0..n {
-            for &successor in &succ[node] {
-                let (from, to) = (qid[node], qid[successor]);
-                if from != to && qsucc[from].insert(to) {
-                    qindeg[to] += 1;
-                }
+    }
+    if visited != next {
+        // Individually convex groups can still form a cyclic quotient when branches
+        // interleave. Topological runs keep every supported node without introducing
+        // a dependency cycle between fused regions.
+        let mut fallback: Vec<Vec<usize>> = Vec::new();
+        let mut previous = None;
+        for &node in &order {
+            if !supported[node] {
+                previous = None;
+                continue;
             }
-        }
-        let mut stack: Vec<usize> = (0..next).filter(|&node| qindeg[node] == 0).collect();
-        let mut visited = 0usize;
-        while let Some(node) = stack.pop() {
-            visited += 1;
-            for &successor in &qsucc[node] {
-                qindeg[successor] -= 1;
-                if qindeg[successor] == 0 {
-                    stack.push(successor);
-                }
+            let colour = (float64[node], compile_class[node]);
+            if previous != Some(colour) {
+                fallback.push(Vec::new());
             }
+            fallback.last_mut().unwrap().push(node);
+            previous = Some(colour);
         }
-        if visited == next {
-            break;
-        }
-        let victim = (0..next)
-            .filter(|&node| qindeg[node] > 0 && node < clusters.len())
-            .min_by_key(|&cluster| clusters[cluster].len());
-        match victim {
-            Some(cluster) => {
-                clusters.remove(cluster);
-            }
-            None => break,
-        }
+        return fallback;
     }
     clusters.sort_by_key(|cluster| cluster[0]);
     clusters
@@ -484,6 +490,97 @@ mod tests {
             ),
             vec![vec![0], vec![1], vec![2], vec![3], vec![4]]
         );
+    }
+
+    #[test]
+    fn interleaved_convex_groups_keep_every_supported_node() {
+        // Both {0,3} and {1,2} are convex, but contracting both creates a cycle.
+        let succ = vec![vec![2, 3], vec![2, 3], vec![], vec![]];
+        let pred = vec![vec![], vec![], vec![0, 1], vec![0, 1]];
+        let classes = [Shapeless, ShapeKeyed, ShapeKeyed, Shapeless];
+        let groups = cluster_edges(&[true; 4], &[false; 4], &classes, &succ, &pred);
+        let mut nodes = groups.iter().flatten().copied().collect::<Vec<_>>();
+        nodes.sort_unstable();
+        assert_eq!(nodes, vec![0, 1, 2, 3]);
+        assert_ne!(groups, vec![vec![0, 3], vec![1, 2]]);
+        for group in groups {
+            assert!(group.iter().all(|&node| classes[node] == classes[group[0]]));
+        }
+    }
+
+    #[test]
+    fn branched_partitions_cover_supported_nodes_with_an_acyclic_quotient() {
+        for seed in 1u64..=256 {
+            let n = 7;
+            let mut state = seed;
+            let mut next_bit = || {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                state >> 63 != 0
+            };
+            let mut succ = vec![Vec::new(); n];
+            let mut pred = vec![Vec::new(); n];
+            for (from, successors) in succ.iter_mut().enumerate() {
+                for (to, predecessors) in pred.iter_mut().enumerate().skip(from + 1) {
+                    if next_bit() {
+                        successors.push(to);
+                        predecessors.push(from);
+                    }
+                }
+            }
+            let supported = (0..n)
+                .map(|_| seed % 2 == 0 || next_bit())
+                .collect::<Vec<_>>();
+            let wide = (0..n)
+                .map(|_| seed % 3 == 0 && next_bit())
+                .collect::<Vec<_>>();
+            let classes = (0..n)
+                .map(|_| if next_bit() { ShapeKeyed } else { Shapeless })
+                .collect::<Vec<_>>();
+            let groups = cluster_edges(&supported, &wide, &classes, &succ, &pred);
+            let mut owner = vec![usize::MAX; n];
+            for (id, group) in groups.iter().enumerate() {
+                for &node in group {
+                    assert!(supported[node]);
+                    assert_eq!(owner[node], usize::MAX);
+                    assert_eq!(wide[node], wide[group[0]]);
+                    assert_eq!(classes[node], classes[group[0]]);
+                    owner[node] = id;
+                }
+            }
+            let mut count = groups.len();
+            for (node, id) in owner.iter_mut().enumerate() {
+                assert_eq!(*id != usize::MAX, supported[node]);
+                if *id == usize::MAX {
+                    *id = count;
+                    count += 1;
+                }
+            }
+            let mut outgoing = vec![Vec::new(); count];
+            let mut incoming = vec![0; count];
+            for (node, successors) in succ.iter().enumerate() {
+                for &to in successors {
+                    let (a, b) = (owner[node], owner[to]);
+                    if a != b {
+                        outgoing[a].push(b);
+                        incoming[b] += 1;
+                    }
+                }
+            }
+            let mut ready = (0..count)
+                .filter(|&id| incoming[id] == 0)
+                .collect::<Vec<_>>();
+            let mut seen = 0;
+            while let Some(id) = ready.pop() {
+                seen += 1;
+                for &to in &outgoing[id] {
+                    incoming[to] -= 1;
+                    if incoming[to] == 0 {
+                        ready.push(to);
+                    }
+                }
+            }
+            assert_eq!(seen, count, "cyclic quotient for seed {seed}");
+        }
     }
 
     #[test]

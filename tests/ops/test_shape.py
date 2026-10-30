@@ -496,25 +496,132 @@ def test_tile_runtime_repeats_are_claimed_and_fresh():
         np.testing.assert_array_equal(session.run(None, feeds)[0], np.tile(feeds["x"], repeats))
 
 
-def test_range_runtime_bounds_stay_on_cpu():
+def test_range_runtime_integer_bounds_stay_fresh_on_mlx():
     model = m.make_model(
         "Range",
         [m.tensor(name, DT.INT64, []) for name in ["start", "limit", "delta"]],
         [m.tensor("out", DT.INT64, ["length"])],
     )
-    feeds = {
-        name: np.array(value, dtype=np.int64)
-        for name, value in zip(["start", "limit", "delta"], [1, 7, 2], strict=True)
-    }
-    m.assert_op_declined(model, feeds, "Range")
-    session = m._session(model, m.EP_PROVIDERS)
-    for start, limit, delta in [(1, 7, 2), (4, 0, -1), (1, 7, 1), (7, 1, 2)]:
+    session = _native_range_session(model)
+    for start, limit, delta in [
+        (1, 7, 2),
+        (4, 0, -1),
+        (1, 7, 1),
+        (7, 1, 2),
+        (2**63 - 6, 2**63 - 2, 1),
+        (-(2**63), 2**63 - 1, 2**63 - 1),
+        (2**63 - 1, -(2**63), -(2**63)),
+        (1, 7, 2),
+    ]:
         feeds = {
             name: np.array(value, dtype=np.int64)
-            for name, value in zip(["start", "limit", "delta"], [start, limit, delta], strict=True)
+            for name, value in zip(
+                ["start", "limit", "delta"], [start, limit, delta], strict=True
+            )
         }
         np.testing.assert_array_equal(
-            session.run(None, feeds)[0], np.arange(start, limit, delta, dtype=np.int64)
+            session.run(None, feeds)[0],
+            np.array(list(range(start, limit, delta)), dtype=np.int64),
+        )
+
+
+def _native_range_session(model):
+    options = ort.SessionOptions()
+    options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+    options.add_session_config_entry("session.disable_cpu_ep_fallback", "1")
+    session = ort.InferenceSession(
+        model, options, providers=["MLXExecutionProvider"], enable_fallback=False
+    )
+    session.disable_fallback()
+    return session
+
+
+def test_range_live_integer_error_then_recovery():
+    model = m.make_model(
+        "Range",
+        [m.tensor(n, DT.INT64, []) for n in ("start", "limit", "delta")],
+        [m.tensor("out", DT.INT64, ["length"])],
+    )
+    session = _native_range_session(model)
+
+    def feeds(start, limit, delta):
+        return {
+            name: np.array(v, np.int64)
+            for name, v in zip(
+                ("start", "limit", "delta"), (start, limit, delta), strict=True
+            )
+        }
+
+    for invalid in ((0, 3, 0), (-(2**63), 2**63 - 1, 1)):
+        with pytest.raises(ort.capi.onnxruntime_pybind11_state.EPFail, match="Range"):
+            session.run(None, feeds(*invalid))
+        np.testing.assert_array_equal(session.run(None, feeds(1, 7, 2))[0], [1, 3, 5])
+
+
+def test_range_from_shape_keeps_causal_mask_on_mlx():
+    x = m.tensor("x", DT.FLOAT, ["batch", "sequence", 3])
+    tape = ir.tape.Tape()
+
+    def constant(value):
+        return tape.initializer(
+            ir.tensor(np.asarray(value, np.int64), name=f"c{len(tape.initializers)}")
+        )
+
+    length = tape.op("Gather", [tape.op("Shape", [x]), constant(1)], {"axis": 0})
+    positions = tape.op("Range", [constant(0), length, constant(1)])
+    positions.name, positions.dtype, positions.shape = (
+        "positions",
+        DT.INT64,
+        ir.Shape(["sequence"]),
+    )
+    keys = tape.op("Unsqueeze", [positions, constant([0])])
+    queries = tape.op("Unsqueeze", [positions, constant([1])])
+    mask = tape.op("LessOrEqual", [keys, queries])
+    mask.name, mask.dtype, mask.shape = (
+        "mask",
+        DT.BOOL,
+        ir.Shape(["sequence", "sequence"]),
+    )
+    graph = ir.Graph(
+        [x],
+        [positions, mask],
+        nodes=tape.nodes,
+        initializers=tape.initializers,
+        opset_imports={"": 24},
+        name="range_mask",
+    )
+    session = _native_range_session(
+        ir.to_proto(ir.Model(graph, ir_version=11)).SerializeToString()
+    )
+    for length in (5, 8, 3, 5):
+        positions, mask = session.run(None, {"x": np.ones((1, length, 3), np.float32)})
+        np.testing.assert_array_equal(positions, np.arange(length))
+        np.testing.assert_array_equal(mask, np.tri(length, dtype=bool))
+
+
+def test_range_live_axes_feed_compiled_reduction():
+    inputs = [m.tensor(n, DT.INT64, []) for n in ("start", "limit", "delta")]
+    x = m.tensor("x", DT.FLOAT, [2, 3, 4])
+    tape = ir.tape.Tape()
+    axes = tape.op("Range", inputs)
+    axes.dtype, axes.shape = DT.INT64, ir.Shape(["axes"])
+    out = tape.op("ReduceSum", [x, axes], {"keepdims": 1, "noop_with_empty_axes": 1})
+    out.name, out.dtype, out.shape = "out", DT.FLOAT, ir.Shape(["a", "b", "c"])
+    graph = ir.Graph(
+        [*inputs, x], [out], nodes=tape.nodes, opset_imports={"": 24}, name="range_axes"
+    )
+    session = _native_range_session(
+        ir.to_proto(ir.Model(graph, ir_version=11)).SerializeToString()
+    )
+    values = np.arange(24, dtype=np.float32).reshape(2, 3, 4)
+    for bounds in ((0, 2, 1), (1, 3, 1), (2, -1, -1), (0, 0, 1), (0, 2, 1)):
+        feeds = {
+            name: np.array(v, np.int64)
+            for name, v in zip(("start", "limit", "delta"), bounds, strict=True)
+        }
+        expected = values.sum(axis=tuple(range(*bounds)), keepdims=True)
+        np.testing.assert_array_equal(
+            session.run(None, {**feeds, "x": values})[0], expected
         )
 
 

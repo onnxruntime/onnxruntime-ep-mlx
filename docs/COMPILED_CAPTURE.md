@@ -159,7 +159,10 @@ after that limit use eager translation; previously cached values remain reusable
 parameters also use eager translation. Runtime-valued **intermediates** still require proven
 shape-constant provenance; the compiler never evaluates a data-dependent tracer.
 
-Runtime `Range` remains on CPU, and dynamic Slice axes/steps are not newly claimed.
+Live INT64 `Range` executes at an eager partition boundary, including containing
+control-flow parents. Its checked output length and values are refreshed before
+dependent compiled partitions. Other Range dtypes retain constant-bound claims.
+Dynamic Slice axes/steps are unchanged.
 Modern live-repeat `Tile` is claimed eagerly, including boundary and produced INT64 repeats.
 It and recursively containing parents are capture barriers, not new host-value specializations.
 The existing exact native-attention position proof alone restores the sole owned top-level
@@ -221,8 +224,8 @@ violates one falls back to eager (or, for attention, to the growing-concat route
    (`reads_data_dependent_parameter`). The general route additionally permits the explicitly
    value-guarded boundary parameters described above. Shape-const is OK because it changes with the shape-keyed cache
    key; an ordinary runtime tensor value does not participate in that key and would otherwise be
-   silently baked into later calls. (This is exactly why runtime-bounded `Range` is deferred — see
-   `OP_ARCHITECTURE`/README Range note.)
+   silently baked into later calls. Live INT64 `Range` uses an eager boundary
+   before this compile route.
 
 3. **No host-computed / data-dependent-output-shape ops** — `Det`, `NonZero`, `Unique` materialize
    input data mid-translate and/or emit a shape known only at runtime. NonZero and Unique are

@@ -52,7 +52,7 @@ pub(crate) unsafe fn build_plan(
     let has_control_flow = any_control_flow(&nodes);
     let has_compile_barrier = has_compile_barrier(&nodes);
     let mut plan = Plan::new(nodes);
-    fence_live_tiles(&mut plan);
+    fence_live_shape_values(&mut plan);
     if snapshot
         .ir
         .topological_order()
@@ -78,7 +78,7 @@ pub(crate) unsafe fn build_plan(
     Ok(plan)
 }
 
-fn fence_live_tiles(plan: &mut Plan) {
+fn fence_live_shape_values(plan: &mut Plan) {
     fn live_tile(node: &NodeDesc) -> bool {
         matches!(node.domain.as_str(), "" | "ai.onnx")
             && node.op_type == "Tile"
@@ -88,6 +88,15 @@ fn fence_live_tiles(plan: &mut Plan) {
             && node.inputs[1].source != Src::Initializer
             && !node.inputs[1].constant
     }
+    fn live_range(node: &NodeDesc) -> bool {
+        matches!(node.domain.as_str(), "" | "ai.onnx")
+            && node.op_type == "Range"
+            && node.inputs.len() == 3
+            && node.outputs.len() == 1
+            && node.outputs[0].otype
+                == ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64
+            && node.inputs.iter().any(|input| !input.constant)
+    }
     fn fence(nodes: &mut [NodeDesc], native_owner: bool) -> bool {
         let mut contains_live = false;
         for node in nodes {
@@ -95,19 +104,19 @@ fn fence_live_tiles(plan: &mut Plan) {
             for body in &mut node.subgraphs {
                 nested_live |= fence(&mut body.nodes, false);
             }
-            let live = live_tile(node);
+            let live = live_tile(node) || live_range(node);
             if live && native_owner {
                 node.compile_shape_safety = crate::registry::CompileShapeSafety::Shapeless;
             } else if live || nested_live {
                 node.compile_shape_safety = crate::registry::CompileShapeSafety::EagerOnly {
-                    reason: "Tile live repeats, including nested bodies, must be reread eagerly",
+                    reason: "Live Range bounds or Tile repeats, including nested bodies, must be reread eagerly",
                 };
             }
             contains_live |= live || nested_live;
         }
         contains_live
     }
-    // Plan::new's unchanged position proof requires exactly one top-level live Tile.
+    // Plan::new's position proof owns exactly one top-level live Range/Tile pair.
     // Never pass that exemption into a body, or infer it from the broad capability override.
     fence(&mut plan.nodes, plan.native_attention_decode);
 }
@@ -939,7 +948,7 @@ mod tests {
                 tile.inputs[1].shape_const = shape_const;
                 let mut plan = Plan::new(vec![tile]);
                 assert!(!plan.native_attention_decode);
-                fence_live_tiles(&mut plan);
+                fence_live_shape_values(&mut plan);
                 assert!(matches!(
                     plan.nodes[0].compile_shape_safety,
                     crate::registry::CompileShapeSafety::EagerOnly { .. }
@@ -970,7 +979,7 @@ mod tests {
             nodes.push(outer);
             let mut plan = Plan::new(nodes);
             assert!(plan.native_attention_decode);
-            fence_live_tiles(&mut plan);
+            fence_live_shape_values(&mut plan);
             let outer = plan.nodes.last().unwrap();
             let inner = &outer.subgraphs[0].nodes[0];
             let tile = &inner.subgraphs[0].nodes[0];
@@ -1061,7 +1070,7 @@ mod tests {
             tile.compile_shape_safety = crate::registry::CompileShapeSafety::EagerOnly {
                 reason: "live Tile before native context",
             };
-            fence_live_tiles(&mut plan);
+            fence_live_shape_values(&mut plan);
             let tile = plan
                 .nodes
                 .iter()
@@ -1088,8 +1097,31 @@ mod tests {
         ambiguous.push(test_node("Tile", &["data", "other_repeats"], "other_tile"));
         let mut plan = Plan::new(ambiguous);
         assert!(!plan.native_attention_decode);
-        fence_live_tiles(&mut plan);
+        fence_live_shape_values(&mut plan);
         assert_no_capture(&plan.nodes);
+    }
+
+    #[test]
+    fn live_integer_range_keeps_the_exact_native_position_exception() {
+        for exact in [false, true] {
+            let mut nodes = native_position_nodes(exact);
+            nodes
+                .iter_mut()
+                .find(|node| node.op_type == "Range")
+                .unwrap()
+                .compile_shape_safety = crate::registry::CompileShapeSafety::EagerOnly {
+                reason: "live integer Range",
+            };
+            let mut plan = Plan::new(nodes);
+            assert_eq!(plan.native_attention_decode, exact);
+            fence_live_shape_values(&mut plan);
+            let range = plan
+                .nodes
+                .iter()
+                .find(|node| node.op_type == "Range")
+                .unwrap();
+            assert_eq!(range.compile_shape_safety.allows_shapeless(), exact);
+        }
     }
 
     #[test]
@@ -1113,7 +1145,7 @@ mod tests {
                 tile.inputs[1].constant = hoisted;
                 tile.compile_shape_safety = safety;
                 let mut plan = Plan::new(vec![tile]);
-                fence_live_tiles(&mut plan);
+                fence_live_shape_values(&mut plan);
                 assert_eq!(plan.nodes[0].compile_shape_safety, safety);
             }
         }
@@ -1168,7 +1200,7 @@ mod tests {
             }
             let mut plan = Plan::new(nodes);
             assert!(!plan.native_attention_decode, "{mismatch}");
-            fence_live_tiles(&mut plan);
+            fence_live_shape_values(&mut plan);
             assert_no_capture(&plan.nodes);
         }
     }

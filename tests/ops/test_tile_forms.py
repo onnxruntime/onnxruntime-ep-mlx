@@ -205,9 +205,9 @@ def test_native_candidate_tile_payload_actual_capability(tmp_path):
         unsupported = extra not in {"none", "int64"}
         assert claim["unclaimed"] == int(unsupported), (extra, claim)
         assert claim["claimed"] == total - int(unsupported), (extra, claim)
-        # A live INT64 Range is rejected by the ordinary claim. Its admission in
-        # this actual GetCapability trace proves the unchanged broad detector
-        # returned true, including when the unrelated constant-repeat Tile exists.
+        # Live INT64 Range is supported generically; it and the valid Tile remain
+        # admitted when an unrelated constant-repeat Tile is present. Rust tests
+        # separately guard the exact native-position capture exception.
         assert "fallback_Range" not in claim, (extra, claim)
         fallbacks = {key for key in claim if key.startswith("fallback_")}
         assert fallbacks == ({"fallback_Tile"} if unsupported else set()), (extra, claim)

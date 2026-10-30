@@ -263,6 +263,11 @@ pub fn compile_shape_safety(node: &NodeView) -> CompileShapeSafety {
             reason: "Tile live repeats, including nested bodies, must be reread eagerly",
         };
     }
+    if requires_live_range_eager_boundary(node) {
+        return CompileShapeSafety::EagerOnly {
+            reason: "Range live integer bounds require fresh values before allocating the output",
+        };
+    }
     if requires_float64_metadata_eager_boundary(node) {
         return CompileShapeSafety::EagerOnly {
             reason: "float64 metadata reads must not import payloads into a compiled GPU closure",
@@ -284,6 +289,20 @@ pub fn requires_live_tile_eager_boundary(node: &NodeView) -> bool {
             .subgraphs()
             .iter()
             .any(|(_, body)| body.nodes().iter().any(requires_live_tile_eager_boundary))
+}
+
+/// Live integer Range and its containing control-flow parents allocate from runtime values.
+pub fn requires_live_range_eager_boundary(node: &NodeView) -> bool {
+    (matches!(node.domain().as_str(), "" | "ai.onnx")
+        && node.op_type() == "Range"
+        && node.input_info(0).is_some_and(|info| {
+            info.dtype == ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64
+        })
+        && (0..3).any(|i| !node.is_const_int64(i)))
+        || node
+            .subgraphs()
+            .iter()
+            .any(|(_, body)| body.nodes().iter().any(requires_live_range_eager_boundary))
 }
 
 /// Data-dependent host scans, including those inside an otherwise capture-safe parent.
