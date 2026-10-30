@@ -190,16 +190,23 @@ pub(crate) unsafe fn get_capability(
                     && matches!(view.domain().as_str(), "" | "ai.onnx")
                     && view.op_type() == "Tile"
                     && view.subgraphs().is_empty();
+                let live_range_boundary =
+                    crate::registry::requires_live_range_eager_boundary(&view);
+                let native_live_range = live_range_boundary
+                    && native_q8_attention_graph
+                    && view.op_type() == "Range"
+                    && view.subgraphs().is_empty();
                 if packed_qdq_nodes.contains(&node)
                     || crate::registry::requires_random_eager_boundary(&view)
                     || crate::registry::requires_unique_eager_boundary(&view)
+                    || (live_range_boundary && !native_live_range)
                     || crate::registry::requires_elementary_contrib_eager_boundary(&view)
                     || crate::registry::requires_cdist_eager_boundary(&view)
                     || (live_tile_boundary && !native_live_tile)
                     || crate::registry::requires_float64_metadata_eager_boundary(&view)
                 {
                     CompilePartitionClass::Eager
-                } else if native_live_tile {
+                } else if native_live_tile || native_live_range {
                     CompilePartitionClass::Shapeless
                 } else if decoder_graph || mod_boundary || nonzero_boundary {
                     crate::registry::compile_shape_safety(&view).partition_class()

@@ -1,6 +1,7 @@
 """Real current-runtime QDQ sessions; GroupedMatMul-29 handler tests live in Rust."""
 
 import json
+import math
 import os
 from pathlib import Path
 import subprocess
@@ -111,7 +112,14 @@ def test_qdq_session_replay(case, dtype):
         w = ((feeds["w"].astype(np.float32) - _expanded(feeds["wz"], feeds["w"].shape, w_axis, block))
              * _expanded(sw, feeds["w"].shape, w_axis, block))
         actual = session.run(None, feeds)
-        np.testing.assert_allclose(actual[0], a @ w, rtol=1e-5, atol=1e-6)
+        # Accumulate the exact FP32 operand products independently of BLAS.
+        # FP32 GEMM itself loses ~2.4e-5 on the repeated-value replay case.
+        expected = np.array([
+            [math.fsum(float(x) * float(y) for x, y in zip(row, column))
+             for column in w.T]
+            for row in a
+        ], dtype=np.float64).reshape(m, w.shape[1])
+        np.testing.assert_allclose(actual[0], expected, rtol=1e-5, atol=1e-6)
         np.testing.assert_array_equal(actual[1], w)
         np.testing.assert_array_equal(actual[2], w + w)
         # Live bytes and parameters must not become trace/cache constants.
