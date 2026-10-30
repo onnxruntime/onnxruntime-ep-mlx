@@ -194,6 +194,14 @@ fn infer_boundary_indices(
     Some(boundaries)
 }
 
+fn convex_bitsets(members: &[u64], descendants: &[u64], ancestors: &[u64]) -> bool {
+    members
+        .iter()
+        .zip(descendants)
+        .zip(ancestors)
+        .all(|((&members, &descendants), &ancestors)| descendants & ancestors & !members == 0)
+}
+
 fn cluster_edges(
     supported: &[bool],
     float64: &[bool],
@@ -232,6 +240,18 @@ fn cluster_edges(
         }
     }
 
+    // A cluster is convex exactly when every node both reachable from it and
+    // able to reach it is already a member. Cache ancestor unions alongside
+    // descendant unions so each tentative merge checks one bitset, not all nodes.
+    let mut ancestor_bits = vec![vec![0u64; words]; n];
+    for &node in &order {
+        for &predecessor in &pred[node] {
+            bit_set(&mut ancestor_bits[node], predecessor);
+            let ancestors = ancestor_bits[predecessor].clone();
+            bit_or_into(&mut ancestor_bits[node], &ancestors);
+        }
+    }
+
     let mut parent: Vec<usize> = (0..n).collect();
     let mut cluster_bits = vec![vec![0u64; words]; n];
     let mut reach_bits = vec![vec![0u64; words]; n];
@@ -256,13 +276,6 @@ fn cluster_edges(
             }
         }
     }
-    let is_convex = |cluster: &[u64], cluster_reach: &[u64]| {
-        reach.iter().enumerate().all(|(node, reaches)| {
-            bit_test(cluster, node)
-                || !bit_test(cluster_reach, node)
-                || !bit_intersects(reaches, cluster)
-        })
-    };
     let mut changed = true;
     while changed {
         changed = false;
@@ -276,12 +289,15 @@ fn cluster_edges(
             bit_or_into(&mut merged, &cluster_bits[right_root]);
             let mut merged_reach = reach_bits[left_root].clone();
             bit_or_into(&mut merged_reach, &reach_bits[right_root]);
-            if !is_convex(&merged, &merged_reach) {
+            let mut merged_ancestors = ancestor_bits[left_root].clone();
+            bit_or_into(&mut merged_ancestors, &ancestor_bits[right_root]);
+            if !convex_bitsets(&merged, &merged_reach, &merged_ancestors) {
                 continue;
             }
             parent[right_root] = left_root;
             cluster_bits[left_root] = merged;
             reach_bits[left_root] = merged_reach;
+            ancestor_bits[left_root] = merged_ancestors;
             changed = true;
         }
     }
@@ -373,29 +389,65 @@ fn bit_set(bits: &mut [u64], index: usize) {
     bits[index >> 6] |= 1u64 << (index & 63);
 }
 
-fn bit_test(bits: &[u64], index: usize) -> bool {
-    (bits[index >> 6] >> (index & 63)) & 1 != 0
-}
-
 fn bit_or_into(destination: &mut [u64], source: &[u64]) {
     for index in 0..destination.len() {
         destination[index] |= source[index];
     }
 }
 
-fn bit_intersects(left: &[u64], right: &[u64]) -> bool {
-    left.iter()
-        .zip(right)
-        .any(|(left, right)| left & right != 0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        build_contiguous_clusters, build_convex_clusters, cluster_edges, infer_boundary_indices,
+        build_contiguous_clusters, build_convex_clusters, cluster_edges, convex_bitsets,
+        infer_boundary_indices,
     };
     use crate::registry::CompilePartitionClass::{Eager, ShapeKeyed, Shapeless};
     use onnx_runtime_ir::{DataType, Graph, Node};
+
+    #[test]
+    fn convex_bitsets_match_path_definition_exhaustively() {
+        const N: usize = 5;
+        let edges = (0..N)
+            .flat_map(|a| (a + 1..N).map(move |b| (a, b)))
+            .collect::<Vec<_>>();
+        for edge_mask in 0..1usize << edges.len() {
+            let mut reach = [0u64; N];
+            for (i, &(a, b)) in edges.iter().enumerate() {
+                if edge_mask & (1 << i) != 0 {
+                    reach[a] |= 1 << b;
+                }
+            }
+            for k in (0..N).rev() {
+                for a in 0..k {
+                    if reach[a] & (1 << k) != 0 {
+                        reach[a] |= reach[k];
+                    }
+                }
+            }
+            for members in 0..1u64 << N {
+                let mut descendants = 0;
+                let mut ancestors = 0;
+                for (node, &reachable) in reach.iter().enumerate() {
+                    if members & (1 << node) != 0 {
+                        descendants |= reachable;
+                    }
+                    if reachable & members != 0 {
+                        ancestors |= 1 << node;
+                    }
+                }
+                let path_definition = reach.iter().enumerate().all(|(node, &reachable)| {
+                    members & (1 << node) != 0
+                        || descendants & (1 << node) == 0
+                        || reachable & members == 0
+                });
+                assert_eq!(
+                    convex_bitsets(&[members], &[descendants], &[ancestors]),
+                    path_definition,
+                    "edges={edge_mask}, members={members}"
+                );
+            }
+        }
+    }
 
     fn chain(n: usize) -> (Vec<Vec<usize>>, Vec<Vec<usize>>) {
         let mut succ = vec![Vec::new(); n];
@@ -405,6 +457,22 @@ mod tests {
             pred[index + 1].push(index);
         }
         (succ, pred)
+    }
+
+    #[test]
+    fn convex_clustering_handles_long_decoder_chains() {
+        let n = 10_000;
+        let (succ, pred) = chain(n);
+        assert_eq!(
+            cluster_edges(
+                &vec![true; n],
+                &vec![false; n],
+                &vec![Shapeless; n],
+                &succ,
+                &pred
+            ),
+            vec![(0..n).collect::<Vec<_>>()]
+        );
     }
 
     #[test]
