@@ -95,7 +95,10 @@ fn fence_live_shape_values(plan: &mut Plan) {
             && node.outputs.len() == 1
             && node.outputs[0].otype
                 == ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64
-            && node.inputs.iter().any(|input| !input.constant)
+            && node
+                .inputs
+                .iter()
+                .any(|input| input.source != Src::Initializer && !input.constant)
     }
     fn fence(nodes: &mut [NodeDesc], native_owner: bool) -> bool {
         let mut contains_live = false;
@@ -937,6 +940,23 @@ mod tests {
         assert!(!crate::compiled::decode_enabled(false, nodes));
         assert!(!crate::compiled::prefill_enabled(false, nodes));
         assert!(!crate::compiled::general_enabled(false, nodes));
+    }
+
+    #[test]
+    fn initializer_integer_ranges_keep_their_compiled_route() {
+        let mut range = test_node("Range", &["start", "limit", "delta"], "range");
+        range.outputs[0].otype =
+            crate::sys::ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64;
+        for input in &mut range.inputs {
+            input.source = Src::Initializer;
+            input.constant = false; // Initializer provenance is sufficient.
+        }
+        let mut plan = Plan::new(vec![range]);
+        fence_live_shape_values(&mut plan);
+        assert!(matches!(
+            plan.nodes[0].compile_shape_safety,
+            crate::registry::CompileShapeSafety::Shapeless
+        ));
     }
 
     #[test]
