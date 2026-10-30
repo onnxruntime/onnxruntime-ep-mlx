@@ -320,6 +320,8 @@ fn cluster_edges(
         })
         .collect::<Vec<_>>();
 
+    clusters.sort_by_key(|cluster| cluster[0]);
+
     let mut qid = vec![usize::MAX; n];
     for (cluster_id, cluster) in clusters.iter().enumerate() {
         for &node in cluster {
@@ -354,10 +356,57 @@ fn cluster_edges(
             }
         }
     }
-    let runs = topological_colour_runs(supported, float64, compile_class, succ, pred);
-    if visited != next || runs.len() < clusters.len() {
-        // Compatible topological runs have an acyclic quotient. They also combine
-        // disconnected regions that edge-only merging leaves separate.
+    if visited != next {
+        return topological_colour_runs(supported, float64, compile_class, succ, pred);
+    }
+    // Schedule existing convex regions as atomic units. Only shapeless regions
+    // may coalesce across independent branches: shape-keyed and eager regions
+    // retain their input boundaries and cache keys.
+    let mut units = clusters.clone();
+    units.extend(
+        (0..n)
+            .filter(|&node| !supported[node])
+            .map(|node| vec![node]),
+    );
+    let eligible: Vec<_> = units
+        .iter()
+        .map(|unit| {
+            let node = unit[0];
+            supported[node] && compile_class[node] == CompilePartitionClass::Shapeless
+        })
+        .collect();
+    let wide: Vec<_> = units.iter().map(|unit| float64[unit[0]]).collect();
+    let classes = vec![CompilePartitionClass::Shapeless; next];
+    let edges: Vec<Vec<_>> = qsucc
+        .iter()
+        .map(|edges| edges.iter().copied().collect())
+        .collect();
+    let mut parents = vec![Vec::new(); next];
+    for (from, successors) in edges.iter().enumerate() {
+        for &to in successors {
+            parents[to].push(from);
+        }
+    }
+    let mut runs: Vec<Vec<usize>> =
+        topological_colour_runs(&eligible, &wide, &classes, &edges, &parents)
+            .into_iter()
+            .map(|run| {
+                let mut nodes: Vec<_> = run
+                    .into_iter()
+                    .flat_map(|unit| units[unit].iter().copied())
+                    .collect();
+                nodes.sort_unstable();
+                nodes
+            })
+            .collect();
+    runs.extend(
+        clusters
+            .iter()
+            .filter(|cluster| !eligible[qid[cluster[0]]])
+            .cloned(),
+    );
+    if runs.len() < clusters.len() {
+        runs.sort_by_key(|cluster| cluster[0]);
         return runs;
     }
     clusters.sort_by_key(|cluster| cluster[0]);
@@ -617,6 +666,22 @@ mod tests {
         assert_eq!(
             cluster_edges(&[true; 4], &[false; 4], &[Shapeless; 4], &empty, &empty),
             vec![vec![0, 1, 2, 3]]
+        );
+    }
+
+    #[test]
+    fn regrouping_preserves_independent_shape_keyed_cache_boundaries() {
+        let succ = vec![vec![2], vec![], vec![], vec![]];
+        let pred = vec![vec![], vec![], vec![0], vec![]];
+        assert_eq!(
+            cluster_edges(
+                &[true; 4],
+                &[false; 4],
+                &[ShapeKeyed, ShapeKeyed, ShapeKeyed, Shapeless],
+                &succ,
+                &pred,
+            ),
+            vec![vec![0, 2], vec![1], vec![3]],
         );
     }
 
