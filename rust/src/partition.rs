@@ -1,6 +1,7 @@
 //! Pure capability-partition algorithms over the owned graph IR.
 
-use std::collections::{HashMap, HashSet};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 
 use onnx_runtime_ir::{Graph, NodeId, ValueId};
 
@@ -36,7 +37,7 @@ pub(crate) fn build_contiguous_clusters(
     clusters
 }
 
-/// Prefer maximal convex groups; use topological runs if their quotient would be cyclic.
+/// Prefer convex edge groups; use topological runs to reduce fragmentation or break cycles.
 /// A set S is convex iff no outside node lies on a path between two members of S.
 pub(crate) fn build_convex_clusters(
     graph: &Graph,
@@ -319,6 +320,8 @@ fn cluster_edges(
         })
         .collect::<Vec<_>>();
 
+    clusters.sort_by_key(|cluster| cluster[0]);
+
     let mut qid = vec![usize::MAX; n];
     for (cluster_id, cluster) in clusters.iter().enumerate() {
         for &node in cluster {
@@ -354,26 +357,123 @@ fn cluster_edges(
         }
     }
     if visited != next {
-        // Individually convex groups can still form a cyclic quotient when branches
-        // interleave. Topological runs keep every supported node without introducing
-        // a dependency cycle between fused regions.
-        let mut fallback: Vec<Vec<usize>> = Vec::new();
-        let mut previous = None;
-        for &node in &order {
-            if !supported[node] {
-                previous = None;
-                continue;
-            }
-            let colour = (float64[node], compile_class[node]);
-            if previous != Some(colour) {
-                fallback.push(Vec::new());
-            }
-            fallback.last_mut().unwrap().push(node);
-            previous = Some(colour);
+        return topological_colour_runs(supported, float64, compile_class, succ, pred);
+    }
+    // Schedule existing convex regions as atomic units. Only shapeless regions
+    // may coalesce across independent branches: shape-keyed and eager regions
+    // retain their input boundaries and cache keys.
+    let mut units = clusters.clone();
+    units.extend(
+        (0..n)
+            .filter(|&node| !supported[node])
+            .map(|node| vec![node]),
+    );
+    let eligible: Vec<_> = units
+        .iter()
+        .map(|unit| {
+            let node = unit[0];
+            supported[node] && compile_class[node] == CompilePartitionClass::Shapeless
+        })
+        .collect();
+    let wide: Vec<_> = units.iter().map(|unit| float64[unit[0]]).collect();
+    let classes = vec![CompilePartitionClass::Shapeless; next];
+    let edges: Vec<Vec<_>> = qsucc
+        .iter()
+        .map(|edges| edges.iter().copied().collect())
+        .collect();
+    let mut parents = vec![Vec::new(); next];
+    for (from, successors) in edges.iter().enumerate() {
+        for &to in successors {
+            parents[to].push(from);
         }
-        return fallback;
+    }
+    let mut runs: Vec<Vec<usize>> =
+        topological_colour_runs(&eligible, &wide, &classes, &edges, &parents)
+            .into_iter()
+            .map(|run| {
+                let mut nodes: Vec<_> = run
+                    .into_iter()
+                    .flat_map(|unit| units[unit].iter().copied())
+                    .collect();
+                nodes.sort_unstable();
+                nodes
+            })
+            .collect();
+    runs.extend(
+        clusters
+            .iter()
+            .filter(|cluster| !eligible[qid[cluster[0]]])
+            .cloned(),
+    );
+    if runs.len() < clusters.len() {
+        runs.sort_by_key(|cluster| cluster[0]);
+        return runs;
     }
     clusters.sort_by_key(|cluster| cluster[0]);
+    clusters
+}
+
+/// Keep a ready colour running until its queue empties. Each run remains a
+/// contiguous interval of a valid topological order, hence a convex region.
+fn topological_colour_runs(
+    supported: &[bool],
+    float64: &[bool],
+    compile_class: &[CompilePartitionClass],
+    succ: &[Vec<usize>],
+    pred: &[Vec<usize>],
+) -> Vec<Vec<usize>> {
+    const CLASSES: usize = 3;
+    const UNSUPPORTED: usize = 2 * CLASSES;
+    let colour = |node: usize| {
+        if !supported[node] {
+            return UNSUPPORTED;
+        }
+        usize::from(float64[node]) * CLASSES
+            + match compile_class[node] {
+                CompilePartitionClass::Shapeless => 0,
+                CompilePartitionClass::ShapeKeyed => 1,
+                CompilePartitionClass::Eager => 2,
+            }
+    };
+    let mut ready: Vec<BinaryHeap<Reverse<usize>>> =
+        (0..=UNSUPPORTED).map(|_| BinaryHeap::new()).collect();
+    let mut indegree: Vec<_> = pred.iter().map(Vec::len).collect();
+    for (node, &degree) in indegree.iter().enumerate() {
+        if degree == 0 {
+            ready[colour(node)].push(Reverse(node));
+        }
+    }
+    let mut current: Option<usize> = None;
+    let mut previous = None;
+    let mut clusters: Vec<Vec<usize>> = Vec::new();
+    loop {
+        let next = current.filter(|&kind| !ready[kind].is_empty()).or_else(|| {
+            ready
+                .iter()
+                .enumerate()
+                .filter_map(|(kind, queue)| queue.peek().map(|node| (kind, node.0)))
+                .min_by_key(|&(_, node)| node)
+                .map(|(kind, _)| kind)
+        });
+        let Some(kind) = next else { break };
+        let Reverse(node) = ready[kind].pop().unwrap();
+        current = Some(kind);
+        if supported[node] {
+            if previous != Some(kind) {
+                clusters.push(Vec::new());
+            }
+            clusters.last_mut().unwrap().push(node);
+            previous = Some(kind);
+        } else {
+            previous = None;
+        }
+        for &successor in &succ[node] {
+            indegree[successor] -= 1;
+            if indegree[successor] == 0 {
+                ready[colour(successor)].push(Reverse(successor));
+            }
+        }
+    }
     clusters
 }
 
@@ -399,7 +499,7 @@ fn bit_or_into(destination: &mut [u64], source: &[u64]) {
 mod tests {
     use super::{
         build_contiguous_clusters, build_convex_clusters, cluster_edges, convex_bitsets,
-        infer_boundary_indices,
+        infer_boundary_indices, topological_colour_runs,
     };
     use crate::registry::CompilePartitionClass::{Eager, ShapeKeyed, Shapeless};
     use onnx_runtime_ir::{DataType, Graph, Node};
@@ -561,6 +661,58 @@ mod tests {
     }
 
     #[test]
+    fn disconnected_compatible_nodes_share_one_acyclic_region() {
+        let empty = vec![vec![]; 4];
+        assert_eq!(
+            cluster_edges(&[true; 4], &[false; 4], &[Shapeless; 4], &empty, &empty),
+            vec![vec![0, 1, 2, 3]]
+        );
+    }
+
+    #[test]
+    fn regrouping_preserves_independent_shape_keyed_cache_boundaries() {
+        let succ = vec![vec![2], vec![], vec![], vec![]];
+        let pred = vec![vec![], vec![], vec![0], vec![]];
+        assert_eq!(
+            cluster_edges(
+                &[true; 4],
+                &[false; 4],
+                &[ShapeKeyed, ShapeKeyed, ShapeKeyed, Shapeless],
+                &succ,
+                &pred,
+            ),
+            vec![vec![0, 2], vec![1], vec![3]],
+        );
+    }
+
+    #[test]
+    fn ready_colour_runs_group_independent_interleaved_branches() {
+        let succ = vec![vec![2], vec![3], vec![4], vec![5], vec![], vec![]];
+        let pred = vec![vec![], vec![], vec![0], vec![1], vec![2], vec![3]];
+        assert_eq!(
+            topological_colour_runs(
+                &[true; 6],
+                &[false; 6],
+                &[Shapeless, Eager, Shapeless, Eager, Shapeless, Eager],
+                &succ,
+                &pred,
+            ),
+            vec![vec![0, 2, 4], vec![1, 3, 5]]
+        );
+        let (succ, pred) = chain(3);
+        assert_eq!(
+            topological_colour_runs(
+                &[true, false, true],
+                &[false; 3],
+                &[Shapeless; 3],
+                &succ,
+                &pred
+            ),
+            vec![vec![0], vec![2]]
+        );
+    }
+
+    #[test]
     fn interleaved_convex_groups_keep_every_supported_node() {
         // Both {0,3} and {1,2} are convex, but contracting both creates a cycle.
         let succ = vec![vec![2, 3], vec![2, 3], vec![], vec![]];
@@ -604,50 +756,54 @@ mod tests {
             let classes = (0..n)
                 .map(|_| if next_bit() { ShapeKeyed } else { Shapeless })
                 .collect::<Vec<_>>();
-            let groups = cluster_edges(&supported, &wide, &classes, &succ, &pred);
-            let mut owner = vec![usize::MAX; n];
-            for (id, group) in groups.iter().enumerate() {
-                for &node in group {
-                    assert!(supported[node]);
-                    assert_eq!(owner[node], usize::MAX);
-                    assert_eq!(wide[node], wide[group[0]]);
-                    assert_eq!(classes[node], classes[group[0]]);
-                    owner[node] = id;
-                }
-            }
-            let mut count = groups.len();
-            for (node, id) in owner.iter_mut().enumerate() {
-                assert_eq!(*id != usize::MAX, supported[node]);
-                if *id == usize::MAX {
-                    *id = count;
-                    count += 1;
-                }
-            }
-            let mut outgoing = vec![Vec::new(); count];
-            let mut incoming = vec![0; count];
-            for (node, successors) in succ.iter().enumerate() {
-                for &to in successors {
-                    let (a, b) = (owner[node], owner[to]);
-                    if a != b {
-                        outgoing[a].push(b);
-                        incoming[b] += 1;
+            for groups in [
+                cluster_edges(&supported, &wide, &classes, &succ, &pred),
+                topological_colour_runs(&supported, &wide, &classes, &succ, &pred),
+            ] {
+                let mut owner = vec![usize::MAX; n];
+                for (id, group) in groups.iter().enumerate() {
+                    for &node in group {
+                        assert!(supported[node]);
+                        assert_eq!(owner[node], usize::MAX);
+                        assert_eq!(wide[node], wide[group[0]]);
+                        assert_eq!(classes[node], classes[group[0]]);
+                        owner[node] = id;
                     }
                 }
-            }
-            let mut ready = (0..count)
-                .filter(|&id| incoming[id] == 0)
-                .collect::<Vec<_>>();
-            let mut seen = 0;
-            while let Some(id) = ready.pop() {
-                seen += 1;
-                for &to in &outgoing[id] {
-                    incoming[to] -= 1;
-                    if incoming[to] == 0 {
-                        ready.push(to);
+                let mut count = groups.len();
+                for (node, id) in owner.iter_mut().enumerate() {
+                    assert_eq!(*id != usize::MAX, supported[node]);
+                    if *id == usize::MAX {
+                        *id = count;
+                        count += 1;
                     }
                 }
+                let mut outgoing = vec![Vec::new(); count];
+                let mut incoming = vec![0; count];
+                for (node, successors) in succ.iter().enumerate() {
+                    for &to in successors {
+                        let (a, b) = (owner[node], owner[to]);
+                        if a != b {
+                            outgoing[a].push(b);
+                            incoming[b] += 1;
+                        }
+                    }
+                }
+                let mut ready = (0..count)
+                    .filter(|&id| incoming[id] == 0)
+                    .collect::<Vec<_>>();
+                let mut seen = 0;
+                while let Some(id) = ready.pop() {
+                    seen += 1;
+                    for &to in &outgoing[id] {
+                        incoming[to] -= 1;
+                        if incoming[to] == 0 {
+                            ready.push(to);
+                        }
+                    }
+                }
+                assert_eq!(seen, count, "cyclic quotient for seed {seed}");
             }
-            assert_eq!(seen, count, "cyclic quotient for seed {seed}");
         }
     }
 

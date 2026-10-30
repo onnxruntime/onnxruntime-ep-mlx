@@ -330,6 +330,11 @@ pub(crate) unsafe fn get_capability(
             }
             claimed += cluster.len();
         }
+        log::debug!(
+            "capability: {claimed}/{} nodes in {} fused subgraphs",
+            node_order.len(),
+            clusters.len()
+        );
         tr.record_claim(claimed, node_order.len(), clusters.len(), &rejected);
         ptr::null_mut()
     }
