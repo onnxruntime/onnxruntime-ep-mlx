@@ -37,7 +37,7 @@ pub(crate) fn build_contiguous_clusters(
     clusters
 }
 
-/// Prefer maximal convex groups; use topological runs if their quotient would be cyclic.
+/// Prefer convex edge groups; use topological runs to reduce fragmentation or break cycles.
 /// A set S is convex iff no outside node lies on a path between two members of S.
 pub(crate) fn build_convex_clusters(
     graph: &Graph,
@@ -354,11 +354,11 @@ fn cluster_edges(
             }
         }
     }
-    if visited != next {
-        // Individually convex groups can still form a cyclic quotient when branches
-        // interleave. Topological runs keep every supported node without introducing
-        // a dependency cycle between fused regions.
-        return topological_colour_runs(supported, float64, compile_class, succ, pred);
+    let runs = topological_colour_runs(supported, float64, compile_class, succ, pred);
+    if visited != next || runs.len() < clusters.len() {
+        // Compatible topological runs have an acyclic quotient. They also combine
+        // disconnected regions that edge-only merging leaves separate.
+        return runs;
     }
     clusters.sort_by_key(|cluster| cluster[0]);
     clusters
@@ -608,6 +608,15 @@ mod tests {
                 &pred,
             ),
             vec![vec![0], vec![1], vec![2], vec![3], vec![4]]
+        );
+    }
+
+    #[test]
+    fn disconnected_compatible_nodes_share_one_acyclic_region() {
+        let empty = vec![vec![]; 4];
+        assert_eq!(
+            cluster_edges(&[true; 4], &[false; 4], &[Shapeless; 4], &empty, &empty),
+            vec![vec![0, 1, 2, 3]]
         );
     }
 
