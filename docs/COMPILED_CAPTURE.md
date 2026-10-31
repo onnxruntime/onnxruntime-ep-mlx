@@ -106,6 +106,12 @@ every compiled replay. Boundary-provided positions retain compilation; graph-pro
 (or offset spans whose input shape is internal) require eager validation instead of capturing a
 first-call bounds check.
 
+With `ONNXRUNTIME_EP_MLX_NO_COMPILE=1`, capability partitioning uses one eager
+colour. Compatible supported regions can merge across capture-mode boundaries,
+reducing native kernel boundaries and ORT subgraph initialization work. Float64
+stream separation, unsupported nodes, graph convexity and explicit layer cuts
+still apply. The default compiled mode retains its capture colours.
+
 In decoder graphs, shapeless, shape-keyed-only, and eager-only nodes receive distinct partition
 colours. Stricter nodes remain claimed by MLX without disabling a more capable neighbouring
 partition. ShapeKeyed pays one recompile per distinct `(shape, dtype)` tuple — cheap when the shape

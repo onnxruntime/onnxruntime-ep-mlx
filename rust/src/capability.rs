@@ -187,7 +187,7 @@ pub(crate) unsafe fn get_capability(
                 .map(|members| members.into_iter().map(|i| node_order[i]).collect())
                 .collect();
         let lookup_nodes: HashSet<_> = lookup_regions.iter().flatten().copied().collect();
-        let compile_class: Vec<CompilePartitionClass> = node_order
+        let mut compile_class: Vec<CompilePartitionClass> = node_order
             .iter()
             .map(|&node| {
                 let view = NodeView::new(ort_api, raw_nodes_by_id[&node]);
@@ -226,6 +226,12 @@ pub(crate) unsafe fn get_capability(
                 }
             })
             .collect();
+        // Capture colours serve no purpose when every plan executes eagerly.
+        // Keep dtype/convexity/claim boundaries while avoiding ORT fusion and
+        // host-array boundaries created solely for compiled capture modes.
+        if !crate::compiled::compile_enabled(false) {
+            compile_class.fill(CompilePartitionClass::Eager);
+        }
 
         let tr = crate::trace::tracer();
         let mut rejected: Vec<(String, usize, String, Vec<String>)> = Vec::new();
