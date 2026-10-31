@@ -3109,7 +3109,7 @@ fn tile_claim(node: &NodeView) -> ClaimResult {
         node.num_inputs(),
         node.num_outputs()
     );
-    require!(node.num_attributes() == 0, "Tile has no attributes");
+    require!(node.num_attributes() == Some(0), "Tile has no attributes");
     let data = tile_payload_dtype(node)?;
     let repeats_info = node.input_info(1).ok_or("Tile: missing repeats metadata")?;
     require!(

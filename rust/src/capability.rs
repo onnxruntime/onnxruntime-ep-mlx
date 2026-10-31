@@ -213,6 +213,7 @@ pub(crate) unsafe fn get_capability(
                     || (live_range_boundary && !native_live_range)
                     || crate::registry::requires_elementary_contrib_eager_boundary(&view)
                     || crate::registry::requires_cdist_eager_boundary(&view)
+                    || crate::registry::requires_inverse_eager_boundary(&view)
                     || (live_tile_boundary && !native_live_tile)
                     || crate::registry::requires_float64_metadata_eager_boundary(&view)
                 {
