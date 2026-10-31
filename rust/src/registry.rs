@@ -2006,7 +2006,6 @@ mod tests {
             ("", "CumProd", 26),
             ("", "ScatterElements", 24),
             ("", "CenterCropPad", 24),
-            ("", "ScatterND", 24),
             ("", "GatherND", 13),
             ("", "Slice", 24),
             ("", "Split", 24),
@@ -2047,6 +2046,10 @@ mod tests {
             );
         }
 
+        assert!(matches!(
+            compile_shape_rule("", "ScatterND", 24),
+            CompileShapeRule::Classified(_)
+        ));
         assert!(matches!(
             compile_shape_rule("", "RoiAlign", 24),
             CompileShapeRule::Classified(_)
