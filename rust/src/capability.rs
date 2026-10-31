@@ -12,7 +12,7 @@ use crate::engine::is_separate_qkv_attention_op;
 use crate::factory::ORT_API_VERSION;
 use crate::ort_graph::{NodeMetadata, OrtGraphSnapshot};
 use crate::partition::{
-    build_contiguous_clusters, build_convex_clusters, infer_layer_boundary_values,
+    build_contiguous_clusters, build_convex_clusters_with_regions, infer_layer_boundary_values,
     split_annotated_layer_clusters,
 };
 use crate::registry::{ClaimResult, CompilePartitionClass, NodeView, claimable};
@@ -177,6 +177,16 @@ pub(crate) unsafe fn get_capability(
         } else {
             HashSet::new()
         };
+        let lookup_views = node_order
+            .iter()
+            .map(|&node| NodeView::new(ort_api, raw_nodes_by_id[&node]))
+            .collect::<Vec<_>>();
+        let lookup_regions: Vec<Vec<_>> =
+            crate::ops::lut4::partition_regions(&lookup_views, &supported)
+                .into_iter()
+                .map(|members| members.into_iter().map(|i| node_order[i]).collect())
+                .collect();
+        let lookup_nodes: HashSet<_> = lookup_regions.iter().flatten().copied().collect();
         let compile_class: Vec<CompilePartitionClass> = node_order
             .iter()
             .map(|&node| {
@@ -196,7 +206,8 @@ pub(crate) unsafe fn get_capability(
                     && native_q8_attention_graph
                     && view.op_type() == "Range"
                     && view.subgraphs().is_empty();
-                if packed_qdq_nodes.contains(&node)
+                if lookup_nodes.contains(&node)
+                    || packed_qdq_nodes.contains(&node)
                     || crate::registry::requires_random_eager_boundary(&view)
                     || crate::registry::requires_unique_eager_boundary(&view)
                     || (live_range_boundary && !native_live_range)
@@ -268,12 +279,13 @@ pub(crate) unsafe fn get_capability(
         let clusters = if mixed_vision_quant_graph {
             build_contiguous_clusters(&node_order, &supported, &float64, &compile_class)
         } else {
-            build_convex_clusters(
+            build_convex_clusters_with_regions(
                 &snapshot.ir,
                 &node_order,
                 &supported,
                 &float64,
                 &compile_class,
+                &lookup_regions,
             )
         };
         let layer_boundary_outputs = if in_cf_body {

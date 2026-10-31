@@ -77,6 +77,166 @@ pub(crate) fn build_convex_clusters(
         .collect()
 }
 
+/// Keep proven operator regions intact while partitioning the remaining graph.
+/// Regions must be supported, homogeneous, disjoint and convex. A cyclic region
+/// quotient falls back to ordinary partitioning without changing graph semantics.
+pub(crate) fn build_convex_clusters_with_regions(
+    graph: &Graph,
+    order: &[NodeId],
+    supported: &[bool],
+    float64: &[bool],
+    compile_class: &[CompilePartitionClass],
+    regions: &[Vec<NodeId>],
+) -> Vec<Vec<NodeId>> {
+    let positions: HashMap<_, _> = order
+        .iter()
+        .enumerate()
+        .map(|(i, &node)| (node, i))
+        .collect();
+    let successors: Vec<Vec<usize>> = order
+        .iter()
+        .map(|&node| {
+            graph
+                .successors(node)
+                .into_iter()
+                .filter_map(|next| positions.get(&next).copied())
+                .collect()
+        })
+        .collect();
+    let ordered = successors
+        .iter()
+        .enumerate()
+        .all(|(i, next)| next.iter().all(|&j| i < j));
+    let mut covered = vec![false; order.len()];
+    let mut units = Vec::new();
+    for region in regions {
+        let Some(mut nodes) = region
+            .iter()
+            .map(|n| positions.get(n).copied())
+            .collect::<Option<Vec<_>>>()
+        else {
+            continue;
+        };
+        nodes.sort_unstable();
+        nodes.dedup();
+        let Some(&first) = nodes.first() else {
+            continue;
+        };
+        if nodes.iter().any(|&i| {
+            covered[i]
+                || !supported[i]
+                || float64[i] != float64[first]
+                || compile_class[i] != compile_class[first]
+        }) {
+            continue;
+        }
+        let last = *nodes.last().unwrap();
+        let members: HashSet<_> = nodes.iter().copied().collect();
+        let mut pending: Vec<_> = nodes
+            .iter()
+            .flat_map(|&i| successors[i].iter().copied())
+            .filter(|i| !members.contains(i))
+            .collect();
+        let mut visited = vec![false; order.len()];
+        let mut convex = true;
+        while let Some(node) = pending.pop() {
+            if ordered && node > last {
+                continue;
+            }
+            if members.contains(&node) {
+                convex = false;
+                break;
+            }
+            if visited[node] {
+                continue;
+            }
+            visited[node] = true;
+            pending.extend(successors[node].iter().copied());
+        }
+        if !convex {
+            continue;
+        }
+        for &i in &nodes {
+            covered[i] = true;
+        }
+        units.push(nodes);
+    }
+    if units.is_empty() {
+        return build_convex_clusters(graph, order, supported, float64, compile_class);
+    }
+    units.extend((0..order.len()).filter(|&i| !covered[i]).map(|i| vec![i]));
+    let mut owner = vec![0; order.len()];
+    for (unit, nodes) in units.iter().enumerate() {
+        for &node in nodes {
+            owner[node] = unit;
+        }
+    }
+    let mut edges = vec![HashSet::new(); units.len()];
+    let mut indegree = vec![0usize; units.len()];
+    for (node, next) in successors.iter().enumerate() {
+        for &next in next {
+            let (a, b) = (owner[node], owner[next]);
+            if a != b && edges[a].insert(b) {
+                indegree[b] += 1;
+            }
+        }
+    }
+    let mut ready = BinaryHeap::new();
+    for (i, nodes) in units.iter().enumerate() {
+        if indegree[i] == 0 {
+            ready.push(Reverse((nodes[0], i)));
+        }
+    }
+    let mut topology = Vec::with_capacity(units.len());
+    while let Some(Reverse((_, unit))) = ready.pop() {
+        topology.push(unit);
+        for &next in &edges[unit] {
+            indegree[next] -= 1;
+            if indegree[next] == 0 {
+                ready.push(Reverse((units[next][0], next)));
+            }
+        }
+    }
+    if topology.len() != units.len() {
+        return build_convex_clusters(graph, order, supported, float64, compile_class);
+    }
+    let mut remap = vec![0; units.len()];
+    for (position, &unit) in topology.iter().enumerate() {
+        remap[unit] = position;
+    }
+    let next: Vec<Vec<usize>> = topology
+        .iter()
+        .map(|&unit| {
+            let mut next: Vec<_> = edges[unit].iter().map(|&i| remap[i]).collect();
+            next.sort_unstable();
+            next
+        })
+        .collect();
+    let mut previous = vec![Vec::new(); units.len()];
+    for (i, next) in next.iter().enumerate() {
+        for &j in next {
+            previous[j].push(i);
+        }
+    }
+    let ok: Vec<_> = topology.iter().map(|&i| supported[units[i][0]]).collect();
+    let wide: Vec<_> = topology.iter().map(|&i| float64[units[i][0]]).collect();
+    let classes: Vec<_> = topology
+        .iter()
+        .map(|&i| compile_class[units[i][0]])
+        .collect();
+    cluster_edges(&ok, &wide, &classes, &next, &previous)
+        .into_iter()
+        .map(|cluster| {
+            let mut expanded: Vec<_> = cluster
+                .into_iter()
+                .flat_map(|i| units[topology[i]].iter().copied())
+                .collect();
+            expanded.sort_unstable();
+            expanded.into_iter().map(|i| order[i]).collect()
+        })
+        .collect()
+}
+
 pub(crate) fn infer_layer_boundary_values(
     graph: &Graph,
     order: &[NodeId],
@@ -503,6 +663,103 @@ mod tests {
     };
     use crate::registry::CompilePartitionClass::{Eager, ShapeKeyed, Shapeless};
     use onnx_runtime_ir::{DataType, Graph, Node};
+
+    fn region_graph(parents: &[&[usize]]) -> (Graph, Vec<onnx_runtime_ir::NodeId>) {
+        let mut graph = Graph::new();
+        let input = graph.create_named_value("input", DataType::Float32, Vec::new());
+        let values: Vec<_> = (0..parents.len())
+            .map(|i| graph.create_named_value(format!("v{i}"), DataType::Float32, Vec::new()))
+            .collect();
+        let mut nodes = Vec::new();
+        for (i, parents) in parents.iter().enumerate() {
+            let inputs = if parents.is_empty() {
+                vec![Some(input)]
+            } else {
+                parents.iter().map(|&p| Some(values[p])).collect()
+            };
+            nodes.push(graph.insert_node(Node::new(
+                onnx_runtime_ir::NodeId(0),
+                "Compute",
+                inputs,
+                vec![values[i]],
+            )));
+        }
+        (graph, nodes)
+    }
+
+    #[test]
+    fn atomic_regions_keep_weight_prefixes_with_their_products() {
+        let (graph, order) = region_graph(&[&[], &[], &[], &[0, 2], &[3], &[1, 4]]);
+        let classes = vec![Eager, Eager, Shapeless, Eager, Shapeless, Eager];
+        let regions = vec![vec![order[0], order[3]], vec![order[1], order[5]]];
+        let clusters = super::build_convex_clusters_with_regions(
+            &graph,
+            &order,
+            &[true; 6],
+            &[false; 6],
+            &classes,
+            &regions,
+        );
+        for region in regions {
+            assert!(
+                clusters
+                    .iter()
+                    .any(|c| region.iter().all(|n| c.contains(n)))
+            );
+        }
+        assert_eq!(clusters.len(), 4);
+    }
+
+    #[test]
+    fn atomic_regions_preserve_cache_and_dtype_boundaries() {
+        let (graph, order) = region_graph(&[&[], &[0]]);
+        for (classes, wide) in [
+            (vec![Eager, ShapeKeyed], vec![false, false]),
+            (vec![Eager, Eager], vec![false, true]),
+        ] {
+            let clusters = super::build_convex_clusters_with_regions(
+                &graph,
+                &order,
+                &[true; 2],
+                &wide,
+                &classes,
+                std::slice::from_ref(&order),
+            );
+            assert_eq!(clusters.len(), 2);
+        }
+    }
+
+    #[test]
+    fn nonconvex_atomic_region_is_declined() {
+        let (graph, order) = region_graph(&[&[], &[0], &[1]]);
+        let classes = vec![Eager, Shapeless, Eager];
+        let clusters = super::build_convex_clusters_with_regions(
+            &graph,
+            &order,
+            &[true; 3],
+            &[false; 3],
+            &classes,
+            &[vec![order[0], order[2]]],
+        );
+        assert_eq!(clusters.len(), 3);
+    }
+
+    #[test]
+    fn cyclic_atomic_quotient_uses_ordinary_convex_groups() {
+        let (graph, order) = region_graph(&[&[], &[], &[0], &[1]]);
+        let clusters = super::build_convex_clusters_with_regions(
+            &graph,
+            &order,
+            &[true; 4],
+            &[false; 4],
+            &[Eager; 4],
+            &[vec![order[0], order[3]], vec![order[1], order[2]]],
+        );
+        assert_eq!(
+            clusters,
+            vec![vec![order[0], order[2]], vec![order[1], order[3]]]
+        );
+    }
 
     #[test]
     fn convex_bitsets_match_path_definition_exhaustively() {

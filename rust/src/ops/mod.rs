@@ -7,6 +7,7 @@ pub mod elementwise;
 mod host_scan;
 pub mod image;
 mod kv_cache;
+pub(crate) mod lut4;
 pub mod math;
 pub mod matmul;
 pub mod nonzero;
