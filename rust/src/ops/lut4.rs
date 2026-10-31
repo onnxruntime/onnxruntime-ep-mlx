@@ -307,17 +307,17 @@ pub(crate) fn recognize(nodes: &mut Vec<NodeDesc>, graph_outputs: &HashSet<Strin
 
 /// Use the same semantic proof at claim time, retaining only bounded literals.
 /// Large frozen buffers carry metadata here; execution descriptors require real storage.
-pub(crate) fn partition_eager_nodes(views: &[NodeView], supported: &[bool]) -> HashSet<usize> {
+pub(crate) fn partition_regions(views: &[NodeView], supported: &[bool]) -> Vec<Vec<usize>> {
     if std::env::var_os("ONNXRUNTIME_EP_MLX_NO_LUT4_FUSION")
         .is_some_and(|v| v != "0" && !v.is_empty())
     {
-        return HashSet::new();
+        return Vec::new();
     }
     if !views
         .iter()
         .any(|v| v.domain().is_empty() && v.op_type() == "Mod")
     {
-        return HashSet::new();
+        return Vec::new();
     }
     let mut nodes = Vec::with_capacity(views.len());
     for view in views {
@@ -408,7 +408,7 @@ pub(crate) fn partition_eager_nodes(views: &[NodeView], supported: &[bool]) -> H
             .collect(),
         false,
     );
-    let mut selected = HashSet::new();
+    let mut selected = Vec::new();
     for (index, node) in nodes.iter().enumerate() {
         if !supported[index] || producers.recognize(node).is_none() {
             continue;
@@ -423,7 +423,9 @@ pub(crate) fn partition_eager_nodes(views: &[NodeView], supported: &[bool]) -> H
             }
         }
         if members.iter().all(|&i| supported[i]) {
-            selected.extend(members);
+            let mut members: Vec<_> = members.into_iter().collect();
+            members.sort_unstable();
+            selected.push(members);
         }
     }
     selected
@@ -649,4 +651,113 @@ pub(super) fn execute(ctx: &mut TranslationContext, node: &NodeDesc) -> Result<b
     };
     ctx.bind(&node.outputs[0], y);
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::Plan;
+    use crate::mlx::Stream;
+
+    fn initializer(
+        name: &str,
+        bytes: Vec<u8>,
+        dtype: ort::ONNXTensorElementDataType,
+        count: usize,
+    ) -> TensorRef {
+        let owned = Arc::new(bytes);
+        let mut value = TensorRef::absent();
+        value.name = name.into();
+        value.source = Src::Initializer;
+        value.init = Some(InitData {
+            data: owned.as_ptr().cast(),
+            shape: vec![count as i64],
+            dtype,
+            count,
+            owned: Some(owned),
+        });
+        value
+    }
+
+    #[test]
+    fn cpu_products_keep_branch_weights_and_transposed_layouts_distinct() {
+        let book = std::array::from_fn(|i| (i * i) as f32 / 32.0);
+        let patterns = [(0x12, 0.125f32), (0x34, 0.25f32)].map(|(code, scale)| LookupMatMul {
+            packed: initializer("packed", vec![code; 32], UINT8, 32),
+            scales: initializer("scales", scale.to_ne_bytes().to_vec(), FLOAT, 1),
+            book,
+            rows: 3,
+            cols: 5,
+            block: 64,
+            transpose: false,
+        });
+        let stream = Stream::new_default_cpu();
+        let mut plan = Plan::new(vec![]);
+        let mut ctx = TranslationContext::new(
+            &mut plan,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            stream.as_raw(),
+        );
+        let output = |name: &str| OutRef {
+            name: name.into(),
+            external: false,
+            ctx_index: 0,
+            otype: FLOAT,
+        };
+        let mut input = TensorRef::absent();
+        input.name = "x".into();
+        input.source = Src::Intermediate;
+        for transpose in [false, true] {
+            let (k, n) = if transpose { (5, 3) } else { (3, 5) };
+            let values = vec![0.25f32; 2 * k as usize];
+            let x = ctx.from_host(values.as_ptr().cast(), &[2, k], F32);
+            ctx.bind(&output("x"), x);
+            for index in [0, 1, 0, 1] {
+                let mut pattern = patterns[index].clone();
+                pattern.transpose = transpose;
+                let mut node = NodeDesc::new(
+                    "MatMul".into(),
+                    String::new(),
+                    13,
+                    CompileShapeSafety::Shapeless,
+                );
+                node.name = "same_name_in_both_branches".into();
+                node.inputs = vec![input.clone()];
+                node.outputs = vec![output("y")];
+                node.lut4 = Some(Box::new(pattern));
+                assert!(execute(&mut ctx, &node).unwrap());
+                let mut yref = TensorRef::absent();
+                yref.name = "y".into();
+                yref.source = Src::Intermediate;
+                let y = ctx.resolve(&yref).unwrap();
+                let y = ctx.contiguous_eval(y).unwrap();
+                assert_eq!(ctx.shape_of(y), vec![2, n]);
+                let result = unsafe {
+                    std::slice::from_raw_parts(mlx::mlx_array_data_float32(y), (2 * n) as usize)
+                };
+                let (byte, scale) = if index == 0 {
+                    (0x12, 0.125)
+                } else {
+                    (0x34, 0.25)
+                };
+                for row in 0..2 {
+                    for col in 0..n {
+                        let expected = (0..k)
+                            .map(|inner| {
+                                let flat = if transpose {
+                                    col * 5 + inner
+                                } else {
+                                    inner * 5 + col
+                                };
+                                let code = if flat % 2 == 0 { byte >> 4 } else { byte & 15 };
+                                0.25 * book[code as usize] * scale
+                            })
+                            .sum::<f32>();
+                        assert_eq!(result[(row * n + col) as usize], expected);
+                    }
+                }
+            }
+        }
+    }
 }
