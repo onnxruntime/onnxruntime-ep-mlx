@@ -80,3 +80,21 @@ def test_interleaved_eager_regions_preserve_native_coverage(
         assert len(kernels) == 5, len(kernels)
     else:
         assert len(kernels) > 5, len(kernels)
+
+    if no_compile:
+        # Changing the diagnostic switch after construction must not capture
+        # Range/Tile's first live values in a coalesced plan.
+        monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_COMPILE", "0")
+        for repeat in (4, 0, 1):
+            values = np.array([20 + repeat], np.int64)
+            actual = session.run(
+                None,
+                {
+                    "x": values,
+                    "start": np.array(repeat, np.int64),
+                    "limit": np.array(repeat + 1, np.int64),
+                    "delta": np.array(1, np.int64),
+                },
+            )
+            np.testing.assert_array_equal(actual[0], values + repeat)
+            np.testing.assert_array_equal(actual[1], np.tile(values, repeat))
