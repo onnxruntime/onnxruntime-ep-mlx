@@ -184,6 +184,9 @@ fn cdist_op(ctx: &mut TranslationContext, node: &NodeDesc) -> Result<(), MlxErro
 }
 
 fn matmul_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
+    if super::lut4::execute(ctx, n)? {
+        return Ok(());
+    }
     if super::qdq::execute(ctx, n)? {
         return Ok(());
     }

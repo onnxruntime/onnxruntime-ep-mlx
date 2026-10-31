@@ -177,6 +177,14 @@ pub(crate) unsafe fn get_capability(
         } else {
             HashSet::new()
         };
+        let lookup_views = node_order
+            .iter()
+            .map(|&node| NodeView::new(ort_api, raw_nodes_by_id[&node]))
+            .collect::<Vec<_>>();
+        let lookup_nodes = crate::ops::lut4::partition_eager_nodes(&lookup_views, &supported)
+            .into_iter()
+            .map(|i| node_order[i])
+            .collect::<HashSet<_>>();
         let compile_class: Vec<CompilePartitionClass> = node_order
             .iter()
             .map(|&node| {
@@ -196,7 +204,8 @@ pub(crate) unsafe fn get_capability(
                     && native_q8_attention_graph
                     && view.op_type() == "Range"
                     && view.subgraphs().is_empty();
-                if packed_qdq_nodes.contains(&node)
+                if lookup_nodes.contains(&node)
+                    || packed_qdq_nodes.contains(&node)
                     || crate::registry::requires_random_eager_boundary(&view)
                     || crate::registry::requires_unique_eager_boundary(&view)
                     || (live_range_boundary && !native_live_range)

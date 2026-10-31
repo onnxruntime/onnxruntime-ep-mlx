@@ -456,6 +456,13 @@ fn build_graph(
     }
     mark_shape_constants(&mut nodes, &inits.keys().cloned().collect());
     crate::ops::qdq::recognize(&mut nodes);
+    let graph_outputs = snapshot
+        .graph_output_slots
+        .iter()
+        .flatten()
+        .map(|value| snapshot.values[value].name.clone())
+        .collect();
+    crate::ops::lut4::recognize(&mut nodes, &graph_outputs);
     Ok(nodes)
 }
 
