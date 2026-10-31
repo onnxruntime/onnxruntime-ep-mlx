@@ -9,41 +9,31 @@ import pytest
 
 
 def native(shape, index_shape, update_shape, dtype=ir.DataType.FLOAT):
-    graph = m.make_model(
-        "ScatterND",
-        [
-            m.tensor("data", dtype, shape),
-            m.tensor("indices", ir.DataType.INT64, index_shape),
-            m.tensor("updates", dtype, update_shape),
-        ],
-        [m.tensor("out", dtype, shape)],
-        attributes={"reduction": "add"},
-    )
+    boundary = ir.DataType.FLOAT if dtype == ir.DataType.BFLOAT16 else dtype
+    data = m.tensor("data", boundary, shape)
+    indices = m.tensor("indices", ir.DataType.INT64, index_shape)
+    updates = m.tensor("updates", boundary, update_shape)
+    tape = ir.tape.Tape()
+    a, b = data, updates
     if dtype == ir.DataType.BFLOAT16:
-        model = onnx.load_model_from_string(graph)
-        scatter = model.graph.node[0]
-        scatter.input[0], scatter.input[2] = "data_bf16", "updates_bf16"
-        scatter.output[0] = "out_bf16"
-        for index in (0, 2):
-            model.graph.input[index].type.tensor_type.elem_type = onnx.TensorProto.FLOAT
-        model.graph.output[0].type.tensor_type.elem_type = onnx.TensorProto.FLOAT
-        prefix = [
-            onnx.helper.make_node(
-                "Cast", [name], [name + "_bf16"], to=onnx.TensorProto.BFLOAT16
-            )
-            for name in ("data", "updates")
-        ]
-        model.graph.node.extend(
-            [
-                onnx.helper.make_node(
-                    "Cast", ["out_bf16"], ["out"], to=onnx.TensorProto.FLOAT
-                )
-            ]
-        )
-        for node in reversed(prefix):
-            model.graph.node.insert(0, node)
-        onnx.checker.check_model(model, full_check=True)
-        graph = model.SerializeToString()
+        a, b = [tape.op("Cast", [v], {"to": int(dtype)}) for v in (data, updates)]
+    output = tape.op("ScatterND", [a, indices, b], {"reduction": "add"})
+    if dtype == ir.DataType.BFLOAT16:
+        output = tape.op("Cast", [output], {"to": int(boundary)})
+    output.name, output.dtype, output.shape = "out", boundary, ir.Shape(shape)
+    model = ir.Model(
+        ir.Graph(
+            [data, indices, updates],
+            [output],
+            nodes=tape.nodes,
+            opset_imports={"": 24},
+            name="scatternd_add",
+        ),
+        ir_version=11,
+    )
+    proto = ir.to_proto(model)
+    onnx.checker.check_model(proto, full_check=True)
+    graph = proto.SerializeToString()
     options = ort.SessionOptions()
     options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
     options.add_session_config_entry("session.disable_cpu_ep_fallback", "1")

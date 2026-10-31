@@ -6,11 +6,67 @@ import subprocess
 import sys
 from pathlib import Path
 
+import _models as models
 import numpy as np
 import onnx
+import onnx_ir as ir
 import onnxruntime as ort
 import pytest
-from onnx import TensorProto, helper, numpy_helper
+
+
+def _buffers(k, n, block):
+    blocks = (k * n + block - 1) // block
+    rng = np.random.default_rng(23)
+    return {
+        "packed": rng.integers(0, 256, blocks * block // 2, dtype=np.uint8),
+        "scales": rng.uniform(0.01, 0.1, blocks).astype(np.float32),
+        "book": np.linspace(-1, 1, 16, dtype=np.float32) ** 3,
+        "sixteen": np.array(16, np.int64),
+        "axes": np.array([1], np.int64),
+        "blocks": np.array([-1, block], np.int64),
+        "flat": np.array([-1], np.int64),
+        "start": np.array([0], np.int64),
+        "end": np.array([k * n], np.int64),
+        "axis": np.array([0], np.int64),
+        "matrix": np.array([k, n], np.int64),
+    }
+
+
+def _lookup(
+    tape, x, buffers, *, prefix="", transpose=False, low_first=False, live=False
+):
+    values, inputs = {}, []
+    for name, array in buffers.items():
+        tensor = ir.tensor(array, name=prefix + name)
+        if live and name in {"packed", "scales"}:
+            values[name] = models.tensor(prefix + name, tensor.dtype, array.shape)
+            inputs.append(values[name])
+        else:
+            values[name] = tape.initializer(tensor)
+    integer = tape.op("Cast", [values["packed"]], {"to": int(ir.DataType.INT64)})
+    high = tape.op("Div", [integer, values["sixteen"]])
+    low = tape.op("Mod", [integer, values["sixteen"]])
+    hi, lo = [tape.op("Unsqueeze", [v, values["axes"]]) for v in (high, low)]
+    pairs = tape.op("Concat", [lo, hi] if low_first else [hi, lo], {"axis": 1})
+    indices = tape.op("Reshape", [pairs, values["blocks"]])
+    decoded = tape.op("Gather", [values["book"], indices], {"axis": 0})
+    scale = tape.op("Unsqueeze", [values["scales"], values["axes"]])
+    scaled = tape.op("Mul", [decoded, scale])
+    flat = tape.op("Reshape", [scaled, values["flat"]])
+    trimmed = tape.op("Slice", [flat, values["start"], values["end"], values["axis"]])
+    weight = tape.op("Reshape", [trimmed, values["matrix"]])
+    k, n = buffers["matrix"].tolist()
+    weight.name, weight.dtype, weight.shape = (
+        prefix + "weight",
+        ir.DataType.FLOAT,
+        ir.Shape([k, n]),
+    )
+    right = tape.op("Transpose", [weight], {"perm": [1, 0]}) if transpose else weight
+    output = tape.op("MatMul", [x, right])
+    tape.nodes[-1].name = prefix + "product"
+    output.name, output.dtype = prefix + "y", ir.DataType.FLOAT
+    output.shape = ir.Shape([*x.shape[:-1], k if transpose else n])
+    return output, weight, inputs
 
 
 def _model(
@@ -24,84 +80,32 @@ def _model(
     n=23,
     block=64,
 ):
-    blocks = (k * n + block - 1) // block
-    rng = np.random.default_rng(23)
-    packed = rng.integers(0, 256, blocks * block // 2, dtype=np.uint8)
-    scales = rng.uniform(0.01, 0.1, blocks).astype(np.float32)
-    book = np.linspace(-1, 1, 16, dtype=np.float32) ** 3
-    values = {
-        "packed": packed,
-        "scales": scales,
-        "book": book,
-        "sixteen": np.array(16, np.int64),
-        "axes": np.array([1], np.int64),
-        "blocks": np.array([-1, block], np.int64),
-        "flat": np.array([-1], np.int64),
-        "start": np.array([0], np.int64),
-        "end": np.array([k * n], np.int64),
-        "axis": np.array([0], np.int64),
-        "matrix": np.array([k, n], np.int64),
-    }
-    node = helper.make_node
-    nodes = [
-        node("Cast", ["packed"], ["integer"], to=TensorProto.INT64),
-        node("Div", ["integer", "sixteen"], ["high"]),
-        node("Mod", ["integer", "sixteen"], ["low"]),
-        node("Unsqueeze", ["high", "axes"], ["hi"]),
-        node("Unsqueeze", ["low", "axes"], ["lo"]),
-        node("Concat", ["lo", "hi"] if low_first else ["hi", "lo"], ["pairs"], axis=1),
-        node("Reshape", ["pairs", "blocks"], ["indices"]),
-        node("Gather", ["book", "indices"], ["decoded"], axis=0),
-        node("Unsqueeze", ["scales", "axes"], ["scale_column"]),
-        node("Mul", ["decoded", "scale_column"], ["scaled"]),
-        node("Reshape", ["scaled", "flat"], ["flattened"]),
-        node("Slice", ["flattened", "start", "end", "axis"], ["trimmed"]),
-        node("Reshape", ["trimmed", "matrix"], ["weight"]),
-    ]
-    if transpose:
-        nodes.append(node("Transpose", ["weight"], ["weight_t"], perm=[1, 0]))
-    nodes.append(
-        node(
-            "MatMul",
-            ["x", "weight_t" if transpose else "weight"],
-            ["y"],
-            name="product",
-        )
-    )
-    inner, outer = (n, k) if transpose else (k, n)
+    buffers = _buffers(k, n, block)
+    inner = n if transpose else k
     prefix = [] if rank == 1 else ["m"] if rank == 2 else [2, "m"]
-    info = helper.make_tensor_value_info
-    inputs = [info("x", TensorProto.FLOAT, [*prefix, inner])]
-    if live:
-        inputs.extend(
-            info(
-                name,
-                helper.np_dtype_to_tensor_dtype(values[name].dtype),
-                values[name].shape,
-            )
-            for name in ("packed", "scales")
-        )
-    outputs = [info("y", TensorProto.FLOAT, [*prefix, outer])]
+    x = models.tensor("x", ir.DataType.FLOAT, [*prefix, inner])
+    tape = ir.tape.Tape()
+    output, weight, inputs = _lookup(
+        tape, x, buffers, transpose=transpose, low_first=low_first, live=live
+    )
+    outputs = [output]
     if shared:
-        nodes.append(node("Add", ["weight", "weight"], ["shared"]))
-        outputs.extend(
-            [
-                info("weight", TensorProto.FLOAT, [k, n]),
-                info("shared", TensorProto.FLOAT, [k, n]),
-            ]
-        )
-    initializers = [
-        numpy_helper.from_array(v, name)
-        for name, v in values.items()
-        if not live or name not in {"packed", "scales"}
-    ]
-    model = helper.make_model(
-        helper.make_graph(nodes, "lookup4", inputs, outputs, initializers),
-        opset_imports=[helper.make_opsetid("", 18)],
+        added = tape.op("Add", [weight, weight])
+        added.name, added.dtype, added.shape = "shared", weight.dtype, weight.shape
+        outputs.extend([weight, added])
+    model = ir.Model(
+        ir.Graph(
+            [x, *inputs],
+            outputs,
+            nodes=tape.nodes,
+            initializers=tape.initializers,
+            opset_imports={"": 18},
+            name="lookup4",
+        ),
         ir_version=10,
     )
-    onnx.checker.check_model(model, full_check=True)
-    return model.SerializeToString(), packed, scales, book, (k, n)
+    onnx.checker.check_model(ir.to_proto(model), full_check=True)
+    return model, buffers["packed"], buffers["scales"], buffers["book"], (k, n)
 
 
 def _session(model, provider):
@@ -110,7 +114,9 @@ def _session(model, provider):
     options.intra_op_num_threads = options.inter_op_num_threads = 1
     if provider == "MLXExecutionProvider":
         options.add_session_config_entry("session.disable_cpu_ep_fallback", "1")
-    return ort.InferenceSession(model, options, providers=[provider])
+    return ort.InferenceSession(
+        ir.to_proto(model).SerializeToString(), options, providers=[provider]
+    )
 
 
 def _reference(packed, scales, book, shape, low_first=False):
@@ -229,15 +235,10 @@ def test_lut4_nonfinite_input_classification(value):
 
 
 def test_lut4_overridable_initializers():
-    blob, p, s, book, shape = _model()
-    model = onnx.load_from_string(blob)
-    for name, value in [("packed", p), ("scales", s)]:
-        model.graph.input.append(
-            helper.make_tensor_value_info(
-                name, helper.np_dtype_to_tensor_dtype(value.dtype), value.shape
-            )
-        )
-    runtime = _session(model.SerializeToString(), "MLXExecutionProvider")
+    model, p, s, book, shape = _model()
+    for name in ("packed", "scales"):
+        model.graph.inputs.append(model.graph.initializers[name])
+    runtime = _session(model, "MLXExecutionProvider")
     x = np.full((2, shape[0]), 0.1, np.float32)
     for _ in range(3):
         expected = x @ _reference(p, s, book, shape)
@@ -252,49 +253,48 @@ def test_lut4_overridable_initializers():
 
 
 def test_lut4_nested_outputs_and_branch_weights():
-    blob, p, s, book, shape = _model()
-    source = onnx.load_from_string(blob)
-    then = onnx.GraphProto()
-    then.CopyFrom(source.graph)
-    then.name = "then"
-    then.ClearField("input")
-    then.output.append(
-        helper.make_tensor_value_info("weight", TensorProto.FLOAT, list(shape))
-    )
-    otherwise = onnx.GraphProto()
-    otherwise.CopyFrom(then)
-    otherwise.name = "else"
+    shape = (19, 23)
+    buffers = _buffers(*shape, 64)
+    p, s, book = (buffers[name] for name in ("packed", "scales", "book"))
     alternative = np.bitwise_xor(p, np.uint8(15))
-    for value in otherwise.initializer:
-        if value.name == "packed":
-            value.CopyFrom(numpy_helper.from_array(alternative, "packed"))
-    info = helper.make_tensor_value_info
-    model = helper.make_model(
-        helper.make_graph(
-            [
-                helper.make_node(
-                    "If",
-                    ["condition"],
-                    ["y", "w"],
-                    then_branch=then,
-                    else_branch=otherwise,
-                )
-            ],
-            "nested_lookup",
-            [
-                info("condition", TensorProto.BOOL, []),
-                info("x", TensorProto.FLOAT, ["m", shape[0]]),
-            ],
-            [
-                info("y", TensorProto.FLOAT, ["m", shape[1]]),
-                info("w", TensorProto.FLOAT, list(shape)),
-            ],
+    condition = models.tensor("condition", ir.DataType.BOOL, [])
+    x = models.tensor("x", ir.DataType.FLOAT, ["m", shape[0]])
+
+    def branch(name, packed):
+        tape = ir.tape.Tape()
+        output, weight, _ = _lookup(tape, x, {**buffers, "packed": packed})
+        return ir.Graph(
+            [],
+            [output, weight],
+            nodes=tape.nodes,
+            initializers=tape.initializers,
+            opset_imports={"": 18},
+            name=name,
+        )
+
+    y = models.tensor("y", ir.DataType.FLOAT, ["m", shape[1]])
+    w = models.tensor("w", ir.DataType.FLOAT, list(shape))
+    node = ir.node(
+        "If",
+        [condition],
+        outputs=[y, w],
+        attributes={
+            "then_branch": branch("then", p),
+            "else_branch": branch("else", alternative),
+        },
+    )
+    model = ir.Model(
+        ir.Graph(
+            [condition, x],
+            [y, w],
+            nodes=[node],
+            opset_imports={"": 18},
+            name="nested_lookup",
         ),
-        opset_imports=[helper.make_opsetid("", 18)],
         ir_version=10,
     )
-    onnx.checker.check_model(model, full_check=True)
-    runtime = _session(model.SerializeToString(), "MLXExecutionProvider")
+    onnx.checker.check_model(ir.to_proto(model), full_check=True)
+    runtime = _session(model, "MLXExecutionProvider")
     for condition, m in [(True, 1), (False, 3), (True, 2), (False, 1)]:
         x = np.full((m, shape[0]), 0.1, np.float32)
         expected = _reference(p if condition else alternative, s, book, shape)
@@ -304,47 +304,33 @@ def test_lut4_nested_outputs_and_branch_weights():
 
 
 def test_lut4_composed_dispatch_probe():
-    nodes, initializers, weights = [], [], []
-    previous = "x"
+    tape, weights = ir.tape.Tape(), []
+    x = models.tensor("x", ir.DataType.FLOAT, ["m", 23])
+    previous = x
     for layer in range(3):
-        blob, p, s, book, shape = _model(k=23, n=23)
-        original = onnx.load_from_string(blob)
-        p = np.bitwise_xor(p, np.uint8(layer * 17))
-
-        def rename(name, layer=layer, previous=previous):
-            return previous if name == "x" else f"layer{layer}_{name}"
-
-        for value in original.graph.initializer:
-            if value.name == "packed":
-                value.CopyFrom(numpy_helper.from_array(p, "packed"))
-            value.name = rename(value.name)
-            initializers.append(value)
-        for i, node in enumerate(original.graph.node):
-            node.name = f"layer{layer}_{node.op_type}_{i}"
-            node.input[:] = [rename(n) for n in node.input]
-            node.output[:] = [rename(n) for n in node.output]
-            nodes.append(node)
-        previous = f"layer{layer}_y"
-        weights.append(_reference(p, s, book, shape))
+        buffers = _buffers(23, 23, 64)
+        buffers["packed"] = np.bitwise_xor(buffers["packed"], np.uint8(layer * 17))
+        previous, _, _ = _lookup(tape, previous, buffers, prefix=f"layer{layer}_")
+        weights.append(
+            _reference(buffers["packed"], buffers["scales"], buffers["book"], (23, 23))
+        )
         if layer < 2:
-            nodes.append(
-                helper.make_node("Tanh", [previous], [f"layer{layer}_activation"])
-            )
-            previous = f"layer{layer}_activation"
-    info = helper.make_tensor_value_info
-    model = helper.make_model(
-        helper.make_graph(
-            nodes,
-            "composed_lookup",
-            [info("x", TensorProto.FLOAT, ["m", 23])],
-            [info(previous, TensorProto.FLOAT, ["m", 23])],
-            initializers,
+            previous = tape.op("Tanh", [previous])
+            previous.name = f"layer{layer}_activation"
+            previous.dtype, previous.shape = ir.DataType.FLOAT, ir.Shape(["m", 23])
+    model = ir.Model(
+        ir.Graph(
+            [x],
+            [previous],
+            nodes=tape.nodes,
+            initializers=tape.initializers,
+            opset_imports={"": 18},
+            name="composed_lookup",
         ),
-        opset_imports=[helper.make_opsetid("", 18)],
         ir_version=10,
     )
-    onnx.checker.check_model(model, full_check=True)
-    runtime = _session(model.SerializeToString(), "MLXExecutionProvider")
+    onnx.checker.check_model(ir.to_proto(model), full_check=True)
+    runtime = _session(model, "MLXExecutionProvider")
     for m in [1, 3]:
         x = np.full((m, 23), 0.1, np.float32)
         expected = x
