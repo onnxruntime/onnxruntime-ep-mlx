@@ -11,6 +11,9 @@ then releases its temporary arena, name lookup and cast cache before evaluation,
 so MLX can recycle intermediates after their final consumer. Constant initializer
 and repack arrays retain their plan lifetime. Output views and ordered state
 writebacks are copied from owning references obtained from the output vector.
+Runtime input wrappers remain referenced through evaluation, protecting
+caller-owned zero-copy buffers from donation and reuse. Regressions cover
+16 KiB-aligned inputs as well as ordinary NumPy allocations.
 
 ## Reproduce the allocation comparison
 

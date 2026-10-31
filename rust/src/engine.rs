@@ -756,6 +756,9 @@ pub struct TranslationContext<'a> {
     /// Arrays produced during translation. Boundary roots retain their own references before
     /// these handles are released, allowing MLX to recycle intermediates during eager eval.
     arena: Vec<Array>,
+    /// Runtime input wrappers stay referenced through eval, preventing donation of caller-owned
+    /// zero-copy buffers when intermediate handles are released.
+    input_arena: Vec<Array>,
     /// Per-translation cast CSE. This is intentionally scoped to one graph build: runtime inputs
     /// must never be retained across Compute calls, while repeated Q/K/V and gate/up projections
     /// should share one explicit activation cast inside the compiled closure.
@@ -825,6 +828,7 @@ impl<'a> TranslationContext<'a> {
             stream,
             env: HashMap::new(),
             arena: Vec::new(),
+            input_arena: Vec::new(),
             astype_cache: HashMap::new(),
             path_mark: None,
             trace_enabled: crate::trace::tracer().is_enabled(),
@@ -883,6 +887,12 @@ impl<'a> TranslationContext<'a> {
     pub fn keep(&mut self, a: Array) -> mlxsys::mlx_array {
         let raw = a.as_raw();
         self.arena.push(a);
+        raw
+    }
+
+    fn keep_input(&mut self, a: Array) -> mlxsys::mlx_array {
+        let raw = a.as_raw();
+        self.input_arena.push(a);
         raw
     }
 
@@ -1041,7 +1051,7 @@ impl<'a> TranslationContext<'a> {
                     // mode where the per-token past K/V is a full [B,kv,cap,hd] buffer that
                     // `from_data` used to memcpy every token.
                     let arr = Array::from_data_managed(data, &ishape, mlx_dtype_from_onnx(dtype));
-                    let raw = self.keep(arr);
+                    let raw = self.keep_input(arr);
                     self.env.insert(r.name.clone(), raw);
                     Ok(raw)
                 }
@@ -1162,7 +1172,7 @@ impl<'a> TranslationContext<'a> {
             self.plan.cache.insert(cache_key, array);
             raw
         } else {
-            self.keep(Array::from_data_managed(
+            self.keep_input(Array::from_data_managed(
                 host.data,
                 &storage_shape,
                 mlxsys::mlx_dtype__MLX_UINT8,

@@ -5,6 +5,7 @@ import numpy as np
 import onnx
 import onnx_ir as ir
 import onnxruntime as ort
+import pytest
 
 
 def chain_model(*, layers=32):
@@ -42,7 +43,8 @@ def chain_model(*, layers=32):
     return proto.SerializeToString()
 
 
-def test_eager_roots_keep_intermediate_outputs_and_views_alive(monkeypatch):
+@pytest.mark.parametrize("aligned", [False, True])
+def test_eager_roots_keep_intermediate_outputs_and_views_alive(monkeypatch, aligned):
     monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_COMPILE", "1")
     options = ort.SessionOptions()
     options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
@@ -54,10 +56,18 @@ def test_eager_roots_keep_intermediate_outputs_and_views_alive(monkeypatch):
         enable_fallback=False,
     )
     runtime.disable_fallback()
-    for rows, columns in ((2, 5), (3, 7), (2, 5)):
+    shapes = ((256, 64), (128, 128), (256, 64)) if aligned else ((2, 5), (3, 7), (2, 5))
+    for rows, columns in shapes:
         x = np.linspace(-0.2, 0.2, rows * columns, dtype=np.float32).reshape(
             rows, columns
         )
+        if aligned:
+            storage = np.empty(x.nbytes + 32768, np.uint8)
+            offset = (-storage.ctypes.data) % 16384
+            view = storage[offset : offset + x.nbytes].view(np.float32).reshape(x.shape)
+            view[:] = x
+            x = view
+            assert x.ctypes.data % 16384 == 0
         expected = x.copy()
         for index in range(32):
             expected = np.tanh(expected + np.float32(0.01))
