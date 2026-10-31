@@ -400,11 +400,14 @@ def test_inverse_exact_form_validation(variant, tmp_path):
     model = _model(np.float32, [2, 2])
     graph = model.graph
     node = graph[0]
-    inputs, outputs, attrs = list(node.inputs), list(node.outputs), {}
+    inputs = list(node.inputs)
+    output = _value("inverse", T.FLOAT, [2, 2])
+    graph.outputs[0] = output
+    outputs, attrs = [output], {}
     if variant == "missing_x":
         inputs[0] = None
     elif variant == "missing_y":
-        outputs[0].name = ""
+        outputs[0] = ir.val("")
     elif variant == "extra_input":
         inputs.append(inputs[0])
     elif variant == "extra_output":
