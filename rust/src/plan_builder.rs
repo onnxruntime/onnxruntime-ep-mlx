@@ -605,6 +605,17 @@ unsafe fn collect_initializer_bytes(
     }
     let mut result = HashMap::new();
     for info in infos {
+        // An initializer may also be an overridable graph input. Its defaults belong to
+        // ORT; the fused kernel must read the live input slot on every execution.
+        let mut constant = false;
+        check(
+            api,
+            unsafe { (api.ValueInfo_IsConstantInitializer.unwrap())(info, &mut constant) },
+            "checking initializer mutability",
+        )?;
+        if !constant {
+            continue;
+        }
         let name = unsafe { value_name(api, info)? };
         let string_metadata = snapshot
             .value_by_name
