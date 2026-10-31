@@ -74,8 +74,10 @@ impl<'a> Producers<'a> {
             return None;
         }
         Some(
-            data.chunks_exact(8)
-                .map(|v| i64::from_ne_bytes(v.try_into().unwrap()))
+            data.as_chunks::<8>()
+                .0
+                .iter()
+                .map(|v| i64::from_ne_bytes(*v))
                 .collect(),
         )
     }
@@ -153,8 +155,10 @@ impl<'a> Producers<'a> {
             return None;
         }
         let book: Vec<f32> = bytes
-            .chunks_exact(4)
-            .map(|v| f32::from_ne_bytes(v.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|v| f32::from_ne_bytes(*v))
             .collect();
         let index_reshape = self.op(&gather.inputs[1], "Reshape", 2)?;
         let index_shape = self.ints(&index_reshape.inputs[1])?;

@@ -723,7 +723,7 @@ mod tests {
                 &[true; 2],
                 &wide,
                 &classes,
-                &[order.clone()],
+                std::slice::from_ref(&order),
             );
             assert_eq!(clusters.len(), 2);
         }
