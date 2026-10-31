@@ -753,7 +753,8 @@ pub struct TranslationContext<'a> {
     stream: mlxsys::mlx_stream,
     /// name -> raw handle (borrowed; owned by `arena` or the plan cache).
     env: HashMap<String, mlxsys::mlx_array>,
-    /// All arrays produced this run; freed together on drop (RAII, no per-site frees).
+    /// Arrays produced during translation. Boundary roots retain their own references before
+    /// these handles are released, allowing MLX to recycle intermediates during eager eval.
     arena: Vec<Array>,
     /// Per-translation cast CSE. This is intentionally scoped to one graph build: runtime inputs
     /// must never be retained across Compute calls, while repeated Q/K/V and gate/up projections
@@ -2309,7 +2310,7 @@ impl<'a> TranslationContext<'a> {
         // Collect boundary outputs, cast each to its ORT output dtype BEFORE eval so copy-out is a
         // straight typed memcpy, then eval the whole graph in one shot.
         let mut outs = VectorArray::new();
-        let mut ext: Vec<(OutRef, mlxsys::mlx_array)> = Vec::new();
+        let mut ext: Vec<OutRef> = Vec::new();
         for node in nodes {
             for o in &node.outputs {
                 if o.external
@@ -2322,13 +2323,23 @@ impl<'a> TranslationContext<'a> {
                     // consuming kernels; only actual subgraph outputs pay a contiguous copy.
                     let casted = self.contiguous(casted)?;
                     outs.append(casted);
-                    ext.push((o.clone(), casted));
-                }
-                for &(_, a, _) in &self.input_writebacks {
-                    outs.append(a);
+                    ext.push(o.clone());
                 }
             }
         }
+        let mut writebacks = Vec::with_capacity(self.input_writebacks.len());
+        for &(dst, a, bytes) in &self.input_writebacks {
+            let index = outs.size();
+            outs.append(a);
+            writebacks.push((dst, index, bytes));
+        }
+        // VectorArray owns references to every boundary root, whose lazy graphs keep their
+        // dependencies alive. Per-node handles must not pin every intermediate allocation
+        // after its final consumer has executed (notably large unpacked lookup matrices).
+        self.env.clear();
+        self.astype_cache.clear();
+        self.input_writebacks.clear();
+        self.arena.clear();
         // The single synchronous `mlx_eval` boundary: with tracing on this is wrapped
         // in the `mlx.eval` (cat "gpu") span, whose CPU wall time is the GPU-inclusive
         // time of the whole fused subgraph (MLX blocks here until the GPU work lands).
@@ -2352,11 +2363,12 @@ impl<'a> TranslationContext<'a> {
             tr.record_phase("eval", t0.elapsed());
         }
         tr.sample_gpu_counters();
-        for (o, a) in &ext {
-            self.copy_out(o, *a)?;
+        for (index, o) in ext.iter().enumerate() {
+            let a = outs.get(index);
+            self.copy_out(o, a.as_raw())?;
         }
-        for &(dst, a, bytes) in &self.input_writebacks {
-            let arr = std::mem::ManuallyDrop::new(Array::from_raw(a));
+        for &(dst, index, bytes) in &writebacks {
+            let arr = outs.get(index);
             unsafe {
                 std::ptr::copy_nonoverlapping(arr.data_bytes(), dst as *mut u8, bytes);
             }

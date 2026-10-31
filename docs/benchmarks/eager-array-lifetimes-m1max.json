@@ -1,0 +1,44 @@
+{
+  "platform": "macOS-27.0.1-arm64-arm-64bit",
+  "hardware": "Apple M1 Max, 32 GiB unified memory",
+  "before": {
+    "library": "/tmp/onnax-eager-target/release/libonnxruntime_mlx_ep.dylib",
+    "library_sha256": "1c9e7c0b40449408caf300d7da42cee8b4b50f0e1dc2564c30170eee2dcbdf20",
+    "graph_sha256": "fa0d42289e7d8bffd89c946b0a526c7e6275ff2dc994c0ace8ceaf43fb786234",
+    "layers": 48,
+    "nodes": 97,
+    "shape": [
+      1024,
+      1024
+    ],
+    "input_bytes": 4194304,
+    "checked_outputs": 3,
+    "peak_mlx_active_bytes": 411041796,
+    "scope": "Fresh process; one eager ORT execution; MLX allocator peak reset after session creation, before run; cache and CPU allocations excluded"
+  },
+  "after": {
+    "library": "/tmp/onnax-lifetimes-target/release/libonnxruntime_mlx_ep.dylib",
+    "library_sha256": "a0426de4db4ce4106e356948a0a5a9f560ab42ea4d80f61fb095aadebed5a057",
+    "graph_sha256": "fa0d42289e7d8bffd89c946b0a526c7e6275ff2dc994c0ace8ceaf43fb786234",
+    "layers": 48,
+    "nodes": 97,
+    "shape": [
+      1024,
+      1024
+    ],
+    "input_bytes": 4194304,
+    "checked_outputs": 3,
+    "peak_mlx_active_bytes": 16777220,
+    "scope": "Fresh process; one eager ORT execution; MLX allocator peak reset after session creation, before run; cache and CPU allocations excluded"
+  },
+  "scope": "MLX allocator active-memory peak for this synthetic eager graph, independent processes; distinct from process RSS and runtime-wide Metal allocation",
+  "numerics": "All three boundary outputs checked against independent NumPy arithmetic in both runs",
+  "tests": {
+    "related_native": 41,
+    "controlflow_and_state_writebacks": 252,
+    "state_test_skips": 1,
+    "rust_units": 169
+  },
+  "modified_source_sha256": "bbca0405e515fea6094ea88e0923cf98afbdcda09ef016580f0d8c261bffecfb",
+  "reproduce": "python tests/ops/test_eager_array_lifetimes.py --library LIBRARY --output REPORT"
+}
