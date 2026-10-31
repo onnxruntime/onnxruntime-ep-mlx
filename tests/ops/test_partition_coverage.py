@@ -1,13 +1,19 @@
 """Keep supported eager/compiled branches native when fusions interleave."""
 
+import json
+
+import _models as m
 import numpy as np
 import onnx_ir as ir
 import onnxruntime as ort
+import pytest
 
-import _models as m
 
-
-def test_interleaved_eager_regions_preserve_native_coverage():
+@pytest.mark.parametrize("no_compile", [False, True])
+def test_interleaved_eager_regions_preserve_native_coverage(
+    monkeypatch, tmp_path, no_compile
+):
+    monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_COMPILE", "1" if no_compile else "0")
     x = m.tensor("x", ir.DataType.INT64, [1])
     bounds = [
         m.tensor(name, ir.DataType.INT64, []) for name in ("start", "limit", "delta")
@@ -37,6 +43,8 @@ def test_interleaved_eager_regions_preserve_native_coverage():
         ir_version=11,
     )
     options = ort.SessionOptions()
+    options.enable_profiling = True
+    options.profile_file_prefix = str(tmp_path / "partition")
     options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
     options.add_session_config_entry("session.disable_cpu_ep_fallback", "1")
     session = ort.InferenceSession(
@@ -57,3 +65,36 @@ def test_interleaved_eager_regions_preserve_native_coverage():
         actual = session.run(None, feeds)
         np.testing.assert_array_equal(actual[0], values + repeat)
         np.testing.assert_array_equal(actual[1], np.tile(values, repeat))
+
+    with open(session.end_profiling()) as stream:
+        events = json.load(stream)
+    kernels = [
+        event
+        for event in events
+        if event.get("args", {}).get("provider") == "MLXExecutionProvider"
+        and event.get("name", "").endswith("_kernel_time")
+    ]
+    # Five executions keep Range/Tile values live. Eager execution needs one
+    # native region, while capture retains its stricter operation boundaries.
+    if no_compile:
+        assert len(kernels) == 5, len(kernels)
+    else:
+        assert len(kernels) > 5, len(kernels)
+
+    if no_compile:
+        # Changing the diagnostic switch after construction must not capture
+        # Range/Tile's first live values in a coalesced plan.
+        monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_COMPILE", "0")
+        for repeat in (4, 0, 1):
+            values = np.array([20 + repeat], np.int64)
+            actual = session.run(
+                None,
+                {
+                    "x": values,
+                    "start": np.array(repeat, np.int64),
+                    "limit": np.array(repeat + 1, np.int64),
+                    "delta": np.array(1, np.int64),
+                },
+            )
+            np.testing.assert_array_equal(actual[0], values + repeat)
+            np.testing.assert_array_equal(actual[1], np.tile(values, repeat))
