@@ -1869,6 +1869,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn mul_integer_is_exact_contrib_revision_one_and_shapeless() {
+        let registry = registry();
+        let index = registry
+            .find_entry_index("com.microsoft", "MulInteger", 1)
+            .expect("MulInteger contrib v1 must be registered");
+        assert!(matches!(
+            registry.table[index].compile_shape_rule,
+            CompileShapeRule::Always(CompileShapeSafety::Shapeless)
+        ));
+        for (domain, version) in [("", 1), ("com.microsoft", 0), ("com.microsoft", 2)] {
+            assert!(registry.find_entry(domain, "MulInteger", version).is_none());
+        }
+    }
+
+    #[test]
     fn grouped_matmul_schema29_registration() {
         assert!(registry().find_entry("", "GroupedMatMul", 28).is_none());
         assert!(registry().find_entry("", "GroupedMatMul", 29).is_some());

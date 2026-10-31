@@ -15,6 +15,7 @@
 //!   * DequantizeLinear — y = (x - zero_point) * scale.
 //!   * DynamicQuantizeLinear — compute affine uint8 scale + zero point from x's [min,0]..[max,0] range.
 //!   * MatMulInteger         — (A - a_zp) @ (B - b_zp), int32 (exact via a small-K fp32 GEMM gate).
+//!   * com.microsoft::MulInteger — (A - a_zp) * (B - b_zp), exact native int32 elementwise math.
 //!   * ConvInteger           — conv(x - x_zp, w - w_zp), int32 (exact via a small-accumulation gate).
 //!   * QLinearMatMul         — dequant a,b -> matmul -> requantize to int8/uint8.
 //!   * QLinearConv           — dequant x,w -> conv (+int32 bias) -> requantize to int8/uint8.
@@ -28,7 +29,7 @@ use crate::engine::{MlxError, NodeDesc, Src, TranslationContext, packed4_signed}
 use crate::mlx::{Array, VectorArray};
 use crate::registry::{
     ClaimResult, CompileShapeSafety, K_ANY_OPSET, NodeView, OpRegistration, OpRegistry,
-    is_int_index, is_mlx_float,
+    is_int_index, is_mlx_float, scalar_or_suffix_broadcast,
 };
 use crate::sys::mlx;
 use crate::sys::ort;
@@ -1510,6 +1511,103 @@ fn dynamic_quantize_linear_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Res
     ctx.bind(&n.outputs[1], scale);
     let zpu = ctx.astype(zpf, mlx::mlx_dtype__MLX_UINT8)?;
     ctx.bind(&n.outputs[2], zpu);
+    Ok(())
+}
+
+// ---- com.microsoft::MulInteger -----------------------------------------------------------------
+
+fn mul_integer_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
+    if !(3..=4).contains(&n.inputs.len())
+        || !present(n, 0)
+        || !present(n, 2)
+        || n.outputs.len() != 1
+        || n.outputs[0].name.is_empty()
+        || n.outputs[0].otype != ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32
+    {
+        return Err("MulInteger: requires A, optional A_zero_point, B, optional B_zero_point and one int32 output".into());
+    }
+    let a = ctx.resolve(&n.inputs[0])?;
+    let b = ctx.resolve(&n.inputs[2])?;
+    let dtype = ctx.dtype_of(a);
+    if !matches!(dtype, mlx::mlx_dtype__MLX_INT8 | mlx::mlx_dtype__MLX_UINT8)
+        || ctx.dtype_of(b) != dtype
+    {
+        return Err("MulInteger: A and B must have the same int8 or uint8 dtype".into());
+    }
+    let mut zero_points = [None; 2];
+    for (zero_point, slot) in zero_points.iter_mut().zip([1, 3]) {
+        if present(n, slot) {
+            let z = ctx.resolve(&n.inputs[slot])?;
+            if ctx.dtype_of(z) != dtype || ctx.ndim(z) != 0 {
+                return Err(format!(
+                    "MulInteger: zero point at slot {slot} must be scalar (rank 0) with the operand dtype"
+                ));
+            }
+            *zero_point = Some(z);
+        }
+    }
+    // Both differences are in [-255, 255]; their product fits int32 exactly.
+    let a = ctx.astype(a, mlx::mlx_dtype__MLX_INT32)?;
+    let b = ctx.astype(b, mlx::mlx_dtype__MLX_INT32)?;
+    let mut widened = [ctx.scalar_i32(0); 2];
+    for (out, z) in widened.iter_mut().zip(zero_points) {
+        if let Some(z) = z {
+            *out = ctx.astype(z, mlx::mlx_dtype__MLX_INT32)?;
+        }
+    }
+    let a = sub(ctx, a, widened[0])?;
+    let b = sub(ctx, b, widened[1])?;
+    let out = mul(ctx, a, b).map_err(|e| format!("MulInteger: broadcast/multiply: {e}"))?;
+    ctx.bind(&n.outputs[0], out);
+    Ok(())
+}
+
+fn mul_integer_claim(node: &NodeView) -> ClaimResult {
+    require!(
+        (3..=4).contains(&node.num_inputs())
+            && node.input_present(0)
+            && node.input_present(2)
+            && node.num_outputs() == 1
+            && node.output_present(0),
+        "MulInteger: requires 3..4 positional inputs with A at 0, B at 2, and one present output"
+    );
+    require!(
+        node.num_attributes() == 0,
+        "MulInteger: no attributes are allowed"
+    );
+    let (Some(a), Some(b), Some(out)) =
+        (node.input_info(0), node.input_info(2), node.output_info(0))
+    else {
+        deny!("MulInteger: missing tensor metadata for A, B or output");
+    };
+    require!(
+        is_int8or(a.dtype) && b.dtype == a.dtype,
+        "MulInteger: A and B must have the same int8 or uint8 dtype"
+    );
+    require!(
+        out.dtype == ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32,
+        "MulInteger: output must be int32"
+    );
+    let (Some(a_rank), Some(b_rank)) = (node.input_rank_known(0), node.input_rank_known(2)) else {
+        deny!("MulInteger: missing rank metadata for A or B");
+    };
+    require!(
+        !a_rank || !b_rank || scalar_or_suffix_broadcast(&a.shape, &b.shape),
+        "MulInteger: A and B must support multidirectional NumPy broadcasting"
+    );
+    for slot in [1, 3] {
+        if !node.input_present(slot) {
+            continue;
+        }
+        let (Some(z), Some(rank_known)) = (node.input_info(slot), node.input_rank_known(slot))
+        else {
+            deny!("MulInteger: missing zero-point tensor/rank metadata at slot {slot}");
+        };
+        require!(
+            z.dtype == a.dtype && (!rank_known || z.shape.is_empty()),
+            "MulInteger: zero point at slot {slot} must be scalar (rank 0) with the operand dtype"
+        );
+    }
     Ok(())
 }
 
@@ -3284,6 +3382,14 @@ fn shape_classified(
 }
 
 pub fn register(registry: &mut OpRegistry) {
+    registry.register_shapeless(OpRegistration {
+        domain: "com.microsoft",
+        op_type: "MulInteger",
+        min_opset: 1,
+        max_opset: 1,
+        handler: mul_integer_op,
+        claim: mul_integer_claim,
+    });
     shape_classified(
         registry,
         "com.microsoft",
@@ -3434,6 +3540,345 @@ mod compile_shape_safety_tests {
             std::slice::from_ref(&parent)
         ));
         assert!(!crate::compiled::general_enabled(false, &[parent]));
+    }
+
+    #[cfg(test)]
+    mod mul_integer_claim_tests {
+        use super::super::mul_integer_claim;
+        use crate::engine::{NodeDesc, SubgraphDesc};
+        use crate::registry::{CompileShapeSafety, NodeView};
+        use crate::sys::ort;
+
+        const U8: ort::ONNXTensorElementDataType =
+            ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8;
+        const I8: ort::ONNXTensorElementDataType =
+            ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8;
+        const I32: ort::ONNXTensorElementDataType =
+            ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32;
+
+        #[derive(Clone)]
+        struct Value {
+            dtype: ort::ONNXTensorElementDataType,
+            shape: Vec<i64>,
+            rank_known: bool,
+            metadata: bool,
+            named: bool,
+        }
+
+        impl Value {
+            fn new(dtype: ort::ONNXTensorElementDataType, shape: &[i64]) -> Self {
+                Self {
+                    dtype,
+                    shape: shape.to_vec(),
+                    rank_known: true,
+                    metadata: true,
+                    named: true,
+                }
+            }
+        }
+
+        struct Fixture {
+            inputs: Vec<Option<Value>>,
+            outputs: Vec<Option<Value>>,
+            attributes: usize,
+        }
+
+        impl Fixture {
+            fn new(dtype: ort::ONNXTensorElementDataType) -> Self {
+                Self {
+                    inputs: vec![
+                        Some(Value::new(dtype, &[2, 1])),
+                        None,
+                        Some(Value::new(dtype, &[1, 3])),
+                    ],
+                    outputs: vec![Some(Value::new(I32, &[2, 3]))],
+                    attributes: 0,
+                }
+            }
+
+            fn claim(&self) -> crate::registry::ClaimResult {
+                unsafe extern "C" fn num_inputs(
+                    n: *const ort::OrtNode,
+                    out: *mut usize,
+                ) -> *mut ort::OrtStatus {
+                    unsafe { *out = (*n.cast::<Fixture>()).inputs.len() };
+                    std::ptr::null_mut()
+                }
+                unsafe extern "C" fn num_outputs(
+                    n: *const ort::OrtNode,
+                    out: *mut usize,
+                ) -> *mut ort::OrtStatus {
+                    unsafe { *out = (*n.cast::<Fixture>()).outputs.len() };
+                    std::ptr::null_mut()
+                }
+                unsafe extern "C" fn attributes(
+                    n: *const ort::OrtNode,
+                    out: *mut usize,
+                ) -> *mut ort::OrtStatus {
+                    unsafe { *out = (*n.cast::<Fixture>()).attributes };
+                    std::ptr::null_mut()
+                }
+                unsafe fn values(values: &[Option<Value>], out: *mut *const ort::OrtValueInfo) {
+                    for (i, value) in values.iter().enumerate() {
+                        unsafe {
+                            *out.add(i) = value
+                                .as_ref()
+                                .map_or(std::ptr::null(), |v| std::ptr::from_ref(v).cast())
+                        };
+                    }
+                }
+                unsafe extern "C" fn inputs(
+                    n: *const ort::OrtNode,
+                    out: *mut *const ort::OrtValueInfo,
+                    _: usize,
+                ) -> *mut ort::OrtStatus {
+                    unsafe { values(&(*n.cast::<Fixture>()).inputs, out) };
+                    std::ptr::null_mut()
+                }
+                unsafe extern "C" fn outputs(
+                    n: *const ort::OrtNode,
+                    out: *mut *const ort::OrtValueInfo,
+                    _: usize,
+                ) -> *mut ort::OrtStatus {
+                    unsafe { values(&(*n.cast::<Fixture>()).outputs, out) };
+                    std::ptr::null_mut()
+                }
+                unsafe extern "C" fn name(
+                    value: *const ort::OrtValueInfo,
+                    out: *mut *const std::ffi::c_char,
+                ) -> *mut ort::OrtStatus {
+                    unsafe {
+                        *out = if (*value.cast::<Value>()).named {
+                            c"value".as_ptr()
+                        } else {
+                            c"".as_ptr()
+                        }
+                    };
+                    std::ptr::null_mut()
+                }
+                unsafe extern "C" fn type_info(
+                    value: *const ort::OrtValueInfo,
+                    out: *mut *const ort::OrtTypeInfo,
+                ) -> *mut ort::OrtStatus {
+                    unsafe {
+                        *out = if (*value.cast::<Value>()).metadata {
+                            value.cast()
+                        } else {
+                            std::ptr::null()
+                        }
+                    };
+                    std::ptr::null_mut()
+                }
+                unsafe extern "C" fn kind(
+                    _: *const ort::OrtTypeInfo,
+                    out: *mut ort::ONNXType,
+                ) -> *mut ort::OrtStatus {
+                    unsafe { *out = ort::ONNXType_ONNX_TYPE_TENSOR };
+                    std::ptr::null_mut()
+                }
+                unsafe extern "C" fn tensor(
+                    info: *const ort::OrtTypeInfo,
+                    out: *mut *const ort::OrtTensorTypeAndShapeInfo,
+                ) -> *mut ort::OrtStatus {
+                    unsafe { *out = info.cast() };
+                    std::ptr::null_mut()
+                }
+                unsafe extern "C" fn dtype(
+                    info: *const ort::OrtTensorTypeAndShapeInfo,
+                    out: *mut ort::ONNXTensorElementDataType,
+                ) -> *mut ort::OrtStatus {
+                    unsafe { *out = (*info.cast::<Value>()).dtype };
+                    std::ptr::null_mut()
+                }
+                unsafe extern "C" fn rank(
+                    info: *const ort::OrtTensorTypeAndShapeInfo,
+                    out: *mut usize,
+                ) -> *mut ort::OrtStatus {
+                    unsafe { *out = (*info.cast::<Value>()).shape.len() };
+                    std::ptr::null_mut()
+                }
+                unsafe extern "C" fn shape(
+                    info: *const ort::OrtTensorTypeAndShapeInfo,
+                    out: *mut i64,
+                    count: usize,
+                ) -> *mut ort::OrtStatus {
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            (*info.cast::<Value>()).shape.as_ptr(),
+                            out,
+                            count,
+                        )
+                    };
+                    std::ptr::null_mut()
+                }
+                unsafe extern "C" fn has_shape(
+                    info: *const ort::OrtTensorTypeAndShapeInfo,
+                ) -> bool {
+                    unsafe { (*info.cast::<Value>()).rank_known }
+                }
+                let mut api: ort::OrtApi = unsafe { std::mem::zeroed() };
+                api.Node_GetNumInputs = Some(num_inputs);
+                api.Node_GetNumOutputs = Some(num_outputs);
+                api.Node_GetNumAttributes = Some(attributes);
+                api.Node_GetInputs = Some(inputs);
+                api.Node_GetOutputs = Some(outputs);
+                api.GetValueInfoName = Some(name);
+                api.GetValueInfoTypeInfo = Some(type_info);
+                api.GetOnnxTypeFromTypeInfo = Some(kind);
+                api.CastTypeInfoToTensorInfo = Some(tensor);
+                api.GetTensorElementType = Some(dtype);
+                api.GetDimensionsCount = Some(rank);
+                api.GetDimensions = Some(shape);
+                api.TensorTypeAndShape_HasShape = Some(has_shape);
+                mul_integer_claim(&NodeView::new(&api, std::ptr::from_ref(self).cast()))
+            }
+        }
+
+        #[test]
+        fn exact_positional_optional_forms_and_homogeneous_types() {
+            for dtype in [U8, I8] {
+                for az in [false, true] {
+                    for trailing in [false, true] {
+                        for bz in [false, true] {
+                            if bz && !trailing {
+                                continue;
+                            }
+                            let mut f = Fixture::new(dtype);
+                            if az {
+                                f.inputs[1] = Some(Value::new(dtype, &[]));
+                            }
+                            if trailing {
+                                f.inputs.push(bz.then(|| Value::new(dtype, &[])));
+                            }
+                            assert!(f.claim().is_ok(), "{:?}", f.claim());
+                        }
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn malformed_claims_have_explicit_reasons() {
+            for case in 0..21 {
+                let mut f = Fixture::new(U8);
+                f.inputs[1] = Some(Value::new(U8, &[]));
+                match case {
+                    0 => {
+                        f.inputs.pop();
+                    }
+                    1 => f.inputs.extend([None, None]),
+                    2 => f.inputs[0] = None,
+                    3 => f.inputs[2] = None,
+                    4 => f.outputs.clear(),
+                    5 => f.outputs.push(Some(Value::new(I32, &[2, 3]))),
+                    6 => f.outputs[0] = None,
+                    7 => f.inputs[2].as_mut().unwrap().dtype = I8,
+                    8 => f.inputs[1].as_mut().unwrap().dtype = I8,
+                    9 => f.outputs[0].as_mut().unwrap().dtype = U8,
+                    10 => f.inputs[1].as_mut().unwrap().shape = vec![1],
+                    11 => f.inputs[2].as_mut().unwrap().shape = vec![3, 2],
+                    12 => f.inputs[1].as_mut().unwrap().metadata = false,
+                    13 => f.inputs[0].as_mut().unwrap().metadata = false,
+                    14 => f.outputs[0].as_mut().unwrap().named = false,
+                    15 => f.attributes = 1,
+                    16 => {
+                        for value in f.inputs.iter_mut().flatten() {
+                            value.dtype = I32;
+                        }
+                    }
+                    17 => f.outputs[0].as_mut().unwrap().metadata = false,
+                    18 => f.inputs[2].as_mut().unwrap().named = false,
+                    19 => f.inputs.push(Some(Value::new(U8, &[1]))),
+                    20 => f.inputs.push(Some(Value {
+                        metadata: false,
+                        ..Value::new(U8, &[])
+                    })),
+                    _ => unreachable!(),
+                }
+                assert!(!f.claim().unwrap_err().is_empty(), "case {case}");
+            }
+            // An empty-name optional placeholder is absent even if the graph API supplies a handle.
+            let mut f = Fixture::new(U8);
+            let mut absent = Value::new(I32, &[9]);
+            absent.named = false;
+            f.inputs[1] = Some(absent);
+            assert!(f.claim().is_ok());
+        }
+
+        #[test]
+        fn scalar_empty_symbolic_and_unknown_rank_metadata_are_distinct() {
+            for (a, b) in [
+                (&[][..], &[][..]),
+                (&[0, 1], &[1, 3]),
+                (&[-1, 1], &[1, -1]),
+                (&[2, 1, 3], &[4, 3]),
+            ] {
+                let mut f = Fixture::new(U8);
+                f.inputs[0].as_mut().unwrap().shape = a.to_vec();
+                f.inputs[2].as_mut().unwrap().shape = b.to_vec();
+                assert!(f.claim().is_ok());
+            }
+            let mut f = Fixture::new(U8);
+            f.inputs[0].as_mut().unwrap().rank_known = false;
+            f.inputs[0].as_mut().unwrap().shape.clear();
+            f.inputs[1] = Some(Value {
+                rank_known: false,
+                ..Value::new(U8, &[])
+            });
+            assert!(
+                f.claim().is_ok(),
+                "unknown ranks defer actual scalar/broadcast checks to runtime"
+            );
+            f.inputs[1].as_mut().unwrap().rank_known = true;
+            f.inputs[1].as_mut().unwrap().shape = vec![-1];
+            assert!(f.claim().is_err(), "a symbolic vector is not a scalar");
+        }
+
+        #[test]
+        fn recursive_compile_descriptor_eligibility() {
+            let node = NodeDesc::new(
+                "MulInteger".into(),
+                "com.microsoft".into(),
+                1,
+                CompileShapeSafety::Shapeless,
+            );
+            let mut parent = NodeDesc::new(
+                "If".into(),
+                String::new(),
+                13,
+                CompileShapeSafety::Shapeless,
+            );
+            parent.subgraphs.push(SubgraphDesc {
+                attr_name: "then_branch".into(),
+                input_names: vec![],
+                output_names: vec![],
+                nodes: vec![node.clone()],
+            });
+            assert!(crate::compiled::decode_enabled(
+                false,
+                std::slice::from_ref(&node)
+            ));
+            assert!(crate::compiled::general_enabled(
+                false,
+                std::slice::from_ref(&node)
+            ));
+            assert!(!crate::compiled::prefill_enabled(
+                false,
+                std::slice::from_ref(&node)
+            ));
+            let attention = NodeDesc::new(
+                "GroupQueryAttention".into(),
+                "com.microsoft".into(),
+                1,
+                CompileShapeSafety::Shapeless,
+            );
+            assert!(crate::compiled::prefill_enabled(false, &[node, attention]));
+            assert!(!crate::compiled::decode_enabled(
+                true,
+                std::slice::from_ref(&parent)
+            ));
+            assert!(crate::compiled::general_enabled(false, &[parent]));
+        }
     }
 
     #[test]
