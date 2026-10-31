@@ -108,9 +108,12 @@ fences. Template scope restoration has a focused Rust fixture. A fresh subproces
 also exercises simultaneous successful
 and singular plans, requiring every numerical/error/recovery assertion and
 exit0; this is bounded concurrency coverage, not proof of all possible schedules.
-A separate fresh child repeatedly creates/runs/drops sessions on one thread
-under the existing macOS `leaks --atExit` zero-leak gate. That gate does not count
-globally retained worker threads or certify native resource reclamation.
+A separate fresh child repeatedly creates, runs and drops sessions on one
+thread, then stays alive while macOS `leaks` scans its PID. The test requires an
+explicit zero-leak report and a successful child exit. Keeping the final Python
+process alive lets the scanner run after framework Python has finished launching.
+A paired native fixture checks that the scanner distinguishes a freed allocation
+from a lost 1 MiB allocation. The scan checks unreachable heap allocations.
 Provider profiles are required to contain actual nonempty all-MLX kernel events;
 they do not identify a physical CPU stream. Separate trace assertions cover eager
 Inverse/If execution and compiled neighbor cache reuse, not CPU/GPU hardware

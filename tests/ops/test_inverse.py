@@ -3,6 +3,8 @@
 import hashlib
 import json
 import os
+import re
+import select
 import shutil
 import subprocess
 import sys
@@ -254,6 +256,59 @@ def _session_churn(dtype_name, directory):
         _placement(session)
         del session
     print("INVERSE_SESSION_CHURN_RECOVERY_OK", flush=True)
+
+
+@pytest.mark.parametrize("lost", [False, True])
+def test_inverse_leaks_scanner_controls(lost, tmp_path):
+    source = tmp_path / "leaks_control.c"
+    source.write_text(r"""
+#include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+static void *allocate(void *lost) {
+    void *p = malloc(1048576);
+    memset(p, 42, 1048576);
+    __asm__ volatile("" : : "r"(p) : "memory");
+    if (!lost) free(p);
+    return NULL;
+}
+int main(int argc, char **argv) {
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, allocate, argc > 1 ? (void *)1 : NULL)) return 2;
+    if (pthread_join(thread, NULL)) return 3;
+    puts("READY"); fflush(stdout);
+    getchar();
+    return 0;
+}
+""")
+    binary = tmp_path / "leaks_control"
+    subprocess.run(["clang", "-O0", str(source), "-o", str(binary)], check=True, timeout=30)
+    child = subprocess.Popen([str(binary), *(["lost"] if lost else [])],
+                             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, text=True,
+                             env={**os.environ, "MallocStackLogging": "1"})
+    try:
+        assert select.select([child.stdout], [], [], 30)[0], "control child readiness timed out"
+        assert child.stdout.readline().strip() == "READY"
+        report = subprocess.run(["/usr/bin/leaks", str(child.pid)], check=False,
+                                capture_output=True, text=True, timeout=60)
+    finally:
+        try:
+            child.communicate("\n", timeout=15)
+        except subprocess.TimeoutExpired:
+            child.kill()
+            child.communicate()
+            raise
+    assert child.returncode == 0
+    text = report.stdout + report.stderr
+    assert report.returncode == int(lost), text
+    if lost:
+        allocation = re.search(r"1 leaks? for (\d+) total leaked bytes\.", text)
+        assert allocation is not None, text
+        assert int(allocation[1]) >= 1048576, text
+    else:
+        assert "0 leaks for 0 total leaked bytes." in text, text
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
