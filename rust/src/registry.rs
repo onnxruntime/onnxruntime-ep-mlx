@@ -258,12 +258,51 @@ fn registry() -> &'static OpRegistry {
 
 /// Compile-shape capability declared by the registered lowering for one concrete node.
 pub fn compile_shape_safety(node: &NodeView) -> CompileShapeSafety {
+    if requires_live_tile_eager_boundary(node) {
+        return CompileShapeSafety::EagerOnly {
+            reason: "Tile live repeats, including nested bodies, must be reread eagerly",
+        };
+    }
+    if requires_live_range_eager_boundary(node) {
+        return CompileShapeSafety::EagerOnly {
+            reason: "Range live integer bounds require fresh values before allocating the output",
+        };
+    }
     if requires_float64_metadata_eager_boundary(node) {
         return CompileShapeSafety::EagerOnly {
             reason: "float64 metadata reads must not import payloads into a compiled GPU closure",
         };
     }
     registry().compile_shape_safety(node)
+}
+
+/// Modern live Tile and every containing control-flow parent require eager translation.
+pub fn requires_live_tile_eager_boundary(node: &NodeView) -> bool {
+    (matches!(node.domain().as_str(), "" | "ai.onnx")
+        && node.op_type() == "Tile"
+        && node.since_version() >= 6
+        && node.num_inputs() == 2
+        && node.num_outputs() == 1
+        && node.num_attributes() == Some(0)
+        && !node.is_const_int64(1))
+        || node
+            .subgraphs()
+            .iter()
+            .any(|(_, body)| body.nodes().iter().any(requires_live_tile_eager_boundary))
+}
+
+/// Live integer Range and its containing control-flow parents allocate from runtime values.
+pub fn requires_live_range_eager_boundary(node: &NodeView) -> bool {
+    (matches!(node.domain().as_str(), "" | "ai.onnx")
+        && node.op_type() == "Range"
+        && node.input_info(0).is_some_and(|info| {
+            info.dtype == ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64
+        })
+        && (0..3).any(|i| !node.is_const_int64(i)))
+        || node
+            .subgraphs()
+            .iter()
+            .any(|(_, body)| body.nodes().iter().any(requires_live_range_eager_boundary))
 }
 
 /// Data-dependent host scans, including those inside an otherwise capture-safe parent.
@@ -678,6 +717,16 @@ impl NodeView {
     pub fn input_rank_known(&self, i: usize) -> Option<bool> {
         let values = self.inputs_raw();
         let &value = values.get(i)?;
+        self.value_rank_known(value)
+    }
+
+    pub fn output_rank_known(&self, i: usize) -> Option<bool> {
+        let values = self.outputs_raw();
+        let &value = values.get(i)?;
+        self.value_rank_known(value)
+    }
+
+    fn value_rank_known(&self, value: *const ort::OrtValueInfo) -> Option<bool> {
         if value.is_null() {
             return None;
         }
@@ -1835,6 +1884,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn grouped_matmul_schema29_registration() {
+        assert!(registry().find_entry("", "GroupedMatMul", 28).is_none());
+        assert!(registry().find_entry("", "GroupedMatMul", 29).is_some());
+        assert!(registry().find_entry("", "GroupedMatMul", 30).is_none());
+    }
+
+    #[test]
     fn nonzero_is_version_gated_and_always_eager() {
         assert!(registry().find_entry("", "NonZero", 8).is_none());
         for version in [9, 13, 26] {
@@ -1965,7 +2021,6 @@ mod tests {
             ("", "CumProd", 26),
             ("", "ScatterElements", 24),
             ("", "CenterCropPad", 24),
-            ("", "ScatterND", 24),
             ("", "GatherND", 13),
             ("", "Slice", 24),
             ("", "Split", 24),
@@ -2006,6 +2061,10 @@ mod tests {
             );
         }
 
+        assert!(matches!(
+            compile_shape_rule("", "ScatterND", 24),
+            CompileShapeRule::Classified(_)
+        ));
         assert!(matches!(
             compile_shape_rule("", "RoiAlign", 24),
             CompileShapeRule::Classified(_)
@@ -2109,6 +2168,7 @@ mod tests {
             ("SwiGLU", 27, 28),
             ("DeformConv", 18, 19),
             ("GridSample", 15, 16),
+            ("Tile", 1, 6),
         ] {
             assert!(
                 registry.find_entry("", op, before).is_none(),

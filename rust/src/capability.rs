@@ -12,11 +12,26 @@ use crate::engine::is_separate_qkv_attention_op;
 use crate::factory::ORT_API_VERSION;
 use crate::ort_graph::{NodeMetadata, OrtGraphSnapshot};
 use crate::partition::{
-    build_contiguous_clusters, build_convex_clusters, infer_layer_boundary_values,
+    build_contiguous_clusters, build_convex_clusters_with_regions, infer_layer_boundary_values,
     split_annotated_layer_clusters,
 };
-use crate::registry::{CompilePartitionClass, NodeView, claimable};
+use crate::registry::{ClaimResult, CompilePartitionClass, NodeView, claimable};
 use crate::sys::ort;
+
+fn native_candidate_claim(
+    native_candidate: bool,
+    op_type: &str,
+    tile_payload: impl FnOnce() -> ClaimResult,
+) -> Option<ClaimResult> {
+    if !native_candidate {
+        return None;
+    }
+    match op_type {
+        "Range" => Some(Ok(())),
+        "Tile" => Some(tile_payload()),
+        _ => None,
+    }
+}
 
 /// Apply EP claim policy to one optimized graph.
 ///
@@ -129,9 +144,12 @@ pub(crate) unsafe fn get_capability(
                     return false;
                 }
                 let view = NodeView::new(ort_api, raw_nodes_by_id[&node_id]);
-                if native_q8_attention_graph && matches!(view.op_type().as_str(), "Range" | "Tile")
+                if let Some(decision) =
+                    native_candidate_claim(native_q8_attention_graph, &view.op_type(), || {
+                        crate::ops::shape::tile_payload_dtype(&view).map(|_| ())
+                    })
                 {
-                    return true;
+                    return decision.is_ok();
                 }
                 claimable(&view)
             })
@@ -148,21 +166,60 @@ pub(crate) unsafe fn get_capability(
             .filter(|node| is_decoder_attention_anchor(&snapshot.nodes[node]))
             .collect::<Vec<_>>();
         let decoder_graph = !attention_anchors.is_empty();
-        let compile_class: Vec<CompilePartitionClass> = node_order
+        let packed_qdq_nodes = if decoder_graph {
+            packed_qdq_eager_nodes(
+                &snapshot,
+                &node_order,
+                &supported,
+                ort_api,
+                &raw_nodes_by_id,
+            )
+        } else {
+            HashSet::new()
+        };
+        let lookup_views = node_order
+            .iter()
+            .map(|&node| NodeView::new(ort_api, raw_nodes_by_id[&node]))
+            .collect::<Vec<_>>();
+        let lookup_regions: Vec<Vec<_>> =
+            crate::ops::lut4::partition_regions(&lookup_views, &supported)
+                .into_iter()
+                .map(|members| members.into_iter().map(|i| node_order[i]).collect())
+                .collect();
+        let lookup_nodes: HashSet<_> = lookup_regions.iter().flatten().copied().collect();
+        let mut compile_class: Vec<CompilePartitionClass> = node_order
             .iter()
             .map(|&node| {
                 let view = NodeView::new(ort_api, raw_nodes_by_id[&node]);
                 let metadata = &snapshot.nodes[&node];
                 let mod_boundary = metadata.domain.is_empty() && metadata.op_type == "Mod";
                 let nonzero_boundary = metadata.domain.is_empty() && metadata.op_type == "NonZero";
-                if crate::registry::requires_random_eager_boundary(&view)
+                let live_tile_boundary = crate::registry::requires_live_tile_eager_boundary(&view);
+                let native_live_tile = live_tile_boundary
+                    && native_q8_attention_graph
+                    && matches!(view.domain().as_str(), "" | "ai.onnx")
+                    && view.op_type() == "Tile"
+                    && view.subgraphs().is_empty();
+                let live_range_boundary =
+                    crate::registry::requires_live_range_eager_boundary(&view);
+                let native_live_range = live_range_boundary
+                    && native_q8_attention_graph
+                    && view.op_type() == "Range"
+                    && view.subgraphs().is_empty();
+                if lookup_nodes.contains(&node)
+                    || packed_qdq_nodes.contains(&node)
+                    || crate::registry::requires_random_eager_boundary(&view)
                     || crate::registry::requires_unique_eager_boundary(&view)
+                    || (live_range_boundary && !native_live_range)
                     || crate::registry::requires_elementary_contrib_eager_boundary(&view)
                     || crate::registry::requires_cdist_eager_boundary(&view)
                     || crate::registry::requires_inverse_eager_boundary(&view)
+                    || (live_tile_boundary && !native_live_tile)
                     || crate::registry::requires_float64_metadata_eager_boundary(&view)
                 {
                     CompilePartitionClass::Eager
+                } else if native_live_tile || native_live_range {
+                    CompilePartitionClass::Shapeless
                 } else if decoder_graph || mod_boundary || nonzero_boundary {
                     crate::registry::compile_shape_safety(&view).partition_class()
                 } else {
@@ -170,6 +227,12 @@ pub(crate) unsafe fn get_capability(
                 }
             })
             .collect();
+        // Capture colours serve no purpose when every plan executes eagerly.
+        // Keep dtype/convexity/claim boundaries while avoiding ORT fusion and
+        // host-array boundaries created solely for compiled capture modes.
+        if !crate::compiled::compile_enabled(false) {
+            compile_class.fill(CompilePartitionClass::Eager);
+        }
 
         let tr = crate::trace::tracer();
         let mut rejected: Vec<(String, usize, String, Vec<String>)> = Vec::new();
@@ -189,10 +252,15 @@ pub(crate) unsafe fn get_capability(
                              If/Loop/Scan, not individually"
                                 .to_string()
                         } else {
-                            crate::registry::claim_decision(&view)
-                                .err()
-                                .map(|cause| cause.into_owned())
-                                .unwrap_or_else(|| "declined (no reason reported)".to_string())
+                            native_candidate_claim(
+                                native_q8_attention_graph,
+                                &view.op_type(),
+                                || crate::ops::shape::tile_payload_dtype(&view).map(|_| ()),
+                            )
+                            .unwrap_or_else(|| crate::registry::claim_decision(&view))
+                            .err()
+                            .map(|cause| cause.into_owned())
+                            .unwrap_or_else(|| "declined (no reason reported)".to_string())
                         };
                     }
                     if entry.2.len() < 16 {
@@ -218,12 +286,13 @@ pub(crate) unsafe fn get_capability(
         let clusters = if mixed_vision_quant_graph {
             build_contiguous_clusters(&node_order, &supported, &float64, &compile_class)
         } else {
-            build_convex_clusters(
+            build_convex_clusters_with_regions(
                 &snapshot.ir,
                 &node_order,
                 &supported,
                 &float64,
                 &compile_class,
+                &lookup_regions,
             )
         };
         let layer_boundary_outputs = if in_cf_body {
@@ -280,9 +349,88 @@ pub(crate) unsafe fn get_capability(
             }
             claimed += cluster.len();
         }
+        log::debug!(
+            "capability: {claimed}/{} nodes in {} fused subgraphs",
+            node_order.len(),
+            clusters.len()
+        );
         tr.record_claim(claimed, node_order.len(), clusters.len(), &rejected);
         ptr::null_mut()
     }
+}
+
+fn packed_qdq_eager_nodes(
+    snapshot: &OrtGraphSnapshot,
+    order: &[onnx_runtime_ir::NodeId],
+    supported: &[bool],
+    api: *const ort::OrtApi,
+    raw_nodes: &HashMap<onnx_runtime_ir::NodeId, *const ort::OrtNode>,
+) -> HashSet<onnx_runtime_ir::NodeId> {
+    let supported: HashSet<_> = order
+        .iter()
+        .copied()
+        .zip(supported.iter().copied())
+        .filter_map(|(node, ok)| ok.then_some(node))
+        .collect();
+    let producers: HashMap<_, _> = order
+        .iter()
+        .flat_map(|&node| {
+            snapshot.nodes[&node]
+                .output_slots
+                .iter()
+                .flatten()
+                .map(move |&value| (value, node))
+        })
+        .collect();
+    let mut result = HashSet::new();
+    for &product in order {
+        if !supported.contains(&product) {
+            continue;
+        }
+        let view = NodeView::new(api, raw_nodes[&product]);
+        if !crate::ops::qdq::partition_product_candidate(&view) {
+            continue;
+        }
+        let inputs = &snapshot.nodes[&product].input_slots;
+        let producer = |slot: usize| {
+            inputs
+                .get(slot)
+                .copied()
+                .flatten()
+                .and_then(|value| producers.get(&value).copied())
+        };
+        let Some(weight) = producer(1).filter(|node| supported.contains(node)) else {
+            continue;
+        };
+        let Some(weight_packed) =
+            crate::ops::qdq::partition_dq_candidate(&NodeView::new(api, raw_nodes[&weight]), true)
+        else {
+            continue;
+        };
+        let mut activation = None;
+        let mut activation_packed = false;
+        if let Some(input) = producer(0) {
+            let metadata = &snapshot.nodes[&input];
+            if metadata.domain.is_empty() && metadata.op_type == "DequantizeLinear" {
+                if !supported.contains(&input) {
+                    continue;
+                }
+                let Some(packed) = crate::ops::qdq::partition_dq_candidate(
+                    &NodeView::new(api, raw_nodes[&input]),
+                    false,
+                ) else {
+                    continue;
+                };
+                activation = Some(input);
+                activation_packed = packed;
+            }
+        }
+        if weight_packed || activation_packed {
+            result.extend([product, weight]);
+            result.extend(activation);
+        }
+    }
+    result
 }
 
 fn select_layer_partition_span(value: Option<&str>, layer_count: usize) -> Option<usize> {
@@ -364,7 +512,182 @@ unsafe fn graph_metadata_value(
 
 #[cfg(test)]
 mod tests {
-    use super::select_layer_partition_span;
+    use super::{native_candidate_claim, select_layer_partition_span};
+    use crate::ops::shape::validate_tile_payload;
+    use crate::registry::{ClaimResult, SlotInfo};
+    use crate::sys::ort::*;
+
+    fn candidate_tile_claim(
+        input: Option<SlotInfo>,
+        output: Option<SlotInfo>,
+        since_version: i32,
+    ) -> ClaimResult {
+        native_candidate_claim(true, "Tile", || {
+            validate_tile_payload(
+                input
+                    .zip(output)
+                    .map(|(input, output)| (input.dtype, output.dtype)),
+                since_version,
+            )
+            .map(|_| ())
+        })
+        .expect("native Tile must take the override")
+    }
+
+    fn slot(dtype: ONNXTensorElementDataType, shape: &[i64]) -> Option<SlotInfo> {
+        Some(SlotInfo {
+            dtype,
+            shape: shape.to_vec(),
+        })
+    }
+
+    #[test]
+    fn native_tile_override_preserves_all_movable_payloads() {
+        for dtype in [
+            ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16,
+            ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
+            ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_DOUBLE,
+            ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16,
+            ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8,
+            ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT16,
+            ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32,
+            ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64,
+            ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8,
+            ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT16,
+            ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT32,
+            ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT64,
+            ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL,
+        ] {
+            // Shapes are deliberately not an admission input: [] also represents
+            // unknown-rank tensor metadata in SlotInfo, not absent metadata.
+            for shape in [&[][..], &[2, 3], &[-1, 3], &[0, 3], &[i64::MAX, 0]] {
+                assert_eq!(
+                    candidate_tile_claim(slot(dtype, shape), slot(dtype, shape), 13),
+                    Ok(()),
+                    "dtype {dtype}, shape {shape:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn native_tile_override_rejects_unsupported_or_missing_payload_metadata() {
+        let f32 = ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT;
+        let string = ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_STRING;
+        for (input, output) in [
+            (None, slot(f32, &[])),
+            (slot(f32, &[]), None),
+            (None, None),
+            (slot(string, &[]), None),
+            (None, slot(string, &[])),
+        ] {
+            assert_eq!(
+                candidate_tile_claim(input, output, 13).unwrap_err(),
+                "missing tensor type/shape info on the data input or output"
+            );
+        }
+        for dtype in [
+            ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_STRING,
+            ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_COMPLEX64,
+            ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_COMPLEX128,
+        ] {
+            for output in [dtype, f32] {
+                assert_eq!(
+                    candidate_tile_claim(slot(dtype, &[2]), slot(output, &[2]), 13).unwrap_err(),
+                    format!(
+                        "data dtype {} is not a movable dtype supported on GPU",
+                        crate::registry::ort_dtype_name(dtype)
+                    )
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn native_tile_override_preserves_mismatch_and_bfloat16_diagnostic_order() {
+        let bf16 = ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16;
+        let f32 = ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT;
+        for (input, output, version) in [
+            (bf16, f32, 6),
+            (bf16, f32, 13),
+            (f32, bf16, 13),
+            (
+                f32,
+                ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_STRING,
+                13,
+            ),
+            (
+                f32,
+                ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_COMPLEX64,
+                13,
+            ),
+            (
+                f32,
+                ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_COMPLEX128,
+                13,
+            ),
+        ] {
+            assert_eq!(
+                candidate_tile_claim(slot(input, &[]), slot(output, &[]), version).unwrap_err(),
+                format!(
+                    "output dtype {} must match data dtype {}",
+                    crate::registry::ort_dtype_name(output),
+                    crate::registry::ort_dtype_name(input)
+                )
+            );
+        }
+        assert_eq!(
+            candidate_tile_claim(slot(bf16, &[]), slot(bf16, &[]), 6).unwrap_err(),
+            "Tile: bfloat16 requires opset 13"
+        );
+        assert_eq!(
+            candidate_tile_claim(slot(bf16, &[]), slot(bf16, &[]), 13),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn native_override_is_lazy_and_does_not_run_the_full_tile_claim() {
+        for (candidate, op_type, expected) in [
+            (false, "Tile", None),
+            (false, "Range", None),
+            (true, "Range", Some(Ok(()))),
+            (true, "Add", None),
+        ] {
+            assert_eq!(
+                native_candidate_claim(candidate, op_type, || {
+                    panic!("must not evaluate the Tile payload guard")
+                }),
+                expected
+            );
+        }
+        let normal_called = std::cell::Cell::new(false);
+        let normal_claim = || -> ClaimResult {
+            normal_called.set(true);
+            Err("ordinary claim rejects geometry".into())
+        };
+        let dtype = ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64;
+        assert_eq!(
+            native_candidate_claim(true, "Tile", || {
+                validate_tile_payload(Some((dtype, dtype)), 13).map(|_| ())
+            })
+            .unwrap_or_else(normal_claim),
+            Ok(())
+        );
+        assert!(!normal_called.get());
+        assert_eq!(
+            native_candidate_claim(true, "Tile", || Err("payload rejected".into()))
+                .unwrap_or_else(normal_claim),
+            Err("payload rejected".into())
+        );
+        assert!(!normal_called.get());
+        assert_eq!(
+            native_candidate_claim(false, "Tile", || panic!("not native"))
+                .unwrap_or_else(normal_claim),
+            Err("ordinary claim rejects geometry".into())
+        );
+        assert!(normal_called.get());
+    }
 
     #[test]
     fn auto_layer_partition_span_scales_with_decoder_size() {

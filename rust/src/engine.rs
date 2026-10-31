@@ -36,6 +36,21 @@ pub struct InitData {
     pub owned: Option<std::sync::Arc<Vec<u8>>>,
 }
 
+pub(crate) fn packed4_signed(dtype: ort::ONNXTensorElementDataType) -> Option<bool> {
+    match dtype {
+        ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT4 => Some(true),
+        ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT4 => Some(false),
+        _ => None,
+    }
+}
+
+/// Packed storage is never an ordinary MLX tensor of the logical ONNX shape.
+pub(crate) struct Packed4 {
+    pub data: mlxsys::mlx_array,
+    pub shape: Vec<i32>,
+    pub signed: bool,
+}
+
 /// A single node input reference.
 #[derive(Clone)]
 pub struct TensorRef {
@@ -162,6 +177,9 @@ pub struct NodeDesc {
     pub outputs: Vec<OutRef>,
     /// Body subgraphs for a control-flow node (If/Scan/Loop). Empty for every ordinary op.
     pub subgraphs: Vec<SubgraphDesc>,
+    /// Recognized DQ operands for a private quantized kernel, never a public ONNX op.
+    pub(crate) qdq: Option<Box<crate::ops::qdq::QuantizedMatMul>>,
+    pub(crate) lut4: Option<Box<crate::ops::lut4::LookupMatMul>>,
 }
 
 impl NodeDesc {
@@ -188,6 +206,8 @@ impl NodeDesc {
             inputs: Vec::new(),
             outputs: Vec::new(),
             subgraphs: Vec::new(),
+            qdq: None,
+            lut4: None,
         }
     }
 }
@@ -733,8 +753,12 @@ pub struct TranslationContext<'a> {
     stream: mlxsys::mlx_stream,
     /// name -> raw handle (borrowed; owned by `arena` or the plan cache).
     env: HashMap<String, mlxsys::mlx_array>,
-    /// All arrays produced this run; freed together on drop (RAII, no per-site frees).
+    /// Arrays produced during translation. Boundary roots retain their own references before
+    /// these handles are released, allowing MLX to recycle intermediates during eager eval.
     arena: Vec<Array>,
+    /// Runtime input wrappers stay referenced through eval, preventing donation of caller-owned
+    /// zero-copy buffers when intermediate handles are released.
+    input_arena: Vec<Array>,
     /// Per-translation cast CSE. This is intentionally scoped to one graph build: runtime inputs
     /// must never be retained across Compute calls, while repeated Q/K/V and gate/up projections
     /// should share one explicit activation cast inside the compiled closure.
@@ -806,6 +830,7 @@ impl<'a> TranslationContext<'a> {
             stream,
             env: HashMap::new(),
             arena: Vec::new(),
+            input_arena: Vec::new(),
             astype_cache: HashMap::new(),
             path_mark: None,
             trace_enabled: crate::trace::tracer().is_enabled(),
@@ -869,6 +894,12 @@ impl<'a> TranslationContext<'a> {
     pub fn keep(&mut self, a: Array) -> mlxsys::mlx_array {
         let raw = a.as_raw();
         self.arena.push(a);
+        raw
+    }
+
+    fn keep_input(&mut self, a: Array) -> mlxsys::mlx_array {
+        let raw = a.as_raw();
+        self.input_arena.push(a);
         raw
     }
 
@@ -1027,7 +1058,7 @@ impl<'a> TranslationContext<'a> {
                     // mode where the per-token past K/V is a full [B,kv,cap,hd] buffer that
                     // `from_data` used to memcpy every token.
                     let arr = Array::from_data_managed(data, &ishape, mlx_dtype_from_onnx(dtype));
-                    let raw = self.keep(arr);
+                    let raw = self.keep_input(arr);
                     self.env.insert(r.name.clone(), raw);
                     Ok(raw)
                 }
@@ -1065,6 +1096,100 @@ impl<'a> TranslationContext<'a> {
             }
             Src::Absent => Err("MLX: absent input".to_string()),
         }
+    }
+
+    pub(crate) fn packed4_host(&self, r: &TensorRef) -> Result<Option<HostBytes>, MlxError> {
+        if !matches!(r.source, Src::Initializer | Src::CtxInput) {
+            return Ok(None);
+        }
+        if self.in_general_trace || self.in_compiled_trace {
+            if r.init
+                .as_ref()
+                .is_some_and(|init| packed4_signed(init.dtype).is_some())
+            {
+                return Err("MLX: packed tensor transport cannot be captured".into());
+            }
+            return Ok(None);
+        }
+        let host = self.raw_host(r)?;
+        Ok(packed4_signed(host.dtype).map(|_| host))
+    }
+
+    pub(crate) fn resolve_packed4(&mut self, r: &TensorRef) -> Result<Option<Packed4>, MlxError> {
+        let Some(host) = self.packed4_host(r)? else {
+            return Ok(None);
+        };
+        let Some(signed) = packed4_signed(host.dtype) else {
+            return Err("MLX: packed tensor metadata lost its logical type".into());
+        };
+        let shape = host
+            .shape
+            .iter()
+            .map(|&d| dim_i32(d))
+            .collect::<Result<Vec<_>, _>>()?;
+        let count = if shape.contains(&0) {
+            0
+        } else {
+            shape.iter().try_fold(1usize, |n, &d| {
+                n.checked_mul(d as usize)
+                    .ok_or("MLX: packed tensor element count overflows")
+            })?
+        };
+        if count != host.count || count > (i32::MAX - 1) as usize {
+            return Err(
+                "MLX: packed tensor logical count is inconsistent or exceeds int32 limits".into(),
+            );
+        }
+        let bytes = onnx_runtime_ir::DataType::from_onnx(host.dtype as i32)
+            .and_then(|dtype| dtype.checked_storage_bytes(count))
+            .ok_or("MLX: packed tensor byte count overflows")?;
+        if r.source == Src::CtxInput {
+            let value = read_ctx_input_value(self.ort_api, self.kctx, r.ctx_index)?;
+            let api = unsafe { &*self.ort_api };
+            let mut actual_bytes = 0;
+            let size_in_bytes = api
+                .GetTensorSizeInBytes
+                .ok_or("MLX: packed tensors require ORT GetTensorSizeInBytes")?;
+            ort_status(
+                api,
+                unsafe { size_in_bytes(value, &mut actual_bytes) },
+                "GetTensorSizeInBytes",
+            )?;
+            if actual_bytes != bytes {
+                return Err("MLX: packed ORT storage size does not match logical shape".into());
+            }
+        }
+        if let Some(owned) = r.init.as_ref().and_then(|init| init.owned.as_ref())
+            && owned.len() != bytes
+        {
+            return Err("MLX: packed initializer byte count does not match logical shape".into());
+        }
+        if bytes != 0 && host.data.is_null() {
+            return Err("MLX: nonempty packed tensor has no payload".into());
+        }
+        let storage_shape = [bytes as i32];
+        let cache_key = format!("{}\0packed4", r.cache_key());
+        let data = if let Some(array) = self.plan.cache.get(&cache_key) {
+            array.as_raw()
+        } else if bytes == 0 {
+            self.zeros(&storage_shape, mlxsys::mlx_dtype__MLX_UINT8)?
+        } else if r.source == Src::Initializer || r.constant {
+            let array = Array::from_data(host.data, &storage_shape, mlxsys::mlx_dtype__MLX_UINT8);
+            let raw = array.as_raw();
+            self.plan.cache.insert(cache_key, array);
+            raw
+        } else {
+            self.keep_input(Array::from_data_managed(
+                host.data,
+                &storage_shape,
+                mlxsys::mlx_dtype__MLX_UINT8,
+            ))
+        };
+        Ok(Some(Packed4 {
+            data,
+            shape,
+            signed,
+        }))
     }
 
     /// Read a constant/parameter input's HOST bytes at translate time (shape/axes/indices operands).
@@ -2075,6 +2200,10 @@ impl<'a> TranslationContext<'a> {
         self.plan.native_attention_decode
     }
 
+    pub(crate) fn is_capturing(&self) -> bool {
+        self.in_general_trace || self.in_compiled_trace || self.rope_dynamic
+    }
+
     /// Take the shared-buffer KV `present` outputs discovered during the compiled trace, handing them
     /// to the core so it can store them on the traced `CompiledSubgraph` slot. Leaves the list empty.
     pub(crate) fn take_compiled_kv_present(&mut self) -> Vec<(String, usize)> {
@@ -2209,7 +2338,7 @@ impl<'a> TranslationContext<'a> {
         // Collect boundary outputs, cast each to its ORT output dtype BEFORE eval so copy-out is a
         // straight typed memcpy, then eval the whole graph in one shot.
         let mut outs = VectorArray::new();
-        let mut ext: Vec<(OutRef, mlxsys::mlx_array)> = Vec::new();
+        let mut ext: Vec<OutRef> = Vec::new();
         for node in nodes {
             for o in &node.outputs {
                 if o.external
@@ -2222,13 +2351,23 @@ impl<'a> TranslationContext<'a> {
                     // consuming kernels; only actual subgraph outputs pay a contiguous copy.
                     let casted = self.contiguous(casted)?;
                     outs.append(casted);
-                    ext.push((o.clone(), casted));
-                }
-                for &(_, a, _) in &self.input_writebacks {
-                    outs.append(a);
+                    ext.push(o.clone());
                 }
             }
         }
+        let mut writebacks = Vec::with_capacity(self.input_writebacks.len());
+        for &(dst, a, bytes) in &self.input_writebacks {
+            let index = outs.size();
+            outs.append(a);
+            writebacks.push((dst, index, bytes));
+        }
+        // VectorArray owns references to every boundary root, whose lazy graphs keep their
+        // dependencies alive. Per-node handles must not pin every intermediate allocation
+        // after its final consumer has executed (notably large unpacked lookup matrices).
+        self.env.clear();
+        self.astype_cache.clear();
+        self.input_writebacks.clear();
+        self.arena.clear();
         // The single synchronous `mlx_eval` boundary: with tracing on this is wrapped
         // in the `mlx.eval` (cat "gpu") span, whose CPU wall time is the GPU-inclusive
         // time of the whole fused subgraph (MLX blocks here until the GPU work lands).
@@ -2252,11 +2391,12 @@ impl<'a> TranslationContext<'a> {
             tr.record_phase("eval", t0.elapsed());
         }
         tr.sample_gpu_counters();
-        for (o, a) in &ext {
-            self.copy_out(o, *a)?;
+        for (index, o) in ext.iter().enumerate() {
+            let a = outs.get(index);
+            self.copy_out(o, a.as_raw())?;
         }
-        for &(dst, a, bytes) in &self.input_writebacks {
-            let arr = std::mem::ManuallyDrop::new(Array::from_raw(a));
+        for &(dst, index, bytes) in &writebacks {
+            let arr = outs.get(index);
             unsafe {
                 std::ptr::copy_nonoverlapping(arr.data_bytes(), dst as *mut u8, bytes);
             }

@@ -33,7 +33,10 @@ If a node is unsupported, ambiguous, or only supported by the old hand-kernel pa
 
 ### 1.2 Fuse
 
-Claimed nodes are grouped into maximal convex connected ORT partitions for the plugin EP. The design goal is a fused decoder subgraph rather than a sequence of per-op custom kernel launches.
+Claimed nodes are grouped into maximal convex connected ORT partitions for the plugin EP.
+If interleaved groups create a cyclic quotient, topological contiguous runs retain every
+supported node while preserving dtype and compile-class boundaries. The resulting fused
+regions have an acyclic dependency graph.
 
 ### 1.3 Compile
 
@@ -70,6 +73,7 @@ The following table is the current support contract. Do not broaden claims witho
 | **NonZero** | `ai.onnx` | schema 9/13; bool, all 8/16/32/64-bit signed/unsigned integers, fp16/fp32/fp64 and (schema 13) bf16 | provider-owned exact eager host scan + int64 MLX output | Live payload determines row-major coordinates and `[rank, count]` shape on every call. Scalar output is `[0, count]` per ONNX, unlike ORT 1.31 CPU's `[1, count]`. |
 | **Unique** | `ai.onnx` | schema 11; bool, all 8/16/32/64-bit signed/unsigned integers, fp16/fp32/fp64; flat or axis slices, scalar/unknown rank/empty shapes, all optional outputs | provider-owned exact eager host sort/group + byte-preserving MLX outputs | [Contracts and authority limits](UNIQUE.md). Live cardinality and exact metadata; recursive eager parent boundaries. Legal NaNs use deterministic NaN-last sorting; NumPy half-axis ordering disagreement is explicit. Future28 dispatch is preserved; bf16 Unique28 remains unclaimed/unvalidated. Native validation pending. |
 | **MatMul** | `ai.onnx` | rank >=1 floating operands, including vector-vector, vector-matrix and batched vector forms | `mlx_matmul` | ONNX vector promotion/squeezing and batch broadcasting are native MLX semantics. Empty contraction dimensions, empty batches and symbolic extents are supported. Float64 uses the isolated MLX CPU stream; integer MatMul stays on ORT CPU. |
+| **GroupedMatMul** | `ai.onnx`, schema 29 (unreleased) | X[M,K], W[G,K,N], indices[M,S] int32/int64, optional bias[G,N]; matching fp16/bf16/fp32/fp64 data | GPU `mlx_gather_mm`; typed CPU gather + matmul | Output [M,S,N]. Eager live index validation rejects negative/out-of-range/full-width-overflow routes before dispatch. Empty M/S/K/N and unused/repeated experts retain ONNX semantics. Source implementation and direct handler tests; ORT 1.31 cannot load this schema. |
 | **CDist** | `com.microsoft` | v1; homogeneous `fp32`/`fp64` rank-two A[M,N], B[K,N]; default/explicit `sqeuclidean` or `euclidean`; C[M,K] | provider-owned eager typed host distances | [Contracts, resource bounds and remaining metrics](CDIST.md). Direct differences; no [M,K,N] workspace. No ORT CPU fallback or GPU-acceleration claim; recursive eager boundary, unchanged DOUBLE-body restrictions. |
 | **Inverse** | `com.microsoft` | v1; homogeneous `fp32`/`fp64` rank >=2, square final axes, same-shape output, no attributes | eager `mlx_linalg_inv` on the run thread's reused default MLX CPU stream | [Contracts and limits](INVERSE.md). Typed LAPACK, explicit nonfinite-input errors, checked empty short-circuit and synchronous native errors; zero-trip Scan shape templates, recursive eager parent boundary, unchanged context stream and DOUBLE-body rejection. FLOAT16 promotion remains OPEN. |
 | **FusedMatMul** | `com.microsoft`, schema 1 | matching fp16/fp32/fp64/bf16 A/B/Y, alpha and all four transpose flags | transpose + `mlx_matmul` + scale | Batch transpose rotates axis 0 behind all batch axes, before last-two transpose; either batch flag requires equal ranks >=3, matching ORT's compute helper. Vector last-two transpose is a no-op. Narrow scaling uses a dtype-rounded alpha and FP32 product/scaling before the final output cast, avoiding an intermediate fp16/bf16 result. Empty-result materialization uses shape-keyed compilation. Float64 retains the existing isolated MLX CPU stream. Source implementation and fixtures only; runtime/compiled evidence pending. |
@@ -89,7 +93,123 @@ The following table is the current support contract. Do not broaden claims witho
 | **Conv** | `ai.onnx` | rank-3/4, static positive W shape; symbolic X batch/channel/spatial dimensions allowed | MLX conv1d/conv2d/conv_general | W and group determine the required input channels; concrete channels are checked at execution. |
 | **RNN / GRU / LSTM** | `ai.onnx` | layout=0, default activations, no sequence_lens; symbolic sequence length allowed | shape-keyed unrolling | Each concrete input shape gets its own trace. Empty sequences preserve initial states and produce an empty Y. |
 | **Dropout** | `ai.onnx` | Versioned floating data, optional ratio/training controls and mask; legacy `is_test` | identity/ones for inference, uniform sampling and scaled masking for training | Opsets 1/6 honor `is_test`; 7/10 retain inference behavior because they provide no per-node training selector. Mask dtype follows the schema (data dtype before opset 10, bool thereafter). Modern controls are live scalar tensors, including intermediate producers; inference ignores the ratio value. BF16 data requires opset 13 and BF16 ratio requires opset 22. Training is an eager partition boundary, preserving compiled neighbors and fresh default keys; explicit INT64 seed bits are preserved. Float64 data uses the MLX CPU stream. |
-| **RandomNormal / RandomNormalLike / RandomUniform / RandomUniformLike / Bernoulli / Multinomial** | `ai.onnx` | Existing versioned dtype/attribute restrictions; Like reads tensor geometry only; Bernoulli accepts float32/float16 probabilities and bfloat16 since schema 22, including explicit DOUBLE output | MLX random primitives | Unseeded forms are eager partition boundaries: each call consumes the live default key, including empty draws. Explicit float-seed forms retain the finite/non-negative/<2^64 claim guard and literal integer truncation; they remain fixed-key and shape-keyed when eligible. Bernoulli preserves its native bool draw and casts 0/1 exactly to the requested output type; DOUBLE output selects the existing CPU-stream eager path, not a higher-precision probability sampler. DOUBLE probabilities remain declined. Like's metadata claim accepts every legal input type in schema 1/22, including string/complex/double with explicit float32/float16 output dtype, without converting its payload; non-MLX input types remain eager even with a seed. [ORT 1.31 initializer sizing](https://github.com/microsoft/onnxruntime/blob/v1.31.0/onnxruntime/core/framework/tensorprotoutils.cc#L1402-L1437) rejects complex initializers, as seen in [hosted run 39913638545](https://github.com/onnxruntime/onnxruntime-ep-mlx/actions/runs/39913638545/job/120282096717): these cases assert the exact session-initialization error against an independent CPU Shape control, not RNG execution. Scalar, empty and unknown-rank Like geometry is checked without narrowing wide dimensions. Recursive eager boundaries preserve neighboring deterministic compilation; control-flow bodies performing DOUBLE payload computation remain declined. Normal/Uniform bfloat16/DOUBLE outputs, full-precision DOUBLE sampling and extreme uniform endpoints remain separate coverage gaps. |
+| **RandomNormal / RandomNormalLike / RandomUniform / RandomUniformLike / Bernoulli / Multinomial** | `ai.onnx` | Existing versioned dtype/attribute restrictions; Like reads tensor geometry only; Normal supports bfloat16 output since schema 22; Bernoulli accepts float32/float16/float64 probabilities since schema 15 and bfloat16 since schema 22, with default or explicit native numeric/Boolean outputs | MLX random primitives | Unseeded forms are eager partition boundaries: each call consumes the live default key, including empty draws. Explicit float-seed forms retain the finite/non-negative/<2^64 claim guard and literal integer truncation; they remain fixed-key and shape-keyed when eligible. Normal's bfloat16 path keeps one existing F32 standard-normal draw/key on the context stream, then uses the current thread's existing default MLX CPU stream for F32 multiplication by the original FLOAT scale, F32 addition of the original FLOAT mean, and the final bfloat16 cast. This is provider-owned CPU affine execution, not an all-GPU path or ORT CPU fallback. It completes evaluation and checks CPU synchronization before exposing the result to consumers, also checking synchronization after construction/evaluation errors. This default stream can share other same-thread work; no exclusive ownership, new per-plan stream/worker/pool, or exhaustive native-error isolation is claimed. BF16 Normal/NormalLike and their recursive parents are eager even when seeded; old float32/float16 compilation behavior is unchanged. Parameters and intermediate samples are not pre-rounded to bfloat16; no new sampler, F64 Normal route or exact-real/higher-precision guarantee is introduced. Ordinary F32 arithmetic and final bfloat16 rounding can overflow or underflow; finite attributes do not guarantee finite outputs, and actual subnormal, signed-zero and cross-stream fidelity require runtime qualification. NormalLike defaults to the input dtype, including bfloat16 since schema 22; RandomNormal still defaults to float32. Bernoulli preserves its native bool draw and casts 0/1 exactly to the requested output type, including uint64 and DOUBLE. DOUBLE input or output selects the existing provider-owned MLX CPU-stream eager path, not ORT CPU fallback. Original DOUBLE probabilities are not downcast: native uint32 bits are compared in F64 against the F64 product of p and the native F32 upper constant (2^32+512). This preserves the native finite 32-bit draw/threshold policy, not a new sampler, 53-bit uniform resolution, exact-real probability guarantee, or cross-provider seeded sequence contract. The default output dtype remains the input dtype. Like's metadata claim accepts every legal input type in schema 1/22, including string/complex/double with explicit float32/float16 output dtype (also bfloat16 for NormalLike since schema 22), without converting its payload; non-MLX input types remain eager even with a seed. [ORT 1.31 initializer sizing](https://github.com/microsoft/onnxruntime/blob/v1.31.0/onnxruntime/core/framework/tensorprotoutils.cc#L1402-L1437) rejects complex initializers, as seen in [hosted run 39913638545](https://github.com/onnxruntime/onnxruntime-ep-mlx/actions/runs/39913638545/job/120282096717): these cases assert the exact session-initialization error against an independent CPU Shape control, not RNG execution. Scalar, empty and unknown-rank Like geometry is checked without narrowing wide dimensions. Recursive eager boundaries preserve neighboring deterministic compilation; control-flow bodies performing DOUBLE payload computation remain declined. Uniform bfloat16 output, Normal/Uniform DOUBLE outputs, full-precision DOUBLE uniform sampling and extreme uniform endpoints remain separate coverage gaps. |
+
+### GroupedMatMul and direct QDQ products
+
+The GroupedMatMul contract is the merged ONNX
+[`0834d5e`](https://github.com/onnx/onnx/blob/0834d5e3a5c41e6e3c36a6853e7540e81c704d07/onnx/defs/math/defs.cc),
+including its standard-operator function decomposition and float64 support. The pinned
+MLX GatherMM CPU kernel accepts only float32; the typed CPU fallback uses ordinary
+Matmul (double GEMM for float64), not a narrowing cast. GPU routing does not construct
+a gathered [M,S,K,N] expert-weight tensor.
+
+`qdq.rs` recognizes default-domain DequantizeLinear weights feeding MatMul or
+GroupedMatMul, optionally recognizing activation DQ too. On Metal, rank-two activations
+and rank-two dense/rank-three expert int4/uint4/int8/uint8 weights with float32 scale/output use a
+private direct kernel. Per-tensor, per-axis (including negative axes), and blocked
+parameters are indexed in their original ONNX layouts; live weights, scales and zero
+points are never cached as constants. Weights need not be initializers. Activation
+QuantizeLinear and output Q/DQ remain in the graph. Shared DQ consumers and graph outputs
+are retained; MLX laziness avoids evaluating unused dequantized tensors.
+
+For K <= 256 with both operands quantized, static positive power-of-two scales in
+[2^-40,2^40], and scale/zero-point layouts constant along K, the kernel uses an exact
+int32 dot before scaling. Each centered integer lies in [-255,255]; every partial
+absolute sum is at most 16,646,400 < 2^24. DQ values, products and all partial sums are
+exact normal float32 values under the exponent guard. Both final binary scalings remain
+exact, finite and normal (or zero). Bias is added separately after the matrix result.
+
+The general path reads quantized bytes directly, performs float32 DQ rounding in
+registers, then uses SIMD-distributed float32 accumulation. With either packed operand,
+it compensates rounded products using FMA residuals and TwoSum errors, including
+the 32-lane reduction, before rounding the dot to float32. Bias is added only after
+that rounding. The original FMA/SIMD sum is retained for the entire output if any
+lane's operand, product, compensated partial/correction, or reduction becomes
+nonfinite, or if the original reduction is nonfinite. Thus it preserves the
+original exceptional arithmetic rather than promising exact-real recovery after
+intermediate overflow. Underflow can lose product residuals; Metal subnormal fidelity
+and blanket correctly-rounded dots are not claimed. Ordinary INT8/UINT8 general
+arithmetic and the proven integer subset are unchanged.
+It supports realistic K and blocked scales, but is **not integer-only ALU or broadly
+bit-exact**. Finite packed regression references independently accumulate exact
+products of the already-float32-rounded DQ operands using binary integer
+coefficients, then round the sum to float32 with ties to even. Existing
+`rtol=1e-5, atol=1e-6` thresholds are unchanged. Original NumPy float32 reductions
+remain named disagreement diagnostics: neither their reduction order nor a fitted
+output is the oracle. Exceptional regressions separately check the retained
+float32 overflow/NaN/Inf behavior. This source change still requires hosted
+qualification; earlier failing CI and numerical evidence are retained.
+No expanded floating activation or
+weight matrix is produced by this kernel. This is not MLX's affine QMM rewrite:
+that kernel's scale-after-dot/bias correction can change ONNX DQ overflow/cancellation
+semantics. Non-float32 DQ, vector/batched MatMul, and CPU streams use ordinary DQ
+and the existing unfused matrix-product path. `ONNXRUNTIME_EP_MLX_NO_QDQ_FUSION=1` disables
+recognition for same-binary comparisons. Nonempty dispatched products expose
+`mlx_qdq_integer_matmul` or `mlx_qdq_matmul` in `op.fast` trace events; products
+with either packed operand expose `mlx_qdq_packed4_integer_matmul` or
+`mlx_qdq_packed4_matmul`, respectively. These names identify dispatch, not measured
+speedup.
+
+Packed INT4/UINT4 support starts at DequantizeLinear-21. Its
+[versioned schema](https://github.com/onnx/onnx/blob/0834d5e3a5c41e6e3c36a6853e7540e81c704d07/onnx/defs/quantization/old.cc)
+and [tensor storage definition](https://github.com/onnx/onnx/blob/0834d5e3a5c41e6e3c36a6853e7540e81c704d07/onnx/onnx.in.proto)
+define globally flattened, low-nibble-first packing with ceil(N/2) bytes; there is
+no row or expert padding. INT4 uses two's complement, not a biased unsigned code.
+The [ORT Int4x2 transport](https://github.com/microsoft/onnxruntime/blob/v1.23.0/include/onnxruntime/core/framework/int4.h)
+uses that same layout. Private kernels extract data and zero-point nibbles at their
+logical indices, including odd K, odd expert boundaries, and blocked tails, without
+an expanded integer or floating weight tensor. Packed and byte operand types may
+be mixed; missing zero points are logical zero for the original ONNX input type.
+
+Only initializers and ORT boundary inputs carry packed storage. An explicit resolver
+keeps their logical shape and signedness separate from the one-dimensional MLX byte
+array; generic dtype mapping, movement operators, QuantizeLinear packed outputs, and
+copy-out are not broadened. Live input byte counts are checked with ORT
+`GetTensorSizeInBytes`; owned initializers use the IR's checked storage size.
+Logical dimensions and unpack indexing must fit int32 (at most 2^31-2 elements).
+Ordinary DQ supports scalar, per-axis and statically valid blocked parameters,
+float32/float16/bfloat16 output, scalar data and empty per-tensor/per-axis data.
+Empty blocked geometry remains unclaimed under the existing block validator.
+It unpacks only for legitimate unfused/shared consumers. Packed DQ is eager-only,
+including nested-body capture checks; compiled input wrapping also rejects packed
+types before treating a logical shape as a byte-array shape. Unsupported matrix
+forms still use ordinary DQ rather than reinterpreting storage or approximating it.
+
+**Decoder co-location:** capability classification ordinarily uses per-node compile
+classes when it sees any `com.microsoft::PagedAttention`, or default-domain
+`Attention` / contrib `GroupQueryAttention` / `MultiHeadAttention` with both
+present-cache output slots 1 and 2 populated. Without pattern integration, packed
+DQ's Eager class and FP32 MatMul's Shapeless class would prevent their union.
+The packed pattern now places only already-claimable, direct FP32 DQ producers
+and their eligible default MatMul / GroupedMatMul-29 consumer in the existing
+Eager class. It requires rank-two activations, rank-two/rank-three weights as
+appropriate, FP32 scales/output, INT4/UINT4/INT8/UINT8 quantized operands, and at
+least one packed operand. The signature predicates are shared with runtime
+recognition; ordinary claims validate types/parameters first, and execution
+independently revalidates live geometry and the GPU device.
+
+All surrounding compile classes, attention-anchor detection, NativeRoPE routing,
+convex/contiguous algorithms, unsupported-node barriers and explicit/inferred layer
+cuts remain unchanged. Existing eligible Eager neighbors can join under those same
+convexity/dtype rules; a class label is not a separate hard island boundary. Shared
+DQ consumers still receive their original floating results, and an explicit layer
+cut that separates the product from DQ is respected (ordinary DQ/matmul then runs).
+Vector/batched, non-FP32 and unclaimable patterns are not promoted to packed-product
+regions. Current-runtime decoder-shaped regression source connects packed MatMul
+to cached Attention-24 with both present outputs, checks repeated live packed data
+and shared results against independent references, and asserts actual eager
+DQ/product co-location plus private dispatch with fusion enabled, absence with
+fusion disabled, and no promotion for vector MatMul. This is bounded integration,
+not a claim of full quantized-MoE model coverage or a positive GroupedMatMul-29
+ORT session.
+
+**Runtime qualification:** ORT v1.31.0 pins ONNX v1.22.0 in `cmake/deps.txt`, predating
+GroupedMatMul-29. The Rust direct-handler tests exercise implementation code, not an
+ORT opset-29 session. The Python QDQ tests exercise ordinary MatMul at opset 24.
+Real GroupedMatMul model loading remains blocked until a runtime is independently
+verified to include the merged schema; no global unreleased-opset override, custom
+domain relabeling, or dependency substitution is introduced.
 
 The FusedMatMul source contract follows immutable ORT
 [`402979ac`](https://github.com/microsoft/onnxruntime/tree/402979ac1bef89dcd55add41eaa7277c407599eb):
@@ -109,10 +229,50 @@ Tests in `tests/ops/test_fused_matmul.py` cover default/eager requests, not yet 
 or CPU-stream execution. Absence of an earlier native registration does not establish a
 baseline failure: ORT expansion/rewrites and actual placement still require admitted execution.
 
-Runtime-bounded **Range** and runtime-repeat **Tile** remain on ORT CPU. Their parameter values
-determine output extents and cannot safely be baked into a shape/dtype-keyed closure. Constant
-initializer forms remain supported. These coverage changes do not reproduce or establish a speedup
-for the Nemotron streaming workload in issue #10.
+Runtime-bounded INT64 **Range** and modern runtime-repeat **Tile** use eager MLX
+translation: live values determine output extents and are refreshed before compiled consumers.
+Constant initializer forms remain supported. The exact native-attention position proof
+preserves its existing Range/Tile capture exception.
+
+Modern **Tile-6/13** INT64 repeats use checked rank-one/cardinality, nonnegative
+full-width per-axis multiplication, native int32 output extents and checked element/byte bounds.
+Every axis is validated even when another axis is zero. Valid empty results use typed zeros
+before importing data or narrowing repeats; `0 * INT64_MAX` is zero, not an overflowing repeat.
+Scalar data requires a rank-one empty repeats vector and is an identity. Known declared output
+dimensions must agree; unknown rank/extents remain live metadata, not frozen scalar/zero values.
+Movable real numeric/bool payloads retain their dtype (BF16 since schema 13, DOUBLE on the
+existing MLX CPU stream); string, complex and encoded transports remain gaps.
+
+The pinned MLX Tile implementation constructs concrete reshape/broadcast/reshape targets.
+With constant repeats, fixed nonempty geometry and scalar identity are capture-safe; symbolic,
+unknown-rank and potentially empty forms are shape-keyed. Known wide input metadata canceled by zero repeats
+is eager-only so compilation cannot pre-import an unrepresentable input. Actual ORT boundary
+acceptance of extreme empty metadata is separate from the checked geometry contract.
+Live boundary and produced repeats are reread on every eager invocation after rank, cardinality
+and INT64 metadata validation; the returned value count must match the metadata. Unknown metadata
+is deferred to runtime. Generic live Tiles and recursively containing parents are eager partition
+boundaries; eligible neighbors retain their own compile routes. They are not added to generic
+host-parameter value keys, and even shape-constant live repeats cannot be captured.
+The existing native RoPE identity condition and Range/Tile Q8/position proofs are unchanged.
+Only the sole top-level live Tile owned by `Plan::new`'s exact native-attention proof regains
+its prior shapeless descriptor, after that proof and before route selection. The broad Q8
+capability override preserves the candidate partition, not capture permission. Native Tile
+admission shares the ordinary Tile payload validator: both tensor metadata records are required,
+the input must be movable, the output dtype must match, and BF16 requires effective schema 13.
+Unknown rank/extents are not missing tensor metadata. This payload-only guard does not re-run
+ordinary repeats or geometry checks or alter the Range exception or native detector/proof.
+Near misses and nested live Tiles stay eager; translation defensively rejects capture after
+the native shortcut.
+Legacy Tile-1 has a distinct three-input signature and remains a separate authority/support
+gap, not a modern alias or a demonstrated backend impossibility. These are bounded source
+contracts and regression fixtures, not proof of every combination or physical GPU execution.
+Live-repeat fixtures are source-only pending independently authorized CI qualification.
+The native-admission source regression imports opset 14 (effective Tile schema 13) and retains
+an unrelated constant-INT64-repeat string/complex Tile as a graph output with optimizations
+disabled. Capability traces require the supported live INT64 Range and Tile to remain admitted
+with an unrelated constant-repeat Tile. Rust plan tests separately guard the exact
+native-position capture exception. These assertions have
+not been executed locally and are not device reproduction or numerical evidence.
 
 **NonZero** uses exact original representations, not float32 conversions: signed floating zeros
 are false, NaNs/infinities/subnormals are true, and large integers retain all bits. Empty tensors
@@ -381,15 +541,15 @@ produce a negative final chunk. Empty partitions follow ONNX shape inference,
 the reference, and equivalent explicit-size partitions, even where ORT 1.31's
 `num_outputs` kernel rejects them.
 
-Constant int64 `Range` bounds and values are generated with checked integer
-arithmetic, not through floating-point start/step arguments. All three bounds
+INT64 `Range` values are generated with checked integer arithmetic. Live bounds
+are reread in an eager partition before downstream compiled consumers. All three bounds
 must be scalars, the output length must fit native int32 geometry, and its
-exact count must agree with ORT's inferred extent. Full-width bounds with small
+exact count must agree with ORT's inferred extent for constant bounds. Full-width bounds with small
 spans follow the ONNX function, including cases where ORT 1.31's native kernel
 incorrectly returns empty. Forms whose exact count disagrees with the inferred
-extent remain unclaimed rather than capturing an incorrect shape. Runtime
-bounds and float64 `Range` remain open coverage partitions, not proven backend
-limitations.
+extent remain unclaimed. Live INT64 bounds support positive/negative steps,
+empty results, full-width values and error recovery; invalid geometry raises
+an EP error. Other Range dtypes continue to require constant scalar bounds.
 
 `BatchNormalization` implements versioned inference and training, including
 legacy version-7 nonspatial features and version-9 rank-one inputs (`C=1`).
@@ -434,7 +594,8 @@ The **core Rust modules** register:
 | `shape.rs` | Gather/scatter, reshape/layout, crop/pad, depth/space transforms, Resize/Upsample, Compress, ReverseSequence, EyeLike |
 | `norm.rs` | RMS/Layer/Group/Instance/Batch/Lp normalization, LRN, Microsoft skip-norm variants |
 | `attention.rs` | GroupQueryAttention, Attention (opset 23 & 24), MultiHeadAttention, RotaryEmbedding |
-| `matmul.rs` | MatMul, Gemm, com.microsoft::FusedMatMul |
+| `matmul.rs` | MatMul, GroupedMatMul, Gemm, com.microsoft::FusedMatMul |
+| `qdq.rs` | Private QDQ matrix-product recognition and direct packed int4/uint4 and int8/uint8 Metal kernels |
 | `conv.rs` | Conv/ConvTranspose/DeformConv and local/global pooling |
 | `quant.rs` | MatMulNBits, GatherBlockQuantized, Quantize/Dequantize/DynamicQuantize, MatMulInteger, ConvInteger, QLinearMatMul, QLinearConv |
 | `ssm.rs` | TensorScatter (opset 24), CausalConvWithState, LinearAttention (linear/gated/delta/gated_delta, GQA) |
@@ -796,3 +957,18 @@ For the data that justified the pivot, see [`docs/MLX_EVALUATION.md`](./MLX_EVAL
 | Additional decoder ops | Not claimed unless/until an MLX translation and tests are added. |
 | Further fp32 drift analysis | Current drift is accepted after the first 14 CPU-matching tokens; keep monitoring with E2E tests. |
 | Broader model-family coverage | Out of scope for the current claim table; CPU fallback remains the default. |
+
+
+## Symbolic ScatterElements geometry
+
+`ScatterElements` reduction `none` accepts compatible symbolic shape metadata.
+Known dimensions must agree; runtime shapes validate indices/update equality,
+rank, axis and non-axis bounds. Partial non-axis updates scatter into the selected
+prefix and merge it back into the original data, preserving untouched elements.
+This avoids MLX broadcasting a one-row update across multiple data rows. Empty
+updates return the original data. The existing shape-keyed compile route checks
+new geometry before reuse.
+
+Native regressions cover FP32/FP16 partial and empty updates, 4-D symbolic
+metadata, invalid geometry and recovery. Dynamic INT64 Range also covers shape-derived
+causal masks, full-width integer values and live axes consumed by reductions.

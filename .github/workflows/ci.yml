@@ -105,7 +105,7 @@ jobs:
             | tar xz
           echo "ORT_HOME=$PWD/onnxruntime-osx-arm64-${ORT_VERSION}" >> "$GITHUB_ENV"
 
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.12"
 
@@ -208,7 +208,7 @@ jobs:
             | tar xz
           echo "ORT_HOME=$PWD/onnxruntime-osx-arm64-${ORT_VERSION}" >> "$GITHUB_ENV"
 
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.12"
 
@@ -233,7 +233,7 @@ jobs:
           python -m abi3audit --strict --report dist/onnxruntime_ep_mlx-*-py3-none-macosx_*.whl
 
       - name: Import + register under Python 3.13 (proves cross-version portability)
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.13"
       - name: Cross-version smoke test

@@ -106,6 +106,12 @@ every compiled replay. Boundary-provided positions retain compilation; graph-pro
 (or offset spans whose input shape is internal) require eager validation instead of capturing a
 first-call bounds check.
 
+With `ONNXRUNTIME_EP_MLX_NO_COMPILE=1`, capability partitioning uses one eager
+colour. Compatible supported regions can merge across capture-mode boundaries,
+reducing native kernel boundaries and ORT subgraph initialization work. Float64
+stream separation, unsupported nodes, graph convexity and explicit layer cuts
+still apply. The default compiled mode retains its capture colours.
+
 In decoder graphs, shapeless, shape-keyed-only, and eager-only nodes receive distinct partition
 colours. Stricter nodes remain claimed by MLX without disabling a more capable neighbouring
 partition. ShapeKeyed pays one recompile per distinct `(shape, dtype)` tuple — cheap when the shape
@@ -159,8 +165,15 @@ after that limit use eager translation; previously cached values remain reusable
 parameters also use eager translation. Runtime-valued **intermediates** still require proven
 shape-constant provenance; the compiler never evaluates a data-dependent tracer.
 
-Claim rules are unchanged: runtime `Range`/`Tile` remain on CPU, and dynamic Slice axes/steps are
-not newly claimed. The shapeless decode and specialized attention configurations are unchanged.
+Live INT64 `Range` executes at an eager partition boundary, including containing
+control-flow parents. Its checked output length and values are refreshed before
+dependent compiled partitions. Other Range dtypes retain constant-bound claims.
+Dynamic Slice axes/steps are unchanged.
+Modern live-repeat `Tile` is claimed eagerly, including boundary and produced INT64 repeats.
+It and recursively containing parents are capture barriers, not new host-value specializations.
+The existing exact native-attention position proof alone restores the sole owned top-level
+Tile's previous shapeless policy before route selection; broad Q8 candidates and nested Tiles
+receive no such permission. The native shortcut and specialized attention proofs are unchanged.
 
 Signal controls must be rank-zero host-readable int32/int64 tensors (DFT axis is int64).
 Lengths and steps are checked in the positive int32 range before narrowing. FFT signal shapes and
@@ -217,8 +230,8 @@ violates one falls back to eager (or, for attention, to the growing-concat route
    (`reads_data_dependent_parameter`). The general route additionally permits the explicitly
    value-guarded boundary parameters described above. Shape-const is OK because it changes with the shape-keyed cache
    key; an ordinary runtime tensor value does not participate in that key and would otherwise be
-   silently baked into later calls. (This is exactly why runtime-bounded `Range` is deferred — see
-   `OP_ARCHITECTURE`/README Range note.)
+   silently baked into later calls. Live INT64 `Range` uses an eager boundary
+   before this compile route.
 
 3. **No host-computed / data-dependent-output-shape ops** — `Det`, `NonZero`, `Unique` materialize
    input data mid-translate and/or emit a shape known only at runtime. NonZero and Unique are

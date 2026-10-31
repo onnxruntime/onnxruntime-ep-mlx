@@ -3,19 +3,20 @@
 import hashlib
 import json
 import os
-from pathlib import Path
 import shutil
 import subprocess
 import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import numpy as np
-from onnx import TensorProto as T, helper, numpy_helper
+import onnx_ir as ir
 import onnxruntime as ort
 import pytest
 
-
+T = ir.DataType
 DTYPES = [np.float32, np.float64]
 ERRORS = (ort.capi.onnxruntime_pybind11_state.InvalidGraph,
           ort.capi.onnxruntime_pybind11_state.InvalidArgument,
@@ -25,25 +26,32 @@ LEAK_ENV_KEYS = ("PATH", "MallocStackLogging", "DYLD_INSERT_LIBRARIES",
                  "DYLD_LIBRARY_PATH", "DYLD_FRAMEWORK_PATH")
 
 
+def _value(name, dtype, shape):
+    return ir.Value(name=name, type=ir.TensorType(dtype),
+                    shape=None if shape is None else ir.Shape(shape))
+
+
 def _model(dtype, shape, *, constant=None, crossing=False):
-    tensor_type = helper.np_dtype_to_tensor_dtype(np.dtype(dtype))
+    tensor_type = ir.DataType.from_numpy(np.dtype(dtype))
+    x = _value("x", tensor_type, shape)
+    if constant is not None:
+        x.const_value = ir.tensor(constant, name="x")
+    inverse = _value("inverse", tensor_type, shape)
     nodes = []
+    operand = x
     if crossing:
-        nodes.append(helper.make_node("Neg", ["x"], ["negated"]))
-    nodes.append(helper.make_node("Inverse", ["negated" if crossing else "x"], ["inverse"],
-                                  domain="com.microsoft", name="inverse_target"))
+        operand = _value("negated", tensor_type, shape)
+        nodes.append(ir.node("Neg", [x], outputs=[operand]))
+    nodes.append(ir.node("Inverse", [operand], outputs=[inverse],
+                         domain="com.microsoft", name="inverse_target"))
+    output = inverse
     if crossing:
-        nodes.append(helper.make_node("Neg", ["inverse"], ["y"]))
-    return helper.make_model(
-        helper.make_graph(nodes, "inverse",
-                          [] if constant is not None else [
-                              helper.make_tensor_value_info("x", tensor_type, shape)],
-                          [helper.make_tensor_value_info(
-                              "y" if crossing else "inverse", tensor_type, shape)],
-                          initializer=[] if constant is None else [
-                              numpy_helper.from_array(constant, "x")]),
-        opset_imports=[helper.make_opsetid("", 21), helper.make_opsetid("com.microsoft", 1)],
-        ir_version=10)
+        output = _value("y", tensor_type, shape)
+        nodes.append(ir.node("Neg", [inverse], outputs=[output]))
+    return ir.Model(ir.Graph(
+        [] if constant is not None else [x], [output], nodes=nodes,
+        initializers=[] if constant is None else [x], name="inverse",
+        opset_imports={"": 21, "com.microsoft": 1}), ir_version=10)
 
 
 def _session(model, path):
@@ -52,7 +60,7 @@ def _session(model, path):
     options.add_session_config_entry("session.disable_cpu_ep_fallback", "1")
     options.enable_profiling = True
     options.profile_file_prefix = str(path)
-    session = ort.InferenceSession(model.SerializeToString(), options,
+    session = ort.InferenceSession(ir.to_proto(model).SerializeToString(), options,
                                    providers=["MLXExecutionProvider"], enable_fallback=False)
     session.disable_fallback()
     providers = session.get_providers()
@@ -181,13 +189,13 @@ def _singular_recovery(dtype_name, directory):
 def test_inverse_singular_error_and_same_session_recovery_subprocess(dtype, tmp_path):
     child = subprocess.run(
         [sys.executable, "-c",
-         "import os,resource,runpy,sys,onnxruntime as ort; "
+         ("import os,resource,runpy,sys,onnxruntime as ort; "
          "resource.setrlimit(resource.RLIMIT_CORE,(0,0)); "
          "ort.register_execution_provider_library('MLXExecutionProvider', "
          "os.environ['ONNXRUNTIME_MLX_EP_LIB']); "
-         "d=runpy.run_path(sys.argv[1]); d['_singular_recovery'](sys.argv[2],sys.argv[3])",
+         "d=runpy.run_path(sys.argv[1]); d['_singular_recovery'](sys.argv[2],sys.argv[3])"),
          str(Path(__file__).resolve()), np.dtype(dtype).name, str(tmp_path)],
-        capture_output=True, text=True, timeout=60)
+        check=False, capture_output=True, text=True, timeout=60)
     (tmp_path / "singular.stdout").write_text(child.stdout)
     (tmp_path / "singular.stderr").write_text(child.stderr)
     assert child.returncode == 0, (child.returncode, child.stdout, child.stderr)
@@ -221,13 +229,13 @@ def _concurrent_owner_threads(dtype_name, directory):
 def test_inverse_concurrent_owner_threads_subprocess(dtype, tmp_path):
     child = subprocess.run(
         [sys.executable, "-c",
-         "import os,resource,runpy,sys,onnxruntime as ort; "
+         ("import os,resource,runpy,sys,onnxruntime as ort; "
          "resource.setrlimit(resource.RLIMIT_CORE,(0,0)); "
          "ort.register_execution_provider_library('MLXExecutionProvider', "
          "os.environ['ONNXRUNTIME_MLX_EP_LIB']); "
-         "d=runpy.run_path(sys.argv[1]); d['_concurrent_owner_threads'](sys.argv[2],sys.argv[3])",
+         "d=runpy.run_path(sys.argv[1]); d['_concurrent_owner_threads'](sys.argv[2],sys.argv[3])"),
          str(Path(__file__).resolve()), np.dtype(dtype).name, str(tmp_path)],
-        capture_output=True, text=True, timeout=90)
+        check=False, capture_output=True, text=True, timeout=90)
     (tmp_path / "concurrent.stdout").write_text(child.stdout)
     (tmp_path / "concurrent.stderr").write_text(child.stderr)
     assert child.returncode == 0, (child.returncode, child.stdout, child.stderr)
@@ -254,22 +262,45 @@ def test_inverse_session_churn_leaks_subprocess(dtype, tmp_path, capsys):
     tool = shutil.which("leaks", path=env.get("PATH"))
     assert tool is not None, "macOS leaks executable not found on PATH"
     tool_hash = hashlib.sha256(Path(tool).read_bytes()).hexdigest()
-    child = subprocess.run(
-        [tool, "--atExit", "--", sys.executable, "-c",
-         f"import json,os,sys; keys={LEAK_ENV_KEYS!r}; "
-         "print(json.dumps({'record_kind':'inverse_leaks_child_environment',"
-         "'pid':os.getpid(),'executable':sys.executable,"
-         "'environment':{k:os.environ.get(k) for k in keys}}),flush=True); "
+    ready = tmp_path / "churn.ready"
+    command = [sys.executable, "-c",
+         ("import gc,json,os,sys; "
          "import resource,runpy,onnxruntime as ort; "
          "resource.setrlimit(resource.RLIMIT_CORE,(0,0)); "
          "ort.register_execution_provider_library('MLXExecutionProvider', "
          "os.environ['ONNXRUNTIME_MLX_EP_LIB']); "
-         "d=runpy.run_path(sys.argv[1]); d['_session_churn'](sys.argv[2],sys.argv[3])",
-         str(Path(__file__).resolve()), np.dtype(dtype).name, str(tmp_path)],
-        env=env,
-        capture_output=True, text=True, timeout=120)
-    (tmp_path / "churn.stdout").write_text(child.stdout)
-    (tmp_path / "churn.stderr").write_text(child.stderr)
+         "d=runpy.run_path(sys.argv[1]); d['_session_churn'](sys.argv[2],sys.argv[3]); "
+         "gc.collect(); "
+         "open(sys.argv[4],'w').write(str(os.getpid())); sys.stdin.readline()"),
+         str(Path(__file__).resolve()), np.dtype(dtype).name, str(tmp_path), str(ready)]
+    # Keep the final Python image alive after session destruction. Scanning its
+    # PID avoids relying on an atExit hook surviving a framework Python exec.
+    with (tmp_path / "churn.stdout").open("w+") as stdout, (
+        tmp_path / "churn.stderr"
+    ).open("w+") as stderr:
+        child = subprocess.Popen(command, env=env, stdin=subprocess.PIPE,
+                                 stdout=stdout, stderr=stderr, text=True)
+        try:
+            deadline = time.monotonic() + 120
+            while not ready.exists():
+                assert child.poll() is None, "session churn child exited before scan"
+                assert time.monotonic() < deadline, "session churn readiness timed out"
+                time.sleep(0.05)
+            assert int(ready.read_text()) == child.pid
+            report = subprocess.run([tool, str(child.pid)], env=env,
+                                    check=False, capture_output=True, text=True, timeout=60)
+        finally:
+            try:
+                child.communicate("\n", timeout=15)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.communicate()
+                raise
+            stdout.seek(0)
+            stderr.seek(0)
+            child_stdout, child_stderr = stdout.read(), stderr.read()
+    (tmp_path / "leaks.stdout").write_text(report.stdout)
+    (tmp_path / "leaks.stderr").write_text(report.stderr)
     with capsys.disabled():
         print(json.dumps({
             "record_kind": "inverse_leaks_launcher",
@@ -277,16 +308,21 @@ def test_inverse_session_churn_leaks_subprocess(dtype, tmp_path, capsys):
             "resolved_tool": tool,
             "tool_realpath": str(Path(tool).resolve()),
             "tool_sha256": tool_hash,
-            "argv": child.args,
+            "argv": report.args,
+            "child_argv": command,
             "launcher_environment": {k: env.get(k) for k in LEAK_ENV_KEYS},
-            "returncode": child.returncode,
-            "stdout": child.stdout,
-            "stderr": child.stderr,
+            "returncode": report.returncode,
+            "stdout": report.stdout,
+            "stderr": report.stderr,
+            "child_returncode": child.returncode,
+            "child_stdout": child_stdout,
+            "child_stderr": child_stderr,
         }, indent=2), flush=True)
-    assert child.returncode == 0, (child.returncode, child.stdout, child.stderr)
-    assert "INVERSE_SESSION_CHURN_RECOVERY_OK" in child.stdout
-    assert "0 leaks for 0 total leaked bytes." in child.stdout + child.stderr, (
-        child.stdout, child.stderr)
+    assert child.returncode == 0, (child.returncode, child_stdout, child_stderr)
+    assert "INVERSE_SESSION_CHURN_RECOVERY_OK" in child_stdout
+    assert report.returncode == 0, (report.returncode, report.stdout, report.stderr)
+    assert "0 leaks for 0 total leaked bytes." in report.stdout + report.stderr, (
+        report.stdout, report.stderr)
 
 
 @pytest.mark.parametrize("shape", [[], [1], [2, 3], [2, 3, 2], None])
@@ -307,42 +343,51 @@ def test_inverse_unclaimed_dtype(dtype, tmp_path):
 ])
 def test_inverse_exact_form_validation(variant, tmp_path):
     model = _model(np.float32, [2, 2])
-    node = model.graph.node[0]
+    graph = model.graph
+    node = graph[0]
+    inputs, outputs, attrs = list(node.inputs), list(node.outputs), {}
     if variant == "missing_x":
-        node.input[0] = ""
+        inputs[0] = None
     elif variant == "missing_y":
-        node.output[0] = ""
+        outputs[0].name = ""
     elif variant == "extra_input":
-        node.input.append("x")
+        inputs.append(inputs[0])
     elif variant == "extra_output":
-        node.output.append("extra")
+        outputs.append(ir.val("extra"))
     elif variant == "no_inputs":
-        del node.input[:]
+        inputs.clear()
     elif variant == "no_outputs":
-        del node.output[:]
+        outputs.clear()
     elif variant == "output_dtype":
-        model.graph.output[0].type.tensor_type.elem_type = T.DOUBLE
+        outputs[0].type = ir.TensorType(T.DOUBLE)
     elif variant == "output_rank":
-        del model.graph.output[0].type.tensor_type.shape.dim[-1]
+        outputs[0].shape = ir.Shape([2])
     elif variant == "bf16":
-        model.graph.input[0].type.tensor_type.elem_type = T.BFLOAT16
-        model.graph.output[0].type.tensor_type.elem_type = T.BFLOAT16
+        inputs[0].type = outputs[0].type = ir.TensorType(T.BFLOAT16)
     else:
-        node.attribute.append(helper.make_attribute("axis", 0))
+        attrs["axis"] = 0
+    graph.remove(node)
+    graph.append(ir.node("Inverse", inputs, outputs=outputs,
+                         domain="com.microsoft", attributes=attrs))
     with pytest.raises(ERRORS):
         _session(model, tmp_path / variant)
 
 
 @pytest.mark.parametrize("depth", [1, 2])
 def test_inverse_nested_cpu_eager_live(depth, tmp_path):
-    model = _model(np.float32, [2, 2], crossing=True)
-    body = helper.make_graph(list(model.graph.node), "branch", [], list(model.graph.output))
+    original = _model(np.float32, [2, 2], crossing=True)
+    x = original.graph.inputs[0]
+    condition = _value("condition", T.BOOL, [])
+    body = original.graph
+    body.inputs.clear()
     for level in range(depth):
-        branch = helper.make_node("If", ["condition"], ["y"], then_branch=body, else_branch=body)
-        body = helper.make_graph([branch], f"parent_{level}", [], list(model.graph.output))
-    del model.graph.node[:]
-    model.graph.node.extend(body.node)
-    model.graph.input.append(helper.make_tensor_value_info("condition", T.BOOL, []))
+        output = _value(f"nested_{level}", T.FLOAT, [2, 2])
+        branch = ir.node("If", [condition], outputs=[output],
+                         attributes={"then_branch": body, "else_branch": body.clone(allow_outer_scope_values=True)})
+        body = ir.Graph([], [output], nodes=[branch], name=f"parent_{level}")
+    body.inputs.extend([x, condition])
+    body.opset_imports.update({"": 21, "com.microsoft": 1})
+    model = ir.Model(body, ir_version=10)
     session = _session(model, tmp_path / "nested")
     for flag, offset in [(True, 0), (False, 2), (True, 0)]:
         x = _matrix((2, 2), np.float32, offset)
@@ -351,12 +396,15 @@ def test_inverse_nested_cpu_eager_live(depth, tmp_path):
 
 
 def test_inverse_double_body_payload_remains_rejected(tmp_path):
-    model = _model(np.float64, [2, 2])
-    body = helper.make_graph(list(model.graph.node), "double_branch", [], list(model.graph.output))
-    del model.graph.node[:]
-    model.graph.node.append(helper.make_node(
-        "If", ["condition"], ["inverse"], then_branch=body, else_branch=body))
-    model.graph.input.append(helper.make_tensor_value_info("condition", T.BOOL, []))
+    original = _model(np.float64, [2, 2])
+    body = original.graph
+    x = body.inputs.pop()
+    condition = _value("condition", T.BOOL, [])
+    output = _value("result", T.DOUBLE, [2, 2])
+    node = ir.node("If", [condition], outputs=[output],
+                   attributes={"then_branch": body, "else_branch": body.clone(allow_outer_scope_values=True)})
+    model = ir.Model(ir.Graph([x, condition], [output], nodes=[node],
+                             opset_imports={"": 21, "com.microsoft": 1}), ir_version=10)
     with pytest.raises(ERRORS):
         _session(model, tmp_path / "double_body")
 
@@ -365,45 +413,44 @@ def test_inverse_double_body_payload_remains_rejected(tmp_path):
 @pytest.mark.parametrize("eager", [False, True])
 def test_inverse_loop_scan_cpu_eager_live(flow, eager, monkeypatch, tmp_path):
     monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_COMPILE", "1" if eager else "0")
-    state = helper.make_tensor_value_info("state", T.FLOAT, [2, 2])
-    next_state = helper.make_tensor_value_info("next_state", T.FLOAT, [2, 2])
+    state = _value("state", T.FLOAT, [2, 2])
+    next_state = _value("next_state", T.FLOAT, [2, 2])
     if flow == "Loop":
-        body = helper.make_graph([
-            helper.make_node("Inverse", ["state"], ["next_state"], domain="com.microsoft"),
-        ], "inverse_loop", [
-            helper.make_tensor_value_info("iteration", T.INT64, []),
-            helper.make_tensor_value_info("condition", T.BOOL, []), state],
-            [helper.make_tensor_value_info("condition", T.BOOL, []), next_state])
-        node = helper.make_node("Loop", ["trip", "condition", "x"], ["y"], body=body)
-        initializers = [numpy_helper.from_array(np.asarray(3, np.int64), "trip"),
-                        numpy_helper.from_array(np.asarray(True), "condition")]
-        shape, outputs = [2, 2], [helper.make_tensor_value_info("y", T.FLOAT, [2, 2])]
+        iteration = _value("iteration", T.INT64, [])
+        condition = _value("condition", T.BOOL, [])
+        body = ir.Graph([iteration, condition, state], [condition, next_state], nodes=[
+            ir.node("Inverse", [state], outputs=[next_state], domain="com.microsoft")],
+            name="inverse_loop")
+        trip = ir.val("trip", const_value=ir.tensor(np.asarray(3, np.int64)))
+        flag = ir.val("condition", const_value=ir.tensor(np.asarray(True)))
+        shape = [2, 2]
+        x, y = _value("x", T.FLOAT, shape), _value("y", T.FLOAT, shape)
+        node = ir.node("Loop", [trip, flag, x], outputs=[y], attributes={"body": body})
+        initializers, outputs = [trip, flag], [y]
     else:
-        body = helper.make_graph([
-            helper.make_node("Inverse", ["element"], ["next_state"], domain="com.microsoft"),
-            helper.make_node("Identity", ["next_state"], ["element_out"]),
-        ], "inverse_scan", [state, helper.make_tensor_value_info("element", T.FLOAT, [2, 2])],
-            [next_state, helper.make_tensor_value_info("element_out", T.FLOAT, [2, 2])])
+        element = _value("element", T.FLOAT, [2, 2])
+        element_out = _value("element_out", T.FLOAT, [2, 2])
+        nodes = [ir.node("Inverse", [element], outputs=[next_state], domain="com.microsoft"),
+                 ir.node("Identity", [next_state], outputs=[element_out])]
+        initial = ir.val("initial", const_value=ir.tensor(np.eye(2, dtype=np.float32)))
+        initializers = [initial]
         if flow == "ScanIf":
-            branch = helper.make_graph(list(body.node), "inverse_branch", [], list(body.output))
-            del body.node[:]
-            body.node.append(helper.make_node(
-                "If", ["template_condition"], ["next_state", "element_out"],
-                then_branch=branch, else_branch=branch))
-        node = helper.make_node("Scan", ["initial", "x"], ["final", "y"],
-                                body=body, num_scan_inputs=1)
-        initializers = [numpy_helper.from_array(np.eye(2, dtype=np.float32), "initial")]
-        if flow == "ScanIf":
-            initializers.append(numpy_helper.from_array(np.asarray(True), "template_condition"))
+            branch = ir.Graph([], [next_state, element_out], nodes=nodes, name="inverse_branch")
+            condition = ir.val("template_condition", const_value=ir.tensor(np.asarray(True)))
+            initializers.append(condition)
+            next_state = _value("if_state", T.FLOAT, [2, 2])
+            element_out = _value("if_element", T.FLOAT, [2, 2])
+            nodes = [ir.node("If", [condition], outputs=[next_state, element_out],
+                             attributes={"then_branch": branch, "else_branch": branch.clone(allow_outer_scope_values=True)})]
+        body = ir.Graph([state, element], [next_state, element_out], nodes=nodes, name="inverse_scan")
         shape = [None, 2, 2]
-        outputs = [helper.make_tensor_value_info("final", T.FLOAT, [2, 2]),
-                   helper.make_tensor_value_info("y", T.FLOAT, shape)]
-    model = helper.make_model(
-        helper.make_graph([node], "inverse_control",
-                          [helper.make_tensor_value_info("x", T.FLOAT, shape)], outputs,
-                          initializer=initializers),
-        opset_imports=[helper.make_opsetid("", 21), helper.make_opsetid("com.microsoft", 1)],
-        ir_version=10)
+        x = _value("x", T.FLOAT, shape)
+        outputs = [_value("final", T.FLOAT, [2, 2]), _value("y", T.FLOAT, shape)]
+        node = ir.node("Scan", [initial, x], outputs=outputs,
+                       attributes={"body": body, "num_scan_inputs": 1})
+    model = ir.Model(ir.Graph([x], outputs, nodes=[node], initializers=initializers,
+                             name="inverse_control", opset_imports={"": 21, "com.microsoft": 1}),
+                     ir_version=10)
     session = _session(model, tmp_path / flow)
     for count, offset in [(3, 0), (1, 2), (0, 0), (3, 0)]:
         x = _matrix((2, 2) if flow == "Loop" else (count, 2, 2), np.float32, offset)

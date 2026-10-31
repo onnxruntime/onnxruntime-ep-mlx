@@ -309,6 +309,12 @@ fn cdist_op(ctx: &mut TranslationContext, node: &NodeDesc) -> Result<(), MlxErro
 }
 
 fn matmul_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
+    if super::lut4::execute(ctx, n)? {
+        return Ok(());
+    }
+    if super::qdq::execute(ctx, n)? {
+        return Ok(());
+    }
     let a = ctx.resolve(&n.inputs[0])?;
     let b = ctx.resolve(&n.inputs[1])?;
     let y = ctx.binary(mlx::mlx_matmul, a, b)?;
@@ -319,6 +325,192 @@ fn matmul_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError>
         let z = ctx.zeros(&shp, dt)?;
         ctx.bind(&n.outputs[0], z);
         return Ok(());
+    }
+    ctx.bind(&n.outputs[0], y);
+    Ok(())
+}
+
+const GROUPED_EAGER_REASON: &str =
+    "GroupedMatMul validates live int32/int64 expert indices before device dispatch";
+
+pub(super) fn grouped_geometry(
+    x: &[i64],
+    w: &[i64],
+    indices: &[i64],
+    bias: Option<&[i64]>,
+    output: Option<&[i64]>,
+) -> Result<(), MlxError> {
+    if x.len() != 2 || w.len() != 3 || indices.len() != 2 {
+        return Err("GroupedMatMul: expected ranks 2, 3, 2 for input, weights, indices".into());
+    }
+    let compatible = |a: i64, b: i64| a < 0 || b < 0 || a == b;
+    if !compatible(x[0], indices[0]) || !compatible(x[1], w[1]) {
+        return Err("GroupedMatMul: token or reduction dimensions differ".into());
+    }
+    if let Some(b) = bias
+        && (b.len() != 2 || !compatible(b[0], w[0]) || !compatible(b[1], w[2]))
+    {
+        return Err("GroupedMatMul: bias must have shape [G,N]".into());
+    }
+    if let Some(y) = output
+        && (y.len() != 3
+            || !compatible(y[0], x[0])
+            || !compatible(y[1], indices[1])
+            || !compatible(y[2], w[2]))
+    {
+        return Err("GroupedMatMul: output must have shape [M,S,N]".into());
+    }
+    Ok(())
+}
+
+fn grouped_claim(node: &NodeView) -> ClaimResult {
+    require!(
+        (3..=4).contains(&node.num_inputs())
+            && node.num_outputs() == 1
+            && (0..3).all(|i| node.input_present(i))
+            && node.output_present(0),
+        "GroupedMatMul requires three inputs, optional bias, and one output"
+    );
+    let (x, w, indices, y) = match (
+        node.input_info(0),
+        node.input_info(1),
+        node.input_info(2),
+        node.output_info(0),
+    ) {
+        (Some(x), Some(w), Some(i), Some(y)) => (x, w, i, y),
+        _ => deny!("GroupedMatMul requires tensor type/shape information"),
+    };
+    require!(
+        is_mlx_cpu_float(x.dtype) && w.dtype == x.dtype && y.dtype == x.dtype,
+        "GroupedMatMul input, weights, output must share float16/bfloat16/float32/float64 dtype"
+    );
+    require!(
+        crate::registry::is_int_index(indices.dtype),
+        "GroupedMatMul indices must be int32 or int64"
+    );
+    let bias = if node.input_present(3) {
+        let Some(b) = node.input_info(3) else {
+            deny!("GroupedMatMul requires bias tensor type/shape information")
+        };
+        require!(
+            b.dtype == x.dtype,
+            "GroupedMatMul bias dtype must match input"
+        );
+        Some(b)
+    } else {
+        None
+    };
+    grouped_geometry(
+        &x.shape,
+        &w.shape,
+        &indices.shape,
+        bias.as_ref().map(|b| b.shape.as_slice()),
+        Some(&y.shape),
+    )?;
+    Ok(())
+}
+
+pub(super) fn grouped_matmul_op(
+    ctx: &mut TranslationContext,
+    n: &NodeDesc,
+) -> Result<(), MlxError> {
+    if super::qdq::execute(ctx, n)? {
+        return Ok(());
+    }
+    let x = ctx.resolve(&n.inputs[0])?;
+    let xs = ctx.shape_of(x);
+    let w = ctx.resolve(&n.inputs[1])?;
+    let ws = ctx.shape_of(w);
+    let indices = ctx.resolve(&n.inputs[2])?;
+    let ish = ctx.shape_of(indices);
+    let bias = if present(n, 3) {
+        Some(ctx.resolve(&n.inputs[3])?)
+    } else {
+        None
+    };
+    let to_i64 = |shape: &[i32]| shape.iter().copied().map(i64::from).collect::<Vec<_>>();
+    grouped_geometry(
+        &to_i64(&xs),
+        &to_i64(&ws),
+        &to_i64(&ish),
+        bias.map(|b| to_i64(&ctx.shape_of(b))).as_deref(),
+        None,
+    )?;
+    let dtype = ctx.dtype_of(x);
+    if !matches!(
+        dtype,
+        mlx::mlx_dtype__MLX_FLOAT16
+            | mlx::mlx_dtype__MLX_BFLOAT16
+            | mlx::mlx_dtype__MLX_FLOAT32
+            | mlx::mlx_dtype__MLX_FLOAT64
+    ) || ctx.dtype_of(w) != dtype
+        || bias.is_some_and(|b| ctx.dtype_of(b) != dtype)
+        || !matches!(
+            ctx.dtype_of(indices),
+            mlx::mlx_dtype__MLX_INT32 | mlx::mlx_dtype__MLX_INT64
+        )
+    {
+        return Err("GroupedMatMul: invalid live data or indices dtype".into());
+    }
+    // Check in int64 before the gather API converts to uint32: truncation could route to a
+    // different expert, and negative indices are invalid here (unlike ONNX Gather).
+    let values = ctx.read_ints_eval(&n.inputs[2])?;
+    if values.len() != (i64::from(ish[0]) * i64::from(ish[1])) as usize {
+        return Err("GroupedMatMul: cannot read complete group_indices".into());
+    }
+    if values.iter().any(|&i| i < 0 || i >= i64::from(ws[0])) {
+        return Err("GroupedMatMul: group_indices values must be in [0,G)".into());
+    }
+    let (m, selections, width) = (xs[0], ish[1], ws[2]);
+    let shape = [m, selections, width];
+    if m == 0 || selections == 0 || width == 0 {
+        let y = ctx.zeros(&shape, dtype)?;
+        ctx.bind(&n.outputs[0], y);
+        return Ok(());
+    }
+    let mut y = if xs[1] == 0 {
+        ctx.zeros(&shape, dtype)?
+    } else {
+        let x = ctx.reshape(x, &[m, 1, xs[1]])?;
+        let row_indices = ctx.arange(0.0, f64::from(m), 1.0, mlx::mlx_dtype__MLX_INT32)?;
+        let row_indices = ctx.reshape(row_indices, &[m, 1])?;
+        {
+            if ctx.dtype_of(w) != dtype {
+                return Err("GroupedMatMul: live weights dtype must match input".into());
+            }
+            let mut device = unsafe { mlx::mlx_device_new() };
+            let mut kind = mlx::mlx_device_type__MLX_CPU;
+            let rc = unsafe { mlx::mlx_stream_get_device(&mut device, ctx.stream()) };
+            let rc = if rc == 0 {
+                unsafe { mlx::mlx_device_get_type(&mut kind, device) }
+            } else {
+                rc
+            };
+            unsafe { mlx::mlx_device_free(device) };
+            if rc != 0 {
+                return Err("GroupedMatMul: cannot inspect MLX stream device".into());
+            }
+            if kind == mlx::mlx_device_type__MLX_CPU {
+                // Pinned GatherMM CPU only supports float32. Ordinary CPU Matmul uses typed
+                // GEMM, including cblas_dgemm for double, without narrowing weights or bias.
+                let selected =
+                    ctx.emit(|res, s| unsafe { mlx::mlx_take_axis(res, w, indices, 0, s) })?;
+                let x = ctx.reshape(x, &[m, 1, 1, xs[1]])?;
+                let result = ctx.binary(mlx::mlx_matmul, x, selected)?;
+                ctx.mark_composed("typed CPU gather + matmul (GatherMM CPU is float32-only)");
+                ctx.reshape(result, &shape)?
+            } else {
+                let result = ctx.emit(|res, s| unsafe {
+                    mlx::mlx_gather_mm(res, x, w, row_indices, indices, false, s)
+                })?;
+                ctx.mark_fast("mlx_gather_mm");
+                ctx.reshape(result, &shape)?
+            }
+        }
+    };
+    if let Some(b) = bias {
+        let selected = ctx.emit(|res, s| unsafe { mlx::mlx_take_axis(res, b, indices, 0, s) })?;
+        y = ctx.binary(mlx::mlx_add, y, selected)?;
     }
     ctx.bind(&n.outputs[0], y);
     Ok(())
@@ -519,6 +711,17 @@ fn fused_matmul_claim(node: &NodeView) -> ClaimResult {
 pub fn register(registry: &mut OpRegistry) {
     registry.register_eager(
         OpRegistration {
+            domain: "",
+            op_type: "GroupedMatMul",
+            min_opset: 29,
+            max_opset: 29,
+            handler: grouped_matmul_op,
+            claim: grouped_claim,
+        },
+        GROUPED_EAGER_REASON,
+    );
+    registry.register_eager(
+        OpRegistration {
             domain: "com.microsoft",
             op_type: "Inverse",
             min_opset: 1,
@@ -640,6 +843,236 @@ mod tests {
         assert!(!Plan::new(vec![inverse]).requires_cpu_stream);
         parent.subgraphs.clear();
         assert!(!Plan::new(vec![parent]).requires_cpu_stream);
+    }
+
+    #[test]
+    fn grouped_matmul_geometry_and_version() {
+        use super::grouped_geometry;
+        assert!(
+            grouped_geometry(
+                &[2, 3],
+                &[4, 3, 5],
+                &[2, 2],
+                Some(&[4, 5]),
+                Some(&[2, 2, 5])
+            )
+            .is_ok()
+        );
+        assert!(
+            grouped_geometry(
+                &[-1, -1],
+                &[-1, -1, -1],
+                &[-1, -1],
+                None,
+                Some(&[-1, -1, -1])
+            )
+            .is_ok()
+        );
+        for (x, w, i, b, y) in [
+            (vec![2], vec![4, 3, 5], vec![2, 2], None, None),
+            (vec![2, 3], vec![4, 6, 5], vec![2, 2], None, None),
+            (vec![2, 3], vec![4, 3, 5], vec![3, 2], None, None),
+            (vec![2, 3], vec![4, 3, 5], vec![2, 2], Some(vec![5]), None),
+            (
+                vec![2, 3],
+                vec![4, 3, 5],
+                vec![2, 2],
+                None,
+                Some(vec![2, 5]),
+            ),
+        ] {
+            assert!(grouped_geometry(&x, &w, &i, b.as_deref(), y.as_deref()).is_err());
+        }
+    }
+
+    #[test]
+    fn grouped_matmul_typed_dense_handlers() {
+        use crate::engine::{NodeDesc, OutRef, Plan, Src, TensorRef, TranslationContext};
+        use crate::mlx::{Array, Stream};
+        use crate::registry::CompileShapeSafety;
+        use crate::sys::{mlx, ort};
+        let reference = |name: &str| TensorRef {
+            name: name.into(),
+            source: Src::Intermediate,
+            ..TensorRef::absent()
+        };
+        let output = |name: &str| OutRef {
+            name: name.into(),
+            external: false,
+            ctx_index: 0,
+            otype: ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
+        };
+        for cpu in [false, true] {
+            for dtype in [
+                mlx::mlx_dtype__MLX_FLOAT32,
+                mlx::mlx_dtype__MLX_FLOAT16,
+                mlx::mlx_dtype__MLX_BFLOAT16,
+                mlx::mlx_dtype__MLX_FLOAT64,
+            ] {
+                if !cpu && dtype == mlx::mlx_dtype__MLX_FLOAT64 {
+                    continue;
+                }
+                let stream = if cpu {
+                    Stream::new_default_cpu()
+                } else {
+                    Stream::new_default_gpu()
+                };
+                let mut plan = Plan::new(vec![]);
+                let mut ctx = TranslationContext::new(
+                    &mut plan,
+                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                    stream.as_raw(),
+                );
+                let mut node = NodeDesc::new(
+                    "GroupedMatMul".into(),
+                    String::new(),
+                    29,
+                    CompileShapeSafety::EagerOnly {
+                        reason: super::GROUPED_EAGER_REASON,
+                    },
+                );
+                node.inputs = ["x", "w", "indices", "bias"].map(reference).to_vec();
+                node.outputs = vec![output("y")];
+                for (name, shape, values) in [
+                    ("x", vec![2, 2], vec![1.0f64, 2.0, 3.0, 4.0]),
+                    (
+                        "w",
+                        vec![3, 2, 2],
+                        vec![
+                            1.0f64, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+                        ],
+                    ),
+                    ("bias", vec![3, 2], vec![0.5f64, 0.25, 1.5, 1.25, 2.5, 2.25]),
+                ] {
+                    let array = if dtype == mlx::mlx_dtype__MLX_FLOAT64 {
+                        ctx.keep(Array::from_data(values.as_ptr().cast(), &shape, dtype))
+                    } else {
+                        let values: Vec<_> = values.into_iter().map(|v| v as f32).collect();
+                        ctx.keep(Array::from_data(
+                            values.as_ptr().cast(),
+                            &shape,
+                            mlx::mlx_dtype__MLX_FLOAT32,
+                        ))
+                    };
+                    let array = ctx.astype(array, dtype).unwrap();
+                    ctx.bind(&output(name), array);
+                }
+                for index_dtype in [mlx::mlx_dtype__MLX_INT32, mlx::mlx_dtype__MLX_INT64] {
+                    let routes = [2i64, 0, 2, 1];
+                    let array = ctx.keep(Array::from_data(
+                        routes.as_ptr().cast(),
+                        &[2, 2],
+                        mlx::mlx_dtype__MLX_INT64,
+                    ));
+                    let array = ctx.astype(array, index_dtype).unwrap();
+                    ctx.bind(&output("indices"), array);
+                    super::grouped_matmul_op(&mut ctx, &node).unwrap();
+                    let y = ctx.resolve(&reference("y")).unwrap();
+                    assert_eq!(ctx.dtype_of(y), dtype);
+                    assert_eq!(ctx.shape_of(y), [2, 2, 2]);
+                    let y = ctx.astype(y, mlx::mlx_dtype__MLX_FLOAT32).unwrap();
+                    let y = ctx.contiguous_eval(y).unwrap();
+                    let actual =
+                        unsafe { std::slice::from_raw_parts(mlx::mlx_array_data_float32(y), 8) };
+                    let mut expected = [33.5f32, 36.25, 7.5, 10.25, 73.5, 80.25, 44.5, 51.25];
+                    if dtype == mlx::mlx_dtype__MLX_BFLOAT16 {
+                        // BF16 rounds the exact 80.25 tie to even 80.0.
+                        expected[5] = 80.0;
+                    }
+                    assert_eq!(
+                        actual, expected,
+                        "cpu={cpu}, dtype={dtype}, index_dtype={index_dtype}"
+                    );
+                }
+                for (m, k, s, n, g) in [
+                    (0, 3, 2, 4, 2),
+                    (2, 3, 0, 4, 2),
+                    (2, 0, 2, 4, 2),
+                    (2, 3, 2, 0, 2),
+                    (0, 3, 2, 4, 0),
+                ] {
+                    for (name, shape, dt) in [
+                        ("x", vec![m, k], dtype),
+                        ("w", vec![g, k, n], dtype),
+                        ("indices", vec![m, s], mlx::mlx_dtype__MLX_INT64),
+                        ("bias", vec![g, n], dtype),
+                    ] {
+                        let array = ctx.zeros(&shape, dt).unwrap();
+                        ctx.bind(&output(name), array);
+                    }
+                    super::grouped_matmul_op(&mut ctx, &node).unwrap();
+                    let y = ctx.resolve(&reference("y")).unwrap();
+                    assert_eq!(ctx.shape_of(y), [m, s, n]);
+                    ctx.contiguous_eval(y).unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn grouped_matmul_double_keeps_low_bits() {
+        use crate::engine::{NodeDesc, OutRef, Plan, Src, TensorRef, TranslationContext};
+        use crate::mlx::{Array, Stream};
+        use crate::registry::CompileShapeSafety;
+        use crate::sys::{mlx, ort};
+        let stream = Stream::new_default_cpu();
+        let mut plan = Plan::new(vec![]);
+        let mut ctx = TranslationContext::new(
+            &mut plan,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            stream.as_raw(),
+        );
+        let mut node = NodeDesc::new(
+            "GroupedMatMul".into(),
+            String::new(),
+            29,
+            CompileShapeSafety::EagerOnly {
+                reason: super::GROUPED_EAGER_REASON,
+            },
+        );
+        let output = |name: &str| OutRef {
+            name: name.into(),
+            external: false,
+            ctx_index: 0,
+            otype: ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_DOUBLE,
+        };
+        for (name, shape, values) in [
+            ("x", vec![1, 1], vec![1.0f64]),
+            ("w", vec![1, 1, 1], vec![2f64.powi(40)]),
+            ("bias", vec![1, 1], vec![0.125]),
+        ] {
+            let a = ctx.keep(Array::from_data(
+                values.as_ptr().cast(),
+                &shape,
+                mlx::mlx_dtype__MLX_FLOAT64,
+            ));
+            ctx.bind(&output(name), a);
+        }
+        let i = ctx.zeros(&[1, 1], mlx::mlx_dtype__MLX_INT64).unwrap();
+        ctx.bind(&output("indices"), i);
+        node.inputs = ["x", "w", "indices", "bias"]
+            .map(|name| TensorRef {
+                name: name.into(),
+                source: Src::Intermediate,
+                ..TensorRef::absent()
+            })
+            .to_vec();
+        node.outputs = vec![output("y")];
+        super::grouped_matmul_op(&mut ctx, &node).unwrap();
+        let y = ctx
+            .resolve(&TensorRef {
+                name: "y".into(),
+                source: Src::Intermediate,
+                ..TensorRef::absent()
+            })
+            .unwrap();
+        let y = ctx.contiguous_eval(y).unwrap();
+        assert_eq!(
+            unsafe { *mlx::mlx_array_data_float64(y) },
+            2f64.powi(40) + 0.125
+        );
     }
 
     #[test]

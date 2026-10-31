@@ -52,6 +52,7 @@ pub(crate) unsafe fn build_plan(
     let has_control_flow = any_control_flow(&nodes);
     let has_compile_barrier = has_compile_barrier(&nodes);
     let mut plan = Plan::new(nodes);
+    fence_live_shape_values(&mut plan);
     if snapshot
         .ir
         .topological_order()
@@ -75,6 +76,52 @@ pub(crate) unsafe fn build_plan(
         plan.general.enabled = false;
     }
     Ok(plan)
+}
+
+fn fence_live_shape_values(plan: &mut Plan) {
+    fn live_tile(node: &NodeDesc) -> bool {
+        matches!(node.domain.as_str(), "" | "ai.onnx")
+            && node.op_type == "Tile"
+            && node.since_version >= 6
+            && node.inputs.len() == 2
+            && node.outputs.len() == 1
+            && node.inputs[1].source != Src::Initializer
+            && !node.inputs[1].constant
+    }
+    fn live_range(node: &NodeDesc) -> bool {
+        matches!(node.domain.as_str(), "" | "ai.onnx")
+            && node.op_type == "Range"
+            && node.inputs.len() == 3
+            && node.outputs.len() == 1
+            && node.outputs[0].otype
+                == ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64
+            && node
+                .inputs
+                .iter()
+                .any(|input| input.source != Src::Initializer && !input.constant)
+    }
+    fn fence(nodes: &mut [NodeDesc], native_owner: bool) -> bool {
+        let mut contains_live = false;
+        for node in nodes {
+            let mut nested_live = false;
+            for body in &mut node.subgraphs {
+                nested_live |= fence(&mut body.nodes, false);
+            }
+            let live = live_tile(node) || live_range(node);
+            if live && native_owner {
+                node.compile_shape_safety = crate::registry::CompileShapeSafety::Shapeless;
+            } else if live || nested_live {
+                node.compile_shape_safety = crate::registry::CompileShapeSafety::EagerOnly {
+                    reason: "Live Range bounds or Tile repeats, including nested bodies, must be reread eagerly",
+                };
+            }
+            contains_live |= live || nested_live;
+        }
+        contains_live
+    }
+    // Plan::new's position proof owns exactly one top-level live Range/Tile pair.
+    // Never pass that exemption into a body, or infer it from the broad capability override.
+    fence(&mut plan.nodes, plan.native_attention_decode);
 }
 
 impl GraphSidecars {
@@ -408,6 +455,14 @@ fn build_graph(
         nodes.push(node);
     }
     mark_shape_constants(&mut nodes, &inits.keys().cloned().collect());
+    crate::ops::qdq::recognize(&mut nodes);
+    let graph_outputs = snapshot
+        .graph_output_slots
+        .iter()
+        .flatten()
+        .map(|value| snapshot.values[value].name.clone())
+        .collect();
+    crate::ops::lut4::recognize(&mut nodes, &graph_outputs);
     Ok(nodes)
 }
 
@@ -550,6 +605,17 @@ unsafe fn collect_initializer_bytes(
     }
     let mut result = HashMap::new();
     for info in infos {
+        // An initializer may also be an overridable graph input. Its defaults belong to
+        // ORT; the fused kernel must read the live input slot on every execution.
+        let mut constant = false;
+        check(
+            api,
+            unsafe { (api.ValueInfo_IsConstantInitializer.unwrap())(info, &mut constant) },
+            "checking initializer mutability",
+        )?;
+        if !constant {
+            continue;
+        }
         let name = unsafe { value_name(api, info)? };
         let string_metadata = snapshot
             .value_by_name
@@ -875,6 +941,306 @@ mod tests {
         node.inputs = inputs;
         node.outputs = outputs;
         node
+    }
+
+    fn test_node(op_type: &str, inputs: &[&str], name: &str) -> NodeDesc {
+        node(
+            op_type,
+            inputs
+                .iter()
+                .map(|name| tensor_ref((*name).to_string(), Src::Intermediate, 0, None))
+                .collect(),
+            vec![output(name)],
+        )
+    }
+
+    fn assert_no_capture(nodes: &[NodeDesc]) {
+        assert!(!crate::compiled::decode_enabled(false, nodes));
+        assert!(!crate::compiled::prefill_enabled(false, nodes));
+        assert!(!crate::compiled::general_enabled(false, nodes));
+    }
+
+    #[test]
+    fn initializer_integer_ranges_keep_their_compiled_route() {
+        let mut range = test_node("Range", &["start", "limit", "delta"], "range");
+        range.outputs[0].otype =
+            crate::sys::ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64;
+        for input in &mut range.inputs {
+            input.source = Src::Initializer;
+            input.constant = false; // Initializer provenance is sufficient.
+        }
+        let mut plan = Plan::new(vec![range]);
+        fence_live_shape_values(&mut plan);
+        assert!(matches!(
+            plan.nodes[0].compile_shape_safety,
+            crate::registry::CompileShapeSafety::Shapeless
+        ));
+    }
+
+    #[test]
+    fn live_tiles_are_eager_regardless_of_source_or_shape_provenance() {
+        for source in [Src::CtxInput, Src::Intermediate] {
+            for shape_const in [false, true] {
+                let mut tile = test_node("Tile", &["data", "repeats"], "tiled");
+                tile.inputs[1].source = source;
+                tile.inputs[1].shape_const = shape_const;
+                let mut plan = Plan::new(vec![tile]);
+                assert!(!plan.native_attention_decode);
+                fence_live_shape_values(&mut plan);
+                assert!(matches!(
+                    plan.nodes[0].compile_shape_safety,
+                    crate::registry::CompileShapeSafety::EagerOnly { .. }
+                ));
+                assert_no_capture(&plan.nodes);
+            }
+        }
+    }
+
+    #[test]
+    fn live_tile_fences_recurse_without_inheriting_native_ownership() {
+        for parent in ["If", "Loop", "Scan"] {
+            let mut inner = test_node(parent, &[], "inner_output");
+            inner.subgraphs.push(SubgraphDesc {
+                attr_name: "body".into(),
+                input_names: vec![],
+                output_names: vec!["tiled".into()],
+                nodes: vec![test_node("Tile", &["data", "repeats"], "tiled")],
+            });
+            let mut outer = test_node("If", &["condition"], "outer_output");
+            outer.subgraphs.push(SubgraphDesc {
+                attr_name: "then_branch".into(),
+                input_names: vec![],
+                output_names: vec!["inner_output".into()],
+                nodes: vec![inner],
+            });
+            let mut nodes = native_position_nodes(true);
+            nodes.push(outer);
+            let mut plan = Plan::new(nodes);
+            assert!(plan.native_attention_decode);
+            fence_live_shape_values(&mut plan);
+            let outer = plan.nodes.last().unwrap();
+            let inner = &outer.subgraphs[0].nodes[0];
+            let tile = &inner.subgraphs[0].nodes[0];
+            for node in [outer, inner, tile] {
+                assert!(matches!(
+                    node.compile_shape_safety,
+                    crate::registry::CompileShapeSafety::EagerOnly { .. }
+                ));
+            }
+            assert_no_capture(&plan.nodes);
+        }
+    }
+
+    fn native_position_nodes(expand: bool) -> Vec<NodeDesc> {
+        let mut range = test_node("Range", &["start", "limit", "step"], "range");
+        range.inputs[2].constant = true;
+        let mut nodes = vec![
+            test_node("Add", &["start", "length"], "limit"),
+            range,
+            test_node("Unsqueeze", &["range", "axes"], "positions"),
+            test_node("Concat", &["one", "batch"], "repeats"),
+        ];
+        let positions = if expand {
+            nodes.push(test_node("Expand", &["positions", "shape"], "expanded"));
+            "expanded"
+        } else {
+            "positions"
+        };
+        nodes.push(test_node("Tile", &[positions, "repeats"], "tiled"));
+        for node in &mut nodes {
+            node.outputs[0].otype =
+                ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64;
+        }
+        nodes.push(test_node(
+            "MultiHeadAttention",
+            &["q", "k", "v"],
+            "attention",
+        ));
+        let mut quantized = test_node("MatMulNBits", &["x", "w", "s"], "quantized");
+        quantized.ints.insert("bits".into(), 8);
+        nodes.push(quantized);
+        while nodes.len() <= 32 {
+            nodes.push(test_node(
+                "Add",
+                &["a", "b"],
+                &format!("filler_{}", nodes.len()),
+            ));
+        }
+        nodes
+    }
+
+    #[test]
+    fn only_unchanged_exact_native_position_proof_exempts_live_tile() {
+        for (exact, source, shape_const) in [
+            (true, Src::CtxInput, false),
+            (true, Src::CtxInput, true),
+            (true, Src::Intermediate, false),
+            (true, Src::Intermediate, true),
+            (false, Src::CtxInput, false),
+            (false, Src::CtxInput, true),
+            (false, Src::Intermediate, false),
+            (false, Src::Intermediate, true),
+        ] {
+            let mut nodes = native_position_nodes(exact);
+            let tile = nodes
+                .iter_mut()
+                .find(|node| node.op_type == "Tile")
+                .unwrap();
+            tile.inputs[1].source = source;
+            tile.inputs[1].shape_const = shape_const;
+            let mut plan = Plan::new(nodes);
+            assert_eq!(plan.native_attention_decode, exact);
+            let previous_routes = (
+                crate::compiled::decode_enabled(false, &plan.nodes),
+                crate::compiled::prefill_enabled(false, &plan.nodes),
+                crate::compiled::general_enabled(false, &plan.nodes),
+            );
+            // Reproduce the conservative registry descriptor before native context is known.
+            let tile = plan
+                .nodes
+                .iter_mut()
+                .find(|node| node.op_type == "Tile")
+                .unwrap();
+            assert_eq!(
+                tile.outputs[0].otype,
+                ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64
+            );
+            tile.compile_shape_safety = crate::registry::CompileShapeSafety::EagerOnly {
+                reason: "live Tile before native context",
+            };
+            fence_live_shape_values(&mut plan);
+            let tile = plan
+                .nodes
+                .iter()
+                .find(|node| node.op_type == "Tile")
+                .unwrap();
+            if exact {
+                assert_eq!(
+                    tile.compile_shape_safety,
+                    crate::registry::CompileShapeSafety::Shapeless
+                );
+                assert_eq!(
+                    (
+                        crate::compiled::decode_enabled(false, &plan.nodes),
+                        crate::compiled::prefill_enabled(false, &plan.nodes),
+                        crate::compiled::general_enabled(false, &plan.nodes),
+                    ),
+                    previous_routes
+                );
+            } else {
+                assert_no_capture(&plan.nodes);
+            }
+        }
+        let mut ambiguous = native_position_nodes(true);
+        ambiguous.push(test_node("Tile", &["data", "other_repeats"], "other_tile"));
+        let mut plan = Plan::new(ambiguous);
+        assert!(!plan.native_attention_decode);
+        fence_live_shape_values(&mut plan);
+        assert_no_capture(&plan.nodes);
+    }
+
+    #[test]
+    fn live_integer_range_keeps_the_exact_native_position_exception() {
+        for exact in [false, true] {
+            let mut nodes = native_position_nodes(exact);
+            nodes
+                .iter_mut()
+                .find(|node| node.op_type == "Range")
+                .unwrap()
+                .compile_shape_safety = crate::registry::CompileShapeSafety::EagerOnly {
+                reason: "live integer Range",
+            };
+            let mut plan = Plan::new(nodes);
+            assert_eq!(plan.native_attention_decode, exact);
+            fence_live_shape_values(&mut plan);
+            let range = plan
+                .nodes
+                .iter()
+                .find(|node| node.op_type == "Range")
+                .unwrap();
+            assert_eq!(range.compile_shape_safety.allows_shapeless(), exact);
+        }
+    }
+
+    #[test]
+    fn constant_tiles_keep_their_geometry_specific_capture_policy() {
+        for safety in [
+            crate::registry::CompileShapeSafety::Shapeless,
+            crate::registry::CompileShapeSafety::ShapeKeyedOnly {
+                reason: "symbolic constant Tile",
+            },
+            crate::registry::CompileShapeSafety::EagerOnly {
+                reason: "wide empty constant Tile",
+            },
+        ] {
+            for hoisted in [false, true] {
+                let mut tile = test_node("Tile", &["data", "repeats"], "tiled");
+                tile.inputs[1].source = if hoisted {
+                    Src::CtxInput
+                } else {
+                    Src::Initializer
+                };
+                tile.inputs[1].constant = hoisted;
+                tile.compile_shape_safety = safety;
+                let mut plan = Plan::new(vec![tile]);
+                fence_live_shape_values(&mut plan);
+                assert_eq!(plan.nodes[0].compile_shape_safety, safety);
+            }
+        }
+    }
+
+    #[test]
+    fn native_position_near_misses_never_restore_live_tile_capture() {
+        for mismatch in [
+            "step",
+            "repeat_producer",
+            "range_input",
+            "size",
+            "bits",
+            "attention",
+        ] {
+            let mut nodes = native_position_nodes(true);
+            match mismatch {
+                "step" => {
+                    nodes
+                        .iter_mut()
+                        .find(|n| n.op_type == "Range")
+                        .unwrap()
+                        .inputs[2]
+                        .constant = false
+                }
+                "repeat_producer" => {
+                    nodes
+                        .iter_mut()
+                        .find(|n| n.op_type == "Concat")
+                        .unwrap()
+                        .op_type = "Identity".into()
+                }
+                "range_input" => {
+                    nodes
+                        .iter_mut()
+                        .find(|n| n.op_type == "Unsqueeze")
+                        .unwrap()
+                        .inputs[0]
+                        .name = "not_range".into()
+                }
+                "size" => nodes.truncate(7),
+                "bits" => {
+                    nodes
+                        .iter_mut()
+                        .find(|n| n.op_type == "MatMulNBits")
+                        .unwrap()
+                        .ints
+                        .insert("bits".into(), 4);
+                }
+                "attention" => nodes.retain(|n| n.op_type != "MultiHeadAttention"),
+                _ => unreachable!(),
+            }
+            let mut plan = Plan::new(nodes);
+            assert!(!plan.native_attention_decode, "{mismatch}");
+            fence_live_shape_values(&mut plan);
+            assert_no_capture(&plan.nodes);
+        }
     }
 
     #[test]

@@ -8,7 +8,7 @@ use crate::engine::{MlxError, NodeDesc, TranslationContext, dim_i32, mlx_dtype_f
 use crate::mlx::{Array, VectorArray};
 use crate::registry::{
     ClaimPredicate, ClaimResult, CompileShapeSafety, K_ANY_OPSET, NodeView, OpHandler,
-    OpRegistration, OpRegistry, is_mlx_cpu_float, is_mlx_float, is_mlx_supported,
+    OpRegistration, OpRegistry, is_mlx_cpu_float, is_mlx_supported,
 };
 use crate::sys::mlx;
 use crate::sys::ort;
@@ -48,9 +48,49 @@ fn random_normal_with_shape(
     let dtype = mlx_dtype_from_onnx(n.outputs[0].otype);
     let mean = n.floats.get("mean").copied().unwrap_or(0.0);
     let scale = n.floats.get("scale").copied().unwrap_or(1.0);
-    let out = ctx.emit(|res, s| unsafe {
-        mlx::mlx_random_normal(res, shape.as_ptr(), shape.len(), dtype, mean, scale, key, s)
-    })?;
+    let out = if dtype == mlx::mlx_dtype__MLX_BFLOAT16 {
+        // Keep FLOAT attributes and affine intermediates in F32 until the final BF16 rounding.
+        let standard = ctx.emit(|res, s| unsafe {
+            mlx::mlx_random_normal(
+                res,
+                shape.as_ptr(),
+                shape.len(),
+                mlx::mlx_dtype__MLX_FLOAT32,
+                0.0,
+                1.0,
+                key,
+                s,
+            )
+        })?;
+        let scale = ctx.scalar_f32(scale);
+        let mean = ctx.scalar_f32(mean);
+        let cpu = crate::mlx::Stream::new_default_cpu();
+        let s = cpu.as_raw();
+        let affine = (|| {
+            let scaled =
+                ctx.emit(|res, _| unsafe { mlx::mlx_multiply(res, standard, scale, s) })?;
+            let shifted = ctx.emit(|res, _| unsafe { mlx::mlx_add(res, scaled, mean, s) })?;
+            let out = ctx.emit(|res, _| unsafe { mlx::mlx_astype(res, shifted, dtype, s) })?;
+            let mut outputs = VectorArray::new();
+            outputs.append(out);
+            crate::mlx::eval(&outputs)?;
+            Ok::<_, MlxError>(out)
+        })();
+        // Drain even when construction/eval fails, while all wrappers and inputs are still alive.
+        if unsafe { mlx::mlx_synchronize(s) } != 0 {
+            return Err(match affine {
+                Err(error) => {
+                    format!("{error}; BF16 Normal CPU affine synchronization also failed")
+                }
+                Ok(_) => "BF16 Normal CPU affine synchronization failed".to_string(),
+            });
+        }
+        affine?
+    } else {
+        ctx.emit(|res, s| unsafe {
+            mlx::mlx_random_normal(res, shape.as_ptr(), shape.len(), dtype, mean, scale, key, s)
+        })?
+    };
     ctx.bind(&n.outputs[0], out);
     Ok(())
 }
@@ -159,19 +199,6 @@ fn is_random_float(t: ort::ONNXTensorElementDataType) -> bool {
         || t == ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16
 }
 
-fn is_boundary_type(t: ort::ONNXTensorElementDataType) -> bool {
-    use ort::*;
-    is_mlx_float(t)
-        || t == ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL
-        || t == ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8
-        || t == ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT16
-        || t == ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32
-        || t == ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64
-        || t == ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8
-        || t == ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT16
-        || t == ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT32
-}
-
 fn valid_shape(shape: &[i64]) -> bool {
     shape.iter().all(|&d| d >= 0 && d <= i32::MAX as i64)
 }
@@ -201,8 +228,12 @@ fn random_shape_claim(node: &NodeView, normal: bool) -> ClaimResult {
         None => deny!("missing tensor type/shape info on output"),
     };
     require!(
-        is_random_float(out.dtype),
-        "output dtype must be float32 or float16, got {}",
+        is_random_float(out.dtype)
+            || (normal
+                && node.since_version() >= 22
+                && out.dtype
+                    == ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16),
+        "output dtype must be float32 or float16 (also bfloat16 for Normal since schema 22), got {}",
         crate::registry::ort_dtype_name(out.dtype)
     );
     let dtype_attr = node.int_attr(
@@ -289,8 +320,12 @@ fn random_like_claim(node: &NodeView, normal: bool) -> ClaimResult {
         crate::registry::ort_dtype_name(inp.dtype)
     );
     require!(
-        is_random_float(out.dtype),
-        "output dtype must be float32 or float16, got {}",
+        is_random_float(out.dtype)
+            || (normal
+                && node.since_version() >= 22
+                && out.dtype
+                    == ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16),
+        "output dtype must be float32 or float16 (also bfloat16 for Normal since schema 22), got {}",
         crate::registry::ort_dtype_name(out.dtype)
     );
     let dtype_attr = node.int_attr("dtype", inp.dtype as i64);
@@ -356,14 +391,15 @@ fn bernoulli_claim(node: &NodeView) -> ClaimResult {
     };
     require!(
         is_random_float(inp.dtype)
+            || inp.dtype == ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_DOUBLE
             || (node.since_version() >= 22
                 && inp.dtype
                     == ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16),
-        "probability input dtype must be float32, float16, or bfloat16 since opset 22, got {}",
+        "probability input dtype must be float32, float16, float64, or bfloat16 since opset 22, got {}",
         crate::registry::ort_dtype_name(inp.dtype)
     );
     require!(
-        is_boundary_type(out.dtype)
+        is_mlx_supported(out.dtype)
             || out.dtype == ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_DOUBLE,
         "output dtype {} is unsupported",
         crate::registry::ort_dtype_name(out.dtype)
@@ -726,7 +762,15 @@ fn shapeless(
 }
 
 fn random_compile_shape_safety(node: &NodeView) -> CompileShapeSafety {
-    if node.float_attr_opt("seed").is_none() {
+    if matches!(node.op_type().as_str(), "RandomNormal" | "RandomNormalLike")
+        && node.output_info(0).is_some_and(|info| {
+            info.dtype == ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16
+        })
+    {
+        CompileShapeSafety::EagerOnly {
+            reason: "BF16 Normal completes its F32 affine transform on the MLX CPU stream",
+        }
+    } else if node.float_attr_opt("seed").is_none() {
         CompileShapeSafety::EagerOnly {
             reason: "unseeded random draws consume the live default key",
         }
@@ -805,6 +849,171 @@ pub fn register(registry: &mut OpRegistry) {
         multinomial_claim,
     );
     shapeless(registry, "Einsum", 12, einsum_op, einsum_claim);
+}
+
+#[cfg(test)]
+mod bernoulli_double_tests {
+    use crate::mlx::{Array, Stream, VectorArray, eval};
+    use crate::sys::mlx;
+
+    fn native(call: impl FnOnce(*mut mlx::mlx_array) -> i32) -> Array {
+        let mut raw = unsafe { mlx::mlx_array_new() };
+        let status = call(&mut raw);
+        let output = Array::from_raw(raw);
+        assert_eq!(status, 0, "native Bernoulli test construction failed");
+        output
+    }
+
+    fn evaluate(array: &Array) {
+        let mut outputs = VectorArray::new();
+        outputs.append(array.as_raw());
+        eval(&outputs).expect("native Bernoulli test evaluation failed");
+    }
+
+    fn key(seed: u64) -> Array {
+        native(|res| unsafe { mlx::mlx_random_key(res, seed) })
+    }
+
+    fn split(key: &Array, stream: &Stream) -> (Array, Array) {
+        let mut state = unsafe { mlx::mlx_array_new() };
+        let mut draw = unsafe { mlx::mlx_array_new() };
+        let status =
+            unsafe { mlx::mlx_random_split(&mut state, &mut draw, key.as_raw(), stream.as_raw()) };
+        let result = (Array::from_raw(state), Array::from_raw(draw));
+        assert_eq!(status, 0, "native key split failed");
+        result
+    }
+
+    fn bits(key: &Array, shape: &[i32], stream: &Stream) -> Vec<u32> {
+        let output = native(|res| unsafe {
+            mlx::mlx_random_bits(
+                res,
+                shape.as_ptr(),
+                shape.len(),
+                4,
+                key.as_raw(),
+                stream.as_raw(),
+            )
+        });
+        evaluate(&output);
+        assert_eq!(output.dtype(), mlx::mlx_dtype__MLX_UINT32);
+        assert!(output.size() > 0);
+        let data = output.data_bytes().cast::<u32>();
+        assert!(!data.is_null());
+        unsafe { std::slice::from_raw_parts(data, output.size()).to_vec() }
+    }
+
+    fn sample(probabilities: &[f64], shape: &[i32], key: &Array, stream: &Stream) -> Vec<u8> {
+        let input = Array::from_data(
+            probabilities.as_ptr().cast(),
+            shape,
+            mlx::mlx_dtype__MLX_FLOAT64,
+        );
+        let output = native(|res| unsafe {
+            mlx::mlx_random_bernoulli(
+                res,
+                input.as_raw(),
+                shape.as_ptr(),
+                shape.len(),
+                key.as_raw(),
+                stream.as_raw(),
+            )
+        });
+        evaluate(&output);
+        assert_eq!(output.dtype(), mlx::mlx_dtype__MLX_BOOL);
+        assert_eq!(
+            output.shape(),
+            shape.iter().map(|&d| i64::from(d)).collect::<Vec<_>>()
+        );
+        assert_eq!(output.size(), probabilities.len());
+        if output.size() == 0 {
+            return Vec::new();
+        }
+        let data = output.data_bytes();
+        assert!(!data.is_null());
+        unsafe { std::slice::from_raw_parts(data, output.size()).to_vec() }
+    }
+
+    // Pin the native uint32/F64 threshold policy, not a cross-provider random sequence.
+    fn reference(bits: &[u32], probabilities: &[f64]) -> Vec<u8> {
+        assert_eq!(bits.len(), probabilities.len());
+        let upper = 4_294_967_296.0_f64 + 512.0;
+        bits.iter()
+            .zip(probabilities)
+            .map(|(&r, &p)| u8::from(f64::from(r) < p * upper))
+            .collect()
+    }
+
+    #[test]
+    fn bernoulli_preserves_double_thresholds_and_live_empty_default_keys() {
+        let stream = Stream::new_default_cpu();
+        let shape = [256];
+        for seed in [0, 41] {
+            let key = key(seed);
+            let draws = bits(&key, &shape, &stream);
+            let mut below = vec![0.5_f64; draws.len()];
+            let mut above = below.clone();
+            let mut straddles = Vec::new();
+            for (index, &r) in draws.iter().enumerate() {
+                let center = f64::from(r) / (4_294_967_296.0 + 512.0);
+                if !(0.25..0.75).contains(&center) {
+                    continue;
+                }
+                let low = f64::from_bits(center.to_bits() - 4);
+                let high = f64::from_bits(center.to_bits() + 4);
+                if (low as f32).to_bits() != (high as f32).to_bits() {
+                    continue;
+                }
+                below[index] = low;
+                above[index] = high;
+                straddles.push(index);
+            }
+            assert!(
+                !straddles.is_empty(),
+                "fixture needs same-F32 F64 straddles"
+            );
+            let low = sample(&below, &shape, &key, &stream);
+            let high = sample(&above, &shape, &key, &stream);
+            assert_eq!(low, reference(&draws, &below));
+            assert_eq!(high, reference(&draws, &above));
+            for index in straddles {
+                assert_eq!((low[index], high[index]), (0, 1));
+            }
+            assert_eq!(low, sample(&below, &shape, &key, &stream));
+            for (p, expected) in [(0.0, 0), (1.0, 1)] {
+                assert_eq!(sample(&[p], &[], &key, &stream), vec![expected]);
+                assert_eq!(
+                    sample(&vec![p; draws.len()], &shape, &key, &stream),
+                    vec![expected; draws.len()]
+                );
+            }
+            assert!(sample(&[], &[0, 3], &key, &stream).is_empty());
+        }
+
+        let seed = 7919;
+        let (state, _) = split(&key(seed), &stream);
+        let (state, second_key) = split(&state, &stream);
+        let (_, third_key) = split(&state, &stream);
+        let probabilities = vec![0.5; 256];
+        let expected_second = reference(&bits(&second_key, &shape, &stream), &probabilities);
+        let expected_third = reference(&bits(&third_key, &shape, &stream), &probabilities);
+        assert_ne!(expected_second, expected_third);
+        assert_eq!(unsafe { mlx::mlx_random_seed(seed) }, 0);
+        let default_key = Array::new();
+        assert!(sample(&[], &[0, 3], &default_key, &stream).is_empty());
+        let explicit = key(41);
+        let fixed = sample(&probabilities, &shape, &explicit, &stream);
+        assert_eq!(fixed, sample(&probabilities, &shape, &explicit, &stream));
+        assert_eq!(
+            sample(&probabilities, &shape, &default_key, &stream),
+            expected_second
+        );
+        assert_eq!(
+            sample(&probabilities, &shape, &default_key, &stream),
+            expected_third
+        );
+        assert_eq!(unsafe { mlx::mlx_synchronize(stream.as_raw()) }, 0);
+    }
 }
 
 #[cfg(test)]

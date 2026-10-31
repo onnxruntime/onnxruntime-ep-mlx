@@ -9,7 +9,7 @@ license: MIT
 For placement and fragmentation:
 
 ```bash
-ONNXRUNTIME_EP_MLX_CLAIM_DEBUG=1 ... python repro.py
+RUST_LOG=onnxruntime_ep_mlx=debug ONNXRUNTIME_EP_MLX_CLAIM_DEBUG=1 ... python repro.py
 ```
 
 For routing and cache behavior:

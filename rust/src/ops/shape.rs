@@ -290,15 +290,61 @@ fn scatter_elements_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(),
     let data = ctx.resolve(&n.inputs[0])?;
     let indices = ctx.resolve(&n.inputs[1])?;
     let updates = ctx.resolve(&n.inputs[2])?;
-    let rank = ctx.ndim(data) as i32;
-    let axis = norm_axis(int_attr(n, "axis", 0), rank);
-    let dim = ctx.dim(data, axis);
-    let idx = normalize_indices(ctx, indices, dim)?;
-    let r =
-        ctx.emit(|res, s| unsafe { mlx::mlx_put_along_axis(res, data, idx, updates, axis, s) })?;
-    let r = ctx.contiguous(r)?;
-    ctx.bind(&n.outputs[0], r);
+    let shape = ctx.shape_of(data);
+    let index_shape = ctx.shape_of(indices);
+    let update_shape = ctx.shape_of(updates);
+    let rank = shape.len() as i64;
+    let axis = int_attr(n, "axis", 0);
+    if rank == 0 || axis < -rank || axis >= rank {
+        return Err("ScatterElements: axis is out of range".to_string());
+    }
+    if index_shape != update_shape || index_shape.len() != shape.len() {
+        return Err(
+            "ScatterElements: indices/updates must have equal shapes and data rank".to_string(),
+        );
+    }
+    let axis = norm_axis(axis, rank as i32);
+    let mut extent = shape.clone();
+    for i in 0..shape.len() {
+        if i != axis as usize {
+            if index_shape[i] > shape[i] {
+                return Err("ScatterElements: non-axis indices extent exceeds data".to_string());
+            }
+            extent[i] = index_shape[i];
+        }
+    }
+    if index_shape.contains(&0) {
+        let result = ctx.contiguous(data)?;
+        ctx.bind(&n.outputs[0], result);
+        return Ok(());
+    }
+    let start = vec![0; shape.len()];
+    let partial = extent != shape;
+    let source = if partial {
+        ctx.slice(data, &start, &extent)?
+    } else {
+        data
+    };
+    let idx = normalize_indices(ctx, indices, shape[axis as usize])?;
+    let result = ctx.emit(|res, stream| unsafe {
+        mlx::mlx_put_along_axis(res, source, idx, updates, axis, stream)
+    })?;
+    let result = if partial {
+        ctx.slice_update(data, result, &start, &extent)?
+    } else {
+        result
+    };
+    let result = ctx.contiguous(result)?;
+    ctx.bind(&n.outputs[0], result);
     Ok(())
+}
+
+fn compatible_shape(left: &[i64], right: &[i64]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|(&a, &b)| a < 0 || b < 0 || a == b)
 }
 
 fn center_crop_pad_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
@@ -465,7 +511,93 @@ fn reverse_sequence_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(),
     Ok(())
 }
 
+fn scatter_nd_add_geometry(
+    data: &[i32],
+    indices: &[i32],
+    updates: &[i32],
+) -> Result<(usize, i32, i32, i32), MlxError> {
+    let width = *indices
+        .last()
+        .ok_or("ScatterND: indices rank must be positive")?;
+    if data.is_empty() || width <= 0 || width as usize > data.len() {
+        return Err("ScatterND: index tuple width is outside the data rank".to_string());
+    }
+    let width = width as usize;
+    let mut expected = indices[..indices.len() - 1].to_vec();
+    expected.extend_from_slice(&data[width..]);
+    if updates != expected || data.iter().chain(indices).any(|&d| d < 0) {
+        return Err("ScatterND: updates shape does not match index/data geometry".to_string());
+    }
+    let product = |shape: &[i32]| {
+        shape.iter().try_fold(1i32, |a, &b| {
+            a.checked_mul(b)
+                .ok_or_else(|| "ScatterND: flattened extent exceeds int32 indexing".to_string())
+        })
+    };
+    Ok((
+        width,
+        product(&data[..width])?,
+        product(&data[width..])?,
+        product(&indices[..indices.len() - 1])?,
+    ))
+}
+
+fn scatter_nd_add_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
+    let data = ctx.resolve(&n.inputs[0])?;
+    let indices = ctx.resolve(&n.inputs[1])?;
+    let updates = ctx.resolve(&n.inputs[2])?;
+    let shape = ctx.shape_of(data);
+    let index_shape = ctx.shape_of(indices);
+    let update_shape = ctx.shape_of(updates);
+    let (width, rows, tail, count) = scatter_nd_add_geometry(&shape, &index_shape, &update_shape)?;
+    if count == 0 {
+        let out = ctx.contiguous(data)?;
+        ctx.bind(&n.outputs[0], out);
+        return Ok(());
+    }
+    // MLX scatter does not check bounds. Validate live tuples before a native write.
+    // This form is eager so checks run again when values change at identical shapes.
+    let raw = ctx.read_ints_eval(&n.inputs[1])?;
+    if raw.len() != count as usize * width {
+        return Err("ScatterND: index value count does not match its shape".to_string());
+    }
+    let mut flat = Vec::with_capacity(count as usize);
+    for tuple in raw.chunks_exact(width) {
+        let mut index = 0i64;
+        for (&value, &extent) in tuple.iter().zip(&shape[..width]) {
+            let extent = i64::from(extent);
+            if value < -extent || value >= extent {
+                return Err("ScatterND: index is out of bounds".to_string());
+            }
+            index = index * extent + if value < 0 { value + extent } else { value };
+        }
+        flat.push(index as i32);
+    }
+    if tail == 0 {
+        let out = ctx.contiguous(data)?;
+        ctx.bind(&n.outputs[0], out);
+        return Ok(());
+    }
+    let indices = ctx.keep(Array::from_data(
+        flat.as_ptr() as *const std::os::raw::c_void,
+        &[count],
+        mlx::mlx_dtype__MLX_INT32,
+    ));
+    let base = ctx.reshape(data, &[rows, tail])?;
+    let updates = ctx.reshape(updates, &[count, 1, tail])?;
+    let out = ctx.emit(|res, stream| unsafe {
+        mlx::mlx_scatter_add_single(res, base, indices, updates, 0, stream)
+    })?;
+    let out = ctx.reshape(out, &shape)?;
+    let out = ctx.contiguous(out)?;
+    ctx.bind(&n.outputs[0], out);
+    Ok(())
+}
+
 fn scatter_nd_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
+    if n.strings.get("reduction").map(String::as_str) == Some("add") {
+        return scatter_nd_add_op(ctx, n);
+    }
     let data = ctx.resolve(&n.inputs[0])?;
     let indices = ctx.resolve(&n.inputs[1])?;
     let updates = ctx.resolve(&n.inputs[2])?;
@@ -1045,18 +1177,109 @@ fn split_to_sequence_op(_ctx: &mut TranslationContext, _n: &NodeDesc) -> Result<
     )
 }
 
+fn checked_tile_geometry(
+    shape: &[i64],
+    repeats_shape: &[i64],
+    repeats: &[i64],
+    dtype: mlx::mlx_dtype,
+    symbolic: bool,
+) -> Result<Vec<i64>, MlxError> {
+    if repeats_shape.len() != 1 {
+        return Err("MLX Tile: repeats must have rank one".to_string());
+    }
+    if repeats_shape[0] != repeats.len() as i64 || repeats.len() != shape.len() {
+        return Err("MLX Tile: repeats length must equal data rank".to_string());
+    }
+    let output = shape
+        .iter()
+        .zip(repeats)
+        .map(|(&extent, &repeat)| {
+            if repeat < 0 {
+                return Err("MLX Tile: repeats must be nonnegative".to_string());
+            }
+            if extent < 0 {
+                return if symbolic {
+                    Ok(if repeat == 0 { 0 } else { -1 })
+                } else {
+                    Err("MLX Tile: negative runtime extent".to_string())
+                };
+            }
+            let output = extent
+                .checked_mul(repeat)
+                .ok_or("MLX Tile: output extent overflows int64")?;
+            if output > i64::from(i32::MAX) {
+                return Err("MLX Tile: output extent exceeds int32".to_string());
+            }
+            Ok(output)
+        })
+        .collect::<Result<Vec<_>, MlxError>>()?;
+    if output.iter().all(|&extent| extent >= 0) {
+        super::host_scan::layout(&output, dtype, "Tile output")?;
+    }
+    Ok(output)
+}
+
 fn tile_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
-    let data = ctx.resolve(&n.inputs[0])?;
     if ctx.native_attention_decode() && ctx.rope_dynamic() && !n.inputs[1].constant {
         // The token-at-a-time decoder repeats are [1, 1]. Keep this as graph data instead of
         // forcing a host read during the shapeless compiled trace.
+        let data = ctx.resolve(&n.inputs[0])?;
         ctx.bind(&n.outputs[0], data);
         return Ok(());
     }
+    if n.inputs[1].source != Src::Initializer && !n.inputs[1].constant && ctx.is_capturing() {
+        return Err("MLX Tile: live repeats cannot be captured".to_string());
+    }
+    let shape = ctx.tensor_shape(&n.inputs[0])?;
+    let repeats_shape = ctx.tensor_shape(&n.inputs[1])?;
+    checked_tile_repeats_metadata(&repeats_shape, shape.len())?;
+    let repeats_int64 = if n.inputs[1].source == Src::Intermediate {
+        let repeats = ctx.resolve(&n.inputs[1])?;
+        ctx.dtype_of(repeats) == mlx::mlx_dtype__MLX_INT64
+    } else {
+        ctx.raw_host(&n.inputs[1])?.dtype
+            == ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64
+    };
+    if !repeats_int64 {
+        return Err("MLX Tile: repeats must be int64".to_string());
+    }
     let repeats = read_ints(ctx, n, 1)?;
-    let reps: Vec<i32> = repeats.iter().map(|&x| x as i32).collect();
+    if repeats.len() as i64 != repeats_shape[0] {
+        return Err("MLX Tile: repeats data length disagrees with metadata".to_string());
+    }
+    let dtype = mlx_dtype_from_onnx(n.outputs[0].otype);
+    let output = checked_tile_geometry(&shape, &repeats_shape, &repeats, dtype, false)?;
+    if output.contains(&0) {
+        let output: Vec<_> = output
+            .iter()
+            .map(|&extent| dim_i32(extent))
+            .collect::<Result<_, _>>()?;
+        let result = ctx.zeros(&output, dtype)?;
+        ctx.bind(&n.outputs[0], result);
+        return Ok(());
+    }
+    super::host_scan::layout(&shape, dtype, "Tile input")?;
+    let reps: Vec<i32> = repeats
+        .iter()
+        .map(|&repeat| dim_i32(repeat))
+        .collect::<Result<_, _>>()?;
+    let data = ctx.resolve(&n.inputs[0])?;
+    if shape.is_empty() {
+        ctx.bind(&n.outputs[0], data);
+        return Ok(());
+    }
     let r = ctx.emit(|res, s| unsafe { mlx::mlx_tile(res, data, reps.as_ptr(), reps.len(), s) })?;
     ctx.bind(&n.outputs[0], r);
+    Ok(())
+}
+
+fn checked_tile_repeats_metadata(shape: &[i64], data_rank: usize) -> Result<(), MlxError> {
+    if shape.len() != 1 {
+        return Err("MLX Tile: repeats must have rank one".to_string());
+    }
+    if usize::try_from(shape[0]).ok() != Some(data_rank) {
+        return Err("MLX Tile: repeats length must equal data rank".to_string());
+    }
     Ok(())
 }
 
@@ -1885,7 +2108,7 @@ fn scatter_elements_claim(node: &NodeView) -> ClaimResult {
         "data must have rank >= 1 (scalar data is unsupported)"
     );
     require!(
-        indices.shape == updates.shape,
+        compatible_shape(&indices.shape, &updates.shape),
         "indices shape {:?} must equal updates shape {:?}",
         indices.shape,
         updates.shape
@@ -1897,7 +2120,7 @@ fn scatter_elements_claim(node: &NodeView) -> ClaimResult {
         data.shape.len()
     );
     require!(
-        out.shape == data.shape,
+        compatible_shape(&out.shape, &data.shape),
         "output shape {:?} must equal data shape {:?}",
         out.shape,
         data.shape
@@ -1911,7 +2134,10 @@ fn scatter_elements_claim(node: &NodeView) -> ClaimResult {
     let ax = norm_axis(axis, rank as i32) as usize;
     for i in 0..data.shape.len() {
         require!(
-            i == ax || indices.shape[i] <= data.shape[i],
+            i == ax
+                || indices.shape[i] < 0
+                || data.shape[i] < 0
+                || indices.shape[i] <= data.shape[i],
             "on non-axis dim {i}, indices extent {} must be <= data extent {}",
             indices.shape[i],
             data.shape[i]
@@ -2164,14 +2390,31 @@ fn reverse_sequence_claim(node: &NodeView) -> ClaimResult {
     Ok(())
 }
 
+fn scatter_nd_compile_policy(reduction: &str) -> crate::registry::CompileShapeSafety {
+    if reduction == "add" {
+        crate::registry::CompileShapeSafety::EagerOnly {
+            reason: "validates live ScatterND add indices before unchecked MLX scatter writes",
+        }
+    } else {
+        crate::registry::CompileShapeSafety::ShapeKeyedOnly {
+            reason: crate::registry::MLX_SCATTER_SHAPE_REASON,
+        }
+    }
+}
+
 fn scatter_nd_claim(node: &NodeView) -> ClaimResult {
     require!(
         node.num_inputs() == 3 && node.num_outputs() == 1,
         "ScatterND expects 3 inputs and 1 output"
     );
+    let reduction = node.string_attr("reduction", "none");
     require!(
-        node.string_attr("reduction", "none") == "none",
-        "ScatterND: only reduction=none is supported"
+        reduction == "none" || reduction == "add",
+        "ScatterND: supports reduction none/add"
+    );
+    require!(
+        reduction != "add" || node.since_version() >= 16,
+        "ScatterND: reduction add requires opset 16 or newer"
     );
     let (data, indices, updates, output) = match (
         node.input_info(0),
@@ -2188,6 +2431,37 @@ fn scatter_nd_claim(node: &NodeView) -> ClaimResult {
         is_mlx_float(data.dtype),
         "ScatterND: data must be fp32/fp16/bf16 because MLX scatter payload kernels require float"
     );
+    if reduction == "add" {
+        let compatible = |left: &[i64], right: &[i64]| {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right)
+                    .all(|(&a, &b)| a >= -1 && b >= -1 && (a < 0 || b < 0 || a == b))
+        };
+        require!(
+            updates.dtype == data.dtype
+                && output.dtype == data.dtype
+                && compatible(&data.shape, &output.shape),
+            "ScatterND: data/output dtype or shape mismatch"
+        );
+        require!(
+            is_int_index(indices.dtype) && !indices.shape.is_empty() && !data.shape.is_empty(),
+            "ScatterND: requires integer index tuples and positive ranks"
+        );
+        let width = *indices.shape.last().unwrap();
+        require!(
+            width > 0 && width as usize <= data.shape.len(),
+            "ScatterND: index tuple width must be static and within data rank"
+        );
+        let mut expected = indices.shape[..indices.shape.len() - 1].to_vec();
+        expected.extend_from_slice(&data.shape[width as usize..]);
+        require!(
+            compatible(&expected, &updates.shape),
+            "ScatterND: incompatible updates shape"
+        );
+        return Ok(());
+    }
     require!(
         output.dtype == data.dtype && updates.dtype == data.dtype && output.shape == data.shape,
         "ScatterND: updates/output must match data dtype and output shape"
@@ -2315,7 +2589,7 @@ fn reshape_claim(node: &NodeView) -> ClaimResult {
     require!(
         node.input_info(1).map(|i| i.dtype)
             == Some(ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64),
-        "Reshape `shape` input must be int64 (runtime shape-derived values resolve at trace time; a data-dependent shape falls back to eager, and a cyclic partition is dropped to CPU)"
+        "Reshape `shape` input must be int64 (runtime shape-derived values resolve at trace time; data-dependent geometry uses eager translation and cyclic fusions are split)"
     );
     Ok(())
 }
@@ -2788,14 +3062,20 @@ fn split_to_sequence_claim(node: &NodeView) -> ClaimResult {
     }
 }
 
-fn tile_claim(node: &NodeView) -> ClaimResult {
-    require!(
-        node.num_inputs() == 2 && node.num_outputs() == 1,
-        "Tile expects 2 inputs and 1 output, got {}in/{}out",
-        node.num_inputs(),
-        node.num_outputs()
-    );
-    let (data, out) = match movable_io(node) {
+pub(crate) fn tile_payload_dtype(
+    node: &NodeView,
+) -> Result<ort::ONNXTensorElementDataType, std::borrow::Cow<'static, str>> {
+    validate_tile_payload(movable_io(node), node.since_version())
+}
+
+pub(crate) fn validate_tile_payload(
+    types: Option<(
+        ort::ONNXTensorElementDataType,
+        ort::ONNXTensorElementDataType,
+    )>,
+    since_version: i32,
+) -> Result<ort::ONNXTensorElementDataType, std::borrow::Cow<'static, str>> {
+    let (data, out) = match types {
         Some(v) => v,
         None => deny!("missing tensor type/shape info on the data input or output"),
     };
@@ -2811,10 +3091,136 @@ fn tile_claim(node: &NodeView) -> ClaimResult {
         crate::registry::ort_dtype_name(data)
     );
     require!(
-        node.is_const_int64(1),
-        "Tile: only a constant `repeats` initializer is claimed; this node's is a runtime value — stays on CPU"
+        data != ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16
+            || since_version >= 13,
+        "Tile: bfloat16 requires opset 13"
     );
+    Ok(data)
+}
+
+fn tile_claim(node: &NodeView) -> ClaimResult {
+    require!(
+        node.since_version() >= 6,
+        "Tile-1 has a distinct unsupported three-input signature"
+    );
+    require!(
+        node.num_inputs() == 2 && node.num_outputs() == 1,
+        "Tile expects 2 inputs and 1 output, got {}in/{}out",
+        node.num_inputs(),
+        node.num_outputs()
+    );
+    require!(node.num_attributes() == Some(0), "Tile has no attributes");
+    let data = tile_payload_dtype(node)?;
+    let repeats_info = node.input_info(1).ok_or("Tile: missing repeats metadata")?;
+    require!(
+        repeats_info.dtype == ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64,
+        "Tile: repeats must be int64"
+    );
+    require!(
+        node.input_rank_known(1) != Some(true) || repeats_info.shape.len() == 1,
+        "Tile: repeats must have rank one"
+    );
+    let info = node.input_info(0).ok_or("Tile: missing data metadata")?;
+    if !node.is_const_int64(1) {
+        if node.input_rank_known(0) == Some(true) {
+            if node.input_rank_known(1) == Some(true) && repeats_info.shape[0] >= 0 {
+                checked_tile_repeats_metadata(&repeats_info.shape, info.shape.len())?;
+            }
+            if node.output_rank_known(0) == Some(true) {
+                require!(
+                    node.output_info(0)
+                        .ok_or("Tile: missing output metadata")?
+                        .shape
+                        .len()
+                        == info.shape.len(),
+                    "Tile: output rank must match data rank"
+                );
+            }
+        }
+        if node.input_rank_known(1) == Some(true)
+            && repeats_info.shape[0] >= 0
+            && node.output_rank_known(0) == Some(true)
+        {
+            require!(
+                node.output_info(0)
+                    .ok_or("Tile: missing output metadata")?
+                    .shape
+                    .len() as i64
+                    == repeats_info.shape[0],
+                "Tile: output rank must match repeats length"
+            );
+        }
+        return Ok(());
+    }
+    let repeats = node
+        .read_const_int64(1)
+        .ok_or("Tile: cannot read constant repeats")?;
+    require!(
+        node.input_rank_known(1) == Some(true),
+        "Tile: repeats must have rank one"
+    );
+    let shape = if node.input_rank_known(0) == Some(true) {
+        info.shape
+    } else {
+        vec![-1; repeats.len()]
+    };
+    let output = checked_tile_geometry(
+        &shape,
+        &repeats_info.shape,
+        &repeats,
+        mlx_dtype_from_onnx(data),
+        true,
+    )?;
+    if node.output_rank_known(0) == Some(true) {
+        let declared = node.output_info(0).ok_or("Tile: missing output metadata")?;
+        require!(
+            declared.shape.len() == output.len(),
+            "Tile: output rank must match data rank"
+        );
+        require!(
+            declared
+                .shape
+                .iter()
+                .zip(&output)
+                .all(|(&declared, &actual)| { declared < 0 || actual < 0 || declared == actual }),
+            "Tile: declared output dimensions disagree with repeats"
+        );
+    }
     Ok(())
+}
+
+fn tile_compile_shape_safety(node: &NodeView) -> crate::registry::CompileShapeSafety {
+    if !node.is_const_int64(1) {
+        return crate::registry::CompileShapeSafety::EagerOnly {
+            reason: "Tile live repeats require fresh host values on every invocation",
+        };
+    }
+    let shape = node
+        .input_info(0)
+        .filter(|_| node.input_rank_known(0) == Some(true))
+        .map(|info| info.shape);
+    tile_geometry_shape_safety(shape.as_deref(), node.read_const_int64(1).as_deref())
+}
+
+fn tile_geometry_shape_safety(
+    shape: Option<&[i64]>,
+    repeats: Option<&[i64]>,
+) -> crate::registry::CompileShapeSafety {
+    use crate::registry::CompileShapeSafety;
+    if shape.is_some_and(|shape| shape.iter().any(|&extent| extent > i64::from(i32::MAX))) {
+        return CompileShapeSafety::EagerOnly {
+            reason: "Tile metadata-only empty output must not pre-import wide input extents",
+        };
+    }
+    if shape.is_some_and(|shape| shape.iter().all(|&extent| extent > 0))
+        && repeats.is_some_and(|repeats| repeats.iter().all(|&repeat| repeat > 0))
+    {
+        CompileShapeSafety::Shapeless
+    } else {
+        CompileShapeSafety::ShapeKeyedOnly {
+            reason: "conservatively shape-keyed: Tile emits concrete reshape/broadcast and empty output geometry",
+        }
+    }
 }
 
 fn pad_claim(node: &NodeView) -> ClaimResult {
@@ -3004,7 +3410,7 @@ fn range_claim(node: &NodeView) -> ClaimResult {
         for (i, value) in bounds.iter_mut().enumerate() {
             let values = match node.read_const_int64(i) {
                 Some(values) if values.len() == 1 => values,
-                _ => deny!("Range: integer bounds must be constant scalar initializers"),
+                _ => return Ok(()), // Live INT64 bounds are evaluated at an eager boundary.
             };
             *value = values[0];
         }
@@ -3547,12 +3953,16 @@ pub fn register(registry: &mut OpRegistry) {
         reverse_sequence_op,
         reverse_sequence_claim,
     );
-    shape_keyed(
-        registry,
-        "ScatterND",
-        scatter_nd_op,
-        scatter_nd_claim,
-        crate::registry::MLX_SCATTER_SHAPE_REASON,
+    registry.register_shape_classified(
+        OpRegistration {
+            domain: "",
+            op_type: "ScatterND",
+            min_opset: K_ANY_OPSET,
+            max_opset: K_ANY_OPSET,
+            handler: scatter_nd_op,
+            claim: scatter_nd_claim,
+        },
+        |node| scatter_nd_compile_policy(&node.string_attr("reduction", "none")),
     );
     shapeless(
         registry,
@@ -3620,7 +4030,17 @@ pub fn register(registry: &mut OpRegistry) {
         handler: split_to_sequence_op,
         claim: split_to_sequence_claim,
     });
-    shapeless(registry, "Tile", tile_op, tile_claim);
+    registry.register_shape_classified(
+        OpRegistration {
+            domain: "",
+            op_type: "Tile",
+            min_opset: 6,
+            max_opset: K_ANY_OPSET,
+            handler: tile_op,
+            claim: tile_claim,
+        },
+        tile_compile_shape_safety,
+    );
     shape_keyed(
         registry,
         "Pad",
@@ -3677,10 +4097,184 @@ pub fn register(registry: &mut OpRegistry) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn scatter_add_checks_empty_scalar_and_invalid_geometry() {
+        assert!(matches!(
+            super::scatter_nd_compile_policy("none"),
+            crate::registry::CompileShapeSafety::ShapeKeyedOnly { .. }
+        ));
+        assert!(matches!(
+            super::scatter_nd_compile_policy("add"),
+            crate::registry::CompileShapeSafety::EagerOnly { .. }
+        ));
+        assert_eq!(
+            super::scatter_nd_add_geometry(&[2, 3, 4], &[0, 2], &[0, 4]).unwrap(),
+            (2, 6, 4, 0)
+        );
+        assert_eq!(
+            super::scatter_nd_add_geometry(&[2, 3], &[2], &[]).unwrap(),
+            (2, 6, 1, 1)
+        );
+        assert!(super::scatter_nd_add_geometry(&[2], &[1, 2], &[1]).is_err());
+        assert!(super::scatter_nd_add_geometry(&[2], &[1, 0], &[1, 2]).is_err());
+        assert!(super::scatter_nd_add_geometry(&[2, 3], &[2, 1], &[2, 2]).is_err());
+        assert!(super::scatter_nd_add_geometry(&[i32::MAX, 2], &[1, 2], &[1]).is_err());
+    }
+
     use super::{
         checked_flatten_axis, checked_flatten_shape, checked_pad_axes, checked_pad_geometry,
-        checked_rank_change_axes, checked_split_sizes, checked_transpose_perm, integer_range_count,
+        checked_rank_change_axes, checked_split_sizes, checked_tile_geometry,
+        checked_tile_repeats_metadata, checked_transpose_perm, integer_range_count,
+        tile_geometry_shape_safety,
     };
+    use crate::registry::CompileShapeSafety;
+    use crate::sys::mlx;
+
+    #[test]
+    fn tile_live_metadata_is_validated_before_reading_values() {
+        for rank in [0, 1, 2, 65] {
+            assert!(checked_tile_repeats_metadata(&[rank as i64], rank).is_ok());
+            for shape in [
+                vec![],
+                vec![1, rank as i64],
+                vec![-1],
+                vec![rank as i64 + 1],
+            ] {
+                assert!(checked_tile_repeats_metadata(&shape, rank).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn tile_exact_checked_geometry() {
+        let dtype = mlx::mlx_dtype__MLX_FLOAT32;
+        for (shape, repeats, expected) in [
+            (vec![], vec![], vec![]),
+            (vec![2, 3], vec![3, 2], vec![6, 6]),
+            (vec![0, 2], vec![i64::MAX, 3], vec![0, 6]),
+            (vec![0, i64::MAX], vec![1, 0], vec![0, 0]),
+            (vec![i64::MAX, 0], vec![0, i64::MAX], vec![0, 0]),
+            (vec![65536, 65536, 0], vec![1, 1, 1], vec![65536, 65536, 0]),
+            (
+                vec![i64::from(i32::MAX)],
+                vec![1],
+                vec![i64::from(i32::MAX)],
+            ),
+        ] {
+            assert_eq!(
+                checked_tile_geometry(&shape, &[repeats.len() as i64], &repeats, dtype, false)
+                    .unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn tile_rejects_each_invalid_axis_before_empty_shortcut() {
+        let dtype = mlx::mlx_dtype__MLX_UINT64;
+        for (shape, repeats, message) in [
+            (vec![0], vec![-1], "repeats must be nonnegative"),
+            (vec![0, 2], vec![1, i64::MIN], "repeats must be nonnegative"),
+            (
+                vec![1],
+                vec![(1i64 << 32) + 1],
+                "output extent exceeds int32",
+            ),
+            (vec![1], vec![i64::MAX], "output extent exceeds int32"),
+            (vec![2], vec![i64::MAX], "output extent overflows int64"),
+            (
+                vec![0, 2],
+                vec![1, i64::MAX],
+                "output extent overflows int64",
+            ),
+            (
+                vec![0, 1],
+                vec![1, i64::from(i32::MAX) + 1],
+                "output extent exceeds int32",
+            ),
+            (vec![0, i64::MAX], vec![1, 1], "output extent exceeds int32"),
+            (
+                vec![65536, 65536],
+                vec![1, 1],
+                "element count exceeds int32 indexing",
+            ),
+            (vec![-1], vec![0], "negative runtime extent"),
+        ] {
+            let error =
+                checked_tile_geometry(&shape, &[repeats.len() as i64], &repeats, dtype, false)
+                    .unwrap_err();
+            assert!(error.contains(message), "{error}");
+        }
+    }
+
+    #[test]
+    fn tile_rank_cardinality_and_symbolic_geometry() {
+        let dtype = mlx::mlx_dtype__MLX_BOOL;
+        for (shape, repeats_shape, repeats, message) in [
+            (vec![2], vec![], vec![2], "repeats must have rank one"),
+            (vec![2], vec![1, 1], vec![2], "repeats must have rank one"),
+            (
+                vec![2, 3],
+                vec![1],
+                vec![2],
+                "repeats length must equal data rank",
+            ),
+            (
+                vec![],
+                vec![1],
+                vec![],
+                "repeats length must equal data rank",
+            ),
+            (
+                vec![2],
+                vec![0],
+                vec![2],
+                "repeats length must equal data rank",
+            ),
+        ] {
+            assert!(
+                checked_tile_geometry(&shape, &repeats_shape, &repeats, dtype, false)
+                    .unwrap_err()
+                    .contains(message)
+            );
+        }
+        assert_eq!(
+            checked_tile_geometry(&[-1, 2], &[2], &[3, 2], dtype, true).unwrap(),
+            [-1, 4]
+        );
+        assert_eq!(
+            checked_tile_geometry(&[-1, 2], &[2], &[0, 2], dtype, true).unwrap(),
+            [0, 4]
+        );
+        assert!(checked_tile_geometry(&[-1], &[1], &[-1], dtype, true).is_err());
+    }
+
+    #[test]
+    fn tile_capture_is_geometry_specific() {
+        assert_eq!(
+            tile_geometry_shape_safety(Some(&[]), Some(&[])),
+            CompileShapeSafety::Shapeless
+        );
+        assert_eq!(
+            tile_geometry_shape_safety(Some(&[2, 3]), Some(&[2, 1])),
+            CompileShapeSafety::Shapeless
+        );
+        for (shape, repeats) in [
+            (None, Some(&[2, 1][..])),
+            (Some(&[-1, 3][..]), Some(&[2, 1][..])),
+            (Some(&[0, 3][..]), Some(&[2, 1][..])),
+            (Some(&[2, 3][..]), Some(&[0, 1][..])),
+        ] {
+            assert!(matches!(
+                tile_geometry_shape_safety(shape, repeats),
+                CompileShapeSafety::ShapeKeyedOnly { .. }
+            ));
+        }
+        assert!(matches!(
+            tile_geometry_shape_safety(Some(&[0, i64::MAX]), Some(&[1, 0])),
+            CompileShapeSafety::EagerOnly { .. }
+        ));
+    }
 
     #[test]
     fn split_sizes_validate_without_known_axis_geometry() {
