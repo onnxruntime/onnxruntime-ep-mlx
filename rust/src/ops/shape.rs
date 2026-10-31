@@ -511,7 +511,93 @@ fn reverse_sequence_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(),
     Ok(())
 }
 
+fn scatter_nd_add_geometry(
+    data: &[i32],
+    indices: &[i32],
+    updates: &[i32],
+) -> Result<(usize, i32, i32, i32), MlxError> {
+    let width = *indices
+        .last()
+        .ok_or("ScatterND: indices rank must be positive")?;
+    if data.is_empty() || width <= 0 || width as usize > data.len() {
+        return Err("ScatterND: index tuple width is outside the data rank".to_string());
+    }
+    let width = width as usize;
+    let mut expected = indices[..indices.len() - 1].to_vec();
+    expected.extend_from_slice(&data[width..]);
+    if updates != expected || data.iter().chain(indices).any(|&d| d < 0) {
+        return Err("ScatterND: updates shape does not match index/data geometry".to_string());
+    }
+    let product = |shape: &[i32]| {
+        shape.iter().try_fold(1i32, |a, &b| {
+            a.checked_mul(b)
+                .ok_or_else(|| "ScatterND: flattened extent exceeds int32 indexing".to_string())
+        })
+    };
+    Ok((
+        width,
+        product(&data[..width])?,
+        product(&data[width..])?,
+        product(&indices[..indices.len() - 1])?,
+    ))
+}
+
+fn scatter_nd_add_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
+    let data = ctx.resolve(&n.inputs[0])?;
+    let indices = ctx.resolve(&n.inputs[1])?;
+    let updates = ctx.resolve(&n.inputs[2])?;
+    let shape = ctx.shape_of(data);
+    let index_shape = ctx.shape_of(indices);
+    let update_shape = ctx.shape_of(updates);
+    let (width, rows, tail, count) = scatter_nd_add_geometry(&shape, &index_shape, &update_shape)?;
+    if count == 0 {
+        let out = ctx.contiguous(data)?;
+        ctx.bind(&n.outputs[0], out);
+        return Ok(());
+    }
+    // MLX scatter does not check bounds. Validate live tuples before a native write.
+    // This form is eager so checks run again when values change at identical shapes.
+    let raw = ctx.read_ints_eval(&n.inputs[1])?;
+    if raw.len() != count as usize * width {
+        return Err("ScatterND: index value count does not match its shape".to_string());
+    }
+    let mut flat = Vec::with_capacity(count as usize);
+    for tuple in raw.chunks_exact(width) {
+        let mut index = 0i64;
+        for (&value, &extent) in tuple.iter().zip(&shape[..width]) {
+            let extent = i64::from(extent);
+            if value < -extent || value >= extent {
+                return Err("ScatterND: index is out of bounds".to_string());
+            }
+            index = index * extent + if value < 0 { value + extent } else { value };
+        }
+        flat.push(index as i32);
+    }
+    if tail == 0 {
+        let out = ctx.contiguous(data)?;
+        ctx.bind(&n.outputs[0], out);
+        return Ok(());
+    }
+    let indices = ctx.keep(Array::from_data(
+        flat.as_ptr() as *const std::os::raw::c_void,
+        &[count],
+        mlx::mlx_dtype__MLX_INT32,
+    ));
+    let base = ctx.reshape(data, &[rows, tail])?;
+    let updates = ctx.reshape(updates, &[count, 1, tail])?;
+    let out = ctx.emit(|res, stream| unsafe {
+        mlx::mlx_scatter_add_single(res, base, indices, updates, 0, stream)
+    })?;
+    let out = ctx.reshape(out, &shape)?;
+    let out = ctx.contiguous(out)?;
+    ctx.bind(&n.outputs[0], out);
+    Ok(())
+}
+
 fn scatter_nd_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
+    if n.strings.get("reduction").map(String::as_str) == Some("add") {
+        return scatter_nd_add_op(ctx, n);
+    }
     let data = ctx.resolve(&n.inputs[0])?;
     let indices = ctx.resolve(&n.inputs[1])?;
     let updates = ctx.resolve(&n.inputs[2])?;
@@ -2304,14 +2390,31 @@ fn reverse_sequence_claim(node: &NodeView) -> ClaimResult {
     Ok(())
 }
 
+fn scatter_nd_compile_policy(reduction: &str) -> crate::registry::CompileShapeSafety {
+    if reduction == "add" {
+        crate::registry::CompileShapeSafety::EagerOnly {
+            reason: "validates live ScatterND add indices before unchecked MLX scatter writes",
+        }
+    } else {
+        crate::registry::CompileShapeSafety::ShapeKeyedOnly {
+            reason: crate::registry::MLX_SCATTER_SHAPE_REASON,
+        }
+    }
+}
+
 fn scatter_nd_claim(node: &NodeView) -> ClaimResult {
     require!(
         node.num_inputs() == 3 && node.num_outputs() == 1,
         "ScatterND expects 3 inputs and 1 output"
     );
+    let reduction = node.string_attr("reduction", "none");
     require!(
-        node.string_attr("reduction", "none") == "none",
-        "ScatterND: only reduction=none is supported"
+        reduction == "none" || reduction == "add",
+        "ScatterND: supports reduction none/add"
+    );
+    require!(
+        reduction != "add" || node.since_version() >= 16,
+        "ScatterND: reduction add requires opset 16 or newer"
     );
     let (data, indices, updates, output) = match (
         node.input_info(0),
@@ -2328,6 +2431,37 @@ fn scatter_nd_claim(node: &NodeView) -> ClaimResult {
         is_mlx_float(data.dtype),
         "ScatterND: data must be fp32/fp16/bf16 because MLX scatter payload kernels require float"
     );
+    if reduction == "add" {
+        let compatible = |left: &[i64], right: &[i64]| {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right)
+                    .all(|(&a, &b)| a >= -1 && b >= -1 && (a < 0 || b < 0 || a == b))
+        };
+        require!(
+            updates.dtype == data.dtype
+                && output.dtype == data.dtype
+                && compatible(&data.shape, &output.shape),
+            "ScatterND: data/output dtype or shape mismatch"
+        );
+        require!(
+            is_int_index(indices.dtype) && !indices.shape.is_empty() && !data.shape.is_empty(),
+            "ScatterND: requires integer index tuples and positive ranks"
+        );
+        let width = *indices.shape.last().unwrap();
+        require!(
+            width > 0 && width as usize <= data.shape.len(),
+            "ScatterND: index tuple width must be static and within data rank"
+        );
+        let mut expected = indices.shape[..indices.shape.len() - 1].to_vec();
+        expected.extend_from_slice(&data.shape[width as usize..]);
+        require!(
+            compatible(&expected, &updates.shape),
+            "ScatterND: incompatible updates shape"
+        );
+        return Ok(());
+    }
     require!(
         output.dtype == data.dtype && updates.dtype == data.dtype && output.shape == data.shape,
         "ScatterND: updates/output must match data dtype and output shape"
@@ -3819,12 +3953,16 @@ pub fn register(registry: &mut OpRegistry) {
         reverse_sequence_op,
         reverse_sequence_claim,
     );
-    shape_keyed(
-        registry,
-        "ScatterND",
-        scatter_nd_op,
-        scatter_nd_claim,
-        crate::registry::MLX_SCATTER_SHAPE_REASON,
+    registry.register_shape_classified(
+        OpRegistration {
+            domain: "",
+            op_type: "ScatterND",
+            min_opset: K_ANY_OPSET,
+            max_opset: K_ANY_OPSET,
+            handler: scatter_nd_op,
+            claim: scatter_nd_claim,
+        },
+        |node| scatter_nd_compile_policy(&node.string_attr("reduction", "none")),
     );
     shapeless(
         registry,
@@ -3959,6 +4097,30 @@ pub fn register(registry: &mut OpRegistry) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn scatter_add_checks_empty_scalar_and_invalid_geometry() {
+        assert!(matches!(
+            super::scatter_nd_compile_policy("none"),
+            crate::registry::CompileShapeSafety::ShapeKeyedOnly { .. }
+        ));
+        assert!(matches!(
+            super::scatter_nd_compile_policy("add"),
+            crate::registry::CompileShapeSafety::EagerOnly { .. }
+        ));
+        assert_eq!(
+            super::scatter_nd_add_geometry(&[2, 3, 4], &[0, 2], &[0, 4]).unwrap(),
+            (2, 6, 4, 0)
+        );
+        assert_eq!(
+            super::scatter_nd_add_geometry(&[2, 3], &[2], &[]).unwrap(),
+            (2, 6, 1, 1)
+        );
+        assert!(super::scatter_nd_add_geometry(&[2], &[1, 2], &[1]).is_err());
+        assert!(super::scatter_nd_add_geometry(&[2], &[1, 0], &[1, 2]).is_err());
+        assert!(super::scatter_nd_add_geometry(&[2, 3], &[2, 1], &[2, 2]).is_err());
+        assert!(super::scatter_nd_add_geometry(&[i32::MAX, 2], &[1, 2], &[1]).is_err());
+    }
+
     use super::{
         checked_flatten_axis, checked_flatten_shape, checked_pad_axes, checked_pad_geometry,
         checked_rank_change_axes, checked_split_sizes, checked_tile_geometry,
