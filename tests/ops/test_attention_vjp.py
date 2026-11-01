@@ -10,7 +10,7 @@ import pytest
 import _models as m
 
 
-def _model(rank, d, hq, hk, causal, kind, selected=(0, 1, 2)):
+def _model(rank, d, hq, hk, causal, kind, selected=(0, 1, 2), mask_rank=4):
     shape = lambda h, s: ["batch", h, s, d] if rank == 4 else ["batch", s, h * d]
     q, k, v, y, g = [
         m.tensor(n, ir.DataType.FLOAT, shape(h, s))
@@ -25,7 +25,7 @@ def _model(rank, d, hq, hk, causal, kind, selected=(0, 1, 2)):
     mask = m.tensor(
         "mask",
         ir.DataType.BOOL if kind != 2 else ir.DataType.FLOAT,
-        ["batch", 1, "sq", "width"],
+        ["batch", 1, "sq", "width"][-mask_rank:],
     )
     # Function body uses ordinary ONNX. Native execution is selected by its versioned name.
     t = ir.tape.Tape()
@@ -59,7 +59,7 @@ def _model(rank, d, hq, hk, causal, kind, selected=(0, 1, 2)):
             "Where",
             [t.op("Equal", [width, const([1])]), const([0]), t.op("Sub", [dim(ak, 2), width])],
         )
-        pads = t.op("Concat", [const([0] * 7), padding], {"axis": 0})
+        pads = t.op("Concat", [const([0] * (2 * mask_rank - 1)), padding], {"axis": 0})
         fill = (
             t.op("Constant", [], {"value": ir.tensor(np.array(False))})
             if kind == 1
@@ -149,7 +149,7 @@ def _reference(q, k, v, g, mask, causal, scale):
         if mask.shape[-1] != 1 and mask.shape[-1] < k.shape[2]:
             mask = np.pad(
                 mask,
-                [(0, 0)] * 3 + [(0, k.shape[2] - mask.shape[-1])],
+                [(0, 0)] * (mask.ndim - 1) + [(0, k.shape[2] - mask.shape[-1])],
                 constant_values=False if mask.dtype == bool else -np.inf,
             )
         scores += np.where(mask, 0, -np.inf) if mask.dtype == bool else mask
@@ -178,6 +178,7 @@ def _reference(q, k, v, g, mask, causal, scale):
     return y.astype(np.float32), [a.astype(np.float32) for a in (dq, dk, dv)]
 
 
+@pytest.mark.parametrize("mask_rank", [1, 2, 3, 4])
 @pytest.mark.parametrize("dense_limit", [0, 64 * 1024**2])
 @pytest.mark.parametrize(
     "rank,d,hq,hk,causal,kind,selected",
@@ -189,7 +190,7 @@ def _reference(q, k, v, g, mask, causal, scale):
     ],
 )
 def test_tiled_attention_live_inputs(
-    rank, d, hq, hk, causal, kind, selected, dense_limit, monkeypatch
+    rank, d, hq, hk, causal, kind, selected, dense_limit, mask_rank, monkeypatch
 ):
     monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_COMPILE", "1")
     monkeypatch.setenv("ONNXRUNTIME_EP_MLX_ATTENTION_VJP_DENSE_LIMIT_BYTES", str(dense_limit))
@@ -197,12 +198,13 @@ def test_tiled_attention_live_inputs(
     options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
     options.add_session_config_entry("session.disable_cpu_ep_fallback", "1")
     session = ort.InferenceSession(
-        _model(rank, d, hq, hk, causal, kind, selected),
+        _model(rank, d, hq, hk, causal, kind, selected, mask_rank),
         options,
         providers=["MLXExecutionProvider"],
     )
     cpu = ort.InferenceSession(
-        _model(rank, d, hq, hk, causal, kind, selected), providers=["CPUExecutionProvider"]
+        _model(rank, d, hq, hk, causal, kind, selected, mask_rank),
+        providers=["CPUExecutionProvider"],
     )
     rng = np.random.default_rng(45)
     for b, s, t, width in [(2, 5, 7, 7), (1, 33, 35, 29), (1, 32, 32, 1), (1, 17, 18, 18)]:
@@ -211,6 +213,12 @@ def test_tiled_attention_live_inputs(
         g = rng.normal(size=q.shape).astype(np.float32)
         allowed = rng.random((b, 1, s, width)) > 0.2
         allowed[0, :, 0] = False
+        if mask_rank == 1:
+            allowed = allowed[0, 0, -1]
+        elif mask_rank == 2:
+            allowed = allowed[0, 0]
+        elif mask_rank == 3:
+            allowed = allowed[0]
         mask = allowed if kind != 2 else np.where(allowed, 0, -np.inf).astype(np.float32)
         y, expected = _reference(
             q, k, v, g, mask if kind else None, causal, float(np.float32(d**-0.5))

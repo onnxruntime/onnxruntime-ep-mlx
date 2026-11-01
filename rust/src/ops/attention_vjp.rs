@@ -48,6 +48,8 @@ impl Config {
             || hk <= 0
             || hq % hk != 0
             || !matches!(d, 16 | 32 | 64 | 128)
+            || hq.checked_mul(d).is_none()
+            || hk.checked_mul(d).is_none()
             || !scale.is_finite()
             || scale <= 0.
             || !matches!(causal, 0 | 1)
@@ -372,6 +374,7 @@ mod tests {
         for (old, new) in [
             ("v1_", "v2_"),
             ("q16_", "q15_"),
+            ("q16_", "q2147483640_"),
             ("d128_", "d256_"),
             ("s3db504f3_", "s7f800000_"),
             ("c1_", "c2_"),
