@@ -14,9 +14,10 @@ Y = X @ W
 ```
 
 The buffers have `ceil(K*N/B)*B/2` bytes and `ceil(K*N/B)` scales. Packed bytes,
-scales and the lookup table are immutable initializer data. Computation,
-scales, lookup values and outputs use FP32. The input may have dynamic leading
-dimensions, including a vector or an empty batch.
+scales and the lookup table are immutable initializer data. Scales and lookup
+values use FP32. Products support FP32, FP16 and BF16; half-precision adjoints
+can widen rounded weights to FP32 before multiplication. The input may have
+dynamic leading dimensions, including a vector or an empty batch.
 
 ## Execution
 
@@ -27,10 +28,15 @@ packed bytes and scales directly, and removes decoder nodes whose outputs have
 no remaining consumers. Graph outputs, control-flow captures and shared
 consumers retain their decoded values.
 
-The Metal kernel decodes 16-by-16 tiles into threadgroup memory and uses FP32
+Small FP32 products decode 16-by-16 tiles into threadgroup memory and use FP32
 SIMD-group matrix operations with compensated accumulation across K tiles.
-A CPU stream uses a cached FP32 decode and ordinary CPU matrix multiplication.
+Larger FP32 products decode once per execution and use MLX GEMM. FP16/BF16
+products decode directly into the selected half dtype and use MLX GEMM; FP32
+adjoints widen those same rounded weights. Decode buffers remain local to the
+execution. A CPU stream uses a cached decode and ordinary matrix multiplication.
 Cache keys distinguish branch-local initializer storage and lookup values.
+See [half-precision execution](ATTENTION_VJP.md#half-precision-lookup-weights)
+for the rounding contract and precision benchmark.
 The exported ONNX graph and public operator registry keep their existing form.
 
 Set `ONNXRUNTIME_EP_MLX_NO_LUT4_FUSION=1` to compare the original execution path.
