@@ -484,6 +484,94 @@ for (uint i=tid; i<256; i+=128) {
 }
 "#;
 
+// Large training/prefill batches benefit from the tuned MLX GEMM. Decode once per
+// execution, keeping the temporary weight local to this graph evaluation.
+fn decoded_gemm(
+    ctx: &mut TranslationContext,
+    pattern: &LookupMatMul,
+    x: mlx::mlx_array,
+) -> Result<mlx::mlx_array, MlxError> {
+    let packed = ctx.resolve(&pattern.packed)?;
+    let scales = ctx.resolve(&pattern.scales)?;
+    let key = format!("__lookup4_book__{:?}", pattern.book.map(f32::to_bits));
+    let book = if let Some(value) = ctx.cache_get(&key) {
+        value
+    } else {
+        ctx.cache_put(
+            key,
+            Array::from_data(pattern.book.as_ptr().cast(), &[16], F32),
+        )
+    };
+    let names = super::selective_scan::VecString::new(&["packed", "scales", "book"])?;
+    let outputs = super::selective_scan::VecString::new(&["weight"])?;
+    let source = c"uint i=thread_position_in_grid.x; if(i<COUNT){uint byte=packed[i/2];uint code=(i%2==0)?byte>>4:byte&15;weight[i]=book[code]*scales[i/BLOCK];}";
+    let kernel = unsafe {
+        mlx::mlx_fast_metal_kernel_new(
+            c"mlx_lookup4_decode".as_ptr(),
+            names.as_raw(),
+            outputs.as_raw(),
+            source.as_ptr(),
+            c"".as_ptr(),
+            true,
+            false,
+        )
+    };
+    if kernel.ctx.is_null() {
+        return Err("lookup4 GEMM: cannot create decode kernel".into());
+    }
+    let config = unsafe { mlx::mlx_fast_metal_kernel_config_new() };
+    if config.ctx.is_null() {
+        unsafe { mlx::mlx_fast_metal_kernel_free(kernel) };
+        return Err("lookup4 GEMM: cannot create decode config".into());
+    }
+    let count = pattern.rows * pattern.cols;
+    let mut rc = unsafe {
+        mlx::mlx_fast_metal_kernel_config_add_template_arg_int(config, c"COUNT".as_ptr(), count)
+    };
+    rc |= unsafe {
+        mlx::mlx_fast_metal_kernel_config_add_template_arg_int(
+            config,
+            c"BLOCK".as_ptr(),
+            pattern.block,
+        )
+    };
+    let shape = [pattern.rows, pattern.cols];
+    rc |= unsafe {
+        mlx::mlx_fast_metal_kernel_config_add_output_arg(config, shape.as_ptr(), shape.len(), F32)
+    };
+    rc |= unsafe { mlx::mlx_fast_metal_kernel_config_set_grid(config, count, 1, 1) };
+    rc |= unsafe { mlx::mlx_fast_metal_kernel_config_set_thread_group(config, 256, 1, 1) };
+    let mut inputs = VectorArray::new();
+    for value in [packed, scales, book] {
+        inputs.append(value);
+    }
+    let mut output = VectorArray::new();
+    if rc == 0 {
+        rc = unsafe {
+            mlx::mlx_fast_metal_kernel_apply(
+                output.as_mut_ptr(),
+                kernel,
+                inputs.as_raw(),
+                config,
+                ctx.stream(),
+            )
+        };
+    }
+    unsafe {
+        mlx::mlx_fast_metal_kernel_config_free(config);
+        mlx::mlx_fast_metal_kernel_free(kernel);
+    }
+    if rc != 0 || output.size() != 1 {
+        return Err("lookup4 GEMM: decode dispatch failed".into());
+    }
+    let mut weight = ctx.keep(output.get(0));
+    if pattern.transpose {
+        weight = ctx.transpose(weight, &[1, 0])?;
+    }
+    ctx.mark_fast("lookup4 decode + MLX GEMM");
+    ctx.binary(mlx::mlx_matmul, x, weight)
+}
+
 pub(super) fn execute(ctx: &mut TranslationContext, node: &NodeDesc) -> Result<bool, MlxError> {
     let Some(pattern) = &node.lut4 else {
         return Ok(false);
@@ -561,6 +649,8 @@ pub(super) fn execute(ctx: &mut TranslationContext, node: &NodeDesc) -> Result<b
         };
         ctx.mark_composed("frozen lookup4 decode + CPU matmul");
         ctx.binary(mlx::mlx_matmul, x, weight)?
+    } else if m >= 128 && std::env::var("ONNXRUNTIME_EP_MLX_LUT4_GEMM").as_deref() != Ok("0") {
+        decoded_gemm(ctx, pattern, x)?
     } else {
         let x = ctx.contiguous(x)?;
         let packed = ctx.resolve(&pattern.packed)?;
