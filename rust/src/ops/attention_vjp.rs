@@ -347,7 +347,7 @@ fn translate(ctx: &mut TranslationContext, node: &NodeDesc) -> Result<(), MlxErr
 pub fn register(registry: &mut OpRegistry) {
     registry.register_shape_keyed(
         OpRegistration {
-            domain: "ai.onnax",
+            domain: "pkg.onnax",
             op_type: "AttentionVJP",
             min_opset: 1,
             max_opset: 1,

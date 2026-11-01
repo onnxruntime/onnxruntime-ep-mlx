@@ -1,6 +1,6 @@
 # Attention pullbacks for training
 
-The provider executes versioned `ai.onnax::AttentionVJP_v1_*` local functions
+The provider executes versioned `pkg.onnax::AttentionVJP_v1_*` local functions
 emitted by onnax's optional deployment pass. Each function also contains an
 ordinary ONNX implementation for other runtimes.
 

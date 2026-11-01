@@ -203,7 +203,7 @@ impl OpRegistry {
             let e = &registered.entry;
             e.domain == domain
                 && (e.op_type == op_type
-                    || (domain == "ai.onnax"
+                    || (domain == "pkg.onnax"
                         && e.op_type == "AttentionVJP"
                         && op_type.starts_with("AttentionVJP_v1_")))
                 && (e.min_opset == K_ANY_OPSET || since_version >= e.min_opset)
