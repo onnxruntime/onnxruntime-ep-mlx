@@ -117,7 +117,7 @@ def _model(rank, d, hq, hk, causal, kind, selected=(0, 1, 2), mask_rank=4):
         )
         for i in selected
     ]
-    node = ir.node(name, [q, k, v, y, g, mask], domain="ai.onnax", outputs=outputs)
+    node = ir.node(name, [q, k, v, y, g, mask], domain="pkg.onnax", outputs=outputs)
     # Clone formals so the body and call graph own independent values.
     body = ir.GraphView(
         [q, k, v, y, g, mask],
@@ -125,14 +125,14 @@ def _model(rank, d, hq, hk, causal, kind, selected=(0, 1, 2), mask_rank=4):
         nodes=t.nodes,
         opset_imports={"": 25},
     ).clone()
-    fn = ir.Function("ai.onnax", name, graph=body, attributes=[])
+    fn = ir.Function("pkg.onnax", name, graph=body, attributes=[])
     model = ir.Model(
         ir.Graph(
             [q, k, v, y, g, mask],
             outputs,
             nodes=[node],
             name="attention_vjp",
-            opset_imports={"": 25, "ai.onnax": 1},
+            opset_imports={"": 25, "pkg.onnax": 1},
         ),
         ir_version=11,
         functions=[fn],
