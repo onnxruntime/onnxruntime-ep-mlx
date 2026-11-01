@@ -81,6 +81,7 @@ def _affine_model(bits, precision, rows, inner, outer, block=64):
             nodes=tape.nodes,
             initializers=tape.initializers,
             opset_imports={"": 18, "com.microsoft": 1},
+            name="affine_quantized_product",
         ),
         ir_version=10,
     )
