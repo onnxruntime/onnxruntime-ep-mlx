@@ -50,3 +50,24 @@ changing weights and sizes, and check that a loop/body formal cannot enter the
 immutable cache. `ONNXRUNTIME_EP_MLX_PACK_FROZEN_VIEWS=0` disables this policy.
 These derived arrays live with the session; the allocator's idle-buffer budget
 controls a separate cache.
+
+## Half-precision lookup weights
+
+Lookup-4 recognition also follows FP16/BF16 casts around decoded weights.
+Forward products decode directly into the selected half dtype and call MLX GEMM.
+FP32 adjoints widen those same rounded weights before multiplication. A transpose
+preserves the rounding boundary. Decode buffers are local to the execution;
+packed weights stay compressed between calls. Shared decoded outputs retain their
+original producer graph.
+
+Measure the precision paths with the shared correctness graphs:
+
+```sh
+python bench/lookup4_precision.py --library /absolute/path/to/libonnxruntime_mlx_ep.dylib \
+  --precision bf16 --rows 1024 --inner 1024 --outer 2048 --output bf16-forward.json
+```
+
+Add `--adjoint` for a transposed FP32 derivative product, or `--disable-fusion`
+for the portable decode chain. Each invocation uses ten warmups, 100 synchronous
+samples, disabled CPU fallback, and disabled ORT graph optimization. Output files
+include raw samples, runtime/library identity and a NumPy output for comparison.
