@@ -198,7 +198,7 @@ unsafe fn create_ep_impl(
     _devices: *const *const ort::OrtHardwareDevice,
     _ep_metadata: *const *const ort::OrtKeyValuePairs,
     num_devices: usize,
-    _session_options: *const ort::OrtSessionOptions,
+    session_options: *const ort::OrtSessionOptions,
     logger: *const ort::OrtLogger,
     ep: *mut *mut ort::OrtEp,
 ) -> *mut ort::OrtStatus {
@@ -210,6 +210,10 @@ unsafe fn create_ep_impl(
                 ort::OrtErrorCode_ORT_INVALID_ARGUMENT,
                 c"MLXExecutionProvider expects exactly one device".as_ptr(),
             );
+        }
+        let status = crate::memory::configure_cache(&*f.ort_api, session_options);
+        if !status.is_null() {
+            return status;
         }
         let mlx_ep = MlxEp::new(f.ort_api, f.ep_api, &f.name, logger);
         *ep = mlx_ep.as_ptr();
