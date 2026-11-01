@@ -1,4 +1,4 @@
-//! Private frozen, blocked 4-bit lookup decoding followed by FP32 MatMul.
+//! Private frozen, blocked 4-bit lookup decoding with precision-preserving MatMul.
 //! Recognition proves the standard ONNX producer chain; public ONNX remains unchanged.
 
 use std::collections::{HashMap, HashSet};

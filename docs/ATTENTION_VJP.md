@@ -71,3 +71,8 @@ Add `--adjoint` for a transposed FP32 derivative product, or `--disable-fusion`
 for the portable decode chain. Each invocation uses ten warmups, 100 synchronous
 samples, disabled CPU fallback, and disabled ORT graph optimization. Output files
 include raw samples, runtime/library identity and a NumPy output for comparison.
+
+Use `--format int4` or `--format int8` for affine MatMulNBits forward products.
+These modes also check an independent NumPy decoded-weight product and record
+its error. NF4 uses its 16-entry NormalFloat table; affine formats use their own
+scale/zero-point encoding.
