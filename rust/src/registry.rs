@@ -401,6 +401,7 @@ pub fn translate(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxEr
     ctx.reset_path_mark();
     let r = handler(ctx, n);
     if r.is_ok() {
+        ctx.track_frozen_view(n);
         let mark = ctx.take_path_mark();
         tr.record_op_path(n, start, mark);
         // Per-op detail span (rich Args always; fine mode also times a per-op eval).

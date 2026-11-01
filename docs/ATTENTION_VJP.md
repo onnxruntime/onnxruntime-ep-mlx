@@ -35,3 +35,18 @@ released with the execution graph; it is not added to the persistent weight cach
 The regression suite builds models with ONNX IR and compares both attention
 policies with independent NumPy derivatives and portable ONNX function bodies.
 Lookup-4 tests replay both weight layouts across the 128-row dispatch boundary.
+
+## Reuse frozen precision and layout views
+
+Immutable initializers retain provenance through Cast, Transpose and Identity.
+Large FP16/BF16/FP32 conversions are cached once per session. A very wide frozen
+projection's transposed FP32 matrix is packed contiguously for its backward
+GEMM. This avoids the slow tall-reduction transposed-RHS route while preserving
+all weight values.
+
+Runtime inputs and shape-derived data keep their live semantics. Control-flow
+formals shadow outer provenance and restore it on scope exit. Tests replay
+changing weights and sizes, and check that a loop/body formal cannot enter the
+immutable cache. `ONNXRUNTIME_EP_MLX_PACK_FROZEN_VIEWS=0` disables this policy.
+These derived arrays live with the session; the allocator's idle-buffer budget
+controls a separate cache.
