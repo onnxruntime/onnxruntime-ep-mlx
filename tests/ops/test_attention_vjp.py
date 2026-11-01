@@ -202,8 +202,12 @@ def test_tiled_attention_live_inputs(
         options,
         providers=["MLXExecutionProvider"],
     )
+    cpu_options = ort.SessionOptions()
+    cpu_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+    cpu_options.intra_op_num_threads = cpu_options.inter_op_num_threads = 1
     cpu = ort.InferenceSession(
         _model(rank, d, hq, hk, causal, kind, selected, mask_rank),
+        cpu_options,
         providers=["CPUExecutionProvider"],
     )
     rng = np.random.default_rng(45)
