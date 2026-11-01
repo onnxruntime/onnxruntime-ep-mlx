@@ -23,6 +23,7 @@ mod engine;
 mod ep;
 mod factory;
 mod logging;
+mod memory;
 mod mlx;
 mod ops;
 mod ort_graph;

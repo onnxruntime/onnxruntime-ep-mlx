@@ -58,6 +58,7 @@ Use `session.get_inputs()` to inspect the required input names, shapes, and type
 | For | Guide |
 |---|---|
 | Runtime compatibility, native bindings, decoder tuning | [Integration](docs/INTEGRATION.md) |
+| Setting allocator cache budgets | [Memory](docs/MEMORY.md) |
 | Building the plugin or Python wheel | [Build from source](docs/BUILDING.md) |
 | Diagnosing fallback and GPU execution | [Tracing and profiling](examples/traces/README.md) |
 | Running correctness and conformance tests | [Testing](tests/README.md) |
