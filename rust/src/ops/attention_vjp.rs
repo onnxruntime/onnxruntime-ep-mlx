@@ -352,7 +352,7 @@ pub fn register(registry: &mut OpRegistry) {
             handler: translate,
             claim,
         },
-        "custom Metal tile geometry uses live shapes",
+        "conservatively shape-key Metal grids and workspace selection; custom kernels lack dynamic output_shapes",
     );
 }
 
