@@ -70,7 +70,28 @@ fn softmax_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError
 
 fn cast_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
     let x = ctx.resolve(&n.inputs[0])?;
-    let r = ctx.astype(x, mlx_dtype_from_onnx(n.outputs[0].otype))?;
+    let target = mlx_dtype_from_onnx(n.outputs[0].otype);
+    let float_storage = |dt| {
+        matches!(
+            dt,
+            mlx::mlx_dtype__MLX_FLOAT32
+                | mlx::mlx_dtype__MLX_FLOAT16
+                | mlx::mlx_dtype__MLX_BFLOAT16
+        )
+    };
+    let r = if !ctx.is_capturing()
+        && float_storage(ctx.dtype_of(x))
+        && float_storage(target)
+        && std::env::var("ONNXRUNTIME_EP_MLX_PACK_FROZEN_VIEWS").as_deref() != Ok("0")
+        && ctx.size_of(x) >= 16384
+        && let Some(origin) = ctx.frozen_key(&n.inputs[0])
+    {
+        let casted = ctx.cache_astype(format!("__frozen_cast__{origin}:{target}"), x, target)?;
+        ctx.mark_fast("mlx_cached_frozen_cast");
+        casted
+    } else {
+        ctx.astype(x, target)?
+    };
     ctx.bind(&n.outputs[0], r);
     Ok(())
 }

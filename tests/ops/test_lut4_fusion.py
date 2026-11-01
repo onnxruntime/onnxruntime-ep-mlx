@@ -136,7 +136,7 @@ def test_lut4_session_replay(transpose, rank, shared):
     cpu = _session(model, "CPUExecutionProvider")
     weight = _reference(p, s, book, shape)
     rng = np.random.default_rng(17)
-    for m in [1] if rank == 1 else [1, 17, 0, 3, 1]:
+    for m in [1] if rank == 1 else [1, 17, 128, 129, 0, 3, 1]:
         prefix = () if rank == 1 else (m,) if rank == 2 else (2, m)
         x = rng.normal(0, 0.1, (*prefix, shape[1] if transpose else shape[0])).astype(
             np.float32

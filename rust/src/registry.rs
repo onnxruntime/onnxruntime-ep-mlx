@@ -202,7 +202,10 @@ impl OpRegistry {
         self.table.iter().position(|registered| {
             let e = &registered.entry;
             e.domain == domain
-                && e.op_type == op_type
+                && (e.op_type == op_type
+                    || (domain == "ai.onnax"
+                        && e.op_type == "AttentionVJP"
+                        && op_type.starts_with("AttentionVJP_v1_")))
                 && (e.min_opset == K_ANY_OPSET || since_version >= e.min_opset)
                 && (e.max_opset == K_ANY_OPSET || since_version <= e.max_opset)
         })
@@ -366,6 +369,7 @@ fn register_builtin_ops(registry: &mut OpRegistry) {
     crate::ops::onnx_ml_linear::register(registry);
     crate::ops::onnx_ml_preprocess::register(registry);
     crate::ops::attention::register_attention(registry);
+    crate::ops::attention_vjp::register(registry);
     // conv+vision
     crate::ops::conv::register_conv(registry);
     crate::ops::vision::register_vision(registry);
@@ -397,6 +401,7 @@ pub fn translate(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxEr
     ctx.reset_path_mark();
     let r = handler(ctx, n);
     if r.is_ok() {
+        ctx.track_frozen_view(n);
         let mark = ctx.take_path_mark();
         tr.record_op_path(n, start, mark);
         // Per-op detail span (rich Args always; fine mode also times a per-op eval).

@@ -737,8 +737,24 @@ fn transpose_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxErr
     }
     let perm = checked_transpose_perm(shape.len(), n.int_arrays.get("perm").map(Vec::as_slice))?;
     let data = ctx.resolve(&n.inputs[0])?;
-    let t = ctx.transpose(data, &perm)?;
-    // Zero-copy strided view; materialised to contiguous only if it reaches the output boundary.
+    let mut t = ctx.transpose(data, &perm)?;
+    // A very wide frozen projection becomes a tall RHS in backward. MLX GEMM
+    // prefers that reduction dimension row-major; pack it once, including BF16
+    // round-trip views proven immutable by the translation context.
+    if !ctx.is_capturing()
+        && shape.len() == 2
+        && perm == [1, 0]
+        && shape[0] >= 64
+        && shape[1] / shape[0] >= 8
+        && ctx.size_of(data) >= 1024 * 1024
+        && ctx.dtype_of(data) == mlx::mlx_dtype__MLX_FLOAT32
+        && std::env::var("ONNXRUNTIME_EP_MLX_PACK_FROZEN_VIEWS").as_deref() != Ok("0")
+        && let Some(origin) = ctx.frozen_key(&n.inputs[0])
+    {
+        t = ctx.cache_contiguous(format!("__frozen_transpose__{origin}:{shape:?}"), t)?;
+        ctx.mark_fast("mlx_cached_frozen_transpose");
+    }
+    // Other transposes remain zero-copy strided views; materialised to contiguous only if it reaches the output boundary.
     ctx.bind(&n.outputs[0], t);
     Ok(())
 }

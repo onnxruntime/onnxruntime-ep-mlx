@@ -1,6 +1,7 @@
 //! Wave-1 op handler modules. Each op = translate handler + claim predicate + registry entry.
 
 pub mod attention;
+pub mod attention_vjp;
 pub mod conv;
 pub mod elementary_contrib;
 pub mod elementwise;

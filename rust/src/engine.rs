@@ -763,6 +763,8 @@ pub struct TranslationContext<'a> {
     /// must never be retained across Compute calls, while repeated Q/K/V and gate/up projections
     /// should share one explicit activation cast inside the compiled closure.
     astype_cache: HashMap<(usize, u32), mlxsys::mlx_array>,
+    /// Immutable Cast/Transpose/Identity provenance; runtime data never enters this map.
+    frozen_views: HashMap<String, String>,
     /// Path a handler declared for the CURRENT node (fast vs composed); the dispatcher
     /// resets this before each handler and reads it after (see `registry::translate`).
     path_mark: Option<crate::trace::PathMark>,
@@ -832,6 +834,7 @@ impl<'a> TranslationContext<'a> {
             arena: Vec::new(),
             input_arena: Vec::new(),
             astype_cache: HashMap::new(),
+            frozen_views: HashMap::new(),
             path_mark: None,
             trace_enabled: crate::trace::tracer().is_enabled(),
             rope_dynamic: false,
@@ -920,6 +923,60 @@ impl<'a> TranslationContext<'a> {
     /// Bind a node output name to a produced MLX array (visible to downstream nodes and CopyOut).
     pub fn bind(&mut self, o: &OutRef, a: mlxsys::mlx_array) {
         self.env.insert(o.name.clone(), a);
+        self.frozen_views.remove(&o.name);
+    }
+
+    /// Prove that a value comes from immutable initializer data, excluding shape-derived data.
+    pub fn frozen_key(&self, input: &TensorRef) -> Option<String> {
+        if input.source == Src::Initializer || (input.source == Src::CtxInput && input.constant) {
+            Some(format!("leaf:{:?}", input.cache_key()))
+        } else if input.source == Src::Intermediate {
+            self.frozen_views.get(&input.name).cloned()
+        } else {
+            None
+        }
+    }
+
+    /// Propagate only unary views with immutable data and fixed operator attributes.
+    pub fn track_frozen_view(&mut self, node: &NodeDesc) {
+        if !matches!(node.domain.as_str(), "" | "ai.onnx")
+            || node.inputs.len() != 1
+            || node.outputs.len() != 1
+        {
+            return;
+        }
+        if !matches!(node.op_type.as_str(), "Identity" | "Cast" | "Transpose") {
+            return;
+        }
+        let Some(origin) = self.frozen_key(&node.inputs[0]) else {
+            return;
+        };
+        let key = match node.op_type.as_str() {
+            "Identity" => origin,
+            "Cast" => format!("cast({origin},{})", node.outputs[0].otype),
+            "Transpose" => format!("transpose({origin},{:?})", node.int_arrays.get("perm")),
+            _ => unreachable!(),
+        };
+        self.frozen_views.insert(node.outputs[0].name.clone(), key);
+    }
+
+    /// Retain one contiguous layout of proven immutable data for repeated executions.
+    pub fn cache_contiguous(
+        &mut self,
+        key: String,
+        a: mlxsys::mlx_array,
+    ) -> Result<mlxsys::mlx_array, MlxError> {
+        if let Some(cached) = self.cache_get(&key) {
+            return Ok(cached);
+        }
+        let mut raw = unsafe { mlxsys::mlx_array_new() };
+        let rc = unsafe { mlxsys::mlx_contiguous(&mut raw, a, false, self.stream) };
+        let packed = Array::from_raw(raw);
+        if rc != 0 {
+            return Err("MLX frozen layout packing failed".into());
+        }
+        packed.eval();
+        Ok(self.cache_put(key, packed))
     }
 
     pub fn write_back_input(
@@ -929,6 +986,7 @@ impl<'a> TranslationContext<'a> {
     ) -> Result<mlxsys::mlx_array, MlxError> {
         let a = self.contiguous(a)?;
         self.env.insert(input.name.clone(), a);
+        self.frozen_views.remove(&input.name);
         match input.source {
             Src::CtxInput => {
                 let (data, shape, _) = self.read_ctx_input(input.ctx_index)?;
@@ -2048,6 +2106,13 @@ impl<'a> TranslationContext<'a> {
                 saved.insert(nm.clone(), a);
             }
         }
+        // Formal inputs shadow outer bindings and must not inherit frozen provenance.
+        let mut saved_frozen = HashMap::new();
+        for name in &body_names {
+            if let Some(key) = self.frozen_views.remove(name) {
+                saved_frozen.insert(name.clone(), key);
+            }
+        }
         // Bind formal inputs, then translate the body in topological order.
         for (i, nm) in sg.input_names.iter().enumerate() {
             if !nm.is_empty() {
@@ -2073,7 +2138,9 @@ impl<'a> TranslationContext<'a> {
         // Restore the enclosing scope.
         for nm in &body_names {
             self.env.remove(nm);
+            self.frozen_views.remove(nm);
         }
+        self.frozen_views.extend(saved_frozen);
         for (k, v) in saved {
             self.env.insert(k, v);
         }
@@ -2213,6 +2280,7 @@ impl<'a> TranslationContext<'a> {
     /// Seed an env binding (the compiled-closure placeholders: dynamic ctx inputs + pre-sliced RoPE
     /// rows). `raw` is a borrowed handle owned by the trace arena.
     pub(crate) fn seed(&mut self, name: String, raw: mlxsys::mlx_array) {
+        self.frozen_views.remove(&name);
         self.env.insert(name, raw);
     }
 
@@ -2366,6 +2434,7 @@ impl<'a> TranslationContext<'a> {
         // after its final consumer has executed (notably large unpacked lookup matrices).
         self.env.clear();
         self.astype_cache.clear();
+        self.frozen_views.clear();
         self.input_writebacks.clear();
         self.arena.clear();
         // The single synchronous `mlx_eval` boundary: with tracing on this is wrapped
@@ -2823,5 +2892,69 @@ mod tests {
         contrib.inputs[1] = ctx_input("w", 8);
         contrib.inputs[2] = ctx_input("bias", 9);
         assert!(Plan::new(vec![contrib]).stable_cross_ctx_indices.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod frozen_view_tests {
+    use super::*;
+    use crate::mlx::Stream;
+    use crate::registry::CompileShapeSafety;
+
+    #[test]
+    fn subgraph_formals_shadow_frozen_views_and_restore_outer_provenance() {
+        let stream = Stream::new_default_cpu();
+        let mut plan = Plan::new(vec![]);
+        let mut ctx = TranslationContext::new(
+            &mut plan,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            stream.as_raw(),
+        );
+        let mut cast = NodeDesc::new("Cast".into(), "".into(), 25, CompileShapeSafety::Shapeless);
+        cast.inputs.push(TensorRef {
+            name: "weight".into(),
+            source: Src::Intermediate,
+            ctx_index: 0,
+            constant: false,
+            shape_const: false,
+            init: None,
+        });
+        cast.outputs.push(OutRef {
+            name: "rounded".into(),
+            external: false,
+            ctx_index: 0,
+            otype: ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
+        });
+        let body = SubgraphDesc {
+            attr_name: "body".into(),
+            input_names: vec!["weight".into()],
+            output_names: vec!["rounded".into()],
+            nodes: vec![cast],
+        };
+        ctx.frozen_views
+            .insert("weight".into(), "outer immutable weight".into());
+        for value in [1.0f32, 2.0] {
+            let data = vec![value; 16384];
+            let input = ctx.keep(Array::from_data(
+                data.as_ptr().cast(),
+                &[16384],
+                mlxsys::mlx_dtype__MLX_FLOAT32,
+            ));
+            let outputs = ctx.run_subgraph(&body, &[input]).unwrap();
+            unsafe {
+                assert_eq!(mlxsys::mlx_array_eval(outputs[0]), 0);
+                assert_eq!(*mlxsys::mlx_array_data_float32(outputs[0]), value);
+            }
+            assert!(
+                ctx.plan.cache.is_empty(),
+                "a changing formal must not enter the frozen cache"
+            );
+            assert_eq!(
+                ctx.frozen_views.get("weight").map(String::as_str),
+                Some("outer immutable weight")
+            );
+            assert!(!ctx.frozen_views.contains_key("rounded"));
+        }
     }
 }
