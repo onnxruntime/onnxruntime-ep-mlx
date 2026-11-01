@@ -1,4 +1,4 @@
-//! Private frozen, blocked 4-bit lookup decoding followed by FP32 MatMul.
+//! Private frozen, blocked 4-bit lookup decoding with precision-preserving MatMul.
 //! Recognition proves the standard ONNX producer chain; public ONNX remains unchanged.
 
 use std::collections::{HashMap, HashSet};
@@ -11,6 +11,10 @@ use crate::registry::{CompileShapeSafety, NodeView};
 use crate::sys::{mlx, ort};
 
 const F32: mlx::mlx_dtype = mlx::mlx_dtype__MLX_FLOAT32;
+const HALF: ort::ONNXTensorElementDataType =
+    ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16;
+const BF16: ort::ONNXTensorElementDataType =
+    ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16;
 const FLOAT: ort::ONNXTensorElementDataType =
     ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT;
 const INT64: ort::ONNXTensorElementDataType =
@@ -27,6 +31,8 @@ pub(crate) struct LookupMatMul {
     cols: i32,
     block: i32,
     transpose: bool,
+    rounding: i64,
+    output_type: ort::ONNXTensorElementDataType,
 }
 
 struct Producers<'a>(HashMap<&'a str, &'a NodeDesc>, bool);
@@ -97,7 +103,7 @@ impl<'a> Producers<'a> {
             || node.op_type != "MatMul"
             || node.inputs.len() != 2
             || node.outputs.len() != 1
-            || node.outputs[0].otype != FLOAT
+            || !matches!(node.outputs[0].otype, t if t == FLOAT || t == HALF || t == BF16)
         {
             return None;
         }
@@ -111,6 +117,27 @@ impl<'a> Producers<'a> {
         } else {
             false
         };
+        // Forward: Cast(decode, half). Adjoint: Cast(Cast(decode, half), float).
+        // Preserve rounding explicitly; never substitute an affine int4 codebook.
+        let mut rounding = 0;
+        if let Some(cast) = self.op(&weight, "Cast", 1) {
+            let mut cast = cast;
+            if cast.ints.get("to") == Some(&(FLOAT as i64)) {
+                if node.outputs[0].otype != FLOAT {
+                    return None;
+                }
+                cast = self.op(&cast.inputs[0], "Cast", 1)?;
+            } else if cast.ints.get("to") != Some(&(node.outputs[0].otype as i64)) {
+                return None;
+            }
+            rounding = *cast.ints.get("to")?;
+            if !matches!(rounding, t if t == HALF as i64 || t == BF16 as i64) {
+                return None;
+            }
+            weight = cast.inputs[0].clone();
+        } else if node.outputs[0].otype != FLOAT {
+            return None;
+        }
         let reshape = self.op(&weight, "Reshape", 2)?;
         let shape = self.ints(&reshape.inputs[1])?;
         if shape.len() != 2 {
@@ -214,6 +241,8 @@ impl<'a> Producers<'a> {
             cols,
             block,
             transpose,
+            rounding,
+            output_type: node.outputs[0].otype,
         })
     }
 }
@@ -484,6 +513,35 @@ for (uint i=tid; i<256; i+=128) {
 }
 "#;
 
+fn compute_dtype(pattern: &LookupMatMul) -> mlx::mlx_dtype {
+    match pattern.output_type {
+        ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16 => {
+            mlx::mlx_dtype__MLX_FLOAT16
+        }
+        ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16 => {
+            mlx::mlx_dtype__MLX_BFLOAT16
+        }
+        _ => F32,
+    }
+}
+
+fn rounded_weight(
+    ctx: &mut TranslationContext,
+    pattern: &LookupMatMul,
+    weight: mlx::mlx_array,
+) -> Result<mlx::mlx_array, MlxError> {
+    if pattern.rounding == 0 {
+        return Ok(weight);
+    }
+    let dtype = if pattern.rounding == HALF as i64 {
+        mlx::mlx_dtype__MLX_FLOAT16
+    } else {
+        mlx::mlx_dtype__MLX_BFLOAT16
+    };
+    let rounded = ctx.astype(weight, dtype)?;
+    ctx.astype(rounded, compute_dtype(pattern))
+}
+
 // Large training/prefill batches benefit from the tuned MLX GEMM. Decode once per
 // execution, keeping the temporary weight local to this graph evaluation.
 fn decoded_gemm(
@@ -504,7 +562,7 @@ fn decoded_gemm(
     };
     let names = super::selective_scan::VecString::new(&["packed", "scales", "book"])?;
     let outputs = super::selective_scan::VecString::new(&["weight"])?;
-    let source = c"uint i=thread_position_in_grid.x; if(i<COUNT){uint byte=packed[i/2];uint code=(i%2==0)?byte>>4:byte&15;weight[i]=book[code]*scales[i/BLOCK];}";
+    let source = c"uint i=thread_position_in_grid.x; if(i<COUNT){uint byte=packed[i/2];uint code=(i%2==0)?byte>>4:byte&15;weight[i]=OUT(book[code]*scales[i/BLOCK]);}";
     let kernel = unsafe {
         mlx::mlx_fast_metal_kernel_new(
             c"mlx_lookup4_decode".as_ptr(),
@@ -535,9 +593,28 @@ fn decoded_gemm(
             pattern.block,
         )
     };
+    let decoded_dtype = if pattern.rounding == 0 {
+        F32
+    } else if pattern.rounding == HALF as i64 {
+        mlx::mlx_dtype__MLX_FLOAT16
+    } else {
+        mlx::mlx_dtype__MLX_BFLOAT16
+    };
+    rc |= unsafe {
+        mlx::mlx_fast_metal_kernel_config_add_template_arg_dtype(
+            config,
+            c"OUT".as_ptr(),
+            decoded_dtype,
+        )
+    };
     let shape = [pattern.rows, pattern.cols];
     rc |= unsafe {
-        mlx::mlx_fast_metal_kernel_config_add_output_arg(config, shape.as_ptr(), shape.len(), F32)
+        mlx::mlx_fast_metal_kernel_config_add_output_arg(
+            config,
+            shape.as_ptr(),
+            shape.len(),
+            decoded_dtype,
+        )
     };
     rc |= unsafe { mlx::mlx_fast_metal_kernel_config_set_grid(config, count, 1, 1) };
     rc |= unsafe { mlx::mlx_fast_metal_kernel_config_set_thread_group(config, 256, 1, 1) };
@@ -565,6 +642,7 @@ fn decoded_gemm(
         return Err("lookup4 GEMM: decode dispatch failed".into());
     }
     let mut weight = ctx.keep(output.get(0));
+    weight = rounded_weight(ctx, pattern, weight)?;
     if pattern.transpose {
         weight = ctx.transpose(weight, &[1, 0])?;
     }
@@ -588,8 +666,10 @@ pub(super) fn execute(ctx: &mut TranslationContext, node: &NodeDesc) -> Result<b
     } else {
         pattern.cols
     };
-    if ctx.dtype_of(x) != F32 || shape.last().copied() != Some(k) {
-        return Err("lookup4 MatMul: expected FP32 input with matching reduction dimension".into());
+    if ctx.dtype_of(x) != compute_dtype(pattern) || shape.last().copied() != Some(k) {
+        return Err(
+            "lookup4 MatMul: expected matching compute dtype and reduction dimension".into(),
+        );
     }
     shape.pop();
     let m = shape
@@ -611,7 +691,7 @@ pub(super) fn execute(ctx: &mut TranslationContext, node: &NodeDesc) -> Result<b
         return Err("lookup4 MatMul: cannot inspect stream device".into());
     }
     let y = if m == 0 {
-        ctx.zeros(&shape, F32)?
+        ctx.zeros(&shape, compute_dtype(pattern))?
     } else if kind == mlx::mlx_device_type__MLX_CPU {
         let key = format!(
             "__lookup4_cpu__{}:{}:{}:{}:{}:{:?}",
@@ -642,6 +722,7 @@ pub(super) fn execute(ctx: &mut TranslationContext, node: &NodeDesc) -> Result<b
                 Array::from_data(values.as_ptr().cast(), &[pattern.rows, pattern.cols], F32);
             ctx.cache_put(key, owned)
         };
+        let weight = rounded_weight(ctx, pattern, weight)?;
         let weight = if pattern.transpose {
             ctx.emit(|out, stream| unsafe { mlx::mlx_transpose(out, weight, stream) })?
         } else {
@@ -649,7 +730,9 @@ pub(super) fn execute(ctx: &mut TranslationContext, node: &NodeDesc) -> Result<b
         };
         ctx.mark_composed("frozen lookup4 decode + CPU matmul");
         ctx.binary(mlx::mlx_matmul, x, weight)?
-    } else if m >= 128 && std::env::var("ONNXRUNTIME_EP_MLX_LUT4_GEMM").as_deref() != Ok("0") {
+    } else if pattern.rounding != 0
+        || (m >= 128 && std::env::var("ONNXRUNTIME_EP_MLX_LUT4_GEMM").as_deref() != Ok("0"))
+    {
         decoded_gemm(ctx, pattern, x)?
     } else {
         let x = ctx.contiguous(x)?;
@@ -784,6 +867,8 @@ mod tests {
             cols: 5,
             block: 64,
             transpose: false,
+            rounding: 0,
+            output_type: FLOAT,
         });
         let stream = Stream::new_default_cpu();
         let mut plan = Plan::new(vec![]);

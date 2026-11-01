@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 import _models as models
+import ml_dtypes
 import numpy as np
 import onnx
 import onnx_ir as ir
@@ -33,7 +34,16 @@ def _buffers(k, n, block):
 
 
 def _lookup(
-    tape, x, buffers, *, prefix="", transpose=False, low_first=False, live=False
+    tape,
+    x,
+    buffers,
+    *,
+    prefix="",
+    transpose=False,
+    low_first=False,
+    live=False,
+    precision=None,
+    adjoint=False,
 ):
     values, inputs = {}, []
     for name, array in buffers.items():
@@ -61,9 +71,26 @@ def _lookup(
         ir.DataType.FLOAT,
         ir.Shape([k, n]),
     )
-    right = tape.op("Transpose", [weight], {"perm": [1, 0]}) if transpose else weight
-    output = tape.op("MatMul", [x, right])
+    compute_weight = weight
+    operand = x
+    if precision is not None:
+        dtype = ir.DataType.FLOAT16 if precision == "fp16" else ir.DataType.BFLOAT16
+        compute_weight = tape.op("Cast", [weight], {"to": int(dtype)})
+        if adjoint:
+            compute_weight = tape.op(
+                "Cast", [compute_weight], {"to": int(ir.DataType.FLOAT)}
+            )
+        else:
+            operand = tape.op("Cast", [x], {"to": int(dtype)})
+    right = (
+        tape.op("Transpose", [compute_weight], {"perm": [1, 0]})
+        if transpose
+        else compute_weight
+    )
+    output = tape.op("MatMul", [operand, right])
     tape.nodes[-1].name = prefix + "product"
+    if precision is not None and not adjoint:
+        output = tape.op("Cast", [output], {"to": int(ir.DataType.FLOAT)})
     output.name, output.dtype = prefix + "y", ir.DataType.FLOAT
     output.shape = ir.Shape([*x.shape[:-1], k if transpose else n])
     return output, weight, inputs
@@ -79,6 +106,8 @@ def _model(
     k=19,
     n=23,
     block=64,
+    precision=None,
+    adjoint=False,
 ):
     buffers = _buffers(k, n, block)
     inner = n if transpose else k
@@ -86,7 +115,14 @@ def _model(
     x = models.tensor("x", ir.DataType.FLOAT, [*prefix, inner])
     tape = ir.tape.Tape()
     output, weight, inputs = _lookup(
-        tape, x, buffers, transpose=transpose, low_first=low_first, live=live
+        tape,
+        x,
+        buffers,
+        transpose=transpose,
+        low_first=low_first,
+        live=live,
+        precision=precision,
+        adjoint=adjoint,
     )
     outputs = [output]
     if shared:
@@ -341,3 +377,91 @@ def test_lut4_composed_dispatch_probe():
         np.testing.assert_allclose(
             runtime.run(None, {"x": x})[0], expected, rtol=1e-4, atol=1e-6
         )
+
+
+@pytest.mark.parametrize("precision", ["fp16", "bf16"])
+@pytest.mark.parametrize("adjoint", [False, True])
+@pytest.mark.parametrize("transpose", [False, True])
+@pytest.mark.parametrize("shared", [False, True])
+def test_lut4_rounded_compute(precision, adjoint, transpose, shared, monkeypatch):
+    model, p, s, book, shape = _model(
+        k=67,
+        n=37,
+        precision=precision,
+        adjoint=adjoint,
+        transpose=transpose,
+        shared=shared,
+    )
+    monkeypatch.delenv("ONNXRUNTIME_EP_MLX_NO_LUT4_FUSION", raising=False)
+    fused = _session(model, "MLXExecutionProvider")
+    monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_LUT4_FUSION", "1")
+    original = _session(model, "MLXExecutionProvider")
+    dtype = np.float16 if precision == "fp16" else ml_dtypes.bfloat16
+    decoded = _reference(p, s, book, shape)
+    weight = decoded.astype(dtype).astype(np.float32)
+    weight = weight.T if transpose else weight
+    rng = np.random.default_rng(912)
+    for m in [1, 17, 128, 129, 0, 3]:
+        x = rng.normal(0, 0.1, (m, weight.shape[0])).astype(np.float32)
+        expected = (
+            x @ weight
+            if adjoint
+            else (x.astype(dtype).astype(np.float32) @ weight)
+            .astype(dtype)
+            .astype(np.float32)
+        )
+        actual = fused.run(None, {"x": x})
+        portable = original.run(None, {"x": x})
+        for result in [actual[0], portable[0]]:
+            np.testing.assert_allclose(
+                result,
+                expected,
+                rtol=1e-4 if adjoint else 0.01,
+                atol=1e-6 if adjoint else 0.0001,
+            )
+        np.testing.assert_array_equal(actual[0], portable[0])
+        if shared:
+            np.testing.assert_array_equal(actual[1], decoded)
+            np.testing.assert_array_equal(actual[2], decoded + decoded)
+
+
+def test_lut4_rounded_dispatch_probe():
+    for precision in ["fp16", "bf16"]:
+        for adjoint in [False, True]:
+            model, *_ = _model(precision=precision, adjoint=adjoint, transpose=adjoint)
+            runtime = _session(model, "MLXExecutionProvider")
+            runtime.run(
+                None, {"x": np.full((17, 23 if adjoint else 19), 0.1, np.float32)}
+            )
+
+
+def test_lut4_rounded_actual_dispatch(tmp_path):
+    for disabled in [False, True]:
+        trace = tmp_path / f"rounded-{disabled}.json"
+        env = {
+            **os.environ,
+            "ONNXRUNTIME_EP_MLX_TRACE": str(trace),
+            "ONNXRUNTIME_EP_MLX_NO_LUT4_FUSION": "1" if disabled else "0",
+        }
+        subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pytest",
+                f"{Path(__file__)}::test_lut4_rounded_dispatch_probe",
+                "-q",
+                "-p",
+                "no:cacheprovider",
+            ],
+            env=env,
+            check=True,
+            timeout=180,
+        )
+        events = json.loads(trace.read_text())
+        calls = [
+            e
+            for e in events
+            if e.get("cat") == "op.fast"
+            and e.get("args", {}).get("kernel") == "lookup4 decode + MLX GEMM"
+        ]
+        assert len(calls) == (0 if disabled else 4)
