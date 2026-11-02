@@ -30,3 +30,24 @@ The ONNX IR tests cover FP32, FP16, INT32, INT8 and UINT8 weights; renamed weigh
 different contents, shapes and dtypes; overridable inputs; release of the original
 and final sessions; foreign-thread teardown; concurrent independent run threads;
 and compiled execution. The disable switch provides a paired memory control.
+
+## Qwen3.5-0.8B measurement
+
+A paired full forward/loss/backward probe uses the trained FP32 export at revision
+`2fc06364715b967f1860aea9cf38778875588b17`, batch one and 512 tokens on M1 Max.
+Both fresh processes use the same library, inputs and adapters, ORT optimization
+and CPU fallback disabled, MLX compile disabled, and a 512 MiB allocator cache limit.
+
+| Metric | Sharing off | Sharing on |
+|---|---:|---:|
+| End-of-task active allocation | 6.68 GiB | 3.81 GiB |
+| MLX active allocation peak | 7.53 GiB | 4.67 GiB |
+| Whole-process physical footprint peak | 10.55 GiB | 7.66 GiB |
+| Active allocation after closing all sessions | 0 | 0 |
+
+All 51 session calls produce byte-identical outputs, including logits, token loss
+and all adapter gradients. The probe includes construction, one task backward,
+output hashing and cleanup; warmed timing is measured separately. Compilation
+owns and hashes host weights once per plan. The [raw report](benchmarks/shared-initializers-m1max.json)
+includes each allocator observation, output hashes, guarded-process results and
+reproducible worker source.

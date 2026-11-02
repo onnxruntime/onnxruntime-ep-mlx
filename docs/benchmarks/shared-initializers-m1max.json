@@ -1,0 +1,2160 @@
+{
+  "version": 1,
+  "native_implementation_commit": "9b7a8fd",
+  "hardware": "Apple M1 Max, 32 GiB unified memory",
+  "cases": {
+    "off": {
+      "version": 1,
+      "sequence": 512,
+      "pretrained_source": {
+        "checkpoint_to_reference_prefix": {
+          "model.language_model.": "model."
+        },
+        "dtype": "float32",
+        "loading": {
+          "error_msgs": [],
+          "mismatched_keys": [],
+          "missing_keys": [],
+          "unexpected_keys": []
+        },
+        "model_id": "Qwen/Qwen3.5-0.8B",
+        "parameter_count": 752393024,
+        "reference_class": "Qwen3_5ForCausalLM",
+        "revision": "2fc06364715b967f1860aea9cf38778875588b17",
+        "version": 1
+      },
+      "loss": 0.43246200680732727,
+      "calls": [
+        {
+          "session": "block_0_forward.onnx",
+          "allocator": {
+            "active_bytes": 1017118720,
+            "cache_bytes": 2101768,
+            "peak_bytes": 1019224584
+          },
+          "output_sha256": [
+            "bd72c29aed39fcb86470c5c3127d388d0a0e7868b8b881a20ff845f467b047cb"
+          ],
+          "cumulative_declared_initializer_bytes": 1017118720,
+          "unique_initializer_region_bytes": 1017118720
+        },
+        {
+          "session": "block_1_forward.onnx",
+          "allocator": {
+            "active_bytes": 1103364808,
+            "cache_bytes": 180089496,
+            "peak_bytes": 1285661408
+          },
+          "output_sha256": [
+            "7c9fa136d4413fa6173637e883b6998d32e1d675f88cddff9dcbcf331820f4b8",
+            "a6f72d759c099bf4420da887c6326f77953ed55daf1934a9e238b6f4c80e4872"
+          ],
+          "cumulative_declared_initializer_bytes": 1103364856,
+          "unique_initializer_region_bytes": 1103364856
+        },
+        {
+          "session": "block_2_forward.onnx",
+          "allocator": {
+            "active_bytes": 1189610896,
+            "cache_bytes": 180089496,
+            "peak_bytes": 1371907496
+          },
+          "output_sha256": [
+            "35bce214aba61e80655c44d15a2bae872e1d0cb6b686adc90ea68311f42043e8"
+          ],
+          "cumulative_declared_initializer_bytes": 1189610992,
+          "unique_initializer_region_bytes": 1189586296
+        },
+        {
+          "session": "block_3_forward.onnx",
+          "allocator": {
+            "active_bytes": 1275856984,
+            "cache_bytes": 180089496,
+            "peak_bytes": 1458153584
+          },
+          "output_sha256": [
+            "7fa5c5f8bcd6fadd02de0a241b8d49f18074b3e9ae534f903304148ca42a13dc"
+          ],
+          "cumulative_declared_initializer_bytes": 1275857128,
+          "unique_initializer_region_bytes": 1275807736
+        },
+        {
+          "session": "block_4_forward.onnx",
+          "allocator": {
+            "active_bytes": 1416376516,
+            "cache_bytes": 217169675,
+            "peak_bytes": 1522076888
+          },
+          "output_sha256": [
+            "d0b6afc834c82ea9ff17fab808eda754c6b4b7ebc12e42e297ffbf9f79325883",
+            "5e42df34d66e34267660eff9eaec91d15fc3f6da5c674a1c0ea4cd722c69aef0",
+            "1327cdf3f4d1d751ba2cdcd4271f8b87261702746da5351f5539c52c5cf17e50",
+            "150f1850f83137ae4a3b35ffccacd106ce01b85bb2f3e723ea0f243aaf7c4605"
+          ],
+          "cumulative_declared_initializer_bytes": 1416376772,
+          "unique_initializer_region_bytes": 1416327376
+        },
+        {
+          "session": "block_5_forward.onnx",
+          "allocator": {
+            "active_bytes": 1502622604,
+            "cache_bytes": 217169675,
+            "peak_bytes": 1684919204
+          },
+          "output_sha256": [
+            "aed334542dff4720eeb59917ffb28770c4843e438ee2bb284f90fdfc455ca2c4"
+          ],
+          "cumulative_declared_initializer_bytes": 1502622908,
+          "unique_initializer_region_bytes": 1502548816
+        },
+        {
+          "session": "block_6_forward.onnx",
+          "allocator": {
+            "active_bytes": 1588868692,
+            "cache_bytes": 217169675,
+            "peak_bytes": 1771165292
+          },
+          "output_sha256": [
+            "d99e9f705694e6b70123313e1e93f52ee3cfa8756f0de58fe73205cb067ba620"
+          ],
+          "cumulative_declared_initializer_bytes": 1588869044,
+          "unique_initializer_region_bytes": 1588770256
+        },
+        {
+          "session": "block_7_forward.onnx",
+          "allocator": {
+            "active_bytes": 1675114780,
+            "cache_bytes": 217169675,
+            "peak_bytes": 1857411380
+          },
+          "output_sha256": [
+            "57264516e74b716f2ba188a0b6f45d15fbc4de0cdc2edeb1d7a7a21ce91b42d5"
+          ],
+          "cumulative_declared_initializer_bytes": 1675115180,
+          "unique_initializer_region_bytes": 1674991696
+        },
+        {
+          "session": "block_8_forward.onnx",
+          "allocator": {
+            "active_bytes": 1748525344,
+            "cache_bytes": 219266827,
+            "peak_bytes": 1857411380
+          },
+          "output_sha256": [
+            "6e2c4ae46ce4b5e0737ea8e6c19172050f3a59ffa84a0a43275af9d215193fab"
+          ],
+          "cumulative_declared_initializer_bytes": 1748525832,
+          "unique_initializer_region_bytes": 1748402256
+        },
+        {
+          "session": "block_9_forward.onnx",
+          "allocator": {
+            "active_bytes": 1834771432,
+            "cache_bytes": 219266827,
+            "peak_bytes": 2017068032
+          },
+          "output_sha256": [
+            "72b8770314b44f3ba29a3985050996dde23e6f09337f80a49952630bcd732185"
+          ],
+          "cumulative_declared_initializer_bytes": 1834771968,
+          "unique_initializer_region_bytes": 1834623696
+        },
+        {
+          "session": "block_10_forward.onnx",
+          "allocator": {
+            "active_bytes": 1921017520,
+            "cache_bytes": 219266827,
+            "peak_bytes": 2103314120
+          },
+          "output_sha256": [
+            "12e545f66055ea8b0d4c898f09a094902f3e97ec2f4b0704ee9141b20c1337aa"
+          ],
+          "cumulative_declared_initializer_bytes": 1921018104,
+          "unique_initializer_region_bytes": 1920845136
+        },
+        {
+          "session": "block_11_forward.onnx",
+          "allocator": {
+            "active_bytes": 2007263608,
+            "cache_bytes": 219266827,
+            "peak_bytes": 2189560208
+          },
+          "output_sha256": [
+            "62ecf65f6a5e99d59641c44258dad7f3f6e0bbc6e2d264736ef27ee150727339"
+          ],
+          "cumulative_declared_initializer_bytes": 2007264240,
+          "unique_initializer_region_bytes": 2007066576
+        },
+        {
+          "session": "block_12_forward.onnx",
+          "allocator": {
+            "active_bytes": 2080674172,
+            "cache_bytes": 219266827,
+            "peak_bytes": 2189560208
+          },
+          "output_sha256": [
+            "cd54d87a284711ef2410c24a09111d92988ed10cd78120a93dd5bf097fc86c2d"
+          ],
+          "cumulative_declared_initializer_bytes": 2080674892,
+          "unique_initializer_region_bytes": 2080477136
+        },
+        {
+          "session": "block_13_forward.onnx",
+          "allocator": {
+            "active_bytes": 2166920260,
+            "cache_bytes": 219266827,
+            "peak_bytes": 2349216860
+          },
+          "output_sha256": [
+            "7553fab1c305ae6336273bdf799bfaaf41ebe2a7ecf14742443504cae454e6d5"
+          ],
+          "cumulative_declared_initializer_bytes": 2166921028,
+          "unique_initializer_region_bytes": 2166698576
+        },
+        {
+          "session": "block_14_forward.onnx",
+          "allocator": {
+            "active_bytes": 2253166348,
+            "cache_bytes": 219266827,
+            "peak_bytes": 2435462948
+          },
+          "output_sha256": [
+            "78a5e00d5260190d66563fc1b80a9815c53187a9db4cc4e4cf1cfb7c134d292b"
+          ],
+          "cumulative_declared_initializer_bytes": 2253167164,
+          "unique_initializer_region_bytes": 2252920016
+        },
+        {
+          "session": "block_15_forward.onnx",
+          "allocator": {
+            "active_bytes": 2339412436,
+            "cache_bytes": 219266827,
+            "peak_bytes": 2521709036
+          },
+          "output_sha256": [
+            "76ce29ef5a9d8009df8d6664532a605b8ab65c761aae5390b2aa7f0285515aa1"
+          ],
+          "cumulative_declared_initializer_bytes": 2339413300,
+          "unique_initializer_region_bytes": 2339141456
+        },
+        {
+          "session": "block_16_forward.onnx",
+          "allocator": {
+            "active_bytes": 2412823000,
+            "cache_bytes": 219266827,
+            "peak_bytes": 2521709036
+          },
+          "output_sha256": [
+            "7451ffaf39c3f28e4400af4179f79b1c355ed2ece44614d1b20bed4711154da5"
+          ],
+          "cumulative_declared_initializer_bytes": 2412823952,
+          "unique_initializer_region_bytes": 2412552016
+        },
+        {
+          "session": "block_17_forward.onnx",
+          "allocator": {
+            "active_bytes": 2499069088,
+            "cache_bytes": 219266827,
+            "peak_bytes": 2681365688
+          },
+          "output_sha256": [
+            "f287497c1272e8c7fefd10434932420737ba5465c76d2fc0954e2504392d8960"
+          ],
+          "cumulative_declared_initializer_bytes": 2499070088,
+          "unique_initializer_region_bytes": 2498773456
+        },
+        {
+          "session": "block_18_forward.onnx",
+          "allocator": {
+            "active_bytes": 2585315176,
+            "cache_bytes": 219266827,
+            "peak_bytes": 2767611776
+          },
+          "output_sha256": [
+            "559f1444dc40a5ea98b3a1bad880835c0d1bacccc1fb39837e806ea759eec139"
+          ],
+          "cumulative_declared_initializer_bytes": 2585316224,
+          "unique_initializer_region_bytes": 2584994896
+        },
+        {
+          "session": "block_19_forward.onnx",
+          "allocator": {
+            "active_bytes": 2671561264,
+            "cache_bytes": 219266827,
+            "peak_bytes": 2853857864
+          },
+          "output_sha256": [
+            "18565f26e0b95dd0acdb7f60c252a7e9129a4b21713ab9d24c1e1f5e78000d58"
+          ],
+          "cumulative_declared_initializer_bytes": 2671562360,
+          "unique_initializer_region_bytes": 2671216336
+        },
+        {
+          "session": "block_20_forward.onnx",
+          "allocator": {
+            "active_bytes": 2744971828,
+            "cache_bytes": 219266827,
+            "peak_bytes": 2853857864
+          },
+          "output_sha256": [
+            "df4fc4d1724e9ce1dd6a188fd5847ee0c57023a7376fd488e75a11e5645f09f5"
+          ],
+          "cumulative_declared_initializer_bytes": 2744973012,
+          "unique_initializer_region_bytes": 2744626896
+        },
+        {
+          "session": "block_21_forward.onnx",
+          "allocator": {
+            "active_bytes": 2831217916,
+            "cache_bytes": 219266827,
+            "peak_bytes": 3013514516
+          },
+          "output_sha256": [
+            "fa08574d13a384b75fd1321791f8789e86f3e641d2e5544f9426c7f998640b4e"
+          ],
+          "cumulative_declared_initializer_bytes": 2831219148,
+          "unique_initializer_region_bytes": 2830848336
+        },
+        {
+          "session": "block_22_forward.onnx",
+          "allocator": {
+            "active_bytes": 2917464004,
+            "cache_bytes": 219266827,
+            "peak_bytes": 3099760604
+          },
+          "output_sha256": [
+            "483e118d0a017a8dd6e651ac4ae3d2214ab1e195b96b8710f6e48b8d39c9c837"
+          ],
+          "cumulative_declared_initializer_bytes": 2917465284,
+          "unique_initializer_region_bytes": 2917069776
+        },
+        {
+          "session": "block_23_forward.onnx",
+          "allocator": {
+            "active_bytes": 3003710092,
+            "cache_bytes": 219266827,
+            "peak_bytes": 3186006692
+          },
+          "output_sha256": [
+            "bcaa161961e80d7bad2f628e4034db3dd5c4ee472590bc6383a90e1e77bb8f12"
+          ],
+          "cumulative_declared_initializer_bytes": 3003711420,
+          "unique_initializer_region_bytes": 3003291216
+        },
+        {
+          "session": "block_24_forward.onnx",
+          "allocator": {
+            "active_bytes": 3077120656,
+            "cache_bytes": 219266827,
+            "peak_bytes": 3186006692
+          },
+          "output_sha256": [
+            "26c4293fb2b722597c0f91980fcbef9b594836c5b7a05657a03c2480eff1060c"
+          ],
+          "cumulative_declared_initializer_bytes": 3077122072,
+          "unique_initializer_region_bytes": 3076701776
+        },
+        {
+          "session": "block_25_forward.onnx",
+          "allocator": {
+            "active_bytes": 4094243472,
+            "cache_bytes": 727826187,
+            "peak_bytes": 4606997136
+          },
+          "output_sha256": [
+            "c01fcb8f8dd332b8255c8c5e9f7c4adc42ef8366dd0a4b749e611c226b5535c9"
+          ],
+          "cumulative_declared_initializer_bytes": 4094244888,
+          "unique_initializer_region_bytes": 4093824592
+        },
+        {
+          "session": "block_25_backward.onnx",
+          "allocator": {
+            "active_bytes": 5111366292,
+            "cache_bytes": 593494024,
+            "peak_bytes": 5699621536
+          },
+          "output_sha256": [
+            "bff91303c81e1311514b5ab824eda4a69275646e5bf49764a964e9a2c0b0be81"
+          ],
+          "cumulative_declared_initializer_bytes": 5111367716,
+          "unique_initializer_region_bytes": 4093824592
+        },
+        {
+          "session": "block_24_backward.onnx",
+          "allocator": {
+            "active_bytes": 5184777004,
+            "cache_bytes": 468075981,
+            "peak_bytes": 5699621536
+          },
+          "output_sha256": [
+            "59eb4bdba3a055a7364c58c2d59f045692ce1dff9778bb706b0b2fc8d73e0b5c",
+            "0a8ff7c18a420f5ac7955752d123e484b4ce6aa64221225c3da2e5ea5153b309",
+            "ff1c46b59f670e3c2575eb713f46aacfb27d66b39ce75e7b832a72c29ccfff23",
+            "0ceff816da879434402cf759a4ca355ca134ab034e07fee2102f73d7017073a5",
+            "c26ce4993e0ca37cc463ecf9412cd52d52b69c0e7b604efb81682490108733af"
+          ],
+          "cumulative_declared_initializer_bytes": 5184778588,
+          "unique_initializer_region_bytes": 4093824756
+        },
+        {
+          "session": "block_23_backward.onnx",
+          "allocator": {
+            "active_bytes": 5271047832,
+            "cache_bytes": 554722143,
+            "peak_bytes": 6119488820
+          },
+          "output_sha256": [
+            "4b32a4893df1c953a2a0a7a490f0dc9a7d43a5494cb79f4d82527e3b4d8017e1",
+            "40511063fa386bdc51a5ee0eba9fccfcae0f650f2232cabc9e9f548e0fd9f989",
+            "d3d8a3988edb3cb6f18657aa40d15cc3d42c78d1d228a14673ddbc3ba4639eb4"
+          ],
+          "cumulative_declared_initializer_bytes": 5271049480,
+          "unique_initializer_region_bytes": 4093849460
+        },
+        {
+          "session": "block_22_backward.onnx",
+          "allocator": {
+            "active_bytes": 5357318660,
+            "cache_bytes": 545371056,
+            "peak_bytes": 6213025312
+          },
+          "output_sha256": [
+            "abd298490f398680e8cec6c68cdcfa4a1242655d69b817603c79119dfe26d5d4",
+            "7295c96850b945db25e9e72d398d5753ce803a59324d07607904c75598f99fb7",
+            "57ebca6911ac44d2ee67ca58ad5b9638cc055aec2ccaad22842ec78772a8f680"
+          ],
+          "cumulative_declared_initializer_bytes": 5357320372,
+          "unique_initializer_region_bytes": 4093849460
+        },
+        {
+          "session": "block_21_backward.onnx",
+          "allocator": {
+            "active_bytes": 5443589488,
+            "cache_bytes": 550613940,
+            "peak_bytes": 6315082636
+          },
+          "output_sha256": [
+            "0c8e652be5097b1f60a61870ddcd4e4e1f94c0e73146f24475664630e7cbd849",
+            "6a8f4cd5d1728247ab5d04c5c35b8426f1afd72bd59fe6b608a9ccb51ca57f8f",
+            "c2098280711b72c8d09c7f2bd5ccbf59c64b982428b428fcefbc3aa401acbbaf"
+          ],
+          "cumulative_declared_initializer_bytes": 5443591264,
+          "unique_initializer_region_bytes": 4093849460
+        },
+        {
+          "session": "block_20_backward.onnx",
+          "allocator": {
+            "active_bytes": 5521358344,
+            "cache_bytes": 541472815,
+            "peak_bytes": 6315082636
+          },
+          "output_sha256": [
+            "e3984036fa7cc88ad7108d91b424e472d20e1e3ee376e015fdcdea263f613539",
+            "aae88d082e8a82679fa2422f238b07bca0e4b0f109374d65018655a5c917a075",
+            "499540cdadd27d1979b4efcd133d33e79376ee0c026556de6d762f4aaebf7a3f",
+            "68a881ccd9fb1f00a53119472fc7d9b609d74b2fa41c8c12dca216132143e0bf",
+            "56f947e44ef14d1c58d5b8215f5af0390d9ceda93144d01cd0854742f20386e8"
+          ],
+          "cumulative_declared_initializer_bytes": 5517002136,
+          "unique_initializer_region_bytes": 4093849460
+        },
+        {
+          "session": "block_19_backward.onnx",
+          "allocator": {
+            "active_bytes": 5603271028,
+            "cache_bytes": 544314292,
+            "peak_bytes": 6451712016
+          },
+          "output_sha256": [
+            "10e7e01272fc730a10a5a66731a595abfba2872152729e4b5970f961c5b58562",
+            "b661ae93147e6da2e242c6b3b1f055e4f824e69832c7ac78031f80ca0cc0d577",
+            "e949f5900456dbf3f641796a24ca3b03229f7e9bcb2de556879e5ce0a965264a"
+          ],
+          "cumulative_declared_initializer_bytes": 5603273028,
+          "unique_initializer_region_bytes": 4093849460
+        },
+        {
+          "session": "block_18_backward.onnx",
+          "allocator": {
+            "active_bytes": 5689541856,
+            "cache_bytes": 551679092,
+            "peak_bytes": 6561035004
+          },
+          "output_sha256": [
+            "ca505a9b47df1e24e8993d62ff1d5afffa0d1900524a1f452ad84cef48b34653",
+            "84af0dde622bd92890e5fe03621829c0575022fa3d7c82ad3c73c1863e38e346",
+            "2cad49b0b69091ac71933dac20fe2e5b0a8f9d2be76b697e328a174e84534a0a"
+          ],
+          "cumulative_declared_initializer_bytes": 5689543920,
+          "unique_initializer_region_bytes": 4093849460
+        },
+        {
+          "session": "block_17_backward.onnx",
+          "allocator": {
+            "active_bytes": 5775812684,
+            "cache_bytes": 552727664,
+            "peak_bytes": 6647305832
+          },
+          "output_sha256": [
+            "70d7ab3c4649cc8fe300226b3844cebf88261b99ec9e20c6a87bb534b0157796",
+            "6de66c980d7cdd2bdec95073cf529ab4e5026148ae7cf9edef8fbc604fbcd049",
+            "5e27ab33e4c2f3ea3b6ae4d1748675bbf08f5ebdc5b6f6168c6741da7f5d1534"
+          ],
+          "cumulative_declared_initializer_bytes": 5775814812,
+          "unique_initializer_region_bytes": 4093849460
+        },
+        {
+          "session": "block_16_backward.onnx",
+          "allocator": {
+            "active_bytes": 5853581540,
+            "cache_bytes": 543586543,
+            "peak_bytes": 6647305832
+          },
+          "output_sha256": [
+            "16cb784c15db78816f74eb0c59bead511be6178b718a134f3bb06a564e8a75a7",
+            "f7d589f8aed9b5d1f34db219ae99e67a0b7fc4ca30c8304f2fb137e810218f26",
+            "d83f66435a37bea375850320e55d1f3cfd2f424abad5016023b2597f7954970b",
+            "2a2179186d8b08196cb764d8657e738c34ee687c5c6bc788492c3f6d4e7ab945",
+            "1848d277c3007898d982d35f3133dcbc8666b1d49254724d24f31b8853868679"
+          ],
+          "cumulative_declared_initializer_bytes": 5849225684,
+          "unique_initializer_region_bytes": 4093849460
+        },
+        {
+          "session": "block_15_backward.onnx",
+          "allocator": {
+            "active_bytes": 5935494224,
+            "cache_bytes": 549569652,
+            "peak_bytes": 6806987372
+          },
+          "output_sha256": [
+            "1b247c34b7200919fb2bb850db3c04cd8a0764e7dcee7f5c1b518f684ccfca74",
+            "3fe562cbf1004a9a799a070da0b3b3736b021f18d31f999ea3b8280894469af8",
+            "5d2648fb8c47037802e9e281df2bdc24048fea9b69f4058050ab3ec4b7d5f572"
+          ],
+          "cumulative_declared_initializer_bytes": 5935496576,
+          "unique_initializer_region_bytes": 4093849460
+        },
+        {
+          "session": "block_14_backward.onnx",
+          "allocator": {
+            "active_bytes": 6021765052,
+            "cache_bytes": 552727668,
+            "peak_bytes": 6893258200
+          },
+          "output_sha256": [
+            "b4c2b94482e841ce8115d489973c561ce32fcd048bac81dd7ac697942ca9023b",
+            "0277d551f96930760c953dbea90bc18cc37381b384d3b30fc0af0dc060c4e937",
+            "4654b9774532a7b628363a638682c8251e92e01113b6c963c84d892ae1bb22c2"
+          ],
+          "cumulative_declared_initializer_bytes": 6021767468,
+          "unique_initializer_region_bytes": 4093849460
+        },
+        {
+          "session": "block_13_backward.onnx",
+          "allocator": {
+            "active_bytes": 6108035880,
+            "cache_bytes": 552719280,
+            "peak_bytes": 6979529028
+          },
+          "output_sha256": [
+            "2e4e35f480f1adcdeedbc73f12819766605706836e4b12b0380a07103b71e10a",
+            "b4f3225606dd7ee73d0c07776c2978f31132ac8be6c952f717b192f395086874",
+            "6118134b0398fe7237b4a422caa539c970e2b6b17efed59ee7c5d0f3d13c924f"
+          ],
+          "cumulative_declared_initializer_bytes": 6108038360,
+          "unique_initializer_region_bytes": 4093849460
+        },
+        {
+          "session": "block_12_backward.onnx",
+          "allocator": {
+            "active_bytes": 6185804736,
+            "cache_bytes": 543578159,
+            "peak_bytes": 6979529028
+          },
+          "output_sha256": [
+            "9fc86a1a9ad0cb31860b03e7730f562346c790dc5aedd40b7017d83db752665b",
+            "fed960507f71d69950cc9083880f49b84da4499d7bbcb1ae49b42acd925acab4",
+            "7149f5ae892b8bc2da120f308422b0a4042ef717b93ca68648a8aaddeb22cf0e",
+            "975fa088d6c9be07e4cded9835150133ded907858b397ad2bbce65e3912db210",
+            "6f2708dc44a7b1656f0ca08377556ad93badea27887484352b01d8b0107ebe46"
+          ],
+          "cumulative_declared_initializer_bytes": 6181449232,
+          "unique_initializer_region_bytes": 4093849460
+        },
+        {
+          "session": "block_11_backward.onnx",
+          "allocator": {
+            "active_bytes": 6267717420,
+            "cache_bytes": 549581940,
+            "peak_bytes": 7139210568
+          },
+          "output_sha256": [
+            "ad079aa9a4db71d94f5cff3d39271cdfca629a8659a5b0df9c443a64a7894f75",
+            "c5799a1f2a1b607bc84d80a03dc2f85a23bfb3130b0c1f55c45add012303d1ec",
+            "4ca78977b3c5930fb9c2b72f2708c83cfd39ddefdcd586806e6cb85f05ab3f8c"
+          ],
+          "cumulative_declared_initializer_bytes": 6267720124,
+          "unique_initializer_region_bytes": 4093849460
+        },
+        {
+          "session": "block_10_backward.onnx",
+          "allocator": {
+            "active_bytes": 6353988248,
+            "cache_bytes": 551662512,
+            "peak_bytes": 7225481396
+          },
+          "output_sha256": [
+            "d07844e5bd2a863d081a1e608ad4ded311a7808ac98bf96b713a857951383fd8",
+            "801090a36d80ab603985c8f557f6ec30b22854b1d4280319556404844aee960b",
+            "cd2e7e7016fee9d67e8d33797948de962c5c38fbb1babfe13b818dc53f52f23a"
+          ],
+          "cumulative_declared_initializer_bytes": 6353991016,
+          "unique_initializer_region_bytes": 4093849460
+        },
+        {
+          "session": "block_9_backward.onnx",
+          "allocator": {
+            "active_bytes": 6440259076,
+            "cache_bytes": 552727668,
+            "peak_bytes": 7311752224
+          },
+          "output_sha256": [
+            "b561a32760cbf2fb76822e900ec74e714c6dc356e3626458e924bb52b5ab2160",
+            "6695247bf248b588a62d0929156e1b41e665cfd0f5e0c3717625f8d69f3691a1",
+            "4aab84c0ea231c6f7e4ef54a467ba6c71f63bd0496f6515f64d9711f9532fc84"
+          ],
+          "cumulative_declared_initializer_bytes": 6440261908,
+          "unique_initializer_region_bytes": 4093849460
+        },
+        {
+          "session": "block_8_backward.onnx",
+          "allocator": {
+            "active_bytes": 6518027932,
+            "cache_bytes": 543586543,
+            "peak_bytes": 7311752224
+          },
+          "output_sha256": [
+            "a0228e26f786c4f23e4a273c7384568b015fc78c9b5ff1ff8ddfea0d1ebee148",
+            "311963df67ff3feb2265d3ac197c05b5436a93de9e79a91b6d7c25dc4911a209",
+            "42fec3944ef791c7fe797553202491eac6dd81eccf78302b064f2ab9ff475a6f",
+            "c92477a86a9636314e813fb17c805e263dc7cba24c78ac631f86ba283a24471e",
+            "06b51976bbc295cefc47848464885d96b7cb6b8d3fa688d0232ee4dd1291638b"
+          ],
+          "cumulative_declared_initializer_bytes": 6513672780,
+          "unique_initializer_region_bytes": 4093849460
+        },
+        {
+          "session": "block_7_backward.onnx",
+          "allocator": {
+            "active_bytes": 6599940616,
+            "cache_bytes": 547460016,
+            "peak_bytes": 7453541860
+          },
+          "output_sha256": [
+            "052865143c42751b36980e5c1233038dcef041289e25c1d0461aee4e006a88b8",
+            "298b0d8422b0e4620997de42663c572a29adbbb6657694ea1352fdbee1f17fd6",
+            "fe076eb7edfcd63eb15aaeb5fa85fe918b3857aa20570b74de08d91c681c9075"
+          ],
+          "cumulative_declared_initializer_bytes": 6599943672,
+          "unique_initializer_region_bytes": 4093849460
+        },
+        {
+          "session": "block_6_backward.onnx",
+          "allocator": {
+            "active_bytes": 6686211444,
+            "cache_bytes": 551679024,
+            "peak_bytes": 7557704592
+          },
+          "output_sha256": [
+            "0b12c33094cfdcfbe2283aada251ef1066918db025db57ee1b5acdb1bbee0fde",
+            "f2d4cc31fc87196331b5336666260916290874174088d5e226d7f7194c5db45a",
+            "fecf01c8fafd1d421cdc5e7c63fc4a1ed7eca4919a4a511381e19b76297c2b42"
+          ],
+          "cumulative_declared_initializer_bytes": 6686214564,
+          "unique_initializer_region_bytes": 4093849460
+        },
+        {
+          "session": "block_5_backward.onnx",
+          "allocator": {
+            "active_bytes": 6772482272,
+            "cache_bytes": 551678960,
+            "peak_bytes": 7643975420
+          },
+          "output_sha256": [
+            "3f68d078891fc429e8ac66cd7d6428d7a4aeee8d8d17372f184581aa91ea5327",
+            "8d12e8a48c66b1ba63145fd286bd9cac871918eaecbbc954ba29b196d4addf02",
+            "e91126cc86127fcd788b2496529d5fe3cc4ec8a0f16f1aba297dd30723dde92a"
+          ],
+          "cumulative_declared_initializer_bytes": 6772485456,
+          "unique_initializer_region_bytes": 4093849460
+        },
+        {
+          "session": "block_4_backward.onnx",
+          "allocator": {
+            "active_bytes": 6913001916,
+            "cache_bytes": 542058229,
+            "peak_bytes": 7643975420
+          },
+          "output_sha256": [
+            "ac3260ead69405ef255b2916b329c811480c5480d613ac7769f082551f1f3fb7",
+            "4003e704b3d73128513c2c319cfd51cb57fa47beebad612bc25ad6c8427bf964",
+            "d61fe47e75acd0d2f74261e4ed94bd8fbb9b4d4f001a3d53b06c8d0d8bedf565",
+            "5f42cd32843a1fc10824d2a0023c4ad08760053b1e3e1292d70ff443766fdfd9",
+            "926688d3b51cd16adf1b9aec8bfc54e4b2ef82c27ea300539b8907e0ac777ac3"
+          ],
+          "cumulative_declared_initializer_bytes": 6913005276,
+          "unique_initializer_region_bytes": 4093849460
+        },
+        {
+          "session": "block_3_backward.onnx",
+          "allocator": {
+            "active_bytes": 6999272744,
+            "cache_bytes": 549574259,
+            "peak_bytes": 7870765892
+          },
+          "output_sha256": [
+            "b3fa99564c6bbc4aded63bd56e5ff13dc8e47e949e03905888541f8280201b67",
+            "8b33814ef2cb03a928115e8222594555968c3fd07bcc873ccc5b8c634a94e93a",
+            "e8c939b33778f50ea1d3462becac58986b775410cf736ebe1a5cc6a5a693ae22"
+          ],
+          "cumulative_declared_initializer_bytes": 6999276168,
+          "unique_initializer_region_bytes": 4093849460
+        },
+        {
+          "session": "block_2_backward.onnx",
+          "allocator": {
+            "active_bytes": 7085543572,
+            "cache_bytes": 549565424,
+            "peak_bytes": 7957036720
+          },
+          "output_sha256": [
+            "4411e1ea7dea89d751e7df9382dbe3ae1cb917666598ad3248fea92359232d50",
+            "89ca865cf206ff22d1ee770799286e0208c4be2ce769e4af39b90b12e104a504",
+            "e99862f8d178af88acc546e4454a7611b9e24bad29d61f9e8e51c28e0af53762"
+          ],
+          "cumulative_declared_initializer_bytes": 7085547060,
+          "unique_initializer_region_bytes": 4093849460
+        },
+        {
+          "session": "block_1_backward.onnx",
+          "allocator": {
+            "active_bytes": 7171814388,
+            "cache_bytes": 537338968,
+            "peak_bytes": 8090460352
+          },
+          "output_sha256": [
+            "e203c3d8a199a25e9212d64405eaf68a03cdebf71fa0484e3ecbad4771a87941",
+            "10841c79794f9857cac18afee0d9893c813bd11f77d2b8056828bd64fe9dec05"
+          ],
+          "cumulative_declared_initializer_bytes": 7171817940,
+          "unique_initializer_region_bytes": 4093849460
+        }
+      ],
+      "after_close": {
+        "active_bytes": 0,
+        "cache_bytes": 537338968,
+        "peak_bytes": 8090460352
+      },
+      "worker_sha256": "0fc93cd214ea8a18175cd6df9e0857027e5006d249cbd0b7ca4a4a79ce66bf4c",
+      "library_sha256": "8c5b75baf5bd0d72f3f8c28cde790ba836b2e92851aab8e19cf161ab5a0fff0f",
+      "shared_initializers": false,
+      "cache_limit_bytes": 536870912,
+      "scope": "One full task forward/backward; after-call active allocations, declared initializer bytes and distinct immutable region/shape keys; no optimizer updates",
+      "guard": {
+        "command": [
+          ".venv/bin/python",
+          "/tmp/onnax-shared-weight-paired-v3.py"
+        ],
+        "cwd": "/Users/justinc/Documents/GitHub/onnax",
+        "status": "complete",
+        "physical_memory_budget_bytes": 25769803776,
+        "minimum_free_disk_bytes": 5368709120,
+        "memory_source": "proc_pid_rusage/RUSAGE_INFO_V4",
+        "observation_errors": 0,
+        "temporary_directory": "/tmp/onnax-shared-weight-off-v3-guard/worker-tmp-0t1de_fa",
+        "pid": 5545,
+        "started": "2026-11-02T19:45:04.536937+00:00",
+        "returncode": 0,
+        "finished": "2026-11-02T19:45:25.716939+00:00",
+        "temporary_files_removed": true,
+        "peak_physical_bytes": 11324138640
+      }
+    },
+    "on": {
+      "version": 1,
+      "sequence": 512,
+      "pretrained_source": {
+        "checkpoint_to_reference_prefix": {
+          "model.language_model.": "model."
+        },
+        "dtype": "float32",
+        "loading": {
+          "error_msgs": [],
+          "mismatched_keys": [],
+          "missing_keys": [],
+          "unexpected_keys": []
+        },
+        "model_id": "Qwen/Qwen3.5-0.8B",
+        "parameter_count": 752393024,
+        "reference_class": "Qwen3_5ForCausalLM",
+        "revision": "2fc06364715b967f1860aea9cf38778875588b17",
+        "version": 1
+      },
+      "loss": 0.43246200680732727,
+      "calls": [
+        {
+          "session": "block_0_forward.onnx",
+          "allocator": {
+            "active_bytes": 1017118720,
+            "cache_bytes": 2101768,
+            "peak_bytes": 1019224584
+          },
+          "output_sha256": [
+            "bd72c29aed39fcb86470c5c3127d388d0a0e7868b8b881a20ff845f467b047cb"
+          ],
+          "cumulative_declared_initializer_bytes": 1017118720,
+          "unique_initializer_region_bytes": 1017118720
+        },
+        {
+          "session": "block_1_forward.onnx",
+          "allocator": {
+            "active_bytes": 1103364808,
+            "cache_bytes": 180089496,
+            "peak_bytes": 1285661408
+          },
+          "output_sha256": [
+            "7c9fa136d4413fa6173637e883b6998d32e1d675f88cddff9dcbcf331820f4b8",
+            "a6f72d759c099bf4420da887c6326f77953ed55daf1934a9e238b6f4c80e4872"
+          ],
+          "cumulative_declared_initializer_bytes": 1103364856,
+          "unique_initializer_region_bytes": 1103364856
+        },
+        {
+          "session": "block_2_forward.onnx",
+          "allocator": {
+            "active_bytes": 1189586320,
+            "cache_bytes": 180089496,
+            "peak_bytes": 1371882920
+          },
+          "output_sha256": [
+            "35bce214aba61e80655c44d15a2bae872e1d0cb6b686adc90ea68311f42043e8"
+          ],
+          "cumulative_declared_initializer_bytes": 1189610992,
+          "unique_initializer_region_bytes": 1189586296
+        },
+        {
+          "session": "block_3_forward.onnx",
+          "allocator": {
+            "active_bytes": 1275807832,
+            "cache_bytes": 180089496,
+            "peak_bytes": 1458104432
+          },
+          "output_sha256": [
+            "7fa5c5f8bcd6fadd02de0a241b8d49f18074b3e9ae534f903304148ca42a13dc"
+          ],
+          "cumulative_declared_initializer_bytes": 1275857128,
+          "unique_initializer_region_bytes": 1275807736
+        },
+        {
+          "session": "block_4_forward.onnx",
+          "allocator": {
+            "active_bytes": 1416327364,
+            "cache_bytes": 217169675,
+            "peak_bytes": 1522027736
+          },
+          "output_sha256": [
+            "d0b6afc834c82ea9ff17fab808eda754c6b4b7ebc12e42e297ffbf9f79325883",
+            "5e42df34d66e34267660eff9eaec91d15fc3f6da5c674a1c0ea4cd722c69aef0",
+            "1327cdf3f4d1d751ba2cdcd4271f8b87261702746da5351f5539c52c5cf17e50",
+            "150f1850f83137ae4a3b35ffccacd106ce01b85bb2f3e723ea0f243aaf7c4605"
+          ],
+          "cumulative_declared_initializer_bytes": 1416376772,
+          "unique_initializer_region_bytes": 1416327376
+        },
+        {
+          "session": "block_5_forward.onnx",
+          "allocator": {
+            "active_bytes": 1502548876,
+            "cache_bytes": 217169675,
+            "peak_bytes": 1684845476
+          },
+          "output_sha256": [
+            "aed334542dff4720eeb59917ffb28770c4843e438ee2bb284f90fdfc455ca2c4"
+          ],
+          "cumulative_declared_initializer_bytes": 1502622908,
+          "unique_initializer_region_bytes": 1502548816
+        },
+        {
+          "session": "block_6_forward.onnx",
+          "allocator": {
+            "active_bytes": 1588770388,
+            "cache_bytes": 217169675,
+            "peak_bytes": 1771066988
+          },
+          "output_sha256": [
+            "d99e9f705694e6b70123313e1e93f52ee3cfa8756f0de58fe73205cb067ba620"
+          ],
+          "cumulative_declared_initializer_bytes": 1588869044,
+          "unique_initializer_region_bytes": 1588770256
+        },
+        {
+          "session": "block_7_forward.onnx",
+          "allocator": {
+            "active_bytes": 1674991900,
+            "cache_bytes": 217169675,
+            "peak_bytes": 1857288500
+          },
+          "output_sha256": [
+            "57264516e74b716f2ba188a0b6f45d15fbc4de0cdc2edeb1d7a7a21ce91b42d5"
+          ],
+          "cumulative_declared_initializer_bytes": 1675115180,
+          "unique_initializer_region_bytes": 1674991696
+        },
+        {
+          "session": "block_8_forward.onnx",
+          "allocator": {
+            "active_bytes": 1748402464,
+            "cache_bytes": 219266827,
+            "peak_bytes": 1857288500
+          },
+          "output_sha256": [
+            "6e2c4ae46ce4b5e0737ea8e6c19172050f3a59ffa84a0a43275af9d215193fab"
+          ],
+          "cumulative_declared_initializer_bytes": 1748525832,
+          "unique_initializer_region_bytes": 1748402256
+        },
+        {
+          "session": "block_9_forward.onnx",
+          "allocator": {
+            "active_bytes": 1834623976,
+            "cache_bytes": 219266827,
+            "peak_bytes": 2016920576
+          },
+          "output_sha256": [
+            "72b8770314b44f3ba29a3985050996dde23e6f09337f80a49952630bcd732185"
+          ],
+          "cumulative_declared_initializer_bytes": 1834771968,
+          "unique_initializer_region_bytes": 1834623696
+        },
+        {
+          "session": "block_10_forward.onnx",
+          "allocator": {
+            "active_bytes": 1920845488,
+            "cache_bytes": 219266827,
+            "peak_bytes": 2103142088
+          },
+          "output_sha256": [
+            "12e545f66055ea8b0d4c898f09a094902f3e97ec2f4b0704ee9141b20c1337aa"
+          ],
+          "cumulative_declared_initializer_bytes": 1921018104,
+          "unique_initializer_region_bytes": 1920845136
+        },
+        {
+          "session": "block_11_forward.onnx",
+          "allocator": {
+            "active_bytes": 2007067000,
+            "cache_bytes": 219266827,
+            "peak_bytes": 2189363600
+          },
+          "output_sha256": [
+            "62ecf65f6a5e99d59641c44258dad7f3f6e0bbc6e2d264736ef27ee150727339"
+          ],
+          "cumulative_declared_initializer_bytes": 2007264240,
+          "unique_initializer_region_bytes": 2007066576
+        },
+        {
+          "session": "block_12_forward.onnx",
+          "allocator": {
+            "active_bytes": 2080477564,
+            "cache_bytes": 219266827,
+            "peak_bytes": 2189363600
+          },
+          "output_sha256": [
+            "cd54d87a284711ef2410c24a09111d92988ed10cd78120a93dd5bf097fc86c2d"
+          ],
+          "cumulative_declared_initializer_bytes": 2080674892,
+          "unique_initializer_region_bytes": 2080477136
+        },
+        {
+          "session": "block_13_forward.onnx",
+          "allocator": {
+            "active_bytes": 2166699076,
+            "cache_bytes": 219266827,
+            "peak_bytes": 2348995676
+          },
+          "output_sha256": [
+            "7553fab1c305ae6336273bdf799bfaaf41ebe2a7ecf14742443504cae454e6d5"
+          ],
+          "cumulative_declared_initializer_bytes": 2166921028,
+          "unique_initializer_region_bytes": 2166698576
+        },
+        {
+          "session": "block_14_forward.onnx",
+          "allocator": {
+            "active_bytes": 2252920588,
+            "cache_bytes": 219266827,
+            "peak_bytes": 2435217188
+          },
+          "output_sha256": [
+            "78a5e00d5260190d66563fc1b80a9815c53187a9db4cc4e4cf1cfb7c134d292b"
+          ],
+          "cumulative_declared_initializer_bytes": 2253167164,
+          "unique_initializer_region_bytes": 2252920016
+        },
+        {
+          "session": "block_15_forward.onnx",
+          "allocator": {
+            "active_bytes": 2339142100,
+            "cache_bytes": 219266827,
+            "peak_bytes": 2521438700
+          },
+          "output_sha256": [
+            "76ce29ef5a9d8009df8d6664532a605b8ab65c761aae5390b2aa7f0285515aa1"
+          ],
+          "cumulative_declared_initializer_bytes": 2339413300,
+          "unique_initializer_region_bytes": 2339141456
+        },
+        {
+          "session": "block_16_forward.onnx",
+          "allocator": {
+            "active_bytes": 2412552664,
+            "cache_bytes": 219266827,
+            "peak_bytes": 2521438700
+          },
+          "output_sha256": [
+            "7451ffaf39c3f28e4400af4179f79b1c355ed2ece44614d1b20bed4711154da5"
+          ],
+          "cumulative_declared_initializer_bytes": 2412823952,
+          "unique_initializer_region_bytes": 2412552016
+        },
+        {
+          "session": "block_17_forward.onnx",
+          "allocator": {
+            "active_bytes": 2498774176,
+            "cache_bytes": 219266827,
+            "peak_bytes": 2681070776
+          },
+          "output_sha256": [
+            "f287497c1272e8c7fefd10434932420737ba5465c76d2fc0954e2504392d8960"
+          ],
+          "cumulative_declared_initializer_bytes": 2499070088,
+          "unique_initializer_region_bytes": 2498773456
+        },
+        {
+          "session": "block_18_forward.onnx",
+          "allocator": {
+            "active_bytes": 2584995688,
+            "cache_bytes": 219266827,
+            "peak_bytes": 2767292288
+          },
+          "output_sha256": [
+            "559f1444dc40a5ea98b3a1bad880835c0d1bacccc1fb39837e806ea759eec139"
+          ],
+          "cumulative_declared_initializer_bytes": 2585316224,
+          "unique_initializer_region_bytes": 2584994896
+        },
+        {
+          "session": "block_19_forward.onnx",
+          "allocator": {
+            "active_bytes": 2671217200,
+            "cache_bytes": 219266827,
+            "peak_bytes": 2853513800
+          },
+          "output_sha256": [
+            "18565f26e0b95dd0acdb7f60c252a7e9129a4b21713ab9d24c1e1f5e78000d58"
+          ],
+          "cumulative_declared_initializer_bytes": 2671562360,
+          "unique_initializer_region_bytes": 2671216336
+        },
+        {
+          "session": "block_20_forward.onnx",
+          "allocator": {
+            "active_bytes": 2744627764,
+            "cache_bytes": 219266827,
+            "peak_bytes": 2853513800
+          },
+          "output_sha256": [
+            "df4fc4d1724e9ce1dd6a188fd5847ee0c57023a7376fd488e75a11e5645f09f5"
+          ],
+          "cumulative_declared_initializer_bytes": 2744973012,
+          "unique_initializer_region_bytes": 2744626896
+        },
+        {
+          "session": "block_21_forward.onnx",
+          "allocator": {
+            "active_bytes": 2830849276,
+            "cache_bytes": 219266827,
+            "peak_bytes": 3013145876
+          },
+          "output_sha256": [
+            "fa08574d13a384b75fd1321791f8789e86f3e641d2e5544f9426c7f998640b4e"
+          ],
+          "cumulative_declared_initializer_bytes": 2831219148,
+          "unique_initializer_region_bytes": 2830848336
+        },
+        {
+          "session": "block_22_forward.onnx",
+          "allocator": {
+            "active_bytes": 2917070788,
+            "cache_bytes": 219266827,
+            "peak_bytes": 3099367388
+          },
+          "output_sha256": [
+            "483e118d0a017a8dd6e651ac4ae3d2214ab1e195b96b8710f6e48b8d39c9c837"
+          ],
+          "cumulative_declared_initializer_bytes": 2917465284,
+          "unique_initializer_region_bytes": 2917069776
+        },
+        {
+          "session": "block_23_forward.onnx",
+          "allocator": {
+            "active_bytes": 3003292300,
+            "cache_bytes": 219266827,
+            "peak_bytes": 3185588900
+          },
+          "output_sha256": [
+            "bcaa161961e80d7bad2f628e4034db3dd5c4ee472590bc6383a90e1e77bb8f12"
+          ],
+          "cumulative_declared_initializer_bytes": 3003711420,
+          "unique_initializer_region_bytes": 3003291216
+        },
+        {
+          "session": "block_24_forward.onnx",
+          "allocator": {
+            "active_bytes": 3076702864,
+            "cache_bytes": 219266827,
+            "peak_bytes": 3185588900
+          },
+          "output_sha256": [
+            "26c4293fb2b722597c0f91980fcbef9b594836c5b7a05657a03c2480eff1060c"
+          ],
+          "cumulative_declared_initializer_bytes": 3077122072,
+          "unique_initializer_region_bytes": 3076701776
+        },
+        {
+          "session": "block_25_forward.onnx",
+          "allocator": {
+            "active_bytes": 4093825680,
+            "cache_bytes": 727826187,
+            "peak_bytes": 4606579344
+          },
+          "output_sha256": [
+            "c01fcb8f8dd332b8255c8c5e9f7c4adc42ef8366dd0a4b749e611c226b5535c9"
+          ],
+          "cumulative_declared_initializer_bytes": 4094244888,
+          "unique_initializer_region_bytes": 4093824592
+        },
+        {
+          "session": "block_25_backward.onnx",
+          "allocator": {
+            "active_bytes": 4093825684,
+            "cache_bytes": 593494024,
+            "peak_bytes": 4682080928
+          },
+          "output_sha256": [
+            "bff91303c81e1311514b5ab824eda4a69275646e5bf49764a964e9a2c0b0be81"
+          ],
+          "cumulative_declared_initializer_bytes": 5111367716,
+          "unique_initializer_region_bytes": 4093824592
+        },
+        {
+          "session": "block_24_backward.onnx",
+          "allocator": {
+            "active_bytes": 4093827884,
+            "cache_bytes": 434779597,
+            "peak_bytes": 4682080928
+          },
+          "output_sha256": [
+            "59eb4bdba3a055a7364c58c2d59f045692ce1dff9778bb706b0b2fc8d73e0b5c",
+            "0a8ff7c18a420f5ac7955752d123e484b4ce6aa64221225c3da2e5ea5153b309",
+            "ff1c46b59f670e3c2575eb713f46aacfb27d66b39ce75e7b832a72c29ccfff23",
+            "0ceff816da879434402cf759a4ca355ca134ab034e07fee2102f73d7017073a5",
+            "c26ce4993e0ca37cc463ecf9412cd52d52b69c0e7b604efb81682490108733af"
+          ],
+          "cumulative_declared_initializer_bytes": 5184778588,
+          "unique_initializer_region_bytes": 4093824756
+        },
+        {
+          "session": "block_23_backward.onnx",
+          "allocator": {
+            "active_bytes": 4093853336,
+            "cache_bytes": 556024655,
+            "peak_bytes": 4942294324
+          },
+          "output_sha256": [
+            "4b32a4893df1c953a2a0a7a490f0dc9a7d43a5494cb79f4d82527e3b4d8017e1",
+            "40511063fa386bdc51a5ee0eba9fccfcae0f650f2232cabc9e9f548e0fd9f989",
+            "d3d8a3988edb3cb6f18657aa40d15cc3d42c78d1d228a14673ddbc3ba4639eb4"
+          ],
+          "cumulative_declared_initializer_bytes": 5271049480,
+          "unique_initializer_region_bytes": 4093849460
+        },
+        {
+          "session": "block_22_backward.onnx",
+          "allocator": {
+            "active_bytes": 4093854212,
+            "cache_bytes": 551679088,
+            "peak_bytes": 4946390432
+          },
+          "output_sha256": [
+            "abd298490f398680e8cec6c68cdcfa4a1242655d69b817603c79119dfe26d5d4",
+            "7295c96850b945db25e9e72d398d5753ce803a59324d07607904c75598f99fb7",
+            "57ebca6911ac44d2ee67ca58ad5b9638cc055aec2ccaad22842ec78772a8f680"
+          ],
+          "cumulative_declared_initializer_bytes": 5357320372,
+          "unique_initializer_region_bytes": 4093849460
+        },
+        {
+          "session": "block_21_backward.onnx",
+          "allocator": {
+            "active_bytes": 4093855088,
+            "cache_bytes": 551670704,
+            "peak_bytes": 4965348236
+          },
+          "output_sha256": [
+            "0c8e652be5097b1f60a61870ddcd4e4e1f94c0e73146f24475664630e7cbd849",
+            "6a8f4cd5d1728247ab5d04c5c35b8426f1afd72bd59fe6b608a9ccb51ca57f8f",
+            "c2098280711b72c8d09c7f2bd5ccbf59c64b982428b428fcefbc3aa401acbbaf"
+          ],
+          "cumulative_declared_initializer_bytes": 5443591264,
+          "unique_initializer_region_bytes": 4093849460
+        },
+        {
+          "session": "block_20_backward.onnx",
+          "allocator": {
+            "active_bytes": 4098215432,
+            "cache_bytes": 542529583,
+            "peak_bytes": 4965348236
+          },
+          "output_sha256": [
+            "e3984036fa7cc88ad7108d91b424e472d20e1e3ee376e015fdcdea263f613539",
+            "aae88d082e8a82679fa2422f238b07bca0e4b0f109374d65018655a5c917a075",
+            "499540cdadd27d1979b4efcd133d33e79376ee0c026556de6d762f4aaebf7a3f",
+            "68a881ccd9fb1f00a53119472fc7d9b609d74b2fa41c8c12dca216132143e0bf",
+            "56f947e44ef14d1c58d5b8215f5af0390d9ceda93144d01cd0854742f20386e8"
+          ],
+          "cumulative_declared_initializer_bytes": 5517002136,
+          "unique_initializer_region_bytes": 4093849460
+        },
+        {
+          "session": "block_19_backward.onnx",
+          "allocator": {
+            "active_bytes": 4093858164,
+            "cache_bytes": 549581876,
+            "peak_bytes": 4965351312
+          },
+          "output_sha256": [
+            "10e7e01272fc730a10a5a66731a595abfba2872152729e4b5970f961c5b58562",
+            "b661ae93147e6da2e242c6b3b1f055e4f824e69832c7ac78031f80ca0cc0d577",
+            "e949f5900456dbf3f641796a24ca3b03229f7e9bcb2de556879e5ce0a965264a"
+          ],
+          "cumulative_declared_initializer_bytes": 5603273028,
+          "unique_initializer_region_bytes": 4093849460
+        },
+        {
+          "session": "block_18_backward.onnx",
+          "allocator": {
+            "active_bytes": 4093859040,
+            "cache_bytes": 551678960,
+            "peak_bytes": 4965352188
+          },
+          "output_sha256": [
+            "ca505a9b47df1e24e8993d62ff1d5afffa0d1900524a1f452ad84cef48b34653",
+            "84af0dde622bd92890e5fe03621829c0575022fa3d7c82ad3c73c1863e38e346",
+            "2cad49b0b69091ac71933dac20fe2e5b0a8f9d2be76b697e328a174e84534a0a"
+          ],
+          "cumulative_declared_initializer_bytes": 5689543920,
+          "unique_initializer_region_bytes": 4093849460
+        },
+        {
+          "session": "block_17_backward.onnx",
+          "allocator": {
+            "active_bytes": 4093859916,
+            "cache_bytes": 551670768,
+            "peak_bytes": 4965353064
+          },
+          "output_sha256": [
+            "70d7ab3c4649cc8fe300226b3844cebf88261b99ec9e20c6a87bb534b0157796",
+            "6de66c980d7cdd2bdec95073cf529ab4e5026148ae7cf9edef8fbc604fbcd049",
+            "5e27ab33e4c2f3ea3b6ae4d1748675bbf08f5ebdc5b6f6168c6741da7f5d1534"
+          ],
+          "cumulative_declared_initializer_bytes": 5775814812,
+          "unique_initializer_region_bytes": 4093849460
+        },
+        {
+          "session": "block_16_backward.onnx",
+          "allocator": {
+            "active_bytes": 4100333796,
+            "cache_bytes": 542529647,
+            "peak_bytes": 4965353064
+          },
+          "output_sha256": [
+            "16cb784c15db78816f74eb0c59bead511be6178b718a134f3bb06a564e8a75a7",
+            "f7d589f8aed9b5d1f34db219ae99e67a0b7fc4ca30c8304f2fb137e810218f26",
+            "d83f66435a37bea375850320e55d1f3cfd2f424abad5016023b2597f7954970b",
+            "2a2179186d8b08196cb764d8657e738c34ee687c5c6bc788492c3f6d4e7ab945",
+            "1848d277c3007898d982d35f3133dcbc8666b1d49254724d24f31b8853868679"
+          ],
+          "cumulative_declared_initializer_bytes": 5849225684,
+          "unique_initializer_region_bytes": 4093849460
+        },
+        {
+          "session": "block_15_backward.onnx",
+          "allocator": {
+            "active_bytes": 4093862992,
+            "cache_bytes": 548521140,
+            "peak_bytes": 4965356140
+          },
+          "output_sha256": [
+            "1b247c34b7200919fb2bb850db3c04cd8a0764e7dcee7f5c1b518f684ccfca74",
+            "3fe562cbf1004a9a799a070da0b3b3736b021f18d31f999ea3b8280894469af8",
+            "5d2648fb8c47037802e9e281df2bdc24048fea9b69f4058050ab3ec4b7d5f572"
+          ],
+          "cumulative_declared_initializer_bytes": 5935496576,
+          "unique_initializer_region_bytes": 4093849460
+        },
+        {
+          "session": "block_14_backward.onnx",
+          "allocator": {
+            "active_bytes": 4093863868,
+            "cache_bytes": 551662512,
+            "peak_bytes": 4965357016
+          },
+          "output_sha256": [
+            "b4c2b94482e841ce8115d489973c561ce32fcd048bac81dd7ac697942ca9023b",
+            "0277d551f96930760c953dbea90bc18cc37381b384d3b30fc0af0dc060c4e937",
+            "4654b9774532a7b628363a638682c8251e92e01113b6c963c84d892ae1bb22c2"
+          ],
+          "cumulative_declared_initializer_bytes": 6021767468,
+          "unique_initializer_region_bytes": 4093849460
+        },
+        {
+          "session": "block_13_backward.onnx",
+          "allocator": {
+            "active_bytes": 4093864744,
+            "cache_bytes": 552727536,
+            "peak_bytes": 4965357892
+          },
+          "output_sha256": [
+            "2e4e35f480f1adcdeedbc73f12819766605706836e4b12b0380a07103b71e10a",
+            "b4f3225606dd7ee73d0c07776c2978f31132ac8be6c952f717b192f395086874",
+            "6118134b0398fe7237b4a422caa539c970e2b6b17efed59ee7c5d0f3d13c924f"
+          ],
+          "cumulative_declared_initializer_bytes": 6108038360,
+          "unique_initializer_region_bytes": 4093849460
+        },
+        {
+          "session": "block_12_backward.onnx",
+          "allocator": {
+            "active_bytes": 4113030080,
+            "cache_bytes": 543586415,
+            "peak_bytes": 4965357892
+          },
+          "output_sha256": [
+            "9fc86a1a9ad0cb31860b03e7730f562346c790dc5aedd40b7017d83db752665b",
+            "fed960507f71d69950cc9083880f49b84da4499d7bbcb1ae49b42acd925acab4",
+            "7149f5ae892b8bc2da120f308422b0a4042ef717b93ca68648a8aaddeb22cf0e",
+            "975fa088d6c9be07e4cded9835150133ded907858b397ad2bbce65e3912db210",
+            "6f2708dc44a7b1656f0ca08377556ad93badea27887484352b01d8b0107ebe46"
+          ],
+          "cumulative_declared_initializer_bytes": 6181449232,
+          "unique_initializer_region_bytes": 4093849460
+        },
+        {
+          "session": "block_11_backward.onnx",
+          "allocator": {
+            "active_bytes": 4093867820,
+            "cache_bytes": 550626484,
+            "peak_bytes": 4965360968
+          },
+          "output_sha256": [
+            "ad079aa9a4db71d94f5cff3d39271cdfca629a8659a5b0df9c443a64a7894f75",
+            "c5799a1f2a1b607bc84d80a03dc2f85a23bfb3130b0c1f55c45add012303d1ec",
+            "4ca78977b3c5930fb9c2b72f2708c83cfd39ddefdcd586806e6cb85f05ab3f8c"
+          ],
+          "cumulative_declared_initializer_bytes": 6267720124,
+          "unique_initializer_region_bytes": 4093849460
+        },
+        {
+          "session": "block_10_backward.onnx",
+          "allocator": {
+            "active_bytes": 4093868696,
+            "cache_bytes": 539005232,
+            "peak_bytes": 4965361844
+          },
+          "output_sha256": [
+            "d07844e5bd2a863d081a1e608ad4ded311a7808ac98bf96b713a857951383fd8",
+            "801090a36d80ab603985c8f557f6ec30b22854b1d4280319556404844aee960b",
+            "cd2e7e7016fee9d67e8d33797948de962c5c38fbb1babfe13b818dc53f52f23a"
+          ],
+          "cumulative_declared_initializer_bytes": 6353991016,
+          "unique_initializer_region_bytes": 4093849460
+        },
+        {
+          "session": "block_9_backward.onnx",
+          "allocator": {
+            "active_bytes": 4093869572,
+            "cache_bytes": 552727668,
+            "peak_bytes": 4965362720
+          },
+          "output_sha256": [
+            "b561a32760cbf2fb76822e900ec74e714c6dc356e3626458e924bb52b5ab2160",
+            "6695247bf248b588a62d0929156e1b41e665cfd0f5e0c3717625f8d69f3691a1",
+            "4aab84c0ea231c6f7e4ef54a467ba6c71f63bd0496f6515f64d9711f9532fc84"
+          ],
+          "cumulative_declared_initializer_bytes": 6440261908,
+          "unique_initializer_region_bytes": 4093849460
+        },
+        {
+          "session": "block_8_backward.onnx",
+          "allocator": {
+            "active_bytes": 4093871772,
+            "cache_bytes": 543586543,
+            "peak_bytes": 4965362720
+          },
+          "output_sha256": [
+            "a0228e26f786c4f23e4a273c7384568b015fc78c9b5ff1ff8ddfea0d1ebee148",
+            "311963df67ff3feb2265d3ac197c05b5436a93de9e79a91b6d7c25dc4911a209",
+            "42fec3944ef791c7fe797553202491eac6dd81eccf78302b064f2ab9ff475a6f",
+            "c92477a86a9636314e813fb17c805e263dc7cba24c78ac631f86ba283a24471e",
+            "06b51976bbc295cefc47848464885d96b7cb6b8d3fa688d0232ee4dd1291638b"
+          ],
+          "cumulative_declared_initializer_bytes": 6513672780,
+          "unique_initializer_region_bytes": 4093849460
+        },
+        {
+          "session": "block_7_backward.onnx",
+          "allocator": {
+            "active_bytes": 4093872648,
+            "cache_bytes": 550618292,
+            "peak_bytes": 4965365796
+          },
+          "output_sha256": [
+            "052865143c42751b36980e5c1233038dcef041289e25c1d0461aee4e006a88b8",
+            "298b0d8422b0e4620997de42663c572a29adbbb6657694ea1352fdbee1f17fd6",
+            "fe076eb7edfcd63eb15aaeb5fa85fe918b3857aa20570b74de08d91c681c9075"
+          ],
+          "cumulative_declared_initializer_bytes": 6599943672,
+          "unique_initializer_region_bytes": 4093849460
+        },
+        {
+          "session": "block_6_backward.onnx",
+          "allocator": {
+            "active_bytes": 4093873524,
+            "cache_bytes": 552727664,
+            "peak_bytes": 4965366672
+          },
+          "output_sha256": [
+            "0b12c33094cfdcfbe2283aada251ef1066918db025db57ee1b5acdb1bbee0fde",
+            "f2d4cc31fc87196331b5336666260916290874174088d5e226d7f7194c5db45a",
+            "fecf01c8fafd1d421cdc5e7c63fc4a1ed7eca4919a4a511381e19b76297c2b42"
+          ],
+          "cumulative_declared_initializer_bytes": 6686214564,
+          "unique_initializer_region_bytes": 4093849460
+        },
+        {
+          "session": "block_5_backward.onnx",
+          "allocator": {
+            "active_bytes": 4093874400,
+            "cache_bytes": 549556912,
+            "peak_bytes": 4965367548
+          },
+          "output_sha256": [
+            "3f68d078891fc429e8ac66cd7d6428d7a4aeee8d8d17372f184581aa91ea5327",
+            "8d12e8a48c66b1ba63145fd286bd9cac871918eaecbbc954ba29b196d4addf02",
+            "e91126cc86127fcd788b2496529d5fe3cc4ec8a0f16f1aba297dd30723dde92a"
+          ],
+          "cumulative_declared_initializer_bytes": 6772485456,
+          "unique_initializer_region_bytes": 4093849460
+        },
+        {
+          "session": "block_4_backward.onnx",
+          "allocator": {
+            "active_bytes": 4093876668,
+            "cache_bytes": 539936181,
+            "peak_bytes": 4965367548
+          },
+          "output_sha256": [
+            "ac3260ead69405ef255b2916b329c811480c5480d613ac7769f082551f1f3fb7",
+            "4003e704b3d73128513c2c319cfd51cb57fa47beebad612bc25ad6c8427bf964",
+            "d61fe47e75acd0d2f74261e4ed94bd8fbb9b4d4f001a3d53b06c8d0d8bedf565",
+            "5f42cd32843a1fc10824d2a0023c4ad08760053b1e3e1292d70ff443766fdfd9",
+            "926688d3b51cd16adf1b9aec8bfc54e4b2ef82c27ea300539b8907e0ac777ac3"
+          ],
+          "cumulative_declared_initializer_bytes": 6913005276,
+          "unique_initializer_region_bytes": 4093849460
+        },
+        {
+          "session": "block_3_backward.onnx",
+          "allocator": {
+            "active_bytes": 4093877544,
+            "cache_bytes": 550631027,
+            "peak_bytes": 4965370692
+          },
+          "output_sha256": [
+            "b3fa99564c6bbc4aded63bd56e5ff13dc8e47e949e03905888541f8280201b67",
+            "8b33814ef2cb03a928115e8222594555968c3fd07bcc873ccc5b8c634a94e93a",
+            "e8c939b33778f50ea1d3462becac58986b775410cf736ebe1a5cc6a5a693ae22"
+          ],
+          "cumulative_declared_initializer_bytes": 6999276168,
+          "unique_initializer_region_bytes": 4093849460
+        },
+        {
+          "session": "block_2_backward.onnx",
+          "allocator": {
+            "active_bytes": 4093878420,
+            "cache_bytes": 551679088,
+            "peak_bytes": 4965370692
+          },
+          "output_sha256": [
+            "4411e1ea7dea89d751e7df9382dbe3ae1cb917666598ad3248fea92359232d50",
+            "89ca865cf206ff22d1ee770799286e0208c4be2ce769e4af39b90b12e104a504",
+            "e99862f8d178af88acc546e4454a7611b9e24bad29d61f9e8e51c28e0af53762"
+          ],
+          "cumulative_declared_initializer_bytes": 7085547060,
+          "unique_initializer_region_bytes": 4093849460
+        },
+        {
+          "session": "block_1_backward.onnx",
+          "allocator": {
+            "active_bytes": 4093879284,
+            "cache_bytes": 550437912,
+            "peak_bytes": 5012525248
+          },
+          "output_sha256": [
+            "e203c3d8a199a25e9212d64405eaf68a03cdebf71fa0484e3ecbad4771a87941",
+            "10841c79794f9857cac18afee0d9893c813bd11f77d2b8056828bd64fe9dec05"
+          ],
+          "cumulative_declared_initializer_bytes": 7171817940,
+          "unique_initializer_region_bytes": 4093849460
+        }
+      ],
+      "after_close": {
+        "active_bytes": 0,
+        "cache_bytes": 550437912,
+        "peak_bytes": 5012525248
+      },
+      "worker_sha256": "0fc93cd214ea8a18175cd6df9e0857027e5006d249cbd0b7ca4a4a79ce66bf4c",
+      "library_sha256": "8c5b75baf5bd0d72f3f8c28cde790ba836b2e92851aab8e19cf161ab5a0fff0f",
+      "shared_initializers": true,
+      "cache_limit_bytes": 536870912,
+      "scope": "One full task forward/backward; after-call active allocations, declared initializer bytes and distinct immutable region/shape keys; no optimizer updates",
+      "guard": {
+        "command": [
+          ".venv/bin/python",
+          "/tmp/onnax-shared-weight-paired-v3.py"
+        ],
+        "cwd": "/Users/justinc/Documents/GitHub/onnax",
+        "status": "complete",
+        "physical_memory_budget_bytes": 25769803776,
+        "minimum_free_disk_bytes": 5368709120,
+        "memory_source": "proc_pid_rusage/RUSAGE_INFO_V4",
+        "observation_errors": 0,
+        "temporary_directory": "/tmp/onnax-shared-weight-on-v3-guard/worker-tmp-dj0qum92",
+        "pid": 5605,
+        "started": "2026-11-02T19:45:31.991597+00:00",
+        "returncode": 0,
+        "finished": "2026-11-02T19:46:11.344503+00:00",
+        "temporary_files_removed": true,
+        "peak_physical_bytes": 8229428376
+      }
+    }
+  },
+  "all_51_call_outputs_byte_identical": true,
+  "worker_source": "import gc,json,os,hashlib,numpy as np\nfrom pathlib import Path\nimport onnx_ir as ir\nimport torch\nfrom transformers import AutoConfig\nfrom examples.huggingface.block_runtime import MlxMemory,capture\nfrom examples.huggingface.pretrained import PretrainedSource,load_tokenizer\nfrom examples.lora.mlx_runtime import register_library,session\npolicy=os.environ['SHARED_POLICY'];\nroot='/tmp/onnax-qwen35-real-sft/export';lib='/tmp/onnax-shared-test-runtime/libonnxruntime_mlx_ep.dylib'\nregister_library(lib);memory=MlxMemory(lib);torch.set_num_threads(1)\nrows=[];seen=set();total_declared=0;unique_bytes=0\nclass Observe:\n def __init__(self,source):\n  self.original=session(source);self.name=os.path.basename(source);self.regions=[]\n  m=ir.load(source)\n  for value in m.graph.initializers.values():\n   if value in m.graph.inputs:continue\n   tensor=value.const_value\n   if isinstance(tensor,ir.ExternalTensor):key=(tensor.location,tensor.offset,tensor.length,str(tensor.dtype),tuple(tensor.shape))\n   else:key=('inline',str(tensor.dtype),tuple(tensor.shape),tensor.tobytes())\n   self.regions.append((key,tensor.nbytes))\n def __getattr__(self,name):return getattr(self.original,name)\n def run(self,outputs,feeds):\n  global total_declared,unique_bytes\n  result=self.original.run(outputs,feeds)\n  total_declared+=sum(size for _,size in self.regions)\n  for key,size in self.regions:\n   if key not in seen:seen.add(key);unique_bytes+=size\n  rows.append({'session':self.name,'allocator':memory.snapshot(),'output_sha256':[hashlib.sha256(memoryview(np.ascontiguousarray(x))).hexdigest() for x in result],'cumulative_declared_initializer_bytes':total_declared,'unique_initializer_region_bytes':unique_bytes})\n  return result\nconfig=AutoConfig.from_pretrained(root,local_files_only=True);p=config.onnax_pretrained\ntok=load_tokenizer(PretrainedSource(p['model_id'],p['revision']),cache_dir='/tmp/onnax-qwen35-real-cache')\ntext='ONNX models learn from examples. Low-rank adapters update a small set of parameters. '\nrepeat=1;ids=[]\nwhile len(ids)<512:ids=tok.encode(text*repeat,add_special_tokens=False);repeat*=2\nids=torch.tensor([ids[:512]],dtype=torch.int64)\nbatch={'input_ids':ids,'attention_mask':torch.ones_like(ids),'position_ids':torch.arange(512)[None],'labels':ids.clone()}\nresult=capture(root,names=['decoder_0_1','decoder_3_4'],batch=batch,output='/tmp/onnax-shared-weight-'+policy+'-capture',factory=Observe)\ngc.collect()\nreport={'version':1,'sequence':512,'pretrained_source':p,'loss':result['loss'],'calls':rows,'after_close':memory.snapshot(),'worker_sha256':hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),'library_sha256':hashlib.sha256(Path(lib).read_bytes()).hexdigest(),'shared_initializers':os.environ['ONNXRUNTIME_EP_MLX_NO_SHARED_INITIALIZERS']=='0','cache_limit_bytes':int(os.environ['ONNXRUNTIME_EP_MLX_CACHE_LIMIT_BYTES']),'scope':'One full task forward/backward; after-call active allocations, declared initializer bytes and distinct immutable region/shape keys; no optimizer updates'}\nPath('/tmp/onnax-shared-weight-'+policy+'.json').write_text(json.dumps(report,indent=2)+'\\n')\nprint(json.dumps({'calls':len(rows),'last':rows[-1],'after_close':report['after_close']}))\n",
+  "source_capture_sha256": {
+    "off": "76f55366e70d7e32339d4c131822a56c71ef15c601e14469edb9d2cef43c77fb",
+    "on": "76f55366e70d7e32339d4c131822a56c71ef15c601e14469edb9d2cef43c77fb"
+  },
+  "captures": {
+    "off": {
+      "version": 1,
+      "bundle_identity": "229a32d4b255f89d56dd84d09f9a9daf82cfce4129fa57d7a19c3c86b216b693",
+      "interface_sha256": "ef5fcba850fc8000ce8b668440b75217843d5ef300a21dec0149745ac1217110",
+      "batch": {
+        "input_ids": {
+          "shape": [
+            1,
+            512
+          ],
+          "dtype": "int64",
+          "bytes": 4096,
+          "sha256": "db494ebd52fae8866c0878d610ace3fb6af006fd2df5b9a91977de00d1b238b5"
+        },
+        "attention_mask": {
+          "shape": [
+            1,
+            512
+          ],
+          "dtype": "int64",
+          "bytes": 4096,
+          "sha256": "8a472efbc41a4502e6da085422880bc742625c1187f2d36ed39e669d736ac113"
+        },
+        "position_ids": {
+          "shape": [
+            1,
+            512
+          ],
+          "dtype": "int64",
+          "bytes": 4096,
+          "sha256": "5738153ec97595b1c1e4dc027f7b7fb4534f19ed2ce9f9ee712e6d34a384cde7"
+        },
+        "labels": {
+          "shape": [
+            1,
+            512
+          ],
+          "dtype": "int64",
+          "bytes": 4096,
+          "sha256": "db494ebd52fae8866c0878d610ace3fb6af006fd2df5b9a91977de00d1b238b5"
+        }
+      },
+      "loss": 0.43246200680732727,
+      "blocks": {
+        "decoder_3_4": {
+          "index": 4,
+          "model": "block_4_backward.onnx",
+          "feeds": "block_4_feeds.npz",
+          "outputs": "block_4_outputs.npz",
+          "input_arrays": {
+            "position_ids": {
+              "shape": [
+                1,
+                512
+              ],
+              "dtype": "int64",
+              "bytes": 4096,
+              "sha256": "5738153ec97595b1c1e4dc027f7b7fb4534f19ed2ce9f9ee712e6d34a384cde7"
+            },
+            "attention_mask": {
+              "shape": [
+                1,
+                512
+              ],
+              "dtype": "int64",
+              "bytes": 4096,
+              "sha256": "8a472efbc41a4502e6da085422880bc742625c1187f2d36ed39e669d736ac113"
+            },
+            "input_ids": {
+              "shape": [
+                1,
+                512
+              ],
+              "dtype": "int64",
+              "bytes": 4096,
+              "sha256": "db494ebd52fae8866c0878d610ace3fb6af006fd2df5b9a91977de00d1b238b5"
+            },
+            "v_model.layers.2.Add_365": {
+              "shape": [
+                1,
+                512,
+                1024
+              ],
+              "dtype": "float32",
+              "bytes": 2097152,
+              "sha256": "7fa5c5f8bcd6fadd02de0a241b8d49f18074b3e9ae534f903304148ca42a13dc"
+            },
+            "model.layers.3.self_attn.q_proj.lora.A": {
+              "shape": [
+                1024,
+                4
+              ],
+              "dtype": "float32",
+              "bytes": 16384,
+              "sha256": "d6758cdb9b7713fae621dd5159e907b1a48eb5d004e09bc58dde0df3041905c6"
+            },
+            "model.layers.3.self_attn.q_proj.lora.B": {
+              "shape": [
+                4,
+                4096
+              ],
+              "dtype": "float32",
+              "bytes": 65536,
+              "sha256": "4d609316d9ff6a7b052041b29b48dd990a20dfce9aca22d9e4775f5c3402e380"
+            },
+            "model.layers.3.self_attn.v_proj.lora.A": {
+              "shape": [
+                1024,
+                4
+              ],
+              "dtype": "float32",
+              "bytes": 16384,
+              "sha256": "8a3c0c778df50e43a31597ff1ace99e9479767d6beb3ed874a261749b862a380"
+            },
+            "model.layers.3.self_attn.v_proj.lora.B": {
+              "shape": [
+                4,
+                512
+              ],
+              "dtype": "float32",
+              "bytes": 8192,
+              "sha256": "6a1938f4440f44b1efc097293f4a174da754cfa097e9eb130c8bedeb05c2e95e"
+            },
+            "v_model.layers.3.Add_402_cotangent": {
+              "shape": [
+                1,
+                512,
+                1024
+              ],
+              "dtype": "float32",
+              "bytes": 2097152,
+              "sha256": "3f68d078891fc429e8ac66cd7d6428d7a4aeee8d8d17372f184581aa91ea5327"
+            }
+          },
+          "output_arrays": {
+            "v_model.layers.2.Add_365_cotangent": {
+              "shape": [
+                1,
+                512,
+                1024
+              ],
+              "dtype": "float32",
+              "bytes": 2097152,
+              "sha256": "ac3260ead69405ef255b2916b329c811480c5480d613ac7769f082551f1f3fb7"
+            },
+            "model.layers.3.self_attn.q_proj.lora.A_cotangent": {
+              "shape": [
+                1024,
+                4
+              ],
+              "dtype": "float32",
+              "bytes": 16384,
+              "sha256": "4003e704b3d73128513c2c319cfd51cb57fa47beebad612bc25ad6c8427bf964"
+            },
+            "model.layers.3.self_attn.q_proj.lora.B_cotangent": {
+              "shape": [
+                4,
+                4096
+              ],
+              "dtype": "float32",
+              "bytes": 65536,
+              "sha256": "d61fe47e75acd0d2f74261e4ed94bd8fbb9b4d4f001a3d53b06c8d0d8bedf565"
+            },
+            "model.layers.3.self_attn.v_proj.lora.A_cotangent": {
+              "shape": [
+                1024,
+                4
+              ],
+              "dtype": "float32",
+              "bytes": 16384,
+              "sha256": "5f42cd32843a1fc10824d2a0023c4ad08760053b1e3e1292d70ff443766fdfd9"
+            },
+            "model.layers.3.self_attn.v_proj.lora.B_cotangent": {
+              "shape": [
+                4,
+                512
+              ],
+              "dtype": "float32",
+              "bytes": 8192,
+              "sha256": "926688d3b51cd16adf1b9aec8bfc54e4b2ef82c27ea300539b8907e0ac777ac3"
+            }
+          },
+          "output_names": [
+            "v_model.layers.2.Add_365_cotangent",
+            "model.layers.3.self_attn.q_proj.lora.A_cotangent",
+            "model.layers.3.self_attn.q_proj.lora.B_cotangent",
+            "model.layers.3.self_attn.v_proj.lora.A_cotangent",
+            "model.layers.3.self_attn.v_proj.lora.B_cotangent"
+          ]
+        },
+        "decoder_0_1": {
+          "index": 1,
+          "model": "block_1_backward.onnx",
+          "feeds": "block_1_feeds.npz",
+          "outputs": "block_1_outputs.npz",
+          "input_arrays": {
+            "input_ids": {
+              "shape": [
+                1,
+                512
+              ],
+              "dtype": "int64",
+              "bytes": 4096,
+              "sha256": "db494ebd52fae8866c0878d610ace3fb6af006fd2df5b9a91977de00d1b238b5"
+            },
+            "v_model.embed_tokens.Gather_109": {
+              "shape": [
+                1,
+                512,
+                1024
+              ],
+              "dtype": "float32",
+              "bytes": 2097152,
+              "sha256": "bd72c29aed39fcb86470c5c3127d388d0a0e7868b8b881a20ff845f467b047cb"
+            },
+            "model.layers.0.linear_attn.in_proj_qkv.lora.A": {
+              "shape": [
+                1024,
+                4
+              ],
+              "dtype": "float32",
+              "bytes": 16384,
+              "sha256": "b9452843f4544185633eb11c07437ab2600f794e6f8df8bfe2810298ab925d6d"
+            },
+            "model.layers.0.linear_attn.in_proj_qkv.lora.B": {
+              "shape": [
+                4,
+                6144
+              ],
+              "dtype": "float32",
+              "bytes": 98304,
+              "sha256": "bc4cd9651794a863649e4c9e318379cd3212fd8af03451da135085d96a1e2e31"
+            },
+            "v_model.layers.0.Add_219_cotangent": {
+              "shape": [
+                1,
+                512,
+                1024
+              ],
+              "dtype": "float32",
+              "bytes": 2097152,
+              "sha256": "4411e1ea7dea89d751e7df9382dbe3ae1cb917666598ad3248fea92359232d50"
+            }
+          },
+          "output_arrays": {
+            "model.layers.0.linear_attn.in_proj_qkv.lora.A_cotangent": {
+              "shape": [
+                1024,
+                4
+              ],
+              "dtype": "float32",
+              "bytes": 16384,
+              "sha256": "e203c3d8a199a25e9212d64405eaf68a03cdebf71fa0484e3ecbad4771a87941"
+            },
+            "model.layers.0.linear_attn.in_proj_qkv.lora.B_cotangent": {
+              "shape": [
+                4,
+                6144
+              ],
+              "dtype": "float32",
+              "bytes": 98304,
+              "sha256": "10841c79794f9857cac18afee0d9893c813bd11f77d2b8056828bd64fe9dec05"
+            }
+          },
+          "output_names": [
+            "model.layers.0.linear_attn.in_proj_qkv.lora.A_cotangent",
+            "model.layers.0.linear_attn.in_proj_qkv.lora.B_cotangent"
+          ]
+        }
+      },
+      "pretrained_source": {
+        "checkpoint_to_reference_prefix": {
+          "model.language_model.": "model."
+        },
+        "dtype": "float32",
+        "loading": {
+          "error_msgs": [],
+          "mismatched_keys": [],
+          "missing_keys": [],
+          "unexpected_keys": []
+        },
+        "model_id": "Qwen/Qwen3.5-0.8B",
+        "parameter_count": 752393024,
+        "reference_class": "Qwen3_5ForCausalLM",
+        "revision": "2fc06364715b967f1860aea9cf38778875588b17",
+        "version": 1
+      }
+    },
+    "on": {
+      "version": 1,
+      "bundle_identity": "229a32d4b255f89d56dd84d09f9a9daf82cfce4129fa57d7a19c3c86b216b693",
+      "interface_sha256": "ef5fcba850fc8000ce8b668440b75217843d5ef300a21dec0149745ac1217110",
+      "batch": {
+        "input_ids": {
+          "shape": [
+            1,
+            512
+          ],
+          "dtype": "int64",
+          "bytes": 4096,
+          "sha256": "db494ebd52fae8866c0878d610ace3fb6af006fd2df5b9a91977de00d1b238b5"
+        },
+        "attention_mask": {
+          "shape": [
+            1,
+            512
+          ],
+          "dtype": "int64",
+          "bytes": 4096,
+          "sha256": "8a472efbc41a4502e6da085422880bc742625c1187f2d36ed39e669d736ac113"
+        },
+        "position_ids": {
+          "shape": [
+            1,
+            512
+          ],
+          "dtype": "int64",
+          "bytes": 4096,
+          "sha256": "5738153ec97595b1c1e4dc027f7b7fb4534f19ed2ce9f9ee712e6d34a384cde7"
+        },
+        "labels": {
+          "shape": [
+            1,
+            512
+          ],
+          "dtype": "int64",
+          "bytes": 4096,
+          "sha256": "db494ebd52fae8866c0878d610ace3fb6af006fd2df5b9a91977de00d1b238b5"
+        }
+      },
+      "loss": 0.43246200680732727,
+      "blocks": {
+        "decoder_3_4": {
+          "index": 4,
+          "model": "block_4_backward.onnx",
+          "feeds": "block_4_feeds.npz",
+          "outputs": "block_4_outputs.npz",
+          "input_arrays": {
+            "position_ids": {
+              "shape": [
+                1,
+                512
+              ],
+              "dtype": "int64",
+              "bytes": 4096,
+              "sha256": "5738153ec97595b1c1e4dc027f7b7fb4534f19ed2ce9f9ee712e6d34a384cde7"
+            },
+            "attention_mask": {
+              "shape": [
+                1,
+                512
+              ],
+              "dtype": "int64",
+              "bytes": 4096,
+              "sha256": "8a472efbc41a4502e6da085422880bc742625c1187f2d36ed39e669d736ac113"
+            },
+            "input_ids": {
+              "shape": [
+                1,
+                512
+              ],
+              "dtype": "int64",
+              "bytes": 4096,
+              "sha256": "db494ebd52fae8866c0878d610ace3fb6af006fd2df5b9a91977de00d1b238b5"
+            },
+            "v_model.layers.2.Add_365": {
+              "shape": [
+                1,
+                512,
+                1024
+              ],
+              "dtype": "float32",
+              "bytes": 2097152,
+              "sha256": "7fa5c5f8bcd6fadd02de0a241b8d49f18074b3e9ae534f903304148ca42a13dc"
+            },
+            "model.layers.3.self_attn.q_proj.lora.A": {
+              "shape": [
+                1024,
+                4
+              ],
+              "dtype": "float32",
+              "bytes": 16384,
+              "sha256": "d6758cdb9b7713fae621dd5159e907b1a48eb5d004e09bc58dde0df3041905c6"
+            },
+            "model.layers.3.self_attn.q_proj.lora.B": {
+              "shape": [
+                4,
+                4096
+              ],
+              "dtype": "float32",
+              "bytes": 65536,
+              "sha256": "4d609316d9ff6a7b052041b29b48dd990a20dfce9aca22d9e4775f5c3402e380"
+            },
+            "model.layers.3.self_attn.v_proj.lora.A": {
+              "shape": [
+                1024,
+                4
+              ],
+              "dtype": "float32",
+              "bytes": 16384,
+              "sha256": "8a3c0c778df50e43a31597ff1ace99e9479767d6beb3ed874a261749b862a380"
+            },
+            "model.layers.3.self_attn.v_proj.lora.B": {
+              "shape": [
+                4,
+                512
+              ],
+              "dtype": "float32",
+              "bytes": 8192,
+              "sha256": "6a1938f4440f44b1efc097293f4a174da754cfa097e9eb130c8bedeb05c2e95e"
+            },
+            "v_model.layers.3.Add_402_cotangent": {
+              "shape": [
+                1,
+                512,
+                1024
+              ],
+              "dtype": "float32",
+              "bytes": 2097152,
+              "sha256": "3f68d078891fc429e8ac66cd7d6428d7a4aeee8d8d17372f184581aa91ea5327"
+            }
+          },
+          "output_arrays": {
+            "v_model.layers.2.Add_365_cotangent": {
+              "shape": [
+                1,
+                512,
+                1024
+              ],
+              "dtype": "float32",
+              "bytes": 2097152,
+              "sha256": "ac3260ead69405ef255b2916b329c811480c5480d613ac7769f082551f1f3fb7"
+            },
+            "model.layers.3.self_attn.q_proj.lora.A_cotangent": {
+              "shape": [
+                1024,
+                4
+              ],
+              "dtype": "float32",
+              "bytes": 16384,
+              "sha256": "4003e704b3d73128513c2c319cfd51cb57fa47beebad612bc25ad6c8427bf964"
+            },
+            "model.layers.3.self_attn.q_proj.lora.B_cotangent": {
+              "shape": [
+                4,
+                4096
+              ],
+              "dtype": "float32",
+              "bytes": 65536,
+              "sha256": "d61fe47e75acd0d2f74261e4ed94bd8fbb9b4d4f001a3d53b06c8d0d8bedf565"
+            },
+            "model.layers.3.self_attn.v_proj.lora.A_cotangent": {
+              "shape": [
+                1024,
+                4
+              ],
+              "dtype": "float32",
+              "bytes": 16384,
+              "sha256": "5f42cd32843a1fc10824d2a0023c4ad08760053b1e3e1292d70ff443766fdfd9"
+            },
+            "model.layers.3.self_attn.v_proj.lora.B_cotangent": {
+              "shape": [
+                4,
+                512
+              ],
+              "dtype": "float32",
+              "bytes": 8192,
+              "sha256": "926688d3b51cd16adf1b9aec8bfc54e4b2ef82c27ea300539b8907e0ac777ac3"
+            }
+          },
+          "output_names": [
+            "v_model.layers.2.Add_365_cotangent",
+            "model.layers.3.self_attn.q_proj.lora.A_cotangent",
+            "model.layers.3.self_attn.q_proj.lora.B_cotangent",
+            "model.layers.3.self_attn.v_proj.lora.A_cotangent",
+            "model.layers.3.self_attn.v_proj.lora.B_cotangent"
+          ]
+        },
+        "decoder_0_1": {
+          "index": 1,
+          "model": "block_1_backward.onnx",
+          "feeds": "block_1_feeds.npz",
+          "outputs": "block_1_outputs.npz",
+          "input_arrays": {
+            "input_ids": {
+              "shape": [
+                1,
+                512
+              ],
+              "dtype": "int64",
+              "bytes": 4096,
+              "sha256": "db494ebd52fae8866c0878d610ace3fb6af006fd2df5b9a91977de00d1b238b5"
+            },
+            "v_model.embed_tokens.Gather_109": {
+              "shape": [
+                1,
+                512,
+                1024
+              ],
+              "dtype": "float32",
+              "bytes": 2097152,
+              "sha256": "bd72c29aed39fcb86470c5c3127d388d0a0e7868b8b881a20ff845f467b047cb"
+            },
+            "model.layers.0.linear_attn.in_proj_qkv.lora.A": {
+              "shape": [
+                1024,
+                4
+              ],
+              "dtype": "float32",
+              "bytes": 16384,
+              "sha256": "b9452843f4544185633eb11c07437ab2600f794e6f8df8bfe2810298ab925d6d"
+            },
+            "model.layers.0.linear_attn.in_proj_qkv.lora.B": {
+              "shape": [
+                4,
+                6144
+              ],
+              "dtype": "float32",
+              "bytes": 98304,
+              "sha256": "bc4cd9651794a863649e4c9e318379cd3212fd8af03451da135085d96a1e2e31"
+            },
+            "v_model.layers.0.Add_219_cotangent": {
+              "shape": [
+                1,
+                512,
+                1024
+              ],
+              "dtype": "float32",
+              "bytes": 2097152,
+              "sha256": "4411e1ea7dea89d751e7df9382dbe3ae1cb917666598ad3248fea92359232d50"
+            }
+          },
+          "output_arrays": {
+            "model.layers.0.linear_attn.in_proj_qkv.lora.A_cotangent": {
+              "shape": [
+                1024,
+                4
+              ],
+              "dtype": "float32",
+              "bytes": 16384,
+              "sha256": "e203c3d8a199a25e9212d64405eaf68a03cdebf71fa0484e3ecbad4771a87941"
+            },
+            "model.layers.0.linear_attn.in_proj_qkv.lora.B_cotangent": {
+              "shape": [
+                4,
+                6144
+              ],
+              "dtype": "float32",
+              "bytes": 98304,
+              "sha256": "10841c79794f9857cac18afee0d9893c813bd11f77d2b8056828bd64fe9dec05"
+            }
+          },
+          "output_names": [
+            "model.layers.0.linear_attn.in_proj_qkv.lora.A_cotangent",
+            "model.layers.0.linear_attn.in_proj_qkv.lora.B_cotangent"
+          ]
+        }
+      },
+      "pretrained_source": {
+        "checkpoint_to_reference_prefix": {
+          "model.language_model.": "model."
+        },
+        "dtype": "float32",
+        "loading": {
+          "error_msgs": [],
+          "mismatched_keys": [],
+          "missing_keys": [],
+          "unexpected_keys": []
+        },
+        "model_id": "Qwen/Qwen3.5-0.8B",
+        "parameter_count": 752393024,
+        "reference_class": "Qwen3_5ForCausalLM",
+        "revision": "2fc06364715b967f1860aea9cf38778875588b17",
+        "version": 1
+      }
+    }
+  },
+  "versions": {
+    "onnax": "0.1.0",
+    "onnx": "1.23.2",
+    "onnx-ir": "1.1.0",
+    "onnxruntime": "1.31.1",
+    "torch": "2.15.0",
+    "transformers": "5.22.1",
+    "mobius-onnx": "0.1.0",
+    "mlx": "0.32.4",
+    "numpy": "2.4.6"
+  }
+}
