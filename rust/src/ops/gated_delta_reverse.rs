@@ -40,8 +40,10 @@ fn literal(r: &TensorRef, producers: &HashMap<&str, &NodeDesc>) -> Option<Litera
         {
             return Some(Literal::Axes(
                 bytes[..count * 8]
-                    .chunks_exact(8)
-                    .map(|v| i64::from_le_bytes(v.try_into().unwrap()))
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(|v| i64::from_le_bytes(*v))
                     .collect(),
             ));
         }
