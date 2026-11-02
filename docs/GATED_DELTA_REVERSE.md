@@ -65,3 +65,37 @@ same-parameter numerical comparison alongside the timings.
 
 For a macOS physical-memory budget, run the command through onnax's
 `python -m examples.huggingface.guard --output-dir GUARD -- COMMAND ...`.
+
+### M1 Max result
+
+The pinned Qwen3.5-0.8B FP32 adapter at sequence length 512 produced:
+
+| Reverse Scan | Forward/loss/all-gradients median / P95 | Process peak physical footprint |
+|---|---:|---:|
+| Generic unrolled | 5.261 / 6.652 s | 12.25 GiB |
+| Fused Metal | 3.229 / 3.461 s | 11.05 GiB |
+
+Each mode ran in its own process with 10 warmups and 100 samples. The same
+binary, inputs, frozen source and 60 adapter tensors were used; the switch
+above selects the generic control. All 60 final gradient arrays matched at
+`rtol=1e-4, atol=1e-6`. The median throughput ratio for this forward/backward
+workload is 1.63. Physical footprint includes model setup and the runtime.
+
+The complete [generic](../bench/reports/qwen35-512-unrolled-m1max.json) and
+[fused](../bench/reports/qwen35-512-fused-m1max.json) reports contain raw samples,
+fingerprints, software versions and source/library hashes. The measured kernel
+commit is `d7acb25`; the subsequent Rust lint fix changes axes decoding syntax.
+
+The same binary completed 30 SFT updates on the pinned real model at sequence
+length 64, microbatch one and four accumulation steps. Training loss fell from
+5.223939 to 0.302991, and validation loss from 6.019480 to 5.621203. A fresh
+process resumed checkpoint 15 through update 30. Its 61 checkpoint state tensors,
+AdamW moments and scheduler state matched continuous training byte for byte.
+Fresh loaded models also produced identical logits, loss and all 60 adapter
+gradients.
+
+The disk guard interrupted the resumed run during final export, after its
+step-30 checkpoint was saved. After state equality was verified, the immutable
+graph bundle was restored with hardlinks and each final checkpoint was loaded
+strictly before execution. The [training/recovery record](../bench/reports/qwen35-fused-sft-recovery-m1max.json)
+preserves this event, guard summaries and the verifier source.

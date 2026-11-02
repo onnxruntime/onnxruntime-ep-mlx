@@ -1,0 +1,3411 @@
+{
+  "schema_version": 1,
+  "training": {
+    "family": "qwen35",
+    "pretrained_source": {
+      "version": 1,
+      "model_id": "Qwen/Qwen3.5-0.8B",
+      "revision": "2fc06364715b967f1860aea9cf38778875588b17",
+      "reference_class": "Qwen3_5ForCausalLM",
+      "checkpoint_to_reference_prefix": {
+        "model.language_model.": "model."
+      },
+      "parameter_count": 752393024,
+      "dtype": "float32",
+      "loading": {
+        "missing_keys": [],
+        "unexpected_keys": [],
+        "mismatched_keys": [],
+        "error_msgs": []
+      }
+    },
+    "steps": 30,
+    "microbatch_size": 1,
+    "gradient_accumulation_steps": 4,
+    "max_length": 64,
+    "pad_to_multiple_of": 64,
+    "batches": [
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 12
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 12
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 12
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 16
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 12
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 12
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 12
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 16
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 12
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 12
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 12
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 16
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 12
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 12
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 12
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 16
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 12
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 12
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 12
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 16
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 12
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 12
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 12
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 16
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 12
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 12
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 12
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 16
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 12
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 12
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 12
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 16
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 16
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 12
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 12
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 12
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 12
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 12
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 16
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 16
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 12
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 12
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 12
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 12
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 12
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 12
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 12
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 16
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 12
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 12
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 16
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 16
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 12
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 12
+      },
+      {
+        "training": true,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 12
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 12
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 12
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 16
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 12
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 12
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 12
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 16
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 12
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 12
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 12
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 16
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 12
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 12
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 12
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 16
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 12
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 12
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 12
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 16
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 12
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 12
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 12
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 16
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 12
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 12
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 12
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 16
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 12
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 12
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 13
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 10
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 12
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 16
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      },
+      {
+        "training": false,
+        "batch": 1,
+        "sequence": 64,
+        "valid_shifted_targets": 11
+      }
+    ],
+    "adam_epsilon": 1e-05,
+    "validation_loss": [
+      6.019479751586914,
+      5.621203422546387
+    ],
+    "training_loss": [
+      5.223938941955566,
+      0.302990585565567
+    ],
+    "source_identity": "229a32d4b255f89d56dd84d09f9a9daf82cfce4129fa57d7a19c3c86b216b693",
+    "timing_scope": "initial/final evaluation, training and export; excludes construction",
+    "elapsed_seconds": 170.9253659590031,
+    "source_mapping": [
+      {
+        "module": "model.layers.0.linear_attn.in_proj_qkv",
+        "source_weight": "model.layers.0.linear_attn.in_proj_qkv.weight",
+        "A": "model.layers.0.linear_attn.in_proj_qkv.lora.A",
+        "B": "model.layers.0.linear_attn.in_proj_qkv.lora.B",
+        "rank": 4,
+        "alpha": 1.0,
+        "pieces": [
+          {
+            "module": "model.layers.0.linear_attn.in_proj_qkv",
+            "start": 0,
+            "stop": 6144
+          }
+        ],
+        "checkpoint_weight": "model.language_model.layers.0.linear_attn.in_proj_qkv.weight"
+      },
+      {
+        "module": "model.layers.1.linear_attn.in_proj_qkv",
+        "source_weight": "model.layers.1.linear_attn.in_proj_qkv.weight",
+        "A": "model.layers.1.linear_attn.in_proj_qkv.lora.A",
+        "B": "model.layers.1.linear_attn.in_proj_qkv.lora.B",
+        "rank": 4,
+        "alpha": 1.0,
+        "pieces": [
+          {
+            "module": "model.layers.1.linear_attn.in_proj_qkv",
+            "start": 0,
+            "stop": 6144
+          }
+        ],
+        "checkpoint_weight": "model.language_model.layers.1.linear_attn.in_proj_qkv.weight"
+      },
+      {
+        "module": "model.layers.2.linear_attn.in_proj_qkv",
+        "source_weight": "model.layers.2.linear_attn.in_proj_qkv.weight",
+        "A": "model.layers.2.linear_attn.in_proj_qkv.lora.A",
+        "B": "model.layers.2.linear_attn.in_proj_qkv.lora.B",
+        "rank": 4,
+        "alpha": 1.0,
+        "pieces": [
+          {
+            "module": "model.layers.2.linear_attn.in_proj_qkv",
+            "start": 0,
+            "stop": 6144
+          }
+        ],
+        "checkpoint_weight": "model.language_model.layers.2.linear_attn.in_proj_qkv.weight"
+      },
+      {
+        "module": "model.layers.3.self_attn.q_proj",
+        "source_weight": "model.layers.3.self_attn.q_proj.weight",
+        "A": "model.layers.3.self_attn.q_proj.lora.A",
+        "B": "model.layers.3.self_attn.q_proj.lora.B",
+        "rank": 4,
+        "alpha": 1.0,
+        "pieces": [
+          {
+            "module": "model.layers.3.self_attn.q_proj",
+            "start": 0,
+            "stop": 4096
+          }
+        ],
+        "checkpoint_weight": "model.language_model.layers.3.self_attn.q_proj.weight"
+      },
+      {
+        "module": "model.layers.3.self_attn.v_proj",
+        "source_weight": "model.layers.3.self_attn.v_proj.weight",
+        "A": "model.layers.3.self_attn.v_proj.lora.A",
+        "B": "model.layers.3.self_attn.v_proj.lora.B",
+        "rank": 4,
+        "alpha": 1.0,
+        "pieces": [
+          {
+            "module": "model.layers.3.self_attn.v_proj",
+            "start": 0,
+            "stop": 512
+          }
+        ],
+        "checkpoint_weight": "model.language_model.layers.3.self_attn.v_proj.weight"
+      },
+      {
+        "module": "model.layers.4.linear_attn.in_proj_qkv",
+        "source_weight": "model.layers.4.linear_attn.in_proj_qkv.weight",
+        "A": "model.layers.4.linear_attn.in_proj_qkv.lora.A",
+        "B": "model.layers.4.linear_attn.in_proj_qkv.lora.B",
+        "rank": 4,
+        "alpha": 1.0,
+        "pieces": [
+          {
+            "module": "model.layers.4.linear_attn.in_proj_qkv",
+            "start": 0,
+            "stop": 6144
+          }
+        ],
+        "checkpoint_weight": "model.language_model.layers.4.linear_attn.in_proj_qkv.weight"
+      },
+      {
+        "module": "model.layers.5.linear_attn.in_proj_qkv",
+        "source_weight": "model.layers.5.linear_attn.in_proj_qkv.weight",
+        "A": "model.layers.5.linear_attn.in_proj_qkv.lora.A",
+        "B": "model.layers.5.linear_attn.in_proj_qkv.lora.B",
+        "rank": 4,
+        "alpha": 1.0,
+        "pieces": [
+          {
+            "module": "model.layers.5.linear_attn.in_proj_qkv",
+            "start": 0,
+            "stop": 6144
+          }
+        ],
+        "checkpoint_weight": "model.language_model.layers.5.linear_attn.in_proj_qkv.weight"
+      },
+      {
+        "module": "model.layers.6.linear_attn.in_proj_qkv",
+        "source_weight": "model.layers.6.linear_attn.in_proj_qkv.weight",
+        "A": "model.layers.6.linear_attn.in_proj_qkv.lora.A",
+        "B": "model.layers.6.linear_attn.in_proj_qkv.lora.B",
+        "rank": 4,
+        "alpha": 1.0,
+        "pieces": [
+          {
+            "module": "model.layers.6.linear_attn.in_proj_qkv",
+            "start": 0,
+            "stop": 6144
+          }
+        ],
+        "checkpoint_weight": "model.language_model.layers.6.linear_attn.in_proj_qkv.weight"
+      },
+      {
+        "module": "model.layers.7.self_attn.q_proj",
+        "source_weight": "model.layers.7.self_attn.q_proj.weight",
+        "A": "model.layers.7.self_attn.q_proj.lora.A",
+        "B": "model.layers.7.self_attn.q_proj.lora.B",
+        "rank": 4,
+        "alpha": 1.0,
+        "pieces": [
+          {
+            "module": "model.layers.7.self_attn.q_proj",
+            "start": 0,
+            "stop": 4096
+          }
+        ],
+        "checkpoint_weight": "model.language_model.layers.7.self_attn.q_proj.weight"
+      },
+      {
+        "module": "model.layers.7.self_attn.v_proj",
+        "source_weight": "model.layers.7.self_attn.v_proj.weight",
+        "A": "model.layers.7.self_attn.v_proj.lora.A",
+        "B": "model.layers.7.self_attn.v_proj.lora.B",
+        "rank": 4,
+        "alpha": 1.0,
+        "pieces": [
+          {
+            "module": "model.layers.7.self_attn.v_proj",
+            "start": 0,
+            "stop": 512
+          }
+        ],
+        "checkpoint_weight": "model.language_model.layers.7.self_attn.v_proj.weight"
+      },
+      {
+        "module": "model.layers.8.linear_attn.in_proj_qkv",
+        "source_weight": "model.layers.8.linear_attn.in_proj_qkv.weight",
+        "A": "model.layers.8.linear_attn.in_proj_qkv.lora.A",
+        "B": "model.layers.8.linear_attn.in_proj_qkv.lora.B",
+        "rank": 4,
+        "alpha": 1.0,
+        "pieces": [
+          {
+            "module": "model.layers.8.linear_attn.in_proj_qkv",
+            "start": 0,
+            "stop": 6144
+          }
+        ],
+        "checkpoint_weight": "model.language_model.layers.8.linear_attn.in_proj_qkv.weight"
+      },
+      {
+        "module": "model.layers.9.linear_attn.in_proj_qkv",
+        "source_weight": "model.layers.9.linear_attn.in_proj_qkv.weight",
+        "A": "model.layers.9.linear_attn.in_proj_qkv.lora.A",
+        "B": "model.layers.9.linear_attn.in_proj_qkv.lora.B",
+        "rank": 4,
+        "alpha": 1.0,
+        "pieces": [
+          {
+            "module": "model.layers.9.linear_attn.in_proj_qkv",
+            "start": 0,
+            "stop": 6144
+          }
+        ],
+        "checkpoint_weight": "model.language_model.layers.9.linear_attn.in_proj_qkv.weight"
+      },
+      {
+        "module": "model.layers.10.linear_attn.in_proj_qkv",
+        "source_weight": "model.layers.10.linear_attn.in_proj_qkv.weight",
+        "A": "model.layers.10.linear_attn.in_proj_qkv.lora.A",
+        "B": "model.layers.10.linear_attn.in_proj_qkv.lora.B",
+        "rank": 4,
+        "alpha": 1.0,
+        "pieces": [
+          {
+            "module": "model.layers.10.linear_attn.in_proj_qkv",
+            "start": 0,
+            "stop": 6144
+          }
+        ],
+        "checkpoint_weight": "model.language_model.layers.10.linear_attn.in_proj_qkv.weight"
+      },
+      {
+        "module": "model.layers.11.self_attn.q_proj",
+        "source_weight": "model.layers.11.self_attn.q_proj.weight",
+        "A": "model.layers.11.self_attn.q_proj.lora.A",
+        "B": "model.layers.11.self_attn.q_proj.lora.B",
+        "rank": 4,
+        "alpha": 1.0,
+        "pieces": [
+          {
+            "module": "model.layers.11.self_attn.q_proj",
+            "start": 0,
+            "stop": 4096
+          }
+        ],
+        "checkpoint_weight": "model.language_model.layers.11.self_attn.q_proj.weight"
+      },
+      {
+        "module": "model.layers.11.self_attn.v_proj",
+        "source_weight": "model.layers.11.self_attn.v_proj.weight",
+        "A": "model.layers.11.self_attn.v_proj.lora.A",
+        "B": "model.layers.11.self_attn.v_proj.lora.B",
+        "rank": 4,
+        "alpha": 1.0,
+        "pieces": [
+          {
+            "module": "model.layers.11.self_attn.v_proj",
+            "start": 0,
+            "stop": 512
+          }
+        ],
+        "checkpoint_weight": "model.language_model.layers.11.self_attn.v_proj.weight"
+      },
+      {
+        "module": "model.layers.12.linear_attn.in_proj_qkv",
+        "source_weight": "model.layers.12.linear_attn.in_proj_qkv.weight",
+        "A": "model.layers.12.linear_attn.in_proj_qkv.lora.A",
+        "B": "model.layers.12.linear_attn.in_proj_qkv.lora.B",
+        "rank": 4,
+        "alpha": 1.0,
+        "pieces": [
+          {
+            "module": "model.layers.12.linear_attn.in_proj_qkv",
+            "start": 0,
+            "stop": 6144
+          }
+        ],
+        "checkpoint_weight": "model.language_model.layers.12.linear_attn.in_proj_qkv.weight"
+      },
+      {
+        "module": "model.layers.13.linear_attn.in_proj_qkv",
+        "source_weight": "model.layers.13.linear_attn.in_proj_qkv.weight",
+        "A": "model.layers.13.linear_attn.in_proj_qkv.lora.A",
+        "B": "model.layers.13.linear_attn.in_proj_qkv.lora.B",
+        "rank": 4,
+        "alpha": 1.0,
+        "pieces": [
+          {
+            "module": "model.layers.13.linear_attn.in_proj_qkv",
+            "start": 0,
+            "stop": 6144
+          }
+        ],
+        "checkpoint_weight": "model.language_model.layers.13.linear_attn.in_proj_qkv.weight"
+      },
+      {
+        "module": "model.layers.14.linear_attn.in_proj_qkv",
+        "source_weight": "model.layers.14.linear_attn.in_proj_qkv.weight",
+        "A": "model.layers.14.linear_attn.in_proj_qkv.lora.A",
+        "B": "model.layers.14.linear_attn.in_proj_qkv.lora.B",
+        "rank": 4,
+        "alpha": 1.0,
+        "pieces": [
+          {
+            "module": "model.layers.14.linear_attn.in_proj_qkv",
+            "start": 0,
+            "stop": 6144
+          }
+        ],
+        "checkpoint_weight": "model.language_model.layers.14.linear_attn.in_proj_qkv.weight"
+      },
+      {
+        "module": "model.layers.15.self_attn.q_proj",
+        "source_weight": "model.layers.15.self_attn.q_proj.weight",
+        "A": "model.layers.15.self_attn.q_proj.lora.A",
+        "B": "model.layers.15.self_attn.q_proj.lora.B",
+        "rank": 4,
+        "alpha": 1.0,
+        "pieces": [
+          {
+            "module": "model.layers.15.self_attn.q_proj",
+            "start": 0,
+            "stop": 4096
+          }
+        ],
+        "checkpoint_weight": "model.language_model.layers.15.self_attn.q_proj.weight"
+      },
+      {
+        "module": "model.layers.15.self_attn.v_proj",
+        "source_weight": "model.layers.15.self_attn.v_proj.weight",
+        "A": "model.layers.15.self_attn.v_proj.lora.A",
+        "B": "model.layers.15.self_attn.v_proj.lora.B",
+        "rank": 4,
+        "alpha": 1.0,
+        "pieces": [
+          {
+            "module": "model.layers.15.self_attn.v_proj",
+            "start": 0,
+            "stop": 512
+          }
+        ],
+        "checkpoint_weight": "model.language_model.layers.15.self_attn.v_proj.weight"
+      },
+      {
+        "module": "model.layers.16.linear_attn.in_proj_qkv",
+        "source_weight": "model.layers.16.linear_attn.in_proj_qkv.weight",
+        "A": "model.layers.16.linear_attn.in_proj_qkv.lora.A",
+        "B": "model.layers.16.linear_attn.in_proj_qkv.lora.B",
+        "rank": 4,
+        "alpha": 1.0,
+        "pieces": [
+          {
+            "module": "model.layers.16.linear_attn.in_proj_qkv",
+            "start": 0,
+            "stop": 6144
+          }
+        ],
+        "checkpoint_weight": "model.language_model.layers.16.linear_attn.in_proj_qkv.weight"
+      },
+      {
+        "module": "model.layers.17.linear_attn.in_proj_qkv",
+        "source_weight": "model.layers.17.linear_attn.in_proj_qkv.weight",
+        "A": "model.layers.17.linear_attn.in_proj_qkv.lora.A",
+        "B": "model.layers.17.linear_attn.in_proj_qkv.lora.B",
+        "rank": 4,
+        "alpha": 1.0,
+        "pieces": [
+          {
+            "module": "model.layers.17.linear_attn.in_proj_qkv",
+            "start": 0,
+            "stop": 6144
+          }
+        ],
+        "checkpoint_weight": "model.language_model.layers.17.linear_attn.in_proj_qkv.weight"
+      },
+      {
+        "module": "model.layers.18.linear_attn.in_proj_qkv",
+        "source_weight": "model.layers.18.linear_attn.in_proj_qkv.weight",
+        "A": "model.layers.18.linear_attn.in_proj_qkv.lora.A",
+        "B": "model.layers.18.linear_attn.in_proj_qkv.lora.B",
+        "rank": 4,
+        "alpha": 1.0,
+        "pieces": [
+          {
+            "module": "model.layers.18.linear_attn.in_proj_qkv",
+            "start": 0,
+            "stop": 6144
+          }
+        ],
+        "checkpoint_weight": "model.language_model.layers.18.linear_attn.in_proj_qkv.weight"
+      },
+      {
+        "module": "model.layers.19.self_attn.q_proj",
+        "source_weight": "model.layers.19.self_attn.q_proj.weight",
+        "A": "model.layers.19.self_attn.q_proj.lora.A",
+        "B": "model.layers.19.self_attn.q_proj.lora.B",
+        "rank": 4,
+        "alpha": 1.0,
+        "pieces": [
+          {
+            "module": "model.layers.19.self_attn.q_proj",
+            "start": 0,
+            "stop": 4096
+          }
+        ],
+        "checkpoint_weight": "model.language_model.layers.19.self_attn.q_proj.weight"
+      },
+      {
+        "module": "model.layers.19.self_attn.v_proj",
+        "source_weight": "model.layers.19.self_attn.v_proj.weight",
+        "A": "model.layers.19.self_attn.v_proj.lora.A",
+        "B": "model.layers.19.self_attn.v_proj.lora.B",
+        "rank": 4,
+        "alpha": 1.0,
+        "pieces": [
+          {
+            "module": "model.layers.19.self_attn.v_proj",
+            "start": 0,
+            "stop": 512
+          }
+        ],
+        "checkpoint_weight": "model.language_model.layers.19.self_attn.v_proj.weight"
+      },
+      {
+        "module": "model.layers.20.linear_attn.in_proj_qkv",
+        "source_weight": "model.layers.20.linear_attn.in_proj_qkv.weight",
+        "A": "model.layers.20.linear_attn.in_proj_qkv.lora.A",
+        "B": "model.layers.20.linear_attn.in_proj_qkv.lora.B",
+        "rank": 4,
+        "alpha": 1.0,
+        "pieces": [
+          {
+            "module": "model.layers.20.linear_attn.in_proj_qkv",
+            "start": 0,
+            "stop": 6144
+          }
+        ],
+        "checkpoint_weight": "model.language_model.layers.20.linear_attn.in_proj_qkv.weight"
+      },
+      {
+        "module": "model.layers.21.linear_attn.in_proj_qkv",
+        "source_weight": "model.layers.21.linear_attn.in_proj_qkv.weight",
+        "A": "model.layers.21.linear_attn.in_proj_qkv.lora.A",
+        "B": "model.layers.21.linear_attn.in_proj_qkv.lora.B",
+        "rank": 4,
+        "alpha": 1.0,
+        "pieces": [
+          {
+            "module": "model.layers.21.linear_attn.in_proj_qkv",
+            "start": 0,
+            "stop": 6144
+          }
+        ],
+        "checkpoint_weight": "model.language_model.layers.21.linear_attn.in_proj_qkv.weight"
+      },
+      {
+        "module": "model.layers.22.linear_attn.in_proj_qkv",
+        "source_weight": "model.layers.22.linear_attn.in_proj_qkv.weight",
+        "A": "model.layers.22.linear_attn.in_proj_qkv.lora.A",
+        "B": "model.layers.22.linear_attn.in_proj_qkv.lora.B",
+        "rank": 4,
+        "alpha": 1.0,
+        "pieces": [
+          {
+            "module": "model.layers.22.linear_attn.in_proj_qkv",
+            "start": 0,
+            "stop": 6144
+          }
+        ],
+        "checkpoint_weight": "model.language_model.layers.22.linear_attn.in_proj_qkv.weight"
+      },
+      {
+        "module": "model.layers.23.self_attn.q_proj",
+        "source_weight": "model.layers.23.self_attn.q_proj.weight",
+        "A": "model.layers.23.self_attn.q_proj.lora.A",
+        "B": "model.layers.23.self_attn.q_proj.lora.B",
+        "rank": 4,
+        "alpha": 1.0,
+        "pieces": [
+          {
+            "module": "model.layers.23.self_attn.q_proj",
+            "start": 0,
+            "stop": 4096
+          }
+        ],
+        "checkpoint_weight": "model.language_model.layers.23.self_attn.q_proj.weight"
+      },
+      {
+        "module": "model.layers.23.self_attn.v_proj",
+        "source_weight": "model.layers.23.self_attn.v_proj.weight",
+        "A": "model.layers.23.self_attn.v_proj.lora.A",
+        "B": "model.layers.23.self_attn.v_proj.lora.B",
+        "rank": 4,
+        "alpha": 1.0,
+        "pieces": [
+          {
+            "module": "model.layers.23.self_attn.v_proj",
+            "start": 0,
+            "stop": 512
+          }
+        ],
+        "checkpoint_weight": "model.language_model.layers.23.self_attn.v_proj.weight"
+      }
+    ],
+    "export": "/tmp/onnax-gated-qualified-sft/export",
+    "provider": "mlx",
+    "dtype": "float32",
+    "library_sha256": "13ab91e531b0346a667bd976d8ce2b70b2b48312df41a4f2b86df771c130f8df",
+    "source_commit": "a82d41a58d74cdc1bc8fbfbe39ecda30e6662964",
+    "working_tree_dirty": false,
+    "platform": "macOS-27.0.1-arm64-arm-64bit",
+    "versions": {
+      "onnax": "0.1.0",
+      "onnx": "1.23.2",
+      "onnx-ir": "1.1.0",
+      "onnxscript": "0.7.2",
+      "onnxruntime": "1.31.1",
+      "torch": "2.15.0",
+      "transformers": "5.22.1",
+      "trl": "0.24.0",
+      "datasets": "5.1.0",
+      "peft": "0.21.2",
+      "mobius-onnx": "0.1.0"
+    },
+    "threads": {
+      "torch": 1,
+      "ort_intra": 1,
+      "ort_inter": 1
+    },
+    "process_peak_rss_bytes": 9225371648,
+    "rss_scope": "process, imports, construction, runtime, training or audit, and export"
+  },
+  "recovery": {
+    "checkpoint_state_tensors": 61,
+    "checkpoint_and_adamw_scheduler_byte_identical": true,
+    "completed_step": 30,
+    "restored_from_step": 15,
+    "loaded_logits_loss_and_adapter_gradients_byte_identical": true,
+    "adapter_gradients": 60,
+    "restored_graph_files": 60,
+    "export_strategy": "Hardlink identical immutable graph bundle after proving final checkpoint equality; strictly load each final checkpoint into a fresh exported model before execution",
+    "interruption": "Disk guard stopped final export after step-30 checkpoint; preserved original guard journal",
+    "output_sha256": {
+      "logits": "0f25f640aac0a2a5bee1ed347c7df5aec0cfd06082520cfcd64fbe58c7465298",
+      "loss": "e9388326b321ba6354e5cbf02a74c84ac93ae6ea9aec6f5f4741fefa00f54779",
+      "model.layers.0.linear_attn.in_proj_qkv.lora.A": "302b09afe5800f0099df5e860b4d82a9b7c2f8422844d96bb8b322788ba031cc",
+      "model.layers.0.linear_attn.in_proj_qkv.lora.B": "4ecaae7c23a10791cd3b2f5485d2457f0e6884fc29569cd8c8d34cc78e21e071",
+      "model.layers.1.linear_attn.in_proj_qkv.lora.A": "2ab16adf88eaf1e8c48039f42b6318ef8680a1d87e84dc9d414687f76ac69ece",
+      "model.layers.1.linear_attn.in_proj_qkv.lora.B": "ab502134210d03c8a9af312399ca40654b72f51b46467e59c832d81ef06a32d1",
+      "model.layers.2.linear_attn.in_proj_qkv.lora.A": "d59da1b6c1b3b1eb20cdd8423cbaf458923ce3e9ff38c51e219aa3e00b613ce8",
+      "model.layers.2.linear_attn.in_proj_qkv.lora.B": "73c6e7f8816a1af35d58d581a5cbf1e8577f160287f9e36cc7015d12c254a6fc",
+      "model.layers.3.self_attn.q_proj.lora.A": "4a1d54d4284ae7da7eb43138341a5acd37e1f940d9b779b2fae9ce015f332ee4",
+      "model.layers.3.self_attn.q_proj.lora.B": "d1eb26f55a6047b7ad737bf6ca65b5818c426e5ccab8efa5b067ce674a31ed08",
+      "model.layers.3.self_attn.v_proj.lora.A": "4808750fd915cc5fe6f74dc690be4fd1fbb522c1af2186e5b4daac67aae9891a",
+      "model.layers.3.self_attn.v_proj.lora.B": "85e703578031c8679ed1b33f23fe936673b3ff669e53f8a051c71dbe88ce888a",
+      "model.layers.4.linear_attn.in_proj_qkv.lora.A": "3056dce484821eb81dcd98b0bc7e8c1b205f15d30f87e264307e19df93d1e9bd",
+      "model.layers.4.linear_attn.in_proj_qkv.lora.B": "d076b33a74e43828b316fa4ea5835cd3d31fca1e93d682a5ebc1eeac681c9da1",
+      "model.layers.5.linear_attn.in_proj_qkv.lora.A": "6141e387be6d75e0d668ac079d61682c956c0c2efe3464f90c4ce1920fc83917",
+      "model.layers.5.linear_attn.in_proj_qkv.lora.B": "c83f6f1bd7cfa4eee9591da3e264314c3ce82ae2fd6eb4efa0ee718689a3b488",
+      "model.layers.6.linear_attn.in_proj_qkv.lora.A": "ff4a664757de11b8308523638af7220d3bc996cba2ba2e31f84f9d88e7251496",
+      "model.layers.6.linear_attn.in_proj_qkv.lora.B": "98822662cc5e54985bd96cfb66eb96f00fd1e66413912a0c2e1fe458a94f06d4",
+      "model.layers.7.self_attn.q_proj.lora.A": "916780bb469db804a868e2780e774ea49deeb205a21cd6e4b5e55b5a3a6b29c9",
+      "model.layers.7.self_attn.q_proj.lora.B": "724cc4e3aa737d0344e7258a6f16b0943ffa4a3f65c89b9a618c12ad9a8f1116",
+      "model.layers.7.self_attn.v_proj.lora.A": "7b50078cce86271d33ea2d516c88b4ec33eaecdabe49f024c816821736e63a6e",
+      "model.layers.7.self_attn.v_proj.lora.B": "729dda73cac273b8f555126b99d07062a784827e8e123eb3772b5db8254929a9",
+      "model.layers.8.linear_attn.in_proj_qkv.lora.A": "f06f5052b067ef053afe1bf6e2061b6a43248e472c5d14bca2fd46c5d087fa84",
+      "model.layers.8.linear_attn.in_proj_qkv.lora.B": "440247bd4b3c6b554a98e506d633c3308576763e9d96e7b49ea67112a68d6b3d",
+      "model.layers.9.linear_attn.in_proj_qkv.lora.A": "e4dc33786ecb85a9853d8aa342a81c79f329c2ad34df5cecbac4f6f0137ca37f",
+      "model.layers.9.linear_attn.in_proj_qkv.lora.B": "7d9be3facbc9242498377e5203f1e9c996cbe1905abc3450999faa7905197ac0",
+      "model.layers.10.linear_attn.in_proj_qkv.lora.A": "71c1ae0ad33e0b9b1e88a5d8022070f4e70a39e569235e19e7c81d555b8a9752",
+      "model.layers.10.linear_attn.in_proj_qkv.lora.B": "23d7f47028112fecd62f7baf2255f144200bc6170b5101e8eeae966932e50529",
+      "model.layers.11.self_attn.q_proj.lora.A": "bee638db266b7461022c5d193be4d8f48aeb995733b96a0f144f92c43bb0cb60",
+      "model.layers.11.self_attn.q_proj.lora.B": "3b63aec5c1e603f1c070695c4d23d828abaec510ff4122fcb03526e738fbca1d",
+      "model.layers.11.self_attn.v_proj.lora.A": "9e0f15ddade2e3a4f0f65a5a7044b28593811f2d4cceee3647f6f22b1986b587",
+      "model.layers.11.self_attn.v_proj.lora.B": "3d6f410db592efaca6ad1d52afe4e5b794e3e24d4bf524f0441a6193255c924e",
+      "model.layers.12.linear_attn.in_proj_qkv.lora.A": "5fc7cd9a3df714d1da374d464807e7f7b7963ff52a3096f47160ce03c038119d",
+      "model.layers.12.linear_attn.in_proj_qkv.lora.B": "ce4806129c13fe7017d82e5554b32689e62df49dd166fba6508caecbf69f16fc",
+      "model.layers.13.linear_attn.in_proj_qkv.lora.A": "325b274ee1ce03a6c9dffc46de6fd41d2446a8dcc03fe280fd169d664412145c",
+      "model.layers.13.linear_attn.in_proj_qkv.lora.B": "bbd8ecfdbefe3be3068c7d9006f8c0105bc04d9617d0c20c3feaa1b021b859a5",
+      "model.layers.14.linear_attn.in_proj_qkv.lora.A": "f6caeb0ec64293a7cded02e3cf99d3246cfcf58bbd12b301e11f41bc22a54ee0",
+      "model.layers.14.linear_attn.in_proj_qkv.lora.B": "5d216c939b33c0815d85c29144bbc9a4bc26dde20d09abec260ee5d0f16b8fde",
+      "model.layers.15.self_attn.q_proj.lora.A": "dc417a083d1843127cf7d22de7b8e141f76bd13e6eaf609d545cfa904863fc9a",
+      "model.layers.15.self_attn.q_proj.lora.B": "c3539eb98ceeadda1bdcfa1b6e8b92e744e247b7a8ac24b3978e256fcff72e15",
+      "model.layers.15.self_attn.v_proj.lora.A": "f68d91f7c5ad23a27a59730276420f7d716de4b4a239800e82b1225360ea1e51",
+      "model.layers.15.self_attn.v_proj.lora.B": "a688a036013ceac4cd0af42964e27f7684dcf51741f850be43b42ea57ba9a5de",
+      "model.layers.16.linear_attn.in_proj_qkv.lora.A": "f767916a7ebd4ccb2111c2dd608fb40a1cc4d5c9d3208184bd9d46976b0a014a",
+      "model.layers.16.linear_attn.in_proj_qkv.lora.B": "acd71756f16b4013fad91b04fd6dcdaea0a4669981b614a645121c8b94ef5778",
+      "model.layers.17.linear_attn.in_proj_qkv.lora.A": "efce63ba9e1156b26b0c1bcddf21099cdfe83511095b0b165630bbc6e41567d2",
+      "model.layers.17.linear_attn.in_proj_qkv.lora.B": "c879d32a02ad54c165014f6db133181c5028780e3ec7b593c41de58e63196680",
+      "model.layers.18.linear_attn.in_proj_qkv.lora.A": "d159b9cf38744fa69bf81ae5c603f22ad79c7e2cd891b82ffbaf80ee1cbff0e2",
+      "model.layers.18.linear_attn.in_proj_qkv.lora.B": "a91772404478a4737c6198ede45a7561c4ac0021d6d25d6b061185ec10491b7e",
+      "model.layers.19.self_attn.q_proj.lora.A": "416a5a7fae3d5c636fb40ff5db24677d2ed6dfccbea105eeade2cc8670df0805",
+      "model.layers.19.self_attn.q_proj.lora.B": "f98f41f40c842fdd3fe989d9f80039d67e33940f9dda7cd1608887d14616e6fc",
+      "model.layers.19.self_attn.v_proj.lora.A": "0e4cf7b72c36840fa033bb911139a15d3c1c56f083de7b698c6b68a50341fa40",
+      "model.layers.19.self_attn.v_proj.lora.B": "fa912dbcb0af25b75a744c7ca9bca38f6143dad50ba0390728fd8381dda17228",
+      "model.layers.20.linear_attn.in_proj_qkv.lora.A": "3afcb3c09657300a8b81804d722fb4b4e7b637aa86dcc0f07097f5eb57ade069",
+      "model.layers.20.linear_attn.in_proj_qkv.lora.B": "11a9a42dba3c6644fbbedea046e7cfa6e0e12985d193c1ae8df6d3a4bac2760e",
+      "model.layers.21.linear_attn.in_proj_qkv.lora.A": "d7882353458362a8a6a8823f9d948ae839adb4ba8cbecdce41000948b7759145",
+      "model.layers.21.linear_attn.in_proj_qkv.lora.B": "03a446e8c6c1587fdd209bf9cbcbe8f989804db21a07f1897f08a317a9c0977f",
+      "model.layers.22.linear_attn.in_proj_qkv.lora.A": "e4e3ea55cad8be2f3efb511a0564febdc9282c85e1a15d477cfecc984260dfed",
+      "model.layers.22.linear_attn.in_proj_qkv.lora.B": "0912b39559eb735f927f5b048c540bee95b912578ce027dc6c2c2081733a7544",
+      "model.layers.23.self_attn.q_proj.lora.A": "d53782e3c055fa35a3f911bc335a5a391978ff8e3b055c67170887019e704fc3",
+      "model.layers.23.self_attn.q_proj.lora.B": "9c930cbc7e4a0b746557b5010f439211ce831a5353ef1a7e4c8a718537692549",
+      "model.layers.23.self_attn.v_proj.lora.A": "af87ffe31326e0400f71e1474e084057ba9e0fb3f711ab2d9320a62721b118cf",
+      "model.layers.23.self_attn.v_proj.lora.B": "ff0d1de7f8ade36d03652b6b47450591e879a9d21ebb12c6bae4dff8b91fcf78"
+    }
+  },
+  "guards": {
+    "continuous": {
+      "command": [
+        ".venv/bin/python",
+        "-m",
+        "examples.huggingface.decoder_sft",
+        "--family",
+        "qwen35",
+        "--real",
+        "--cache-dir",
+        "/tmp/onnax-qwen35-real-cache",
+        "--output-dir",
+        "/tmp/onnax-gated-qualified-sft",
+        "--steps",
+        "30",
+        "--fused-ops",
+        "--provider",
+        "mlx",
+        "--library",
+        "/tmp/onnax-gated-test-runtime/libonnxruntime_mlx_ep.dylib"
+      ],
+      "cwd": "/Users/justinc/Documents/GitHub/onnax",
+      "status": "complete",
+      "physical_memory_budget_bytes": 25769803776,
+      "minimum_free_disk_bytes": 5368709120,
+      "memory_source": "proc_pid_rusage/RUSAGE_INFO_V4",
+      "observation_errors": 0,
+      "temporary_directory": "/tmp/onnax-gated-qualified-sft-guard/worker-tmp-hhj4lzap",
+      "pid": 92040,
+      "started": "2026-11-02T17:32:23.835670+00:00",
+      "returncode": 0,
+      "finished": "2026-11-02T17:35:51.681743+00:00",
+      "temporary_files_removed": true,
+      "peak_physical_bytes": 11201710152,
+      "minimum_observed_free_disk_bytes": 6854103040
+    },
+    "resume": {
+      "command": [
+        ".venv/bin/python",
+        "-m",
+        "examples.huggingface.decoder_sft",
+        "--family",
+        "qwen35",
+        "--real",
+        "--cache-dir",
+        "/tmp/onnax-qwen35-real-cache",
+        "--output-dir",
+        "/tmp/onnax-gated-qualified-resume",
+        "--steps",
+        "30",
+        "--resume",
+        "/tmp/onnax-gated-qualified-sft/checkpoint-15",
+        "--fused-ops",
+        "--provider",
+        "mlx",
+        "--library",
+        "/tmp/onnax-gated-test-runtime/libonnxruntime_mlx_ep.dylib"
+      ],
+      "cwd": "/Users/justinc/Documents/GitHub/onnax",
+      "status": "failed",
+      "physical_memory_budget_bytes": 25769803776,
+      "minimum_free_disk_bytes": 5368709120,
+      "memory_source": "proc_pid_rusage/RUSAGE_INFO_V4",
+      "observation_errors": 0,
+      "temporary_directory": "/tmp/onnax-gated-qualified-resume-guard/worker-tmp-y_rytpcm",
+      "pid": 92568,
+      "started": "2026-11-02T17:36:48.651745+00:00",
+      "guard_reason": "Free disk below reserve",
+      "returncode": -15,
+      "finished": "2026-11-02T17:39:26.258931+00:00",
+      "temporary_files_removed": true,
+      "peak_physical_bytes": 11202316696,
+      "minimum_observed_free_disk_bytes": 4752543744
+    },
+    "loaded_recovery": {
+      "command": [
+        ".venv/bin/python",
+        "/tmp/onnax-gated-verify-recovery.py"
+      ],
+      "cwd": "/Users/justinc/Documents/GitHub/onnax",
+      "status": "complete",
+      "physical_memory_budget_bytes": 25769803776,
+      "minimum_free_disk_bytes": 5368709120,
+      "memory_source": "proc_pid_rusage/RUSAGE_INFO_V4",
+      "observation_errors": 0,
+      "temporary_directory": "/tmp/onnax-gated-qualified-recovery-v2-guard/worker-tmp-g5nsal0r",
+      "pid": 93195,
+      "started": "2026-11-02T17:42:54.342513+00:00",
+      "returncode": 0,
+      "finished": "2026-11-02T17:43:47.719815+00:00",
+      "temporary_files_removed": true,
+      "peak_physical_bytes": 7985454064,
+      "minimum_observed_free_disk_bytes": 10789302272
+    }
+  },
+  "onnx_graphs_checked_in_continuous_export": 53,
+  "recovery_verifier_source": "import gc,hashlib,json,os,shutil\nfrom pathlib import Path\nimport numpy as np\nimport torch\nfrom safetensors.torch import load_file\nfrom examples.huggingface.decoder_sft import OnnxDecoder\nfrom examples.huggingface.replay import _equal_tree\nfrom examples.lora.mlx_runtime import register_library,session\nroot=Path('/tmp/onnax-gated-qualified-sft');resumed=Path('/tmp/onnax-gated-qualified-resume')\n\n# Completed parameter/state equality was checked before restoring this bundle.\nfirst=load_file(root/'checkpoint-30/model.safetensors');second=load_file(resumed/'checkpoint-30/model.safetensors')\n_equal_tree(first,second)\nfor name in ('optimizer.pt','scheduler.pt'):\n _equal_tree(torch.load(root/'checkpoint-30'/name,weights_only=True),torch.load(resumed/'checkpoint-30'/name,weights_only=True))\nif not (resumed/'export').exists():shutil.copytree(root/'export',resumed/'export',copy_function=os.link)\nfiles=[p for p in (root/'export').rglob('*') if p.is_file()]\nassert all(p.stat().st_ino==(resumed/'export'/p.relative_to(root/'export')).stat().st_ino for p in files)\nregister_library('/tmp/onnax-gated-test-runtime/libonnxruntime_mlx_ep.dylib')\ntorch.set_num_threads(1)\nids=torch.tensor([[1,4,5,6,7,8,9,2]],dtype=torch.int64)\nfeed={'input_ids':ids,'attention_mask':torch.ones_like(ids),'position_ids':torch.arange(8)[None],'labels':ids.clone()}\nresults=[]\nfor directory,state in ((root,first),(resumed,second)):\n model=OnnxDecoder.load(directory/'export',session_factory=session)\n model.load_state_dict(state,strict=True)\n output=model(**feed);output.loss.backward()\n values={'logits':output.logits.detach().numpy().copy(),'loss':output.loss.detach().numpy().copy()}\n values.update({name:p.grad.detach().numpy().copy() for name,p in model.onnx.parameters_by_name().items()})\n assert all(np.isfinite(v).all() for v in values.values())\n results.append(values)\n model.close();del model,output;gc.collect()\nassert results[0].keys()==results[1].keys()\nfor name in results[0]:\n a,b=results[0][name],results[1][name]\n assert a.dtype==b.dtype and a.shape==b.shape and a.tobytes()==b.tobytes(),name\nreport={'checkpoint_state_tensors':len(first),'checkpoint_and_adamw_scheduler_byte_identical':True,'completed_step':30,'restored_from_step':15,'loaded_logits_loss_and_adapter_gradients_byte_identical':True,'adapter_gradients':len(results[0])-2,'restored_graph_files':len(files),'export_strategy':'Hardlink identical immutable graph bundle after proving final checkpoint equality; strictly load each final checkpoint into a fresh exported model before execution','interruption':'Disk guard stopped final export after step-30 checkpoint; preserved original guard journal','output_sha256':{name:hashlib.sha256(value.tobytes()).hexdigest() for name,value in results[0].items()}}\nPath('/tmp/onnax-gated-qualified-recovery.json').write_text(json.dumps(report,indent=2)+'\\n')\nprint(json.dumps(report))\n"
+}
