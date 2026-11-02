@@ -117,7 +117,8 @@ def test_disable_switch_retains_independent_storage(monkeypatch):
     assert active_bytes() - baseline >= 2 * weights.nbytes
 
 
-def test_independent_run_threads_keep_correct_session_ownership():
+@pytest.mark.parametrize("seeds", [(1, 2), (7, 7)])
+def test_independent_run_threads_keep_correct_session_ownership(seeds):
     def worker(seed):
         weights = np.full((128, 128), seed, np.float32)
         first, second = session(weights), session(weights, name="second")
@@ -130,7 +131,7 @@ def test_independent_run_threads_keep_correct_session_ownership():
         return seed
 
     with ThreadPoolExecutor(max_workers=2) as pool:
-        assert list(pool.map(worker, (1, 2))) == [1, 2]
+        assert list(pool.map(worker, seeds)) == list(seeds)
 
 
 def test_original_session_can_close_on_a_different_thread():
