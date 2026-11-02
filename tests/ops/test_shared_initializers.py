@@ -131,3 +131,34 @@ def test_independent_run_threads_keep_correct_session_ownership():
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         assert list(pool.map(worker, (1, 2))) == [1, 2]
+
+
+def test_original_session_can_close_on_a_different_thread():
+    weights = np.full((128, 128), 7, np.float32)
+    first = session(weights)
+    second = session(weights, name="second")
+    run(first, weights)
+    run(second, weights)
+    holder = [first]
+    del first
+
+    def release():
+        holder.clear()
+        gc.collect()
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pool.submit(release).result()
+    run(second, weights)
+
+
+def test_compiled_sessions_reuse_immutable_storage(monkeypatch):
+    monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_COMPILE", "0")
+    weights = np.arange(128 * 128, dtype=np.float32).reshape(128, 128)
+    first, second = session(weights), session(weights, name="second")
+    for executor in (first, second):
+        for row in (3, 4, 3):
+            actual = executor.run(None, {"indices": np.array([row], np.int64)})[0]
+            np.testing.assert_array_equal(actual, weights[row : row + 1])
+    del first
+    gc.collect()
+    run(second, weights)

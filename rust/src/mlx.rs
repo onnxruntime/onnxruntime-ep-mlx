@@ -135,6 +135,30 @@ impl Array {
         arr
     }
 
+    /// Wrap owned immutable host storage, retaining it until MLX releases the buffer.
+    pub fn from_owned_data(
+        storage: std::sync::Arc<Vec<u8>>,
+        shape: &[i32],
+        dtype: mlx::mlx_dtype,
+    ) -> Self {
+        unsafe extern "C" fn release_storage(payload: *mut std::os::raw::c_void) {
+            // Paired with Arc::into_raw below; exactly one callback owns this strong reference.
+            drop(unsafe { std::sync::Arc::<Vec<u8>>::from_raw(payload.cast()) });
+        }
+        let data = storage.as_ptr().cast_mut().cast();
+        let payload = std::sync::Arc::into_raw(storage).cast_mut().cast();
+        Self::from_raw(unsafe {
+            mlx::mlx_array_new_data_managed_payload(
+                data,
+                shape.as_ptr(),
+                shape.len() as i32,
+                dtype,
+                payload,
+                Some(release_storage),
+            )
+        })
+    }
+
     /// A distinct C handle referencing the same array storage.
     pub fn retained(&self) -> Result<Self, String> {
         let mut result = Self::new();

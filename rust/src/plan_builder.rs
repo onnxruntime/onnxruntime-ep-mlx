@@ -7,7 +7,6 @@
 use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, c_char, c_void};
 use std::ptr;
-use std::sync::Arc;
 
 use onnx_runtime_ir::{NodeId, ValueId};
 
@@ -717,8 +716,11 @@ unsafe fn own_init_data(source: &InitData) -> Result<InitData, String> {
     let bytes = dtype
         .checked_storage_bytes(source.count)
         .ok_or_else(|| "initializer byte count overflows".to_string())?;
-    let owned =
-        Arc::new(unsafe { std::slice::from_raw_parts(source.data.cast::<u8>(), bytes) }.to_vec());
+    let owned = crate::shared_initializers::own(
+        unsafe { std::slice::from_raw_parts(source.data.cast::<u8>(), bytes) },
+        source.dtype,
+        &source.shape,
+    )?;
     Ok(InitData {
         data: owned.as_ptr().cast(),
         shape: source.shape.clone(),

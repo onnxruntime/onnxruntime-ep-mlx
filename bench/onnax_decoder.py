@@ -52,10 +52,14 @@ def main():
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--samples", type=int, default=100)
     parser.add_argument("--unfused", action="store_true")
+    parser.add_argument("--unshared-initializers", action="store_true")
     args = parser.parse_args()
     if args.sequence < 2 or args.batch < 1 or args.warmup < 0 or args.samples < 1:
         parser.error("Require sequence >= 2, positive batch/samples and nonnegative warmup")
     os.environ["ONNXRUNTIME_EP_MLX_NO_GATED_DELTA_REVERSE"] = "1" if args.unfused else "0"
+    os.environ["ONNXRUNTIME_EP_MLX_NO_SHARED_INITIALIZERS"] = (
+        "1" if args.unshared_initializers else "0"
+    )
     os.environ["ONNXRUNTIME_EP_MLX_NO_COMPILE"] = "1"
     os.environ.setdefault("ONNXRUNTIME_EP_MLX_CACHE_LIMIT_BYTES", "536870912")
     import numpy as np
@@ -157,6 +161,7 @@ def main():
                 for key in (
                     "ONNXRUNTIME_EP_MLX_NO_COMPILE",
                     "ONNXRUNTIME_EP_MLX_NO_GATED_DELTA_REVERSE",
+                    "ONNXRUNTIME_EP_MLX_NO_SHARED_INITIALIZERS",
                     "ONNXRUNTIME_EP_MLX_CACHE_LIMIT_BYTES",
                 )
             },
@@ -208,6 +213,8 @@ def main():
             after_forward = time.perf_counter()
             output.loss.backward()
             after_backward = time.perf_counter()
+            if index == 0:
+                report["initial_step_seconds"] = after_backward - before
             if not torch.isfinite(output.loss) or any(
                 p.grad is None or not torch.isfinite(p.grad).all() for p in model.parameters()
             ):

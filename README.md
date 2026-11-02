@@ -64,3 +64,6 @@ Use `session.get_inputs()` to inspect the required input names, shapes, and type
 | Diagnosing fallback and GPU execution | [Tracing and profiling](examples/traces/README.md) |
 | Running correctness and conformance tests | [Testing](tests/README.md) |
 | Understanding or extending the provider | [Design](docs/DESIGN.md), [operator architecture](docs/OP_ARCHITECTURE.md), [compiled capture](docs/COMPILED_CAPTURE.md) |
+
+See [shared immutable initializers](docs/SHARED_INITIALIZERS.md) for cross-session
+weight ownership, lifecycle tests and the diagnostic switch.

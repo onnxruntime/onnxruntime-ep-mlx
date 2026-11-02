@@ -6,7 +6,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use sha2::{Digest, Sha256};
 
@@ -17,41 +17,71 @@ use crate::sys::mlx;
 #[derive(Hash, PartialEq, Eq)]
 struct Key {
     dtype: u32,
-    shape: Vec<i32>,
+    shape: Vec<i64>,
     digest: [u8; 32],
+}
+
+type BufferIndex = HashMap<Key, Weak<Vec<u8>>>;
+static BUFFERS: OnceLock<Mutex<BufferIndex>> = OnceLock::new();
+
+fn enabled() -> bool {
+    !std::env::var_os("ONNXRUNTIME_EP_MLX_NO_SHARED_INITIALIZERS").is_some_and(|value| value != "0")
+}
+
+/// Intern the plan's owned host bytes before session-local copies are retained.
+/// This pool contains ordinary immutable Rust bytes and is safe across compile threads.
+pub(crate) fn own(data: &[u8], dtype: u32, shape: &[i64]) -> Result<Arc<Vec<u8>>, MlxError> {
+    if data.len() < 4096 || !enabled() {
+        return Ok(Arc::new(data.to_vec()));
+    }
+    let key = Key {
+        dtype,
+        shape: shape.to_vec(),
+        digest: Sha256::digest(data).into(),
+    };
+    let mut index = BUFFERS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .map_err(|_| "MLX: initializer buffer index is poisoned")?;
+    if let Some(existing) = index.get(&key).and_then(Weak::upgrade) {
+        return Ok(existing);
+    }
+    let owner = Arc::new(data.to_vec());
+    index.retain(|_, value| value.strong_count() != 0);
+    index.insert(key, Arc::downgrade(&owner));
+    Ok(owner)
+}
+
+#[derive(Hash, PartialEq, Eq)]
+struct ArrayKey {
+    data: usize,
+    dtype: u32,
+    shape: Vec<i32>,
 }
 
 thread_local! {
     // The run gate already pins each plan's execution to its first run thread. No raw array
     // handle crosses threads through this index. Arc permits atomic owner teardown even when
     // ORT releases a session on a different thread; it does not make Array Send or Sync.
-    static ARRAYS: RefCell<HashMap<Key, Weak<Array>>> = RefCell::new(HashMap::new());
+    static ARRAYS: RefCell<HashMap<ArrayKey, Weak<Array>>> = RefCell::new(HashMap::new());
 }
 
 pub(crate) fn get(init: &InitData, shape: &[i32]) -> Result<Option<Arc<Array>>, MlxError> {
-    if std::env::var_os("ONNXRUNTIME_EP_MLX_NO_SHARED_INITIALIZERS")
-        .is_some_and(|value| value != "0")
-    {
+    if !enabled() {
         return Ok(None);
     }
-    let dtype = onnx_runtime_ir::DataType::from_onnx(init.dtype as i32)
-        .ok_or("MLX: unsupported shared initializer dtype")?;
-    let bytes = dtype
-        .checked_storage_bytes(init.count)
-        .ok_or("MLX: shared initializer byte count overflows")?;
-    // Keep small constants on the existing path; interning primarily targets model weights.
-    if bytes < 4096 {
+    let Some(storage) = &init.owned else {
+        return Ok(None);
+    };
+    if storage.len() < 4096 {
         return Ok(None);
     }
-    if init.data.is_null() || bytes > isize::MAX as usize {
-        return Err("MLX: invalid shared initializer storage".into());
-    }
-    // InitData describes ORT/session-owned immutable bytes, valid throughout this Compute call.
-    let data = unsafe { std::slice::from_raw_parts(init.data.cast::<u8>(), bytes) };
-    let key = Key {
+    // Owned host buffers are already content-interned. Their addresses remain stable while
+    // an array is alive because its managed payload retains that exact Arc allocation.
+    let key = ArrayKey {
+        data: storage.as_ptr() as usize,
         dtype: init.dtype,
         shape: shape.to_vec(),
-        digest: Sha256::digest(data).into(),
     };
     ARRAYS.with(|index| {
         if let Some(existing) = index.borrow().get(&key).and_then(Weak::upgrade) {
@@ -59,7 +89,7 @@ pub(crate) fn get(init: &InitData, shape: &[i32]) -> Result<Option<Arc<Array>>, 
         }
         // Own the payload: a borrowed ORT buffer could disappear when the originating session
         // closes while another plan still uses the shared array. Publish only evaluated leaves.
-        let array = Array::from_data(init.data, shape, mlx_dtype_from_onnx(init.dtype));
+        let array = Array::from_owned_data(storage.clone(), shape, mlx_dtype_from_onnx(init.dtype));
         if unsafe { mlx::mlx_array_eval(array.as_raw()) } != 0 {
             return Err("MLX: could not evaluate shared initializer".into());
         }
@@ -71,4 +101,48 @@ pub(crate) fn get(init: &InitData, shape: &[i32]) -> Result<Option<Arc<Array>>, 
         index.insert(key, Arc::downgrade(&owner));
         Ok(Some(owner))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn host_pool_distinguishes_metadata_and_contents() {
+        let data = vec![17; 4096];
+        let first = own(&data, 1, &[1024]).unwrap();
+        let same = own(&data, 1, &[1024]).unwrap();
+        assert!(Arc::ptr_eq(&first, &same));
+        assert!(!Arc::ptr_eq(&first, &own(&data, 6, &[1024]).unwrap()));
+        assert!(!Arc::ptr_eq(&first, &own(&data, 1, &[32, 32]).unwrap()));
+        assert!(!Arc::ptr_eq(
+            &first,
+            &own(&vec![18; 4096], 1, &[1024]).unwrap()
+        ));
+        let weak = Arc::downgrade(&first);
+        drop(first);
+        assert!(weak.upgrade().is_some());
+        drop(same);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn concurrent_compilation_uses_one_host_owner() {
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let workers = (0..2)
+            .map(|_| {
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let buffer = own(&vec![91; 8192], 1, &[2048]).unwrap();
+                    barrier.wait();
+                    buffer
+                })
+            })
+            .collect::<Vec<_>>();
+        let owners = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>();
+        assert!(Arc::ptr_eq(&owners[0], &owners[1]));
+    }
 }
