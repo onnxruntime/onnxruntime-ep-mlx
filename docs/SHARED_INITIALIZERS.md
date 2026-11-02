@@ -7,21 +7,22 @@ Overridable graph inputs continue to read their live feeds.
 
 Compile-time host buffers are interned across sessions using weak references.
 Each shared MLX array retains that owned host buffer through a managed-payload
-callback, independently of ORT. Plans retain their own C
-handles and a strong storage owner; a thread-local index holds weak references.
+callback, independently of ORT. Plans retain their own C handles and a strong
+storage owner; the array index holds weak references.
 Closing the originating session leaves other sessions valid. Closing the final
 owner releases active storage, and expired index entries are removed on insertion.
 The MLX allocator may retain freed storage in its separately configured cache.
 
-The pool follows the runtime's existing evaluator-thread ownership. Sessions first
-run on different threads use independent pools. Atomic owners permit ORT to release
+The host-byte pool is process-wide. MLX array pools follow the runtime's evaluator
+thread ownership: sessions first run on different threads use independent array
+pools while sharing immutable host bytes. Atomic owners permit ORT to release
 a session on another thread; the index never transfers an MLX handle across run
 threads. Published arrays are evaluated immutable leaves, and retained ownership
 protects their storage from donation while plans reuse it.
 
 Set `ONNXRUNTIME_EP_MLX_NO_SHARED_INITIALIZERS=1` before execution to use the
-original per-plan initializer wrappers. The default is sharing enabled. Compilation hashes each large initializer once; repeated runs use the
-plan's cached handle. Small constants, live inputs and derived layout/quantization
+original per-plan initializer wrappers. Sharing is enabled by default. Compilation
+hashes large initializers; repeated runs use the plan's cached handle. Small constants, live inputs and derived layout/quantization
 caches retain their existing paths.
 
 ## Validation
@@ -51,3 +52,20 @@ output hashing and cleanup; warmed timing is measured separately. Compilation
 owns and hashes host weights once per plan. The [raw report](benchmarks/shared-initializers-m1max.json)
 includes each allocator observation, output hashes, guarded-process results and
 reproducible worker source.
+
+## ARM hashing
+
+The default build enables SHA-256 hardware dispatch on ARM. In the independent
+M1 Max [hashing test](benchmarks/hash-dispatch-m1max.json), a 256 MiB sample takes
+0.752 seconds through the software backend and 0.122 seconds with ARM dispatch.
+Both outputs match Python hashlib exactly. The complete-model
+[ARM qualification](benchmarks/shared-initializers-arm-hash-m1max.json) preserves
+all 51 session output hashes and releases active storage after closing the model.
+
+The [paired timing report](benchmarks/shared-initializers-timing-m1max.json)
+records the earlier software-hash comparison: 10 warmups and 100 measured full
+forward/loss/backward calls per process, fixed parameters, all 60 gradients and
+losses byte-identical. Median execution falls from 3.198 to 3.111 seconds and
+physical peak from 11.10 to 8.25 GiB. Its construction times identify the hashing
+cost addressed by ARM dispatch. Final-build initialization and execution are
+qualified separately.
