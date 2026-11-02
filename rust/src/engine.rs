@@ -462,6 +462,8 @@ impl CompiledSubgraph {
 pub struct Plan {
     pub nodes: Vec<NodeDesc>,
     pub cache: HashMap<String, Array>,
+    /// Keeps shared immutable storage alive while per-plan handles may be used or traced.
+    pub shared_initializers: Vec<std::sync::Arc<Array>>,
     pub native_attention_decode: bool,
     pub dedicated_decode_stream: bool,
     /// This subgraph carries float64 tensors or computes float64 statistics and must run on an MLX
@@ -641,6 +643,7 @@ impl Plan {
         Plan {
             nodes,
             cache: HashMap::new(),
+            shared_initializers: Vec::new(),
             native_attention_decode,
             dedicated_decode_stream: dedicated_decode_stream && !requires_cpu_stream,
             requires_cpu_stream,
@@ -1144,6 +1147,13 @@ impl<'a> TranslationContext<'a> {
                     .iter()
                     .map(|&d| dim_i32(d))
                     .collect::<Result<_, _>>()?;
+                if let Some(shared) = crate::shared_initializers::get(init, &ishape)? {
+                    let handle = shared.retained()?;
+                    let raw = handle.as_raw();
+                    self.plan.shared_initializers.push(shared);
+                    self.plan.cache.insert(cache_key, handle);
+                    return Ok(raw);
+                }
                 // Compile copied initializer bytes into Plan-owned Arc storage. Borrow that stable
                 // allocation directly for the plan lifetime.
                 let arr =

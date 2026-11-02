@@ -135,6 +135,15 @@ impl Array {
         arr
     }
 
+    /// A distinct C handle referencing the same array storage.
+    pub fn retained(&self) -> Result<Self, String> {
+        let mut result = Self::new();
+        if unsafe { mlx::mlx_array_set(&mut result.raw, self.raw) } != 0 {
+            return Err("MLX: could not retain shared initializer".into());
+        }
+        Ok(result)
+    }
+
     /// The raw handle, for passing to `mlx_*` calls. Ownership is NOT transferred.
     #[inline]
     pub fn as_raw(&self) -> mlx::mlx_array {
