@@ -21,7 +21,7 @@
 use crate::engine::{
     MlxError, NodeDesc, Src, SubgraphDesc, TensorRef, TranslationContext, mlx_dtype_from_onnx,
 };
-use crate::ops::{host_scan, selective_scan};
+use crate::ops::{gated_delta_reverse, host_scan, selective_scan};
 use crate::registry::{
     ClaimPredicate, ClaimResult, GraphView, K_ANY_OPSET, NodeView, OpHandler, OpRegistration,
     OpRegistry, ValueKind, is_movable,
@@ -342,6 +342,35 @@ fn scan_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
             ctx.bind(&n.outputs[num_state + i], empty);
         }
         return Ok(());
+    }
+
+    if let Some(scale) = gated_delta_reverse::match_body(&body, num_state, num_scan) {
+        let covered_form = scan_axes.iter().all(|&axis| axis == 0)
+            && output_axes.iter().all(|&axis| axis == 0)
+            && input_directions.iter().all(|&d| d == input_directions[0])
+            && output_directions.iter().all(|&d| d == output_directions[0]);
+        if gated_delta_reverse::disabled() {
+            ctx.mark_composed("gated-delta reverse disabled by kill-switch -> generic Scan");
+        } else if covered_form {
+            let mut inputs = state[..num_state].to_vec();
+            inputs.extend_from_slice(&scans[..num_scan]);
+            if let Some(outputs) = gated_delta_reverse::emit(
+                ctx,
+                &inputs,
+                scale,
+                input_directions[0] == 1,
+                output_directions[0] == 1,
+            )? {
+                for (reference, value) in n.outputs.iter().zip(outputs) {
+                    ctx.bind(reference, value);
+                }
+                ctx.mark_fast(gated_delta_reverse::KERNEL_NAME);
+                return Ok(());
+            }
+            ctx.mark_composed("gated-delta reverse dtype/shape unsupported -> generic Scan");
+        } else {
+            ctx.mark_composed("gated-delta reverse axes/directions unsupported -> generic Scan");
+        }
     }
 
     let mut collected: Vec<Vec<mlx::mlx_array>> = vec![Vec::new(); num_scan_out];
