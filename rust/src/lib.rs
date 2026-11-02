@@ -31,6 +31,7 @@ mod partition;
 mod plan_builder;
 mod registry;
 mod runtime;
+mod shared_initializers;
 mod sys;
 mod trace;
 

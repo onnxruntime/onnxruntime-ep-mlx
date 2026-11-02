@@ -1,0 +1,350 @@
+{
+  "version": 1,
+  "completed_step": 30,
+  "restored_from_step": 15,
+  "checkpoint_state_tensors": 61,
+  "continuous_and_resumed_parameters_adamw_scheduler_byte_identical": true,
+  "per_session_storage_baseline_parameters_adamw_scheduler_byte_identical": true,
+  "exported_adapters_byte_identical": true,
+  "independent_export_parameters_match_final_checkpoints": true,
+  "export_identities": [
+    "229a32d4b255f89d56dd84d09f9a9daf82cfce4129fa57d7a19c3c86b216b693",
+    "229a32d4b255f89d56dd84d09f9a9daf82cfce4129fa57d7a19c3c86b216b693",
+    "229a32d4b255f89d56dd84d09f9a9daf82cfce4129fa57d7a19c3c86b216b693"
+  ],
+  "source_model_payload_hash": "3c6f53742ff70c6b0e1fadbf007bfc23205513b8133a9847592489b2878c547c",
+  "frozen_named_tensor_count": 3084,
+  "frozen_tensor_manifest_sha256": "80da75a6b39eb1e5204f10887b468254eec7d16a9c218cac324a25149cc7f25c",
+  "external_payloads_by_export": [
+    {
+      "model.data": "3c6f53742ff70c6b0e1fadbf007bfc23205513b8133a9847592489b2878c547c",
+      "weights-bfe312b159fd9a6d08e4b27b6f1c9f83428a44a353e7af93940b47a4e7f816c4.data": "bfe312b159fd9a6d08e4b27b6f1c9f83428a44a353e7af93940b47a4e7f816c4",
+      "forward.data": "61186fefdafd2c14d802811a9aa0e955a4404c5cde5ac470baa604953c4b595f"
+    },
+    {
+      "model.data": "3c6f53742ff70c6b0e1fadbf007bfc23205513b8133a9847592489b2878c547c",
+      "weights-0523cd8e98f1741a1cc2343ba24423340eb4a5b60bd657ffdb6619ea38e2b1b0.data": "0523cd8e98f1741a1cc2343ba24423340eb4a5b60bd657ffdb6619ea38e2b1b0",
+      "forward.data": "61186fefdafd2c14d802811a9aa0e955a4404c5cde5ac470baa604953c4b595f"
+    },
+    {
+      "model.data": "3c6f53742ff70c6b0e1fadbf007bfc23205513b8133a9847592489b2878c547c",
+      "weights-7326536e7119798f1144151eaadaa1aed7cc123c6b62b3cdde36eb3aebcea466.data": "7326536e7119798f1144151eaadaa1aed7cc123c6b62b3cdde36eb3aebcea466",
+      "forward.data": "61186fefdafd2c14d802811a9aa0e955a4404c5cde5ac470baa604953c4b595f"
+    }
+  ],
+  "checked_onnx_models": {
+    "/tmp/onnax-shared-owner-qualified-sft": 53,
+    "/tmp/onnax-shared-owner-qualified-resume": 53
+  },
+  "loaded_logits_loss_all_60_adapter_gradients_byte_identical": true,
+  "library_sha256": "3b99b06a078d7145b0aca822f3ed5e169bf72209de35aa455eb6b49968a5704c",
+  "worker_sha256": "aebbc650c8a8c73914f473b745a9005ac87ebd48c7b943cb6fc4a8e08b079a0b",
+  "training_loss": [
+    5.223938941955566,
+    0.302990585565567
+  ],
+  "validation_loss": [
+    6.019479751586914,
+    5.621203422546387
+  ],
+  "output_sha256": {
+    "logits": "0f25f640aac0a2a5bee1ed347c7df5aec0cfd06082520cfcd64fbe58c7465298",
+    "loss": "e9388326b321ba6354e5cbf02a74c84ac93ae6ea9aec6f5f4741fefa00f54779",
+    "model.layers.0.linear_attn.in_proj_qkv.lora.A": "302b09afe5800f0099df5e860b4d82a9b7c2f8422844d96bb8b322788ba031cc",
+    "model.layers.0.linear_attn.in_proj_qkv.lora.B": "4ecaae7c23a10791cd3b2f5485d2457f0e6884fc29569cd8c8d34cc78e21e071",
+    "model.layers.1.linear_attn.in_proj_qkv.lora.A": "2ab16adf88eaf1e8c48039f42b6318ef8680a1d87e84dc9d414687f76ac69ece",
+    "model.layers.1.linear_attn.in_proj_qkv.lora.B": "ab502134210d03c8a9af312399ca40654b72f51b46467e59c832d81ef06a32d1",
+    "model.layers.2.linear_attn.in_proj_qkv.lora.A": "d59da1b6c1b3b1eb20cdd8423cbaf458923ce3e9ff38c51e219aa3e00b613ce8",
+    "model.layers.2.linear_attn.in_proj_qkv.lora.B": "73c6e7f8816a1af35d58d581a5cbf1e8577f160287f9e36cc7015d12c254a6fc",
+    "model.layers.3.self_attn.q_proj.lora.A": "4a1d54d4284ae7da7eb43138341a5acd37e1f940d9b779b2fae9ce015f332ee4",
+    "model.layers.3.self_attn.q_proj.lora.B": "d1eb26f55a6047b7ad737bf6ca65b5818c426e5ccab8efa5b067ce674a31ed08",
+    "model.layers.3.self_attn.v_proj.lora.A": "4808750fd915cc5fe6f74dc690be4fd1fbb522c1af2186e5b4daac67aae9891a",
+    "model.layers.3.self_attn.v_proj.lora.B": "85e703578031c8679ed1b33f23fe936673b3ff669e53f8a051c71dbe88ce888a",
+    "model.layers.4.linear_attn.in_proj_qkv.lora.A": "3056dce484821eb81dcd98b0bc7e8c1b205f15d30f87e264307e19df93d1e9bd",
+    "model.layers.4.linear_attn.in_proj_qkv.lora.B": "d076b33a74e43828b316fa4ea5835cd3d31fca1e93d682a5ebc1eeac681c9da1",
+    "model.layers.5.linear_attn.in_proj_qkv.lora.A": "6141e387be6d75e0d668ac079d61682c956c0c2efe3464f90c4ce1920fc83917",
+    "model.layers.5.linear_attn.in_proj_qkv.lora.B": "c83f6f1bd7cfa4eee9591da3e264314c3ce82ae2fd6eb4efa0ee718689a3b488",
+    "model.layers.6.linear_attn.in_proj_qkv.lora.A": "ff4a664757de11b8308523638af7220d3bc996cba2ba2e31f84f9d88e7251496",
+    "model.layers.6.linear_attn.in_proj_qkv.lora.B": "98822662cc5e54985bd96cfb66eb96f00fd1e66413912a0c2e1fe458a94f06d4",
+    "model.layers.7.self_attn.q_proj.lora.A": "916780bb469db804a868e2780e774ea49deeb205a21cd6e4b5e55b5a3a6b29c9",
+    "model.layers.7.self_attn.q_proj.lora.B": "724cc4e3aa737d0344e7258a6f16b0943ffa4a3f65c89b9a618c12ad9a8f1116",
+    "model.layers.7.self_attn.v_proj.lora.A": "7b50078cce86271d33ea2d516c88b4ec33eaecdabe49f024c816821736e63a6e",
+    "model.layers.7.self_attn.v_proj.lora.B": "729dda73cac273b8f555126b99d07062a784827e8e123eb3772b5db8254929a9",
+    "model.layers.8.linear_attn.in_proj_qkv.lora.A": "f06f5052b067ef053afe1bf6e2061b6a43248e472c5d14bca2fd46c5d087fa84",
+    "model.layers.8.linear_attn.in_proj_qkv.lora.B": "440247bd4b3c6b554a98e506d633c3308576763e9d96e7b49ea67112a68d6b3d",
+    "model.layers.9.linear_attn.in_proj_qkv.lora.A": "e4dc33786ecb85a9853d8aa342a81c79f329c2ad34df5cecbac4f6f0137ca37f",
+    "model.layers.9.linear_attn.in_proj_qkv.lora.B": "7d9be3facbc9242498377e5203f1e9c996cbe1905abc3450999faa7905197ac0",
+    "model.layers.10.linear_attn.in_proj_qkv.lora.A": "71c1ae0ad33e0b9b1e88a5d8022070f4e70a39e569235e19e7c81d555b8a9752",
+    "model.layers.10.linear_attn.in_proj_qkv.lora.B": "23d7f47028112fecd62f7baf2255f144200bc6170b5101e8eeae966932e50529",
+    "model.layers.11.self_attn.q_proj.lora.A": "bee638db266b7461022c5d193be4d8f48aeb995733b96a0f144f92c43bb0cb60",
+    "model.layers.11.self_attn.q_proj.lora.B": "3b63aec5c1e603f1c070695c4d23d828abaec510ff4122fcb03526e738fbca1d",
+    "model.layers.11.self_attn.v_proj.lora.A": "9e0f15ddade2e3a4f0f65a5a7044b28593811f2d4cceee3647f6f22b1986b587",
+    "model.layers.11.self_attn.v_proj.lora.B": "3d6f410db592efaca6ad1d52afe4e5b794e3e24d4bf524f0441a6193255c924e",
+    "model.layers.12.linear_attn.in_proj_qkv.lora.A": "5fc7cd9a3df714d1da374d464807e7f7b7963ff52a3096f47160ce03c038119d",
+    "model.layers.12.linear_attn.in_proj_qkv.lora.B": "ce4806129c13fe7017d82e5554b32689e62df49dd166fba6508caecbf69f16fc",
+    "model.layers.13.linear_attn.in_proj_qkv.lora.A": "325b274ee1ce03a6c9dffc46de6fd41d2446a8dcc03fe280fd169d664412145c",
+    "model.layers.13.linear_attn.in_proj_qkv.lora.B": "bbd8ecfdbefe3be3068c7d9006f8c0105bc04d9617d0c20c3feaa1b021b859a5",
+    "model.layers.14.linear_attn.in_proj_qkv.lora.A": "f6caeb0ec64293a7cded02e3cf99d3246cfcf58bbd12b301e11f41bc22a54ee0",
+    "model.layers.14.linear_attn.in_proj_qkv.lora.B": "5d216c939b33c0815d85c29144bbc9a4bc26dde20d09abec260ee5d0f16b8fde",
+    "model.layers.15.self_attn.q_proj.lora.A": "dc417a083d1843127cf7d22de7b8e141f76bd13e6eaf609d545cfa904863fc9a",
+    "model.layers.15.self_attn.q_proj.lora.B": "c3539eb98ceeadda1bdcfa1b6e8b92e744e247b7a8ac24b3978e256fcff72e15",
+    "model.layers.15.self_attn.v_proj.lora.A": "f68d91f7c5ad23a27a59730276420f7d716de4b4a239800e82b1225360ea1e51",
+    "model.layers.15.self_attn.v_proj.lora.B": "a688a036013ceac4cd0af42964e27f7684dcf51741f850be43b42ea57ba9a5de",
+    "model.layers.16.linear_attn.in_proj_qkv.lora.A": "f767916a7ebd4ccb2111c2dd608fb40a1cc4d5c9d3208184bd9d46976b0a014a",
+    "model.layers.16.linear_attn.in_proj_qkv.lora.B": "acd71756f16b4013fad91b04fd6dcdaea0a4669981b614a645121c8b94ef5778",
+    "model.layers.17.linear_attn.in_proj_qkv.lora.A": "efce63ba9e1156b26b0c1bcddf21099cdfe83511095b0b165630bbc6e41567d2",
+    "model.layers.17.linear_attn.in_proj_qkv.lora.B": "c879d32a02ad54c165014f6db133181c5028780e3ec7b593c41de58e63196680",
+    "model.layers.18.linear_attn.in_proj_qkv.lora.A": "d159b9cf38744fa69bf81ae5c603f22ad79c7e2cd891b82ffbaf80ee1cbff0e2",
+    "model.layers.18.linear_attn.in_proj_qkv.lora.B": "a91772404478a4737c6198ede45a7561c4ac0021d6d25d6b061185ec10491b7e",
+    "model.layers.19.self_attn.q_proj.lora.A": "416a5a7fae3d5c636fb40ff5db24677d2ed6dfccbea105eeade2cc8670df0805",
+    "model.layers.19.self_attn.q_proj.lora.B": "f98f41f40c842fdd3fe989d9f80039d67e33940f9dda7cd1608887d14616e6fc",
+    "model.layers.19.self_attn.v_proj.lora.A": "0e4cf7b72c36840fa033bb911139a15d3c1c56f083de7b698c6b68a50341fa40",
+    "model.layers.19.self_attn.v_proj.lora.B": "fa912dbcb0af25b75a744c7ca9bca38f6143dad50ba0390728fd8381dda17228",
+    "model.layers.20.linear_attn.in_proj_qkv.lora.A": "3afcb3c09657300a8b81804d722fb4b4e7b637aa86dcc0f07097f5eb57ade069",
+    "model.layers.20.linear_attn.in_proj_qkv.lora.B": "11a9a42dba3c6644fbbedea046e7cfa6e0e12985d193c1ae8df6d3a4bac2760e",
+    "model.layers.21.linear_attn.in_proj_qkv.lora.A": "d7882353458362a8a6a8823f9d948ae839adb4ba8cbecdce41000948b7759145",
+    "model.layers.21.linear_attn.in_proj_qkv.lora.B": "03a446e8c6c1587fdd209bf9cbcbe8f989804db21a07f1897f08a317a9c0977f",
+    "model.layers.22.linear_attn.in_proj_qkv.lora.A": "e4e3ea55cad8be2f3efb511a0564febdc9282c85e1a15d477cfecc984260dfed",
+    "model.layers.22.linear_attn.in_proj_qkv.lora.B": "0912b39559eb735f927f5b048c540bee95b912578ce027dc6c2c2081733a7544",
+    "model.layers.23.self_attn.q_proj.lora.A": "d53782e3c055fa35a3f911bc335a5a391978ff8e3b055c67170887019e704fc3",
+    "model.layers.23.self_attn.q_proj.lora.B": "9c930cbc7e4a0b746557b5010f439211ce831a5353ef1a7e4c8a718537692549",
+    "model.layers.23.self_attn.v_proj.lora.A": "af87ffe31326e0400f71e1474e084057ba9e0fb3f711ab2d9320a62721b118cf",
+    "model.layers.23.self_attn.v_proj.lora.B": "ff0d1de7f8ade36d03652b6b47450591e879a9d21ebb12c6bae4dff8b91fcf78"
+  },
+  "scope": "Two independently exported 30-step results; fresh-process recovery from step15; same-kernel per-session-storage baseline; full ONNX checker; fresh loaded logits/loss/all60gradients",
+  "native_implementation_commit": "877234c",
+  "guards": {
+    "continuous": {
+      "command": [
+        "/Users/justinc/Documents/GitHub/onnax/.venv/bin/python",
+        "-m",
+        "examples.huggingface.decoder_sft",
+        "--family",
+        "qwen35",
+        "--real",
+        "--cache-dir",
+        "/tmp/onnax-qwen35-real-cache",
+        "--output-dir",
+        "/tmp/onnax-shared-owner-qualified-sft",
+        "--steps",
+        "30",
+        "--fused-ops",
+        "--provider",
+        "mlx",
+        "--library",
+        "/tmp/onnax-shared-owner-runtime/libonnxruntime_mlx_ep.dylib"
+      ],
+      "cwd": "/Users/justinc/Documents/GitHub/onnax",
+      "status": "complete",
+      "physical_memory_budget_bytes": 25769803776,
+      "minimum_free_disk_bytes": 5368709120,
+      "memory_source": "proc_pid_rusage/RUSAGE_INFO_V4",
+      "observation_errors": 0,
+      "temporary_directory": "/tmp/onnax-shared-owner-qualified-sft-guard/worker-tmp-97vhhht6",
+      "pid": 11213,
+      "started": "2026-11-02T20:40:42.372875+00:00",
+      "returncode": 0,
+      "finished": "2026-11-02T20:43:58.185509+00:00",
+      "temporary_files_removed": true,
+      "peak_physical_bytes": 8094105680
+    },
+    "resumed": {
+      "command": [
+        "/Users/justinc/Documents/GitHub/onnax/.venv/bin/python",
+        "-m",
+        "examples.huggingface.decoder_sft",
+        "--family",
+        "qwen35",
+        "--real",
+        "--cache-dir",
+        "/tmp/onnax-qwen35-real-cache",
+        "--output-dir",
+        "/tmp/onnax-shared-owner-qualified-resume",
+        "--steps",
+        "30",
+        "--fused-ops",
+        "--provider",
+        "mlx",
+        "--library",
+        "/tmp/onnax-shared-owner-runtime/libonnxruntime_mlx_ep.dylib",
+        "--resume",
+        "/tmp/onnax-shared-owner-qualified-sft/checkpoint-15"
+      ],
+      "cwd": "/Users/justinc/Documents/GitHub/onnax",
+      "status": "complete",
+      "physical_memory_budget_bytes": 25769803776,
+      "minimum_free_disk_bytes": 5368709120,
+      "memory_source": "proc_pid_rusage/RUSAGE_INFO_V4",
+      "observation_errors": 0,
+      "temporary_directory": "/tmp/onnax-shared-owner-qualified-resume-guard/worker-tmp-22uh5_rl",
+      "pid": 11391,
+      "started": "2026-11-02T20:43:58.249698+00:00",
+      "returncode": 0,
+      "finished": "2026-11-02T20:46:34.151298+00:00",
+      "temporary_files_removed": true,
+      "peak_physical_bytes": 8109292736
+    },
+    "verification": {
+      "command": [
+        "/Users/justinc/Documents/GitHub/onnax/.venv/bin/python",
+        "/tmp/onnax-shared-owner-verify-training.py"
+      ],
+      "cwd": "/Users/justinc/Documents/GitHub/onnax",
+      "status": "complete",
+      "physical_memory_budget_bytes": 25769803776,
+      "minimum_free_disk_bytes": 5368709120,
+      "memory_source": "proc_pid_rusage/RUSAGE_INFO_V4",
+      "observation_errors": 0,
+      "temporary_directory": "/tmp/onnax-shared-owner-qualified-recovery-guard/worker-tmp-f98xt66k",
+      "pid": 11644,
+      "started": "2026-11-02T20:46:34.236249+00:00",
+      "returncode": 0,
+      "finished": "2026-11-02T20:47:21.636668+00:00",
+      "temporary_files_removed": true,
+      "peak_physical_bytes": 4907995936
+    }
+  },
+  "continuous": {
+    "family": "qwen35",
+    "pretrained_source": {
+      "version": 1,
+      "model_id": "Qwen/Qwen3.5-0.8B",
+      "revision": "2fc06364715b967f1860aea9cf38778875588b17",
+      "reference_class": "Qwen3_5ForCausalLM",
+      "checkpoint_to_reference_prefix": {
+        "model.language_model.": "model."
+      },
+      "parameter_count": 752393024,
+      "dtype": "float32",
+      "loading": {
+        "missing_keys": [],
+        "unexpected_keys": [],
+        "mismatched_keys": [],
+        "error_msgs": []
+      }
+    },
+    "steps": 30,
+    "microbatch_size": 1,
+    "gradient_accumulation_steps": 4,
+    "max_length": 64,
+    "pad_to_multiple_of": 64,
+    "adam_epsilon": 1e-05,
+    "validation_loss": [
+      6.019479751586914,
+      5.621203422546387
+    ],
+    "training_loss": [
+      5.223938941955566,
+      0.302990585565567
+    ],
+    "source_identity": "229a32d4b255f89d56dd84d09f9a9daf82cfce4129fa57d7a19c3c86b216b693",
+    "timing_scope": "initial/final evaluation, training and export; excludes construction",
+    "elapsed_seconds": 160.27906891598832,
+    "export": "/tmp/onnax-shared-owner-qualified-sft/export",
+    "provider": "mlx",
+    "dtype": "float32",
+    "library_sha256": "3b99b06a078d7145b0aca822f3ed5e169bf72209de35aa455eb6b49968a5704c",
+    "source_commit": "6528c221aecd2c48a839ad3950c54f72d6414918",
+    "working_tree_dirty": false,
+    "platform": "macOS-27.0.1-arm64-arm-64bit",
+    "versions": {
+      "onnax": "0.1.0",
+      "onnx": "1.23.2",
+      "onnx-ir": "1.1.0",
+      "onnxscript": "0.7.2",
+      "onnxruntime": "1.31.1",
+      "torch": "2.15.0",
+      "transformers": "5.22.1",
+      "trl": "0.24.0",
+      "datasets": "5.1.0",
+      "peft": "0.21.2",
+      "mobius-onnx": "0.1.0"
+    },
+    "threads": {
+      "torch": 1,
+      "ort_intra": 1,
+      "ort_inter": 1
+    },
+    "process_peak_rss_bytes": 12719652864,
+    "rss_scope": "process, imports, construction, runtime, training or audit, and export",
+    "batch_calls": 448,
+    "shifted_target_range": [
+      10,
+      16
+    ]
+  },
+  "resumed": {
+    "family": "qwen35",
+    "pretrained_source": {
+      "version": 1,
+      "model_id": "Qwen/Qwen3.5-0.8B",
+      "revision": "2fc06364715b967f1860aea9cf38778875588b17",
+      "reference_class": "Qwen3_5ForCausalLM",
+      "checkpoint_to_reference_prefix": {
+        "model.language_model.": "model."
+      },
+      "parameter_count": 752393024,
+      "dtype": "float32",
+      "loading": {
+        "missing_keys": [],
+        "unexpected_keys": [],
+        "mismatched_keys": [],
+        "error_msgs": []
+      }
+    },
+    "steps": 30,
+    "microbatch_size": 1,
+    "gradient_accumulation_steps": 4,
+    "max_length": 64,
+    "pad_to_multiple_of": 64,
+    "adam_epsilon": 1e-05,
+    "validation_loss": [
+      6.019479751586914,
+      5.621203422546387
+    ],
+    "training_loss": [
+      5.223938941955566,
+      0.302990585565567
+    ],
+    "source_identity": "229a32d4b255f89d56dd84d09f9a9daf82cfce4129fa57d7a19c3c86b216b693",
+    "timing_scope": "initial/final evaluation, training and export; excludes construction",
+    "elapsed_seconds": 122.25971070799278,
+    "export": "/tmp/onnax-shared-owner-qualified-resume/export",
+    "provider": "mlx",
+    "dtype": "float32",
+    "library_sha256": "3b99b06a078d7145b0aca822f3ed5e169bf72209de35aa455eb6b49968a5704c",
+    "source_commit": "6528c221aecd2c48a839ad3950c54f72d6414918",
+    "working_tree_dirty": false,
+    "platform": "macOS-27.0.1-arm64-arm-64bit",
+    "versions": {
+      "onnax": "0.1.0",
+      "onnx": "1.23.2",
+      "onnx-ir": "1.1.0",
+      "onnxscript": "0.7.2",
+      "onnxruntime": "1.31.1",
+      "torch": "2.15.0",
+      "transformers": "5.22.1",
+      "trl": "0.24.0",
+      "datasets": "5.1.0",
+      "peft": "0.21.2",
+      "mobius-onnx": "0.1.0"
+    },
+    "threads": {
+      "torch": 1,
+      "ort_intra": 1,
+      "ort_inter": 1
+    },
+    "process_peak_rss_bytes": 13734969344,
+    "rss_scope": "process, imports, construction, runtime, training or audit, and export",
+    "batch_calls": 388,
+    "shifted_target_range": [
+      10,
+      16
+    ]
+  },
+  "verifier_source": "\"\"\"Verify independently exported continuous/resumed real-model training artifacts.\"\"\"\nimport gc\nimport hashlib\nimport json\nimport os\nfrom pathlib import Path\n\nimport numpy as np\nimport onnx\nimport torch\nfrom safetensors.torch import load_file\n\nfrom examples.huggingface.decoder_sft import OnnxDecoder\nfrom examples.huggingface.replay import _equal_tree\nfrom examples.lora.mlx_runtime import register_library, session\n\nroot = Path('/tmp/onnax-shared-owner-qualified-sft')\nresumed = Path('/tmp/onnax-shared-owner-qualified-resume')\nbaseline = Path('/tmp/onnax-gated-qualified-sft')\nlibrary = '/tmp/onnax-shared-owner-runtime/libonnxruntime_mlx_ep.dylib'\n\n\ndef digest(path):\n    with open(path, 'rb') as stream:\n        return hashlib.file_digest(stream, 'sha256').hexdigest()\n\n\nstates = []\nfor directory in (root, resumed):\n    states.append(load_file(directory / 'checkpoint-30/model.safetensors'))\n_equal_tree(*states)\nfor filename in ('optimizer.pt', 'scheduler.pt'):\n    _equal_tree(*[\n        torch.load(directory / 'checkpoint-30' / filename, weights_only=True)\n        for directory in (root, resumed)\n    ])\n_equal_tree(*[load_file(d / 'adapter/adapter_model.safetensors') for d in (root, resumed)])\n\n# The earlier same-kernel run is an independent control with per-session storage.\nbaseline_state = load_file(baseline / 'checkpoint-30/model.safetensors')\n_equal_tree(states[0], baseline_state)\nfor filename in ('optimizer.pt', 'scheduler.pt'):\n    _equal_tree(\n        torch.load(root / 'checkpoint-30' / filename, weights_only=True),\n        torch.load(baseline / 'checkpoint-30' / filename, weights_only=True),\n    )\nrecords = [json.loads((d / 'export/execution/interface.json').read_text())\n           for d in (root, resumed, baseline)]\nassert len({r['identity'] for r in records}) == 1\nfrozen = {k: v for k, v in records[0]['files'].items() if k.endswith('.data')}\nassert all(r['files']['model.data'] == frozen['model.data'] for r in records)\nimport runpy\nmanifest = runpy.run_path('/tmp/onnax-shared-tensor-manifest.py')['manifest']\nfirst_tensors = manifest(root / 'export/execution')\nsecond_tensors = manifest(resumed / 'export/execution')\nassert first_tensors == second_tensors\ncanonical_tensors = json.dumps(first_tensors, sort_keys=True)\nPath('/tmp/onnax-shared-owner-frozen-tensors.json').write_text(canonical_tensors + '\\n')\ntensor_digest = hashlib.sha256(canonical_tensors.encode()).hexdigest()\nchecked = {}\nfor directory in (root, resumed):\n    files = sorted((directory / 'export/execution').glob('*.onnx'))\n    assert files\n    for file in files:\n        onnx.checker.check_model(str(file), full_check=True)\n    checked[str(directory)] = len(files)\n\nregister_library(library)\ntorch.set_num_threads(1)\nids = torch.tensor([[1, 4, 5, 6, 7, 8, 9, 2]], dtype=torch.int64)\nfeed = {'input_ids': ids, 'attention_mask': torch.ones_like(ids),\n        'position_ids': torch.arange(8)[None], 'labels': ids.clone()}\nresults = []\nfor directory, state in zip((root, resumed), states, strict=True):\n    model = OnnxDecoder.load(directory / 'export', session_factory=session)\n    try:\n        # Check the parameters actually loaded from each independent export before execution.\n        _equal_tree(dict(model.state_dict()), state)\n        output = model(**feed)\n        output.loss.backward()\n        values = {'logits': output.logits.detach().numpy().copy(),\n                  'loss': output.loss.detach().numpy().copy()}\n        values.update({name: p.grad.detach().numpy().copy()\n                       for name, p in model.onnx.parameters_by_name().items()})\n        assert len(values) == 62\n        assert all(np.isfinite(value).all() for value in values.values())\n        results.append(values)\n        del output\n    finally:\n        model.close()\n        del model\n        gc.collect()\nassert results[0].keys() == results[1].keys()\nfor name, value in results[0].items():\n    other = results[1][name]\n    assert value.dtype == other.dtype and value.shape == other.shape\n    assert value.tobytes() == other.tobytes(), name\nreports = [json.loads((d / 'report.json').read_text()) for d in (root, resumed)]\nassert all(r['steps'] == 30 for r in reports)\nassert all(r['training_loss'][-1] < r['training_loss'][0] and\n           r['validation_loss'][-1] < r['validation_loss'][0] for r in reports)\nreport = {'version': 1, 'completed_step': 30, 'restored_from_step': 15,\n          'checkpoint_state_tensors': len(states[0]),\n          'continuous_and_resumed_parameters_adamw_scheduler_byte_identical': True,\n          'per_session_storage_baseline_parameters_adamw_scheduler_byte_identical': True,\n          'exported_adapters_byte_identical': True,\n          'independent_export_parameters_match_final_checkpoints': True,\n          'export_identities': [r['identity'] for r in records],\n          'source_model_payload_hash': frozen['model.data'],\n          'frozen_named_tensor_count': len(first_tensors),\n          'frozen_tensor_manifest_sha256': tensor_digest,\n          'external_payloads_by_export': [{k: v for k, v in r['files'].items() if k.endswith('.data')} for r in records],\n          'checked_onnx_models': checked,\n          'loaded_logits_loss_all_60_adapter_gradients_byte_identical': True,\n          'library_sha256': digest(library), 'worker_sha256': digest(__file__),\n          'training_loss': reports[0]['training_loss'],\n          'validation_loss': reports[0]['validation_loss'],\n          'output_sha256': {name: hashlib.sha256(value.tobytes()).hexdigest()\n                            for name, value in results[0].items()},\n          'scope': 'Two independently exported 30-step results; fresh-process recovery from step15; same-kernel per-session-storage baseline; full ONNX checker; fresh loaded logits/loss/all60gradients'}\nPath('/tmp/onnax-shared-owner-qualified-recovery.json').write_text(json.dumps(report, indent=2)+'\\n')\nprint(json.dumps(report))\n",
+  "tensor_manifest_source": "\"\"\"Compare named tensor bytes independently of external-file packing order.\"\"\"\nimport hashlib\nimport json\nimport os\nfrom pathlib import Path\nimport onnx_ir as ir\n\n\ndef manifest(directory):\n    directory = Path(directory)\n    result, hashed = {}, {}\n\n    def tensor_record(tensor):\n        if isinstance(tensor, ir.ExternalTensor):\n            path = os.path.realpath(os.path.join(tensor.base_dir, tensor.location))\n            offset, length = tensor.offset or 0, tensor.nbytes\n            key = path, offset, length\n            if key not in hashed:\n                digest = hashlib.sha256()\n                remaining = length\n                with open(path, 'rb') as stream:\n                    stream.seek(offset)\n                    while remaining:\n                        chunk = stream.read(min(1024**2, remaining))\n                        if not chunk:\n                            raise ValueError('Truncated external tensor')\n                        digest.update(chunk)\n                        remaining -= len(chunk)\n                hashed[key] = digest.hexdigest()\n            digest = hashed[key]\n        else:\n            digest = hashlib.sha256(tensor.tobytes()).hexdigest()\n        return {'dtype': str(tensor.dtype), 'shape': list(tensor.shape), 'sha256': digest}\n\n    def visit(graph, scope):\n        for value in graph.initializers.values():\n            result[scope + '/initializer/' + value.name] = tensor_record(value.const_value)\n        for node in graph:\n            for name, attribute in node.attributes.items():\n                if attribute.is_ref():\n                    continue\n                key = scope + '/node/' + ','.join(v.name or '' for v in node.outputs) + '/' + name\n                if attribute.type == ir.AttributeType.TENSOR:\n                    result[key] = tensor_record(attribute.as_tensor())\n                elif attribute.type == ir.AttributeType.TENSORS:\n                    for index, tensor in enumerate(attribute.as_tensors()):\n                        result[key + '/' + str(index)] = tensor_record(tensor)\n                elif attribute.type == ir.AttributeType.GRAPH:\n                    visit(attribute.as_graph(), key)\n                elif attribute.type == ir.AttributeType.GRAPHS:\n                    for index, child in enumerate(attribute.as_graphs()):\n                        visit(child, key + '/' + str(index))\n\n    for path in sorted(directory.glob('*.onnx')):\n        model = ir.load(path)\n        visit(model.graph, path.name)\n        for key, function in model.functions.items():\n            visit(function.graph, path.name + '/function/' + str(key))\n    return result\n\n\nif __name__ == '__main__':\n    first = manifest('/tmp/onnax-shared-qualified-sft/export/execution')\n    second = manifest('/tmp/onnax-shared-qualified-resume/export/execution')\n    missing = sorted(set(first) ^ set(second))\n    changed = {key: [first[key], second[key]] for key in first.keys() & second.keys()\n               if first[key] != second[key]}\n    report = {'first_tensor_count': len(first), 'second_tensor_count': len(second),\n              'missing': missing, 'changed': changed,\n              'canonical_sha256': hashlib.sha256(json.dumps(first, sort_keys=True).encode()).hexdigest()}\n    Path('/tmp/onnax-shared-tensor-manifest-comparison.json').write_text(json.dumps(report, indent=2)+'\\n')\n    print(json.dumps(report))\n    assert not missing and not changed\n",
+  "training_driver_source": "\"\"\"Run continuous and resumed SFT in isolated guarded processes, then verify exports.\"\"\"\nimport json\nimport os\nfrom pathlib import Path\nimport subprocess\nimport sys\n\nroot = Path('/Users/justinc/Documents/GitHub/onnax')\nenvironment = {**os.environ, 'PYTHONPATH': str(root), 'HF_HUB_OFFLINE': '1',\n               'ONNXRUNTIME_EP_MLX_NO_COMPILE': '1',\n               'ONNXRUNTIME_EP_MLX_NO_SHARED_INITIALIZERS': '0',\n               'ONNXRUNTIME_EP_MLX_CACHE_LIMIT_BYTES': '536870912'}\n# Refuse to overlap a measurement worker or run after an incomplete formal comparison.\nfor policy in ('off', 'on', 'fast', 'owner'):\n    record = json.loads(Path(f'/tmp/onnax-shared-formal-{policy}.json').read_text())\n    guard = json.loads(Path(f'/tmp/onnax-shared-formal-{policy}-guard/execution.json').read_text())\n    assert record['status'] == 'complete' and len(record['samples']) == 100\n    assert guard['status'] == 'complete' and guard['returncode'] == 0\n    try:\n        os.kill(guard['pid'], 0)\n    except ProcessLookupError:\n        pass\n    else:\n        raise RuntimeError('Measurement worker PID still exists; verify before training')\nsubprocess.run([sys.executable, '/tmp/onnax-shared-dedup-extra.py'], cwd=root, env=environment, check=True)\ncompleted = []\nfor mode in ('sft', 'resume', 'verify'):\n    name = 'onnax-shared-owner-qualified-' + mode\n    if mode == 'verify':\n        command = [sys.executable, '/tmp/onnax-shared-owner-verify-training.py']\n        output = '/tmp/onnax-shared-owner-qualified-recovery-guard'\n    else:\n        directory = '/tmp/' + name\n        assert not Path(directory).exists()\n        command = [sys.executable, '-m', 'examples.huggingface.decoder_sft',\n                   '--family', 'qwen35', '--real', '--cache-dir', '/tmp/onnax-qwen35-real-cache',\n                   '--output-dir', directory, '--steps', '30', '--fused-ops',\n                   '--provider', 'mlx', '--library',\n                   '/tmp/onnax-shared-owner-runtime/libonnxruntime_mlx_ep.dylib']\n        if mode == 'resume':\n            command += ['--resume', '/tmp/onnax-shared-owner-qualified-sft/checkpoint-15']\n        output = directory + '-guard'\n    wrapped = [sys.executable, '-m', 'examples.huggingface.guard', '--output-dir', output,\n               '--', *command]\n    with Path('/tmp/' + name + '-driver.log').open('w') as stream:\n        subprocess.run(wrapped, cwd=root, env=environment, stdout=stream,\n                       stderr=subprocess.STDOUT, check=True)\n    completed.append(mode)\n    Path('/tmp/onnax-shared-owner-training-progress.json').write_text(json.dumps({'completed': completed}))\n    print(mode + ' complete', flush=True)\n",
+  "pipeline_source": "import json,os,subprocess,sys\nfrom pathlib import Path\nroot=Path('/Users/justinc/Documents/GitHub/onnax')\nenv={**os.environ,'PYTHONPATH':str(root),'HF_HUB_OFFLINE':'1','ONNXRUNTIME_EP_MLX_NO_COMPILE':'1','ONNXRUNTIME_EP_MLX_NO_SHARED_INITIALIZERS':'0','ONNXRUNTIME_EP_MLX_CACHE_LIMIT_BYTES':'536870912'}\ncompleted=[]\nformal=[sys.executable,'-m','examples.huggingface.guard','--output-dir','/tmp/onnax-shared-formal-owner-guard','--',sys.executable,'/tmp/onnax-mlx-shared-initializers/bench/onnax_decoder.py','--export','/tmp/onnax-qwen35-real-sft/export','--cache-dir','/tmp/onnax-qwen35-real-cache','--library','/tmp/onnax-shared-owner-runtime/libonnxruntime_mlx_ep.dylib','--sequence','512','--warmup','10','--samples','100','--output','/tmp/onnax-shared-formal-owner.json','--gradients-output','/tmp/onnax-shared-formal-owner.npz']\nstages=[('formal',formal),('timing-verification',[sys.executable,'/tmp/onnax-shared-owner-verify-timing.py']),('training-recovery',[sys.executable,'/tmp/onnax-shared-owner-training-driver.py'])]\nfor name,command in stages:\n Path('/tmp/onnax-shared-owner-pipeline-progress.json').write_text(json.dumps({'completed':completed,'running':name}))\n with Path('/tmp/onnax-shared-owner-pipeline-'+name+'.log').open('w') as log:\n  subprocess.run(command,cwd=root,env=env,stdout=log,stderr=subprocess.STDOUT,check=True)\n completed.append(name)\n print(name+' complete',flush=True)\nPath('/tmp/onnax-shared-owner-pipeline-progress.json').write_text(json.dumps({'completed':completed,'running':None}))\n",
+  "frozen_tensor_manifest_file": "shared-initializers-arm-frozen-tensors.json"
+}
