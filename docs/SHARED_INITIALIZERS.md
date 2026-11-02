@@ -7,8 +7,9 @@ Overridable graph inputs continue to read their live feeds.
 
 Compile-time host buffers are interned across sessions using weak references.
 Each shared MLX array retains that owned host buffer through a managed-payload
-callback, independently of ORT. Plans retain their own C handles and a strong
-storage owner; the array index holds weak references.
+callback, independently of ORT. Each cache entry also retains the host buffer
+explicitly, keeping its identity alive when MLX chooses a copied buffer. Plans
+retain their own C handles and a strong entry owner; the index holds weak references.
 Closing the originating session leaves other sessions valid. Closing the final
 owner releases active storage, and expired index entries are removed on insertion.
 The MLX allocator may retain freed storage in its separately configured cache.

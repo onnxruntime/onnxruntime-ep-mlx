@@ -59,14 +59,24 @@ struct ArrayKey {
     shape: Vec<i32>,
 }
 
+/// Owns both the MLX leaf and its host-buffer identity. A copy fallback can finish with
+/// the managed payload immediately, while the array remains indexed by that host address.
+pub(crate) struct SharedInitializer {
+    pub(crate) array: Array,
+    _storage: Arc<Vec<u8>>,
+}
+
 thread_local! {
     // The run gate already pins each plan's execution to its first run thread. No raw array
     // handle crosses threads through this index. Arc permits atomic owner teardown even when
     // ORT releases a session on a different thread; it does not make Array Send or Sync.
-    static ARRAYS: RefCell<HashMap<ArrayKey, Weak<Array>>> = RefCell::new(HashMap::new());
+    static ARRAYS: RefCell<HashMap<ArrayKey, Weak<SharedInitializer>>> = RefCell::new(HashMap::new());
 }
 
-pub(crate) fn get(init: &InitData, shape: &[i32]) -> Result<Option<Arc<Array>>, MlxError> {
+pub(crate) fn get(
+    init: &InitData,
+    shape: &[i32],
+) -> Result<Option<Arc<SharedInitializer>>, MlxError> {
     if !enabled() {
         return Ok(None);
     }
@@ -76,8 +86,8 @@ pub(crate) fn get(init: &InitData, shape: &[i32]) -> Result<Option<Arc<Array>>, 
     if storage.len() < 4096 {
         return Ok(None);
     }
-    // Owned host buffers are already content-interned. Their addresses remain stable while
-    // an array is alive because its managed payload retains that exact Arc allocation.
+    // The entry's explicit storage owner keeps this content-interned address stable for
+    // its entire indexed lifetime, including MLX's copy fallback and foreign-thread teardown.
     let key = ArrayKey {
         data: storage.as_ptr() as usize,
         dtype: init.dtype,
@@ -94,7 +104,10 @@ pub(crate) fn get(init: &InitData, shape: &[i32]) -> Result<Option<Arc<Array>>, 
             return Err("MLX: could not evaluate shared initializer".into());
         }
         #[allow(clippy::arc_with_non_send_sync)] // Thread-local access; atomic teardown, see above.
-        let owner = Arc::new(array);
+        let owner = Arc::new(SharedInitializer {
+            array,
+            _storage: storage.clone(),
+        });
         let mut index = index.borrow_mut();
         // Remove expired keys on insert, so repeated model loads do not retain model identities.
         index.retain(|_, value| value.strong_count() != 0);
@@ -123,6 +136,27 @@ mod tests {
         drop(first);
         assert!(weak.upgrade().is_some());
         drop(same);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn copied_array_keeps_its_host_identity_until_the_entry_drops() {
+        let data = vec![37; 8192];
+        let dtype = crate::sys::ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8;
+        let storage = own(&data, dtype, &[8192]).unwrap();
+        let weak = Arc::downgrade(&storage);
+        // A copied MLX leaf deliberately has no managed-payload reference to the source.
+        // This models the copy fallback independently of allocator alignment or callback timing.
+        let entry = SharedInitializer {
+            array: Array::from_data(storage.as_ptr().cast(), &[8192], mlx_dtype_from_onnx(dtype)),
+            _storage: storage.clone(),
+        };
+        drop(storage);
+        let again = own(&data, dtype, &[8192]).unwrap();
+        assert!(Arc::ptr_eq(&again, &weak.upgrade().unwrap()));
+        drop(again);
+        assert!(weak.upgrade().is_some());
+        drop(entry);
         assert!(weak.upgrade().is_none());
     }
 

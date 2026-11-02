@@ -463,7 +463,8 @@ pub struct Plan {
     pub nodes: Vec<NodeDesc>,
     pub cache: HashMap<String, Array>,
     /// Keeps shared immutable storage alive while per-plan handles may be used or traced.
-    pub shared_initializers: Vec<std::sync::Arc<Array>>,
+    pub(crate) shared_initializers:
+        Vec<std::sync::Arc<crate::shared_initializers::SharedInitializer>>,
     pub native_attention_decode: bool,
     pub dedicated_decode_stream: bool,
     /// This subgraph carries float64 tensors or computes float64 statistics and must run on an MLX
@@ -1148,7 +1149,7 @@ impl<'a> TranslationContext<'a> {
                     .map(|&d| dim_i32(d))
                     .collect::<Result<_, _>>()?;
                 if let Some(shared) = crate::shared_initializers::get(init, &ishape)? {
-                    let handle = shared.retained()?;
+                    let handle = shared.array.retained()?;
                     let raw = handle.as_raw();
                     self.plan.shared_initializers.push(shared);
                     self.plan.cache.insert(cache_key, handle);
