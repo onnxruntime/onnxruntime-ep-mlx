@@ -799,14 +799,24 @@ fn conv_transpose_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), M
     let w = ctx.contiguous(w)?;
     let weight = ctx.reshape(w, &weight_shape)?;
 
-    // Compute the uncropped transpose, then crop output rather than using negative conv padding
-    // (which would slice the undilated input and lose stride-aligned samples).
-    let low: Vec<i32> = (0..rank)
+    // Apply output cropping as convolution padding when both sides stay nonnegative.
+    // Negative convolution padding slices the undilated input, so those cases keep
+    // the uncropped convolution followed by an output slice.
+    let mut low: Vec<i32> = (0..rank)
         .map(|i| (dilations[i] * (i64::from(ws[i + 2]) - 1)) as i32)
         .collect();
-    let high: Vec<i32> = (0..rank)
+    let mut high: Vec<i32> = (0..rank)
         .map(|i| low[i] + output_padding[i] as i32)
         .collect();
+    let direct =
+        (0..rank).all(|i| i64::from(low[i]) >= pads[i] && i64::from(high[i]) >= pads[i + rank]);
+    if direct {
+        for i in 0..rank {
+            low[i] -= i32::try_from(pads[i]).map_err(|_| "ConvTranspose: pad exceeds int32")?;
+            high[i] -=
+                i32::try_from(pads[i + rank]).map_err(|_| "ConvTranspose: pad exceeds int32")?;
+        }
+    }
     let kernel_dilation: Vec<i32> = dilations.iter().map(|&v| v as i32).collect();
     let input_dilation: Vec<i32> = strides.iter().map(|&v| v as i32).collect();
     let unit = vec![1; rank];
@@ -822,17 +832,20 @@ fn conv_transpose_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), M
         group,
         true,
     )?;
-    let mut start = vec![0; rank + 2];
-    let mut stop = ctx.shape_of(out);
-    for i in 0..rank {
-        start[i + 1] = i32::try_from(pads[i]).map_err(|_| "ConvTranspose: pad exceeds int32")?;
-        stop[i + 1] -=
-            i32::try_from(pads[i + rank]).map_err(|_| "ConvTranspose: pad exceeds int32")?;
-        if stop[i + 1] <= start[i + 1] {
-            return Err("ConvTranspose: output spatial dimensions must be positive".into());
+    if !direct {
+        let mut start = vec![0; rank + 2];
+        let mut stop = ctx.shape_of(out);
+        for i in 0..rank {
+            start[i + 1] =
+                i32::try_from(pads[i]).map_err(|_| "ConvTranspose: pad exceeds int32")?;
+            stop[i + 1] -=
+                i32::try_from(pads[i + rank]).map_err(|_| "ConvTranspose: pad exceeds int32")?;
+            if stop[i + 1] <= start[i + 1] {
+                return Err("ConvTranspose: output spatial dimensions must be positive".into());
+            }
         }
+        out = ctx.slice(out, &start, &stop)?;
     }
-    out = ctx.slice(out, &start, &stop)?;
 
     if present(n, 2) {
         let bias = ctx.resolve(&n.inputs[2])?;
