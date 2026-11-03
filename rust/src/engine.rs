@@ -767,6 +767,8 @@ pub struct TranslationContext<'a> {
     /// must never be retained across Compute calls, while repeated Q/K/V and gate/up projections
     /// should share one explicit activation cast inside the compiled closure.
     astype_cache: HashMap<(usize, u32), mlxsys::mlx_array>,
+    shape_stream: Option<mlx::Stream>,
+    cpu_shape_ops: bool,
     /// Immutable Cast/Transpose/Identity provenance; runtime data never enters this map.
     frozen_views: HashMap<String, String>,
     /// Path a handler declared for the CURRENT node (fast vs composed); the dispatcher
@@ -838,6 +840,9 @@ impl<'a> TranslationContext<'a> {
             arena: Vec::new(),
             input_arena: Vec::new(),
             astype_cache: HashMap::new(),
+            shape_stream: None,
+            cpu_shape_ops: std::env::var_os("ONNXRUNTIME_EP_MLX_GPU_SHAPE_OPS")
+                .is_none_or(|v| v != "1"),
             frozen_views: HashMap::new(),
             path_mark: None,
             trace_enabled: crate::trace::tracer().is_enabled(),
@@ -853,6 +858,98 @@ impl<'a> TranslationContext<'a> {
             in_compiled_trace: false,
             empty_scan_template: false,
         }
+    }
+
+    fn with_shape_stream<T>(
+        &mut self,
+        operation: impl FnOnce(&mut Self) -> Result<T, MlxError>,
+    ) -> Result<T, MlxError> {
+        let saved = self.stream;
+        self.stream = self
+            .shape_stream
+            .get_or_insert_with(mlx::Stream::new_default_cpu)
+            .as_raw();
+        let result = operation(self);
+        self.stream = saved;
+        result
+    }
+
+    fn host_shape_ops_enabled(&self) -> bool {
+        !self.in_compiled_trace
+            && !self.in_general_trace
+            && !self.rope_dynamic
+            && self.cpu_shape_ops
+    }
+
+    pub(crate) fn translate_shape_aware(
+        &mut self,
+        node: &NodeDesc,
+        handler: crate::registry::OpHandler,
+    ) -> Result<(), MlxError> {
+        // Shape-derived integers stay on the host until a GPU consumer needs them.
+        // Live payloads and compiled traces retain their existing execution streams.
+        let candidate = self.host_shape_ops_enabled()
+            && matches!(node.domain.as_str(), "" | "ai.onnx")
+            && matches!(
+                node.op_type.as_str(),
+                "Equal"
+                    | "Greater"
+                    | "Less"
+                    | "GreaterOrEqual"
+                    | "LessOrEqual"
+                    | "Not"
+                    | "And"
+                    | "Or"
+                    | "Squeeze"
+                    | "Unsqueeze"
+                    | "Reshape"
+                    | "Concat"
+                    | "Gather"
+                    | "Slice"
+                    | "Add"
+                    | "Sub"
+                    | "Mul"
+                    | "Div"
+                    | "Cast"
+                    | "Identity"
+                    | "NonZero"
+            )
+            && node.inputs.iter().any(|i| i.shape_const)
+            && node.inputs.iter().all(|i| {
+                i.shape_const || i.constant || matches!(i.source, Src::Absent | Src::Initializer)
+            })
+            && node.outputs.iter().all(|o| {
+                matches!(
+                    o.otype,
+                    ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64
+                        | ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32
+                        | ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL
+                )
+            });
+        if candidate {
+            let mut small = true;
+            for input in &node.inputs {
+                if input.source == Src::Absent {
+                    continue;
+                }
+                let a = self.resolve(input)?;
+                small &= self.size_of(a) <= 64
+                    && matches!(
+                        self.dtype_of(a),
+                        mlxsys::mlx_dtype__MLX_INT64
+                            | mlxsys::mlx_dtype__MLX_INT32
+                            | mlxsys::mlx_dtype__MLX_BOOL
+                    );
+            }
+            if small {
+                let result = self.with_shape_stream(|ctx| handler(ctx, node));
+                if result.is_ok() {
+                    self.mark_fast("mlx_cpu_shape");
+                }
+                return result;
+            }
+        }
+        handler(self, node)
     }
 
     /// Declare that the current node took its **fused MLX kernel** fast path (green/normal).
@@ -2011,6 +2108,13 @@ impl<'a> TranslationContext<'a> {
             );
         }
         let a = self.resolve(r)?;
+        if r.shape_const && self.host_shape_ops_enabled() && self.size_of(a) <= 64 {
+            return self.with_shape_stream(|ctx| ctx.read_ints_array(a));
+        }
+        self.read_ints_array(a)
+    }
+
+    fn read_ints_array(&mut self, a: mlxsys::mlx_array) -> Result<Vec<i64>, MlxError> {
         let a = self.astype(a, mlxsys::mlx_dtype__MLX_INT64)?;
         let a = self.contiguous_eval_const(a)?;
         let n = self.size_of(a);
