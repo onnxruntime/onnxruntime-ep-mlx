@@ -8,14 +8,16 @@ The six inputs are Q, K, V, the forward output Y, the upstream gradient G, and a
 mask. The function name records rank, head counts, head dimension, FP32 scaling,
 causality, selected Q/K/V gradient outputs, mask type, and a fallback-body digest.
 The provider checks this contract before claiming the node. FP32 rank-three and
-rank-four inputs support head dimensions 16, 32, 64 and 128, including GQA/MQA.
+rank-four inputs support head dimensions 16, 32, 64, 128 and 256, including GQA/MQA.
 Masks support boolean or additive values, broadcast dimensions, short key tails,
 and singleton key broadcasting. Causal attention uses top-left alignment.
 
 The tiled Metal pullback recomputes log-sum-exp, then computes dQ and grouped
 dK/dV. It uses fixed-size scratch storage and skips causal tiles above the
 diagonal. Fully masked rows produce zero gradients. dK/dV sum shared-head
-contributions without atomic writes.
+contributions without atomic writes. For 256-wide heads, dK/dV use eight key rows
+per threadgroup. Four score tiles and two FP32 accumulators then occupy 20 KiB;
+16 key rows would need 40 KiB. Smaller heads keep their 16-row layout.
 
 Small score matrices use MLX GEMM and softmax operations. Their intermediates have
 local ownership and expire after their final consumer. The policy is controlled
@@ -76,3 +78,23 @@ Use `--format int4` or `--format int8` for affine MatMulNBits forward products.
 These modes also check an independent NumPy decoded-weight product and record
 its error. NF4 uses its 16-entry NormalFloat table; affine formats use their own
 scale/zero-point encoding.
+
+
+## 256-wide Qwen3.5 block
+
+A complete 4032-token Qwen3.5-0.8B FP32 block (eight query heads, two KV heads)
+uses the same binary for each of these paired forward/backward measurements.
+Each isolated worker performs ten warmups and 100 samples, with ORT graph
+optimization and CPU fallback disabled.
+
+| Pullback | Pair median / P95 | MLX allocator peak | Process peak physical |
+|---|---:|---:|---:|
+| Portable graph | 329 / 350 ms | 3.97 GiB | 4.30 GiB |
+| Tiled, 64 MiB score budget | 376 / 390 ms | 1.74 GiB | 2.43 GiB |
+| GEMM, 1 GiB score budget | 260 / 272 ms | 2.54 GiB | 2.95 GiB |
+
+The GEMM route reduces this block's median paired time by 21%. The tiled route
+uses the least memory. All five captured block gradients agree at
+`rtol=1e-4, atol=1e-6`; maximum absolute differences are below 1.1e-8. The block
+uses fixed parameters during measurement. Full-task training adds the other
+blocks, loss, accumulation and optimizer execution.

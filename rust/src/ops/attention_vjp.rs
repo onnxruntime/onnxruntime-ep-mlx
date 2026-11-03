@@ -25,6 +25,12 @@ struct Config {
     mask: i32,
 }
 impl Config {
+    fn kv_rows(&self) -> i32 {
+        // Two 16x256 FP32 accumulators plus score workspace exceed the
+        // 32 KiB threadgroup budget. Eight rows keep the wide kernel at 20 KiB.
+        if self.d == 256 { 8 } else { 16 }
+    }
+
     fn parse(name: &str) -> Option<Self> {
         let fields: Vec<_> = name.strip_prefix(PREFIX)?.split('_').collect();
         if fields.len() != 9 {
@@ -47,7 +53,7 @@ impl Config {
             || hq <= 0
             || hk <= 0
             || hq % hk != 0
-            || !matches!(d, 16 | 32 | 64 | 128)
+            || !matches!(d, 16 | 32 | 64 | 128 | 256)
             || hq.checked_mul(d).is_none()
             || hk.checked_mul(d).is_none()
             || !scale.is_finite()
@@ -176,6 +182,7 @@ fn dispatch(
         ("HQ", c.hq),
         ("HK", c.hk),
         ("D", c.d),
+        ("KV_ROWS", c.kv_rows()),
         ("SQ", sq),
         ("SK", sk),
         ("SCALE", c.scale.to_bits() as i32),
@@ -327,7 +334,7 @@ fn translate(ctx: &mut TranslationContext, node: &NodeDesc) -> Result<(), MlxErr
             },
             &[q, k, v, g, m, stats[0], stats[1]],
             &[ks, vs],
-            [(sk + 15) / 16 * 128, c.hk, b],
+            [(sk + c.kv_rows() - 1) / c.kv_rows() * 128, c.hk, b],
             &c,
             [sq, sk],
         )?;
@@ -364,6 +371,17 @@ mod tests {
     const VALID: &str = "AttentionVJP_v1_r3_q16_k8_d128_s3db504f3_c1_o012_m1_0123456789abcdef";
 
     #[test]
+    fn wide_tiles_fit_threadgroup_memory() {
+        for d in [16, 32, 64, 128, 256] {
+            let c = Config::parse(&VALID.replace("d128_", &format!("d{d}_"))).unwrap();
+            let kv = (4 * c.kv_rows() * 32 + 2 * c.kv_rows() * d) * 4;
+            let dq = (3 * 16 * 32 + 16 * d) * 4;
+            assert!(kv <= 32 * 1024 && dq <= 32 * 1024);
+            assert_eq!(c.kv_rows(), if d == 256 { 8 } else { 16 });
+        }
+    }
+
+    #[test]
     fn versioned_function_contract() {
         let c = Config::parse(VALID).unwrap();
         assert_eq!(
@@ -375,7 +393,7 @@ mod tests {
             ("v1_", "v2_"),
             ("q16_", "q15_"),
             ("q16_", "q2147483640_"),
-            ("d128_", "d256_"),
+            ("d128_", "d512_"),
             ("s3db504f3_", "s7f800000_"),
             ("c1_", "c2_"),
             ("o012_", "o210_"),

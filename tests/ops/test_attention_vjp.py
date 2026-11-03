@@ -187,6 +187,8 @@ def _reference(q, k, v, g, mask, causal, scale):
         (3, 32, 4, 1, True, 1, (0, 1, 2)),
         (4, 64, 2, 2, False, 2, (0, 2)),
         (3, 128, 4, 2, True, 2, (1, 2)),
+        (3, 256, 8, 2, True, 1, (0, 1, 2)),
+        (4, 256, 4, 2, False, 2, (1, 2)),
     ],
 )
 def test_tiled_attention_live_inputs(
