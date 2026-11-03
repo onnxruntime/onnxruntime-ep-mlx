@@ -1,0 +1,8 @@
+{
+  "source_base": "6a9c985fe36c257553d69baafed933b0585dab70",
+  "source_sha256": "6f41a00b0613655a84858bd7914d169669904df3df984920223691111ea8b28d",
+  "library_sha256": "0509469131df77f8cf5f4dec6cd1aa1dd83121d85cf7c3a0228a25e1d7c6d77a",
+  "training_report": "padded-attention-training-m1max.json",
+  "comparison_report": "padded-attention-comparison-m1max.json",
+  "onnax_revision": "250bc64e916082f82bd7730d2518a988f3f4d631"
+}
