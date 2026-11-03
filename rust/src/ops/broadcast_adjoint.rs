@@ -26,6 +26,18 @@ fn claim(node: &NodeView) -> ClaimResult {
         ),
         "SumToShape supports FP32, FP16 and BF16 gradients"
     );
+    if node.op_type() == "SumToShape_v2" {
+        require!(
+            reference.dtype == ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64
+                && reference.shape.len() == 1,
+            "SumToShape_v2 requires an INT64 target shape vector"
+        );
+        require!(
+            reference.shape[0] < 0 || reference.shape[0] as usize <= gradient.shape.len(),
+            "SumToShape reference rank exceeds gradient rank"
+        );
+        return Ok(());
+    }
     require!(
         gradient.shape.len() >= reference.shape.len(),
         "SumToShape reference rank exceeds gradient rank"
@@ -43,9 +55,23 @@ fn claim(node: &NodeView) -> ClaimResult {
 
 fn translate(ctx: &mut TranslationContext, node: &NodeDesc) -> Result<(), MlxError> {
     let gradient = ctx.resolve(&node.inputs[0])?;
-    let reference = ctx.resolve(&node.inputs[1])?;
     let source = ctx.shape_of(gradient);
-    let target = ctx.shape_of(reference);
+    let target = if node.op_type == "SumToShape_v2" {
+        ctx.read_ints_eval(&node.inputs[1])?
+            .into_iter()
+            .map(|dimension| {
+                i32::try_from(dimension)
+                    .ok()
+                    .filter(|&value| value >= 0)
+                    .ok_or_else(|| {
+                        "SumToShape target dimensions must be nonnegative int32".to_string()
+                    })
+            })
+            .collect::<Result<Vec<_>, MlxError>>()?
+    } else {
+        let reference = ctx.resolve(&node.inputs[1])?;
+        ctx.shape_of(reference)
+    };
     if source.len() < target.len() {
         return Err("SumToShape reference rank exceeds gradient rank".into());
     }
@@ -78,15 +104,17 @@ fn translate(ctx: &mut TranslationContext, node: &NodeDesc) -> Result<(), MlxErr
 }
 
 pub fn register(registry: &mut OpRegistry) {
-    registry.register_shape_keyed(
-        OpRegistration {
-            domain: "pkg.onnax",
-            op_type: "SumToShape_v1",
-            min_opset: 1,
-            max_opset: 1,
-            handler: translate,
-            claim,
-        },
-        "host-selected reduction axes are fixed by the trace, beyond Primitive::output_shapes",
-    );
+    for op_type in ["SumToShape_v1", "SumToShape_v2"] {
+        registry.register_shape_keyed(
+            OpRegistration {
+                domain: "pkg.onnax",
+                op_type,
+                min_opset: 1,
+                max_opset: 1,
+                handler: translate,
+                claim,
+            },
+            "host-selected reduction axes are fixed by the trace, beyond Primitive::output_shapes",
+        );
+    }
 }

@@ -33,3 +33,18 @@ to 8 and recorded materialized output bytes from 4.27 GB to 3.72 MB. The full
 measurement includes setup, warmup and execution in its process peak; diagnostic
 counters include setup events. Qwen3, Qwen3.5 and Phi3 also pass native compiled
 adapter-gradient, three-step update and re-export comparisons against PyTorch.
+
+## Compact target shapes
+
+`pkg.onnax::SumToShape_v2(Gradient, TargetShape)` takes the target dimensions as a
+one-dimensional INT64 vector. Dimensions are nonnegative int32 values; an empty
+vector selects a scalar output. Leading and singleton reduction axes follow v1.
+This interface lets a forward/backward boundary retain the target dimensions
+instead of the reference activation.
+
+Boundary target vectors are read as host shape parameters. Their actual values
+participate in the compiled specialization key, alongside tensor shapes. A new
+shape vector selects a new reduction even when its length and the gradient shape
+stay unchanged. Shape-derived vectors inside a graph reuse the existing host
+shape-program path. Tests cover changing axes, zeros, scalars, invalid dimensions
+and successful reuse of a cached valid reduction after an error.
