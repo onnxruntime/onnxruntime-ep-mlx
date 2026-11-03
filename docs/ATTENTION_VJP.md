@@ -98,3 +98,5 @@ uses the least memory. All five captured block gradients agree at
 `rtol=1e-4, atol=1e-6`; maximum absolute differences are below 1.1e-8. The block
 uses fixed parameters during measurement. Full-task training adds the other
 blocks, loss, accumulation and optimizer execution.
+
+For short forward heads, see [fused attention padding](PADDED_ATTENTION.md).

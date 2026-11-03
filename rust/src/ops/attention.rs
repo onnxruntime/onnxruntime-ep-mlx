@@ -171,6 +171,47 @@ fn concat2(
     ctx.emit(|res, s| unsafe { mlx::mlx_concatenate_axis(res, vec.as_raw(), axis, s) })
 }
 
+/// Padding short heads enables MLX's tiled full-attention kernel. Keep small score
+/// matrices on the existing path: the extra padding allocations outweigh their savings.
+fn pad_short_sdpa_head(q: &[i32], k: &[i32], v: &[i32]) -> bool {
+    if q.len() != 4
+        || k.len() != 4
+        || v.len() != 4
+        || !(32..64).contains(&q[3])
+        || k[3] != q[3]
+        || v[3] != q[3]
+        || q.iter().chain(k).chain(v).any(|&d| d <= 0)
+    {
+        return false;
+    }
+    // At least 16M score elements (64 MiB in FP32); use checked arithmetic for shapes.
+    [q[0], q[1], q[2], k[2]]
+        .into_iter()
+        .try_fold(1u64, |size, dim| size.checked_mul(dim as u64))
+        .is_some_and(|elements| elements >= 16 * 1024 * 1024)
+}
+
+fn pad_head(ctx: &mut TranslationContext, x: mlx::mlx_array) -> Result<mlx::mlx_array, MlxError> {
+    let width = ctx.shape_of(x)[3];
+    let zero = ctx.scalar_f32(0.0);
+    let zero = ctx.astype(zero, ctx.dtype_of(x))?;
+    ctx.emit(|out, stream| unsafe {
+        mlx::mlx_pad(
+            out,
+            x,
+            [3].as_ptr(),
+            1,
+            [0].as_ptr(),
+            1,
+            [64 - width].as_ptr(),
+            1,
+            zero,
+            c"constant".as_ptr(),
+            stream,
+        )
+    })
+}
+
 /// Run MLX fast SDPA. `mask_mode` is a NUL-terminated byte string ("", "causal", or "array");
 /// `mask` is used only for "array".
 fn sdpa(
@@ -198,9 +239,18 @@ fn sdpa(
     } else {
         mask
     };
+    let original_shape = ctx.shape_of(q);
+    // Pad and Slice do not infer live output shapes in shapeless compilation.
+    let padded = !ctx.shapeless_compile()
+        && pad_short_sdpa_head(&original_shape, &ctx.shape_of(k), &ctx.shape_of(v));
+    let (q, k, v) = if padded {
+        (pad_head(ctx, q)?, pad_head(ctx, k)?, pad_head(ctx, v)?)
+    } else {
+        (q, k, v)
+    };
     let mode = mask_mode.as_ptr() as *const c_char;
     ctx.mark_fast("mlx_fast_scaled_dot_product_attention");
-    ctx.emit(|res, s| unsafe {
+    let output = ctx.emit(|res, s| unsafe {
         mlx::mlx_fast_scaled_dot_product_attention(
             res,
             q,
@@ -213,7 +263,12 @@ fn sdpa(
             false,
             s,
         )
-    })
+    })?;
+    if padded {
+        slice(ctx, output, &[0, 0, 0, 0], &original_shape)
+    } else {
+        Ok(output)
+    }
 }
 
 /// Dispatch SDPA over the (mutually exclusive) causal / array-mask / no-mask cases.
@@ -2750,6 +2805,21 @@ fn attention_compile_shape_safety_for(
 }
 
 fn attention_compile_shape_safety(node: &NodeView) -> CompileShapeSafety {
+    let head = node.input_info(0).and_then(|q| match q.shape.as_slice() {
+        [_, _, _, d] if *d > 0 => Some(*d),
+        [_, _, hidden] if *hidden > 0 && node.int_attr("q_num_heads", 0) > 0 => {
+            Some(*hidden / node.int_attr("q_num_heads", 0))
+        }
+        _ => None,
+    });
+    if attention_claim(node).is_ok()
+        && !attention_requires_composed_path(node)
+        && head.is_none_or(|d| (32..64).contains(&d))
+    {
+        return CompileShapeSafety::ShapeKeyedOnly {
+            reason: "short-head Attention may pad to a fused SDPA width using live geometry",
+        };
+    }
     attention_compile_shape_safety_for(
         attention_claim(node).is_ok(),
         attention_requires_composed_path(node),
@@ -4460,10 +4530,33 @@ mod tests {
         ATTENTION_COMPOSED_COMPILE_REASON, GQA_BIAS_COMPILE_REASON, GQA_SLIDING_COMPILE_REASON,
         GQA_UNSUPPORTED_COMPILE_REASON, attention_compile_shape_safety_for,
         attention_mask_dimension_is_compatible, group_query_attention_compile_shape_safety_for,
-        mlx_softmax_precision,
+        mlx_softmax_precision, pad_short_sdpa_head,
     };
     use crate::registry::CompileShapeSafety;
     use crate::sys::mlx;
+
+    #[test]
+    fn short_head_padding_policy() {
+        assert!(pad_short_sdpa_head(
+            &[1, 8, 4096, 40],
+            &[1, 8, 4096, 40],
+            &[1, 8, 4096, 40]
+        ));
+        assert!(pad_short_sdpa_head(
+            &[1, 8, 4096, 40],
+            &[1, 2, 4096, 40],
+            &[1, 2, 4096, 40]
+        ));
+        for (q, k, v) in [
+            ([1, 8, 4096, 40], [1, 8, 77, 40], [1, 8, 77, 40]),
+            ([1, 8, 1024, 80], [1, 8, 1024, 80], [1, 8, 1024, 80]),
+            ([1, 8, 256, 160], [1, 8, 256, 160], [1, 8, 256, 160]),
+            ([0, 8, 4096, 40], [0, 8, 4096, 40], [0, 8, 4096, 40]),
+            ([1, 8, 4096, 40], [1, 8, 4096, 40], [1, 8, 4096, 32]),
+        ] {
+            assert!(!pad_short_sdpa_head(&q, &k, &v));
+        }
+    }
 
     #[test]
     fn group_query_attention_compile_shape_safety_matrix() {
