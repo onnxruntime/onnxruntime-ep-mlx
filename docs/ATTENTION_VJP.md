@@ -103,13 +103,15 @@ For short forward heads, see [fused attention padding](PADDED_ATTENTION.md).
 
 ## Recomputed short-head pullbacks
 
-`pkg.onnax::AttentionVJP_v2_*` takes Q, K, V, G and an unused mask placeholder.
+`pkg.onnax::AttentionVJP_v2_*` takes Q, K, V, G and Mask. Mask carries a boolean
+or additive bias; an unmasked function ignores its placeholder value.
 Its portable ONNX body recomputes Y before applying the pullback. The supplied-Y
 v1 interface retains its existing semantics.
 
-The native v2 route supports unmasked, noncausal FP32 attention, rank three or
-four, equal Q/K/V head widths from 32 through 64 in multiples of eight, and GQA.
-It pads the head to 64, preserves the original scale, and invokes MLX's public
+The native v2 route supports FP32 attention, rank three or four, boolean and
+additive masks, causal attention, equal Q/K/V head widths from 32 through 256
+in multiples of eight, and GQA. It pads heads to a supported training width,
+preserves the original scale, and invokes MLX's public
 VJP transform around fast SDPA. MLX then chooses its fused full-attention
 backward kernel. Short queries are padded to 16 rows and cropped so training
 uses the full-attention kernel that produces log-sum-exp. Zero padded query
@@ -129,3 +131,24 @@ ORT graph optimization and CPU fallback are disabled. Prediction, loss and all
 72 adapter gradients pass the existing norm/pointwise gates. A 20-update
 real-image run aligns all gradients and updates with Diffusers MPS, preserves
 frozen weight hashes, and reloads its exported predictions bitwise.
+
+
+Causal attention follows ONNX's upper-left alignment. The built-in causal mode
+handles equal query/key extents without an external mask; other cases construct
+an explicit upper-left mask. Singleton dimensions and short key tails retain
+their broadcast/padding semantics. Changing mask data remains live in compiled
+specializations.
+
+Fully masked rows receive a finite softmax input and their output is selected
+to zero. Their upstream gradients into SDPA are zero, keeping additive-mask
+backward kernels free of `0 * NaN`. This matches the portable function's zero
+row contribution. FP32 heads above 128 pad to 256: the 192-wide save-LSE forward
+kernel asks for 40,448 bytes of threadgroup memory on M1 Max, above its 32,768-byte
+limit. The 256-wide kernel uses its split-head layout.
+
+The Qwen3.5 4032-token block qualification uses causal attention, additive masks,
+eight query heads, two KV heads and head width 256. Paired median/P95 is
+217.67/222.03 ms, versus 218.28/221.27 ms for the same-binary saved-output GEMM
+control with a 1 GiB score budget. All five captured gradients pass the existing
+gates, with maximum absolute error 1.40e-9. These measurements cover the block's
+forward/backward calls; optimizer and whole-model execution are separate phases.

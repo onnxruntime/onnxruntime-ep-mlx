@@ -58,7 +58,7 @@ impl Config {
             .map(|c| c.to_digit(10).map(|i| i as usize))
             .collect::<Option<_>>()?;
         let mask = integer(7, "m")?;
-        if (recompute && (!(32..=64).contains(&d) || causal != 0 || mask != 0))
+        if (recompute && !(32..=256).contains(&d))
             || !matches!(rank, 3 | 4)
             || hq <= 0
             || hk <= 0
@@ -403,13 +403,18 @@ mod tests {
         assert!(config.recompute);
         for (old, new) in [
             ("d40_", "d8_"),
-            ("d40_", "d80_"),
-            ("c0_", "c1_"),
-            ("m0_", "m1_"),
+            ("d40_", "d264_"),
+            ("c0_", "c2_"),
+            ("m0_", "m3_"),
         ] {
             assert!(Config::parse(&name.replace(old, new)).is_none());
         }
         assert!(!Config::parse(VALID).unwrap().recompute);
+        assert!(
+            Config::parse(&VALID.replace("v1_", "v2_"))
+                .unwrap()
+                .recompute
+        );
     }
 
     #[test]
@@ -432,7 +437,7 @@ mod tests {
         );
         assert_eq!(c.outputs, vec![0, 1, 2]);
         for (old, new) in [
-            ("v1_", "v2_"),
+            ("v1_", "v3_"),
             ("q16_", "q15_"),
             ("q16_", "q2147483640_"),
             ("d128_", "d512_"),
