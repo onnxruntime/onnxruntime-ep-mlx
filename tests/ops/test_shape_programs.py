@@ -51,7 +51,7 @@ def test_dynamic_broadcast_axes_and_live_nonzero(gpu_shapes, eager, monkeypatch)
         providers=["MLXExecutionProvider"],
     )
     executor.disable_fallback()
-    for target_rows, source_rows in [(1, 5), (3, 3), (0, 0), (1, 1), (1, 5)]:
+    for target_rows, source_rows in [(1, 5), (3, 3), (0, 0), (1, 0), (1, 1), (1, 5)]:
         for offset in (0, 1):
             values = np.arange(source_rows * 3, dtype=np.float32).reshape(
                 source_rows, 3
