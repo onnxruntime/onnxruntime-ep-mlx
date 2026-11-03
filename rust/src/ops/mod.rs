@@ -2,6 +2,7 @@
 
 pub mod attention;
 pub mod attention_vjp;
+pub mod broadcast_adjoint;
 pub mod conv;
 pub mod elementary_contrib;
 pub mod elementwise;

@@ -370,6 +370,7 @@ fn register_builtin_ops(registry: &mut OpRegistry) {
     crate::ops::onnx_ml_preprocess::register(registry);
     crate::ops::attention::register_attention(registry);
     crate::ops::attention_vjp::register(registry);
+    crate::ops::broadcast_adjoint::register(registry);
     // conv+vision
     crate::ops::conv::register_conv(registry);
     crate::ops::vision::register_vision(registry);
