@@ -1,11 +1,11 @@
 const uint tid = thread_index_in_threadgroup, sg = tid / 32;
-const uint kb = threadgroup_position_in_grid.x * 16,
+const uint kb = threadgroup_position_in_grid.x * KV_ROWS,
            kh = threadgroup_position_in_grid.y,
            b = threadgroup_position_in_grid.z;
 const float scale = as_type<float>(SCALE);
-threadgroup float score[16 * 32], dp[16 * 32], prob[16 * 32], ds[16 * 32],
-    dk[16 * D], dv[16 * D];
-for (uint i = tid; i < 16 * D; i += 128) {
+threadgroup float score[KV_ROWS * 32], dp[KV_ROWS * 32], prob[KV_ROWS * 32], ds[KV_ROWS * 32],
+    dk[KV_ROWS * D], dv[KV_ROWS * D];
+for (uint i = tid; i < KV_ROWS * D; i += 128) {
   dk[i] = 0;
   dv[i] = 0;
 }
@@ -13,7 +13,7 @@ threadgroup_barrier(mem_flags::mem_threadgroup);
 for (uint h = kh * (HQ / HK); h < (kh + 1) * (HQ / HK); ++h) {
   uint start = CAUSAL ? kb / 32 * 32 : 0;
   for (uint qb = start; qb < SQ; qb += 32) {
-    for (uint tile = sg; tile < 8; tile += 4) {
+    for (uint tile = sg; tile < (KV_ROWS / 8) * 4; tile += 4) {
       uint kr = tile / 4 * 8, qr = tile % 4 * 8;
       simdgroup_float8x8 sc(0), dd(0);
       if (kb + kr + 8 <= SK && qb + qr + 8 <= SQ) {
@@ -60,7 +60,7 @@ for (uint h = kh * (HQ / HK); h < (kh + 1) * (HQ / HK); ++h) {
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint i = tid; i < 16 * 32; i += 128) {
+    for (uint i = tid; i < KV_ROWS * 32; i += 128) {
       uint k = kb + i / 32, q = qb + i % 32;
       float p = 0;
       if (k < SK && q < SQ) {
@@ -75,7 +75,7 @@ for (uint h = kh * (HQ / HK); h < (kh + 1) * (HQ / HK); ++h) {
       ds[i] = p > 0 ? p * (dp[i] - Delta[(b * HQ + h) * SQ + q]) * scale : 0;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint tile = sg; tile < 2 * (D / 8); tile += 4) {
+    for (uint tile = sg; tile < (KV_ROWS / 8) * (D / 8); tile += 4) {
       uint kr = tile / (D / 8) * 8, d = tile % (D / 8) * 8;
       simdgroup_float8x8 ka, va;
       simdgroup_load(ka, dk + kr * D + d, D);
@@ -118,7 +118,7 @@ for (uint h = kh * (HQ / HK); h < (kh + 1) * (HQ / HK); ++h) {
     threadgroup_barrier(mem_flags::mem_threadgroup);
   }
 }
-for (uint i = tid; i < 16 * D; i += 128) {
+for (uint i = tid; i < KV_ROWS * D; i += 128) {
   uint k = kb + i / D;
   if (k < SK) {
     DK[((b * HK + kh) * SK + k) * D + i % D] = dk[i];
