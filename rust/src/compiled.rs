@@ -114,6 +114,9 @@ fn is_general_compile_unsafe(n: &NodeDesc) -> bool {
 }
 
 fn host_parameter_indices(n: &NodeDesc) -> &'static [usize] {
+    if n.domain == "pkg.onnax" && n.op_type == "SumToShape_v2" {
+        return &[1];
+    }
     match n.op_type.as_str() {
         "Reshape" | "Expand" | "AffineGrid" | "Squeeze" | "Unsqueeze" => &[1],
         "ConstantOfShape" => &[0],
@@ -137,6 +140,9 @@ fn host_parameter_indices(n: &NodeDesc) -> &'static [usize] {
 }
 
 fn guarded_boundary_parameter(n: &NodeDesc, r: &crate::engine::TensorRef) -> bool {
+    if n.domain == "pkg.onnax" && n.op_type == "SumToShape_v2" {
+        return r.source == Src::CtxInput;
+    }
     matches!(
         n.op_type.as_str(),
         "Reshape"
