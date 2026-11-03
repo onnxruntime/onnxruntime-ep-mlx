@@ -8,7 +8,9 @@ import onnxruntime as ort
 import pytest
 
 
-def native(shape, index_shape, update_shape, dtype=ir.DataType.FLOAT):
+def native(
+    shape, index_shape, update_shape, dtype=ir.DataType.FLOAT, *, reduction="add"
+):
     boundary = ir.DataType.FLOAT if dtype == ir.DataType.BFLOAT16 else dtype
     data = m.tensor("data", boundary, shape)
     indices = m.tensor("indices", ir.DataType.INT64, index_shape)
@@ -17,7 +19,7 @@ def native(shape, index_shape, update_shape, dtype=ir.DataType.FLOAT):
     a, b = data, updates
     if dtype == ir.DataType.BFLOAT16:
         a, b = [tape.op("Cast", [v], {"to": int(dtype)}) for v in (data, updates)]
-    output = tape.op("ScatterND", [a, indices, b], {"reduction": "add"})
+    output = tape.op("ScatterND", [a, indices, b], {"reduction": reduction})
     if dtype == ir.DataType.BFLOAT16:
         output = tape.op("Cast", [output], {"to": int(boundary)})
     output.name, output.dtype, output.shape = "out", boundary, ir.Shape(shape)
