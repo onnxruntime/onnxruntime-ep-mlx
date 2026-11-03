@@ -399,7 +399,7 @@ pub fn translate(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxEr
     let tr = crate::trace::tracer();
     let start = tr.op_timer_start();
     ctx.reset_path_mark();
-    let r = handler(ctx, n);
+    let r = ctx.translate_shape_aware(n, handler);
     if r.is_ok() {
         ctx.track_frozen_view(n);
         let mark = ctx.take_path_mark();
