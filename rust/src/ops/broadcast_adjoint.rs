@@ -87,6 +87,6 @@ pub fn register(registry: &mut OpRegistry) {
             handler: translate,
             claim,
         },
-        "reduction axes specialize on both live tensor shapes",
+        "host-selected reduction axes are fixed by the trace, beyond Primitive::output_shapes",
     );
 }
