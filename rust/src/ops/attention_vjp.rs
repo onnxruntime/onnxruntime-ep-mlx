@@ -26,9 +26,8 @@ struct Config {
 }
 impl Config {
     fn kv_rows(&self) -> i32 {
-        // Two 16x256 FP32 accumulators plus score workspace exceed the
-        // 32 KiB threadgroup budget. Eight rows keep the wide kernel at 20 KiB.
-        if self.d == 256 { 8 } else { 16 }
+        // Two KV_ROWS x D accumulators and score workspace must fit 32 KiB.
+        if self.d > 192 { 8 } else { 16 }
     }
 
     fn parse(name: &str) -> Option<Self> {
@@ -53,7 +52,8 @@ impl Config {
             || hq <= 0
             || hk <= 0
             || hq % hk != 0
-            || !matches!(d, 16 | 32 | 64 | 128 | 256)
+            || !(8..=256).contains(&d)
+            || d % 8 != 0
             || hq.checked_mul(d).is_none()
             || hk.checked_mul(d).is_none()
             || !scale.is_finite()
@@ -372,12 +372,12 @@ mod tests {
 
     #[test]
     fn wide_tiles_fit_threadgroup_memory() {
-        for d in [16, 32, 64, 128, 256] {
+        for d in (8..=256).step_by(8) {
             let c = Config::parse(&VALID.replace("d128_", &format!("d{d}_"))).unwrap();
             let kv = (4 * c.kv_rows() * 32 + 2 * c.kv_rows() * d) * 4;
             let dq = (3 * 16 * 32 + 16 * d) * 4;
             assert!(kv <= 32 * 1024 && dq <= 32 * 1024);
-            assert_eq!(c.kv_rows(), if d == 256 { 8 } else { 16 });
+            assert_eq!(c.kv_rows(), if d > 192 { 8 } else { 16 });
         }
     }
 
@@ -394,6 +394,8 @@ mod tests {
             ("q16_", "q15_"),
             ("q16_", "q2147483640_"),
             ("d128_", "d512_"),
+            ("d128_", "d0_"),
+            ("d128_", "d41_"),
             ("s3db504f3_", "s7f800000_"),
             ("c1_", "c2_"),
             ("o012_", "o210_"),
