@@ -511,7 +511,7 @@ fn reverse_sequence_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(),
     Ok(())
 }
 
-fn scatter_nd_add_geometry(
+fn scatter_nd_geometry(
     data: &[i32],
     indices: &[i32],
     updates: &[i32],
@@ -549,7 +549,7 @@ fn scatter_nd_add_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), M
     let shape = ctx.shape_of(data);
     let index_shape = ctx.shape_of(indices);
     let update_shape = ctx.shape_of(updates);
-    let (width, rows, tail, count) = scatter_nd_add_geometry(&shape, &index_shape, &update_shape)?;
+    let (width, rows, tail, count) = scatter_nd_geometry(&shape, &index_shape, &update_shape)?;
     if count == 0 {
         let out = ctx.contiguous(data)?;
         ctx.bind(&n.outputs[0], out);
@@ -603,13 +603,14 @@ fn scatter_nd_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxEr
     let updates = ctx.resolve(&n.inputs[2])?;
     let dshape = ctx.shape_of(data);
     let ishape = ctx.shape_of(indices);
-    let m = *ishape
-        .last()
-        .ok_or("ScatterND: indices must have rank >= 1")? as usize;
-    let rows: i32 = dshape[..m].iter().product();
-    let tail: i32 = dshape[m..].iter().product::<i32>().max(1);
+    let ushape = ctx.shape_of(updates);
+    let (m, rows, tail, p) = scatter_nd_geometry(&dshape, &ishape, &ushape)?;
+    if p == 0 || tail == 0 {
+        let out = ctx.contiguous(data)?;
+        ctx.bind(&n.outputs[0], out);
+        return Ok(());
+    }
     let data_flat = ctx.reshape(data, &[rows, tail])?;
-    let p: i32 = ishape[..ishape.len() - 1].iter().product::<i32>().max(1);
     let idx2d = ctx.reshape(indices, &[p, m as i32])?;
     let idx64 = ctx.astype(idx2d, mlx::mlx_dtype__MLX_INT64)?;
 
@@ -2447,60 +2448,33 @@ fn scatter_nd_claim(node: &NodeView) -> ClaimResult {
         is_mlx_float(data.dtype),
         "ScatterND: data must be fp32/fp16/bf16 because MLX scatter payload kernels require float"
     );
-    if reduction == "add" {
-        let compatible = |left: &[i64], right: &[i64]| {
-            left.len() == right.len()
-                && left
-                    .iter()
-                    .zip(right)
-                    .all(|(&a, &b)| a >= -1 && b >= -1 && (a < 0 || b < 0 || a == b))
-        };
-        require!(
-            updates.dtype == data.dtype
-                && output.dtype == data.dtype
-                && compatible(&data.shape, &output.shape),
-            "ScatterND: data/output dtype or shape mismatch"
-        );
-        require!(
-            is_int_index(indices.dtype) && !indices.shape.is_empty() && !data.shape.is_empty(),
-            "ScatterND: requires integer index tuples and positive ranks"
-        );
-        let width = *indices.shape.last().unwrap();
-        require!(
-            width > 0 && width as usize <= data.shape.len(),
-            "ScatterND: index tuple width must be static and within data rank"
-        );
-        let mut expected = indices.shape[..indices.shape.len() - 1].to_vec();
-        expected.extend_from_slice(&data.shape[width as usize..]);
-        require!(
-            compatible(&expected, &updates.shape),
-            "ScatterND: incompatible updates shape"
-        );
-        return Ok(());
-    }
+    let compatible = |left: &[i64], right: &[i64]| {
+        left.len() == right.len()
+            && left
+                .iter()
+                .zip(right)
+                .all(|(&a, &b)| a >= -1 && b >= -1 && (a < 0 || b < 0 || a == b))
+    };
     require!(
-        output.dtype == data.dtype && updates.dtype == data.dtype && output.shape == data.shape,
-        "ScatterND: updates/output must match data dtype and output shape"
+        updates.dtype == data.dtype
+            && output.dtype == data.dtype
+            && compatible(&data.shape, &output.shape),
+        "ScatterND: data/output dtype or shape mismatch"
     );
     require!(
-        is_int_index(indices.dtype)
-            && !indices.shape.is_empty()
-            && indices.shape.iter().all(|&d| d > 0)
-            && data.shape.iter().all(|&d| d > 0),
-        "ScatterND: indices must be non-empty int32/int64 and shapes must be fully static and positive"
+        is_int_index(indices.dtype) && !indices.shape.is_empty() && !data.shape.is_empty(),
+        "ScatterND: requires integer index tuples and positive ranks"
     );
-    let width = *indices.shape.last().unwrap() as usize;
+    let width = *indices.shape.last().unwrap();
     require!(
-        width > 0 && width <= data.shape.len(),
-        "ScatterND: indices tuple width must be in [1, data rank]"
+        width > 0 && width as usize <= data.shape.len(),
+        "ScatterND: index tuple width must be static and within data rank"
     );
-    let mut expected_updates = indices.shape[..indices.shape.len() - 1].to_vec();
-    expected_updates.extend_from_slice(&data.shape[width..]);
+    let mut expected = indices.shape[..indices.shape.len() - 1].to_vec();
+    expected.extend_from_slice(&data.shape[width as usize..]);
     require!(
-        updates.shape == expected_updates,
-        "ScatterND: updates shape {:?} must equal {:?}",
-        updates.shape,
-        expected_updates
+        compatible(&expected, &updates.shape),
+        "ScatterND: incompatible updates shape"
     );
     Ok(())
 }
@@ -4124,17 +4098,17 @@ mod tests {
             crate::registry::CompileShapeSafety::EagerOnly { .. }
         ));
         assert_eq!(
-            super::scatter_nd_add_geometry(&[2, 3, 4], &[0, 2], &[0, 4]).unwrap(),
+            super::scatter_nd_geometry(&[2, 3, 4], &[0, 2], &[0, 4]).unwrap(),
             (2, 6, 4, 0)
         );
         assert_eq!(
-            super::scatter_nd_add_geometry(&[2, 3], &[2], &[]).unwrap(),
+            super::scatter_nd_geometry(&[2, 3], &[2], &[]).unwrap(),
             (2, 6, 1, 1)
         );
-        assert!(super::scatter_nd_add_geometry(&[2], &[1, 2], &[1]).is_err());
-        assert!(super::scatter_nd_add_geometry(&[2], &[1, 0], &[1, 2]).is_err());
-        assert!(super::scatter_nd_add_geometry(&[2, 3], &[2, 1], &[2, 2]).is_err());
-        assert!(super::scatter_nd_add_geometry(&[i32::MAX, 2], &[1, 2], &[1]).is_err());
+        assert!(super::scatter_nd_geometry(&[2], &[1, 2], &[1]).is_err());
+        assert!(super::scatter_nd_geometry(&[2], &[1, 0], &[1, 2]).is_err());
+        assert!(super::scatter_nd_geometry(&[2, 3], &[2, 1], &[2, 2]).is_err());
+        assert!(super::scatter_nd_geometry(&[i32::MAX, 2], &[1, 2], &[1]).is_err());
     }
 
     use super::{
