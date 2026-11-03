@@ -37,6 +37,17 @@ impl Stream {
         }
     }
 
+    /// Retain a stream for an independently owned MLX callback payload.
+    pub fn retained(raw: mlx::mlx_stream) -> Result<Self, String> {
+        let mut stream = Self {
+            raw: unsafe { mlx::mlx_stream_new() },
+        };
+        if unsafe { mlx::mlx_stream_set(&mut stream.raw, raw) } != 0 {
+            return Err("MLX: could not retain stream".into());
+        }
+        Ok(stream)
+    }
+
     #[inline]
     pub fn as_raw(&self) -> mlx::mlx_stream {
         self.raw

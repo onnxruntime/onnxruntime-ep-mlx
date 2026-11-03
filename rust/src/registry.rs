@@ -205,7 +205,8 @@ impl OpRegistry {
                 && (e.op_type == op_type
                     || (domain == "pkg.onnax"
                         && e.op_type == "AttentionVJP"
-                        && op_type.starts_with("AttentionVJP_v1_")))
+                        && (op_type.starts_with("AttentionVJP_v1_")
+                            || op_type.starts_with("AttentionVJP_v2_"))))
                 && (e.min_opset == K_ANY_OPSET || since_version >= e.min_opset)
                 && (e.max_opset == K_ANY_OPSET || since_version <= e.max_opset)
         })

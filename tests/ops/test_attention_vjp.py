@@ -9,7 +9,9 @@ import onnxruntime as ort
 import pytest
 
 
-def _model(rank, d, hq, hk, causal, kind, selected=(0, 1, 2), mask_rank=4):
+def _model(
+    rank, d, hq, hk, causal, kind, selected=(0, 1, 2), mask_rank=4, recompute=False
+):
     shape = lambda h, s: ["batch", h, s, d] if rank == 4 else ["batch", s, h * d]
     q, k, v, y, g = [
         m.tensor(n, ir.DataType.FLOAT, shape(h, s))
@@ -142,7 +144,7 @@ def _model(rank, d, hq, hk, causal, kind, selected=(0, 1, 2), mask_rank=4):
         )
         for i in selected
     ]
-    node = ir.node(name, [q, k, v, y, g, mask], domain="pkg.onnax", outputs=outputs)
+    call_inputs = [q, k, v, y, g, mask]
     # Clone formals so the body and call graph own independent values.
     body = ir.GraphView(
         [q, k, v, y, g, mask],
@@ -150,10 +152,25 @@ def _model(rank, d, hq, hk, causal, kind, selected=(0, 1, 2), mask_rank=4):
         nodes=t.nodes,
         opset_imports={"": 25},
     ).clone()
+    if recompute:
+        bq, bk, bv, by, _, _ = body.inputs
+        forward_y = ir.Value(name="recomputed_y", type=by.type, shape=by.shape)
+        attrs = {"scale": scale, "is_causal": int(causal)}
+        if rank == 3:
+            attrs.update(q_num_heads=hq, kv_num_heads=hk)
+        body.insert_before(
+            body[0],
+            ir.node("Attention", [bq, bk, bv], outputs=[forward_y], attributes=attrs),
+        )
+        by.replace_all_uses_with(forward_y)
+        body.inputs.remove(by)
+        call_inputs.remove(y)
+        name = name.replace("AttentionVJP_v1_", "AttentionVJP_v2_")
+    node = ir.node(name, call_inputs, domain="pkg.onnax", outputs=outputs)
     fn = ir.Function("pkg.onnax", name, graph=body, attributes=[])
     model = ir.Model(
         ir.Graph(
-            [q, k, v, y, g, mask],
+            call_inputs,
             outputs,
             nodes=[node],
             name="attention_vjp",
@@ -285,3 +302,38 @@ def test_tiled_attention_live_inputs(
             np.testing.assert_allclose(
                 portable[i], layout(expected[index]), rtol=1e-4, atol=1e-6
             )
+
+
+@pytest.mark.parametrize("compiled", [False, True])
+@pytest.mark.parametrize("rank", [3, 4])
+@pytest.mark.parametrize("d", [32, 40, 64])
+@pytest.mark.parametrize("selected", [(0,), (1, 2), (0, 1, 2)])
+def test_recomputed_attention_vjp(rank, d, selected, compiled, monkeypatch):
+    monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_COMPILE", "0" if compiled else "1")
+    options = ort.SessionOptions()
+    options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+    options.add_session_config_entry("session.disable_cpu_ep_fallback", "1")
+    session = ort.InferenceSession(
+        _model(rank, d, 4, 2, False, 0, selected, recompute=True),
+        options,
+        providers=["MLXExecutionProvider"],
+    )
+    rng = np.random.default_rng(191)
+    for b, sq, sk in [(2, 5, 7), (1, 33, 35), (1, 1, 1), (2, 17, 9), (1, 33, 35)]:
+        q = rng.normal(0, 0.2, (b, 4, sq, d)).astype(np.float32)
+        k, v = [rng.normal(0, 0.2, (b, 2, sk, d)).astype(np.float32) for _ in range(2)]
+        g = rng.normal(size=q.shape).astype(np.float32)
+        _, expected = _reference(q, k, v, g, None, False, float(np.float32(d**-0.5)))
+        values = [q, k, v, g]
+        if rank == 3:
+            values = [
+                x.transpose(0, 2, 1, 3).reshape(b, x.shape[2], -1) for x in values
+            ]
+            expected = [
+                x.transpose(0, 2, 1, 3).reshape(b, x.shape[2], -1) for x in expected
+            ]
+        feeds = dict(zip(["q", "k", "v", "g"], values))
+        feeds["mask"] = np.ones((b, 1, sq, sk), bool)
+        actual = session.run(None, feeds)
+        for a, i in zip(actual, selected):
+            np.testing.assert_allclose(a, expected[i], rtol=1e-4, atol=1e-6)
