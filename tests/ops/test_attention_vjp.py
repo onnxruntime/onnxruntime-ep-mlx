@@ -2,12 +2,11 @@
 
 import struct
 
+import _models as m
 import numpy as np
 import onnx_ir as ir
 import onnxruntime as ort
 import pytest
-
-import _models as m
 
 
 def _model(rank, d, hq, hk, causal, kind, selected=(0, 1, 2), mask_rank=4):
@@ -29,7 +28,9 @@ def _model(rank, d, hq, hk, causal, kind, selected=(0, 1, 2), mask_rank=4):
     )
     # Function body uses ordinary ONNX. Native execution is selected by its versioned name.
     t = ir.tape.Tape()
-    const = lambda a: t.op("Constant", [], {"value": ir.tensor(np.asarray(a, np.int64))})
+    const = lambda a: t.op(
+        "Constant", [], {"value": ir.tensor(np.asarray(a, np.int64))}
+    )
 
     def to4(x, heads):
         return (
@@ -42,22 +43,33 @@ def _model(rank, d, hq, hk, causal, kind, selected=(0, 1, 2), mask_rank=4):
             )
         )
 
-    aq, ak, av, ay, ag = [to4(x, h) for x, h in zip([q, k, v, y, g], [hq, hk, hk, hq, hq])]
+    aq, ak, av, ay, ag = [
+        to4(x, h) for x, h in zip([q, k, v, y, g], [hq, hk, hk, hq, hq])
+    ]
     indices = const(np.repeat(np.arange(hk), hq // hk))
     ek = t.op("Gather", [ak, indices], {"axis": 1})
     ev = t.op("Gather", [av, indices], {"axis": 1})
     scale = float(np.float32(d**-0.5))
     sc = t.op("Constant", [], {"value": ir.tensor(np.array(scale, np.float32))})
     scores = t.op(
-        "Mul", [t.op("MatMul", [aq, t.op("Transpose", [ek], {"perm": [0, 1, 3, 2]})]), sc]
+        "Mul",
+        [t.op("MatMul", [aq, t.op("Transpose", [ek], {"perm": [0, 1, 3, 2]})]), sc],
     )
-    floating = lambda x: t.op("Constant", [], {"value": ir.tensor(np.array(x, np.float32))})
-    dim = lambda x, axis: t.op("Gather", [t.op("Shape", [x]), const([axis])], {"axis": 0})
+    floating = lambda x: t.op(
+        "Constant", [], {"value": ir.tensor(np.array(x, np.float32))}
+    )
+    dim = lambda x, axis: t.op(
+        "Gather", [t.op("Shape", [x]), const([axis])], {"axis": 0}
+    )
     if kind:
         width = dim(mask, -1)
         padding = t.op(
             "Where",
-            [t.op("Equal", [width, const([1])]), const([0]), t.op("Sub", [dim(ak, 2), width])],
+            [
+                t.op("Equal", [width, const([1])]),
+                const([0]),
+                t.op("Sub", [dim(ak, 2), width]),
+            ],
         )
         pads = t.op("Concat", [const([0] * (2 * mask_rank - 1)), padding], {"axis": 0})
         fill = (
@@ -66,7 +78,11 @@ def _model(rank, d, hq, hk, causal, kind, selected=(0, 1, 2), mask_rank=4):
             else floating(-np.inf)
         )
         padded = t.op("Pad", [mask, pads, fill])
-        bias = t.op("Where", [padded, floating(0), floating(-np.inf)]) if kind == 1 else padded
+        bias = (
+            t.op("Where", [padded, floating(0), floating(-np.inf)])
+            if kind == 1
+            else padded
+        )
         scores = t.op("Add", [scores, bias])
     if causal:
         scalar = lambda value: t.op("Squeeze", [value, const([0])])
@@ -83,7 +99,9 @@ def _model(rank, d, hq, hk, causal, kind, selected=(0, 1, 2), mask_rank=4):
         [
             empty,
             floating(0),
-            t.op("Softmax", [t.op("Where", [empty, floating(0), scores])], {"axis": -1}),
+            t.op(
+                "Softmax", [t.op("Where", [empty, floating(0), scores])], {"axis": -1}
+            ),
         ],
     )
     dp = t.op("MatMul", [ag, t.op("Transpose", [ev], {"perm": [0, 1, 3, 2]})])
@@ -99,13 +117,18 @@ def _model(rank, d, hq, hk, causal, kind, selected=(0, 1, 2), mask_rank=4):
         tail = t.op("Gather", [dims, const([2, 3])], {"axis": 0})
         grouped = t.op("Concat", [batch, const([hk, hq // hk]), tail], {"axis": 0})
         reduced.append(
-            t.op("ReduceSum", [t.op("Reshape", [value, grouped]), const([2])], {"keepdims": 0})
+            t.op(
+                "ReduceSum",
+                [t.op("Reshape", [value, grouped]), const([2])],
+                {"keepdims": 0},
+            )
         )
     grads = [dq, *reduced]
     if rank == 3:
         grads = [
             t.op(
-                "Reshape", [t.op("Transpose", [a], {"perm": [0, 2, 1, 3]}), t.op("Shape", [x])]
+                "Reshape",
+                [t.op("Transpose", [a], {"perm": [0, 2, 1, 3]}), t.op("Shape", [x])],
             )
             for a, x in zip(grads, [q, k, v])
         ]
@@ -113,7 +136,9 @@ def _model(rank, d, hq, hk, causal, kind, selected=(0, 1, 2), mask_rank=4):
     name = f"AttentionVJP_v1_r{rank}_q{hq}_k{hk}_d{d}_s{bits:08x}_c{int(causal)}_o{''.join(map(str, selected))}_m{kind}_0000000000000000"
     outputs = [
         m.tensor(
-            f"d{i}", ir.DataType.FLOAT, shape(hq if i == 0 else hk, "sq" if i == 0 else "sk")
+            f"d{i}",
+            ir.DataType.FLOAT,
+            shape(hq if i == 0 else hk, "sq" if i == 0 else "sk"),
         )
         for i in selected
     ]
@@ -155,7 +180,9 @@ def _reference(q, k, v, g, mask, causal, scale):
         scores += np.where(mask, 0, -np.inf) if mask.dtype == bool else mask
     if causal:
         scores = np.where(
-            np.arange(k.shape[2])[None, :] <= np.arange(q.shape[2])[:, None], scores, -np.inf
+            np.arange(k.shape[2])[None, :] <= np.arange(q.shape[2])[:, None],
+            scores,
+            -np.inf,
         )
     mx = scores.max(-1, keepdims=True)
     p = np.exp(scores - np.where(np.isneginf(mx), 0, mx))
@@ -184,6 +211,13 @@ def _reference(q, k, v, g, mask, causal, scale):
     "rank,d,hq,hk,causal,kind,selected",
     [
         (4, 16, 4, 2, False, 0, (0, 1, 2)),
+        (4, 8, 4, 2, False, 0, (0, 1, 2)),
+        (4, 40, 4, 2, False, 0, (0, 1, 2)),
+        (3, 80, 4, 1, True, 1, (0, 1, 2)),
+        (4, 160, 2, 2, False, 2, (0, 1, 2)),
+        (4, 192, 2, 2, False, 2, (0, 1, 2)),
+        (4, 200, 2, 2, False, 2, (0, 1, 2)),
+        (4, 248, 2, 2, False, 2, (0, 1, 2)),
         (3, 32, 4, 1, True, 1, (0, 1, 2)),
         (4, 64, 2, 2, False, 2, (0, 2)),
         (3, 128, 4, 2, True, 2, (1, 2)),
@@ -195,7 +229,9 @@ def test_tiled_attention_live_inputs(
     rank, d, hq, hk, causal, kind, selected, dense_limit, mask_rank, monkeypatch
 ):
     monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_COMPILE", "1")
-    monkeypatch.setenv("ONNXRUNTIME_EP_MLX_ATTENTION_VJP_DENSE_LIMIT_BYTES", str(dense_limit))
+    monkeypatch.setenv(
+        "ONNXRUNTIME_EP_MLX_ATTENTION_VJP_DENSE_LIMIT_BYTES", str(dense_limit)
+    )
     options = ort.SessionOptions()
     options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
     options.add_session_config_entry("session.disable_cpu_ep_fallback", "1")
@@ -213,7 +249,12 @@ def test_tiled_attention_live_inputs(
         providers=["CPUExecutionProvider"],
     )
     rng = np.random.default_rng(45)
-    for b, s, t, width in [(2, 5, 7, 7), (1, 33, 35, 29), (1, 32, 32, 1), (1, 17, 18, 18)]:
+    for b, s, t, width in [
+        (2, 5, 7, 7),
+        (1, 33, 35, 29),
+        (1, 32, 32, 1),
+        (1, 17, 18, 18),
+    ]:
         q = rng.normal(0, 0.2, (b, hq, s, d)).astype(np.float32)
         k, v = [rng.normal(0, 0.2, (b, hk, t, d)).astype(np.float32) for _ in range(2)]
         g = rng.normal(size=q.shape).astype(np.float32)
@@ -225,18 +266,22 @@ def test_tiled_attention_live_inputs(
             allowed = allowed[0, 0]
         elif mask_rank == 3:
             allowed = allowed[0]
-        mask = allowed if kind != 2 else np.where(allowed, 0, -np.inf).astype(np.float32)
+        mask = (
+            allowed if kind != 2 else np.where(allowed, 0, -np.inf).astype(np.float32)
+        )
         y, expected = _reference(
             q, k, v, g, mask if kind else None, causal, float(np.float32(d**-0.5))
         )
-        layout = lambda a: (
+        layout = lambda a, b=b: (
             a if rank == 4 else a.transpose(0, 2, 1, 3).reshape(b, a.shape[2], -1)
         )
         feeds = dict(zip(["q", "k", "v", "y", "g"], map(layout, [q, k, v, y, g])))
         feeds["mask"] = mask
         portable = cpu.run(None, feeds)
         for i, (got, index) in enumerate(zip(session.run(None, feeds), selected)):
-            np.testing.assert_allclose(got, layout(expected[index]), rtol=1e-4, atol=1e-6)
+            np.testing.assert_allclose(
+                got, layout(expected[index]), rtol=1e-4, atol=1e-6
+            )
             np.testing.assert_allclose(
                 portable[i], layout(expected[index]), rtol=1e-4, atol=1e-6
             )
