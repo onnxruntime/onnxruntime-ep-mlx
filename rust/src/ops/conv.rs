@@ -796,7 +796,22 @@ fn conv_transpose_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), M
     let mut weight_shape = vec![ws[1] * group];
     weight_shape.extend_from_slice(&ws[2..]);
     weight_shape.push(ws[0] / group);
-    let w = ctx.contiguous(w)?;
+    let frozen = if !ctx.is_capturing()
+        && std::env::var_os("ONNXRUNTIME_EP_MLX_PACK_CONV_TRANSPOSE_WEIGHTS")
+            .is_none_or(|value| value != "0")
+    {
+        ctx.frozen_key(&n.inputs[1])
+    } else {
+        None
+    };
+    let w = if let Some(origin) = frozen {
+        ctx.cache_contiguous(
+            format!("conv-transpose-layout({origin},rank={rank},group={group})"),
+            w,
+        )?
+    } else {
+        ctx.contiguous(w)?
+    };
     let weight = ctx.reshape(w, &weight_shape)?;
 
     // Compute the uncropped transpose, then crop output rather than using negative conv padding
