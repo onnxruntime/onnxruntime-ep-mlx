@@ -8,7 +8,7 @@ The six inputs are Q, K, V, the forward output Y, the upstream gradient G, and a
 mask. The function name records rank, head counts, head dimension, FP32 scaling,
 causality, selected Q/K/V gradient outputs, mask type, and a fallback-body digest.
 The provider checks this contract before claiming the node. FP32 rank-three and
-rank-four inputs support head dimensions 16, 32, 64, 128 and 256, including GQA/MQA.
+rank-four inputs support head dimensions from 8 through 256 in multiples of eight, including GQA/MQA.
 Masks support boolean or additive values, broadcast dimensions, short key tails,
 and singleton key broadcasting. Causal attention uses top-left alignment.
 
@@ -100,3 +100,32 @@ uses fixed parameters during measurement. Full-task training adds the other
 blocks, loss, accumulation and optimizer execution.
 
 For short forward heads, see [fused attention padding](PADDED_ATTENTION.md).
+
+## Recomputed short-head pullbacks
+
+`pkg.onnax::AttentionVJP_v2_*` takes Q, K, V, G and an unused mask placeholder.
+Its portable ONNX body recomputes Y before applying the pullback. The supplied-Y
+v1 interface retains its existing semantics.
+
+The native v2 route supports unmasked, noncausal FP32 attention, rank three or
+four, equal Q/K/V head widths from 32 through 64 in multiples of eight, and GQA.
+It pads the head to 64, preserves the original scale, and invokes MLX's public
+VJP transform around fast SDPA. MLX then chooses its fused full-attention
+backward kernel. Short queries are padded to 16 rows and cropped so training
+uses the full-attention kernel that produces log-sum-exp. Zero padded query
+cotangents contribute no K/V gradient. Empty geometry returns zero gradients.
+
+MLX owns the callback payload and retained stream. RAII owns every temporary
+array and closure, and the callback catches Rust unwinds at the C boundary.
+Shape-keyed compilation specializes the live geometry while data inputs remain
+live on every invocation.
+
+A matched M1 Max FP32 UNet LoRA run uses one 512-pixel image, ten warmups and
+100 measured steps, joint scalar-objective execution and external AdamW. The
+same native binary measures 465.21/472.09 ms median/P95 with saved-output
+pullbacks and 372.10/381.60 ms with six recomputed pullbacks. MLX peak allocation
+is 3.846/3.978 GB; whole-process lifetime physical peak is 5.209/5.113 GB.
+ORT graph optimization and CPU fallback are disabled. Prediction, loss and all
+72 adapter gradients pass the existing norm/pointwise gates. A 20-update
+real-image run aligns all gradients and updates with Diffusers MPS, preserves
+frozen weight hashes, and reloads its exported predictions bitwise.

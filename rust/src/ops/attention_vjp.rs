@@ -8,6 +8,7 @@ use crate::sys::{mlx, ort};
 use std::ffi::CString;
 
 mod dense;
+mod native;
 
 const PREFIX: &str = "AttentionVJP_v1_";
 const F32: mlx::mlx_dtype = mlx::mlx_dtype__MLX_FLOAT32;
@@ -15,6 +16,7 @@ const HEADER: &str = include_str!("attention_vjp/common.h");
 
 #[derive(Debug)]
 struct Config {
+    recompute: bool,
     rank: usize,
     hq: i32,
     hk: i32,
@@ -31,7 +33,15 @@ impl Config {
     }
 
     fn parse(name: &str) -> Option<Self> {
-        let fields: Vec<_> = name.strip_prefix(PREFIX)?.split('_').collect();
+        let recompute = name.starts_with("AttentionVJP_v2_");
+        let fields: Vec<_> = name
+            .strip_prefix(if recompute {
+                "AttentionVJP_v2_"
+            } else {
+                PREFIX
+            })?
+            .split('_')
+            .collect();
         if fields.len() != 9 {
             return None;
         }
@@ -48,7 +58,8 @@ impl Config {
             .map(|c| c.to_digit(10).map(|i| i as usize))
             .collect::<Option<_>>()?;
         let mask = integer(7, "m")?;
-        if !matches!(rank, 3 | 4)
+        if (recompute && (!(32..=64).contains(&d) || causal != 0 || mask != 0))
+            || !matches!(rank, 3 | 4)
             || hq <= 0
             || hk <= 0
             || hq % hk != 0
@@ -69,6 +80,7 @@ impl Config {
             return None;
         }
         Some(Self {
+            recompute,
             rank,
             hq,
             hk,
@@ -88,11 +100,12 @@ fn claim(node: &NodeView) -> ClaimResult {
         "unsupported AttentionVJP function contract"
     );
     let c = config.unwrap();
+    let expected_inputs = if c.recompute { 5 } else { 6 };
     require!(
-        node.num_inputs() == 6 && node.num_outputs() == c.outputs.len(),
+        node.num_inputs() == expected_inputs && node.num_outputs() == c.outputs.len(),
         "AttentionVJP interface mismatch"
     );
-    for i in 0..5 {
+    for i in 0..if c.recompute { 4 } else { 5 } {
         let info = node.input_info(i);
         require!(info.is_some(), "AttentionVJP requires tensor inputs");
         let info = info.unwrap();
@@ -118,7 +131,7 @@ fn claim(node: &NodeView) -> ClaimResult {
             );
         }
     }
-    let mask = node.input_info(5);
+    let mask = node.input_info(if c.recompute { 4 } else { 5 });
     require!(mask.is_some(), "AttentionVJP mask tensor required");
     let mask = mask.unwrap();
     require!(
@@ -239,19 +252,32 @@ fn translate(ctx: &mut TranslationContext, node: &NodeDesc) -> Result<(), MlxErr
         .ok_or_else(|| MlxError::from("Invalid AttentionVJP contract"))?;
     let mut inputs = Vec::new();
     let mut original = Vec::new();
+    let tensors = if c.recompute { 4 } else { 5 };
     for (i, input) in node.inputs.iter().enumerate() {
         let mut a = ctx.resolve(input)?;
         let shape = ctx.shape_of(a);
         original.push(shape.clone());
-        if i < 5 && c.rank == 3 {
+        if i < tensors && c.rank == 3 {
             let heads = if i == 1 || i == 2 { c.hk } else { c.hq };
             a = ctx.reshape(a, &[shape[0], shape[1], heads, c.d])?;
             a = ctx.transpose(a, &[0, 2, 1, 3])?;
         }
-        if i < 5 {
+        if i < tensors {
             a = ctx.contiguous(a)?;
         }
         inputs.push(a);
+    }
+    if c.recompute {
+        let grads = native::execute(ctx, &inputs, &c)?;
+        for (output, &index) in node.outputs.iter().zip(&c.outputs) {
+            let mut value = grads[index];
+            if c.rank == 3 {
+                value = ctx.transpose(value, &[0, 2, 1, 3])?;
+                value = ctx.reshape(value, &original[index])?;
+            }
+            ctx.bind(output, value);
+        }
+        return Ok(());
     }
     let (q, k, v, y, g, m) = (
         inputs[0], inputs[1], inputs[2], inputs[3], inputs[4], inputs[5],
@@ -369,6 +395,22 @@ pub fn register(registry: &mut OpRegistry) {
 mod tests {
     use super::*;
     const VALID: &str = "AttentionVJP_v1_r3_q16_k8_d128_s3db504f3_c1_o012_m1_0123456789abcdef";
+
+    #[test]
+    fn recomputed_contract_is_explicit() {
+        let name = "AttentionVJP_v2_r3_q4_k2_d40_s3e21e89b_c0_o012_m0_0123456789abcdef";
+        let config = Config::parse(name).unwrap();
+        assert!(config.recompute);
+        for (old, new) in [
+            ("d40_", "d8_"),
+            ("d40_", "d80_"),
+            ("c0_", "c1_"),
+            ("m0_", "m1_"),
+        ] {
+            assert!(Config::parse(&name.replace(old, new)).is_none());
+        }
+        assert!(!Config::parse(VALID).unwrap().recompute);
+    }
 
     #[test]
     fn wide_tiles_fit_threadgroup_memory() {
