@@ -1,0 +1,59 @@
+import argparse,hashlib,json,time,subprocess,resource
+from pathlib import Path
+import numpy as np
+import onnx
+import onnx_ir as ir
+from onnx_ir.passes import common
+import onnax
+from examples.lora.mlx_runtime import register_library,session
+from examples.process_memory import physical_footprint
+LIB='/tmp/onnax-key-tiles-runtime/libonnxruntime_mlx_ep.dylib'
+S=4096;D=128;HQ=16;HK=8;SCALE=float(np.float32(1/np.sqrt(D)))
+p=argparse.ArgumentParser();p.add_argument('--mode',choices=['reference','dense','tiled','recompute'],required=True);p.add_argument('--directory',required=True);a=p.parse_args();root=Path(a.directory)
+def forward():
+ q=ir.val('Q',dtype=ir.DataType.FLOAT,shape=[1,S,HQ*D]);k=ir.val('K',dtype=ir.DataType.FLOAT,shape=[1,S,HK*D]);v=ir.val('V',dtype=ir.DataType.FLOAT,shape=[1,S,HK*D]);m=ir.val('Mask',dtype=ir.DataType.BOOL,shape=[1,1,1,S]);y=ir.val('Y',dtype=ir.DataType.FLOAT,shape=[1,S,HQ*D])
+ return ir.Model(ir.Graph([q,k,v,m],[y],nodes=[ir.node('Attention',[q,k,v,m],{'q_num_heads':HQ,'kv_num_heads':HK,'is_causal':1,'scale':SCALE},outputs=[y])],opset_imports={'':24},name='attention'),ir_version=10)
+register_library(LIB)
+if a.mode=='reference':
+ import torch
+ torch.set_num_threads(1)
+ rng=np.random.default_rng(42)
+ feeds={name:rng.normal(0,scale,shape).astype(np.float32) for name,scale,shape in [('Q',1,(1,S,HQ*D)),('K',1,(1,S,HK*D)),('V',.1,(1,S,HK*D)),('G',.01,(1,S,HQ*D))]};feeds['Mask']=np.ones((1,1,1,S),bool)
+ original=forward();onnx.checker.check_model(ir.to_proto(original),full_check=True)
+ feeds['SavedY']=session(original,enable_compile=False).run(None,{k:feeds[k] for k in ('Q','K','V','Mask')})[0]
+ leaves=[torch.tensor(feeds[name],device='mps',requires_grad=True) for name in ('Q','K','V')]
+ q,k,v=[t.reshape(1,S,h,D).transpose(1,2) for t,h in zip(leaves,(HQ,HK,HK),strict=True)]
+ y=torch.nn.functional.scaled_dot_product_attention(q,k.repeat_interleave(HQ//HK,dim=1),v.repeat_interleave(HQ//HK,dim=1),is_causal=True,scale=SCALE).transpose(1,2).reshape(1,S,HQ*D)
+ g=torch.tensor(feeds['G'],device='mps');grads=torch.autograd.grad(y,leaves,g);torch.mps.synchronize()
+ refs={name:value.detach().cpu().numpy() for name,value in zip(('dQ','dK','dV'),grads,strict=True)}
+ np.testing.assert_allclose(feeds['SavedY'],y.detach().cpu().numpy(),rtol=1e-4,atol=1e-6)
+ np.savez(root/'feeds.npz',**feeds);np.savez(root/'reference.npz',**refs)
+ print(json.dumps({'phase':'independent_reference_complete'}),flush=True)
+else:
+ from examples.huggingface.long_context import memory_limit
+ memory_limit(LIB,20*1024**3)
+ data=dict(np.load(root/'feeds.npz'));refs=dict(np.load(root/'reference.npz'))
+ joint=onnax.vjp(forward(),inputs=['Q','K','V'],outputs=['Y']);meta=json.loads(joint.graph.metadata_props['onnax.autodiff.interface'])
+ joint=onnax.FuseAttentionVJPPass(recompute=a.mode=='recompute')(joint).model
+ selected={value.name:value for value in joint.graph.outputs};joint.graph.outputs.clear();joint.graph.outputs.extend(selected[name] for name in meta['derivative_outputs'])
+ if a.mode!='recompute':
+  primal=next(node for node in joint.graph if node.op_type=='Attention' and node.domain=='').outputs[0]
+  saved=ir.val('SavedY',dtype=primal.dtype,shape=primal.shape);joint.graph.inputs.append(saved);primal.replace_all_uses_with(saved)
+ common.RemoveUnusedNodesPass()(joint)
+ onnx.checker.check_model(ir.to_proto(joint),full_check=True)
+ calls=[n.op_type for n in joint.graph if n.domain=='pkg.onnax'];assert len(calls)==1,calls
+ feed={name:data[name] for name in ('Q','K','V','Mask')};feed[meta['seeds'][0]]=data['G']
+ if a.mode!='recompute':feed['SavedY']=data['SavedY']
+ runtime=session(joint,enable_compile=False);actual=runtime.run(None,feed)
+ errors={}
+ for (name,expected),value in zip(refs.items(),actual,strict=True):
+  errors[name]={'maximum_absolute_error':float(np.max(np.abs(value-expected))),'violations':int(np.count_nonzero(~np.isclose(value,expected,rtol=1e-4,atol=1e-6)))}
+ np.savez(root/(a.mode+'-outputs.npz'),**dict(zip(refs,actual,strict=True)))
+ samples=[]
+ for i in range(13):
+  before=time.perf_counter();out=runtime.run(None,feed);elapsed=1000*(time.perf_counter()-before)
+  if i>=3:samples.append(elapsed)
+ report={'mode':a.mode,'scope':'Isolated Attention VJP Session.run including array boundary','geometry':{'batch':1,'sequence':S,'query_heads':HQ,'kv_heads':HK,'head_dimension':D,'causal':True},'warmup':3,'samples':10,'timings_ms':{'median':float(np.median(samples)),'p95':float(np.percentile(samples,95)),'samples':samples},'errors':errors,'contract':calls[0],'physical_footprint':physical_footprint(),'peak_rss_bytes':resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,'library_sha256':hashlib.sha256(Path(LIB).read_bytes()).hexdigest(),'driver_sha256':hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),'native_source_sha256':{name:hashlib.sha256((Path('/tmp/onnax-mlx-query-tiles')/name).read_bytes()).hexdigest() for name in ('rust/src/ops/attention_vjp.rs','rust/src/ops/attention_vjp/dq.metal','rust/src/ops/attention_vjp/lse.metal')},'source_commit':subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(),'rtol':1e-4,'atol':1e-6,'ort_optimizer':False,'cpu_fallback':False}
+ (root/(a.mode+'.json')).write_text(json.dumps(report,indent=2)+'\n')
+ print(json.dumps({'mode':a.mode,'timings_ms':report['timings_ms'],'errors':errors}),flush=True)
+ assert not any(row['violations'] for row in errors.values()),errors
