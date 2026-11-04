@@ -1,0 +1,28 @@
+[
+  {
+    "block": "decoder_8_9",
+    "baseline_median": 0.293700042006094,
+    "candidate_median": 0.2945463124779053,
+    "ratio": 0.9971268678779512,
+    "baseline_p95": 0.29975195205770433,
+    "candidate_p95": 0.325071410468081,
+    "baseline_window_allocator_peak": 3483835364,
+    "candidate_window_allocator_peak": 3500678116,
+    "exact_capture_outputs": true,
+    "baseline_peak_physical_bytes": 4226696392,
+    "candidate_peak_physical_bytes": 4229825808
+  },
+  {
+    "block": "decoder_3_4",
+    "baseline_median": 0.2470169584848918,
+    "candidate_median": 0.24789679201785475,
+    "ratio": 0.9964508071048391,
+    "baseline_p95": 0.2555802810005844,
+    "candidate_p95": 0.2545439412584528,
+    "baseline_window_allocator_peak": 3615081908,
+    "candidate_window_allocator_peak": 3625567668,
+    "exact_capture_outputs": true,
+    "baseline_peak_physical_bytes": 3791176856,
+    "candidate_peak_physical_bytes": 3801629896
+  }
+]

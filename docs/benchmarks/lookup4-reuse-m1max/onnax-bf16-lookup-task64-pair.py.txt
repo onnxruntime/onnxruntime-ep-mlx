@@ -1,0 +1,24 @@
+import json,os,subprocess
+from pathlib import Path
+import numpy as np
+root=Path('/tmp/onnax-bf16-lookup-task64-pair');root.mkdir(exist_ok=False)
+python='/Users/justinc/Documents/GitHub/onnax/.venv/bin/python'
+env={**os.environ,'PYTHONPATH':'src:.','HF_HUB_OFFLINE':'1','HF_DATASETS_OFFLINE':'1','ORT_DISABLE_TELEMETRY':'1'}
+for key in ['ONNXRUNTIME_EP_MLX_TRACE','ONNXRUNTIME_EP_MLX_VERBOSE']:env.pop(key,None)
+for name,library in [('baseline','/tmp/onnax-gated-delta-state-runtime/libonnxruntime_mlx_ep.dylib'),('candidate','/tmp/onnax-mlx-lookup-reuse-runtime/libonnxruntime_mlx_ep.dylib')]:
+ (root/'status.json').write_text(json.dumps({'phase':name}))
+ command=[python,'/tmp/onnax-bf16-native-benchmark-worker.py','--export','/tmp/onnax-qwen35-real-bf16-canonical-30/training/export','--cache-dir','/tmp/onnax-qwen35-real-cache','--library',library,'--sequence','64','--warmup','10','--samples','100','--output',str(root/(name+'.json')),'--gradients-output',str(root/(name+'.npz'))]
+ with (root/(name+'.log')).open('w') as log:result=subprocess.run([python,'-m','examples.huggingface.guard','--output-dir',str(root/(name+'-guard')),'--',*command],env=env,stdout=log,stderr=subprocess.STDOUT)
+ if result.returncode:
+  (root/'status.json').write_text(json.dumps({'phase':'failed','case':name,'returncode':result.returncode}));raise SystemExit(result.returncode)
+a=json.loads((root/'baseline.json').read_text());b=json.loads((root/'candidate.json').read_text())
+for k in ['input_sha256','adapter_sha256']:assert a[k]==b[k],k
+assert a['parameters_unchanged'] and b['parameters_unchanged']
+with np.load(root/'baseline.npz') as x,np.load(root/'candidate.npz') as y:
+ assert set(x.files)==set(y.files) and len(x.files)==60
+ for k in x.files:np.testing.assert_array_equal(x[k],y[k],err_msg=k)
+assert [r['loss'] for r in a['samples']]==[r['loss'] for r in b['samples']]
+report={'phase':'complete','scope':'RealQwen3.5-0.8B64tokensBF16/NF4;fixedparamforward/loss/backward+exchange;10warm100samplesindependentserialprocesses','baseline':a['summary']['gradient_step_seconds'],'candidate':b['summary']['gradient_step_seconds'],'ratio':a['summary']['gradient_step_seconds']['median']/b['summary']['gradient_step_seconds']['median'],'all60gradients_and_loss_exact':True}
+for name in ['baseline','candidate']:
+ g=json.loads((root/(name+'-guard')/'execution.json').read_text());assert g['status']=='complete' and g['returncode']==0;report[name+'_peak_physical_bytes']=max(o['peak_bytes'] for o in g['observations'])
+(root/'comparison.json').write_text(json.dumps(report,indent=2)+'\n');(root/'status.json').write_text(json.dumps({'phase':'complete'}));print(json.dumps(report),flush=True)

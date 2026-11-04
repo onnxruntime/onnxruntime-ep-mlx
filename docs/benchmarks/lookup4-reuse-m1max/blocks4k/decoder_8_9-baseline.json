@@ -1,0 +1,269 @@
+{
+  "version": 1,
+  "block": "decoder_8_9",
+  "bundle_identity": "31bffc9c183e70e2e301a1d705167f2bb32db107d01f55e7779eb7422a834d36",
+  "executed_model_sha256": "02d28497a83c5a1ebeee23f1314d7af13807d978314a649474a7f3a507f22945",
+  "input_arrays": {
+    "v_Shape_0": {
+      "shape": [
+        1
+      ],
+      "dtype": "int64",
+      "bytes": 8,
+      "sha256": "7c9fa136d4413fa6173637e883b6998d32e1d675f88cddff9dcbcf331820f4b8"
+    },
+    "v_model.layers.7.Add_658": {
+      "shape": [
+        1,
+        4032,
+        1024
+      ],
+      "dtype": "float32",
+      "bytes": 16515072,
+      "sha256": "0646c0a712db3f155cb30cafc0440e9be2caaac67073d4837ace56c8d9913469"
+    },
+    "model.layers.8.linear_attn.in_proj_qkv.lora.A": {
+      "shape": [
+        1024,
+        4
+      ],
+      "dtype": "float32",
+      "bytes": 16384,
+      "sha256": "23029f5a99aa79dc3f23f00a2849a98a742c56226df9d6568a313caabcbe5ed2"
+    },
+    "model.layers.8.linear_attn.in_proj_qkv.lora.B": {
+      "shape": [
+        4,
+        6144
+      ],
+      "dtype": "float32",
+      "bytes": 98304,
+      "sha256": "6550263fbca80f412812f2f15ab8b47c68056dfce7cd9466d937d6a38cafdfb5"
+    },
+    "v_model.layers.8.Add_731_cotangent": {
+      "shape": [
+        1,
+        4032,
+        1024
+      ],
+      "dtype": "float32",
+      "bytes": 16515072,
+      "sha256": "9815d475c757d0b7b512f932856216e96586dfdf1987fcbca152d48be2267db3"
+    }
+  },
+  "output_arrays": {
+    "v_model.layers.7.Add_658_cotangent": {
+      "shape": [
+        1,
+        4032,
+        1024
+      ],
+      "dtype": "float32",
+      "bytes": 16515072,
+      "sha256": "688ff01a9d4fc68cefb5bb9919ff92f69d82c2b2db92c08ca0df221af5cec07c"
+    },
+    "model.layers.8.linear_attn.in_proj_qkv.lora.A_cotangent": {
+      "shape": [
+        1024,
+        4
+      ],
+      "dtype": "float32",
+      "bytes": 16384,
+      "sha256": "e0f7c6f87aff7f7f2a8d82b749e53e9b5ddf070608f98f160487d72f53df4fc4"
+    },
+    "model.layers.8.linear_attn.in_proj_qkv.lora.B_cotangent": {
+      "shape": [
+        4,
+        6144
+      ],
+      "dtype": "float32",
+      "bytes": 98304,
+      "sha256": "cf23e20a19722c5514c35699c5cd9500a7aec63de0faa81cb38978ed2bfc9b44"
+    }
+  },
+  "dynamic_input_bytes": 33144840,
+  "dynamic_output_bytes": 16629760,
+  "trainable_input_bytes": 114688,
+  "gradient_mapping": {
+    "v_model.layers.7.Add_658": "v_model.layers.7.Add_658_cotangent",
+    "model.layers.8.linear_attn.in_proj_qkv.lora.A": "model.layers.8.linear_attn.in_proj_qkv.lora.A_cotangent",
+    "model.layers.8.linear_attn.in_proj_qkv.lora.B": "model.layers.8.linear_attn.in_proj_qkv.lora.B_cotangent"
+  },
+  "main_graph_nodes": 633,
+  "onnx_file_bytes": 308371,
+  "declared_initializer_bytes": 12266452,
+  "outputs": {
+    "v_model.layers.7.Add_658_cotangent": {
+      "max_abs": 0.0,
+      "sha256": "688ff01a9d4fc68cefb5bb9919ff92f69d82c2b2db92c08ca0df221af5cec07c"
+    },
+    "model.layers.8.linear_attn.in_proj_qkv.lora.A_cotangent": {
+      "max_abs": 0.0,
+      "sha256": "e0f7c6f87aff7f7f2a8d82b749e53e9b5ddf070608f98f160487d72f53df4fc4"
+    },
+    "model.layers.8.linear_attn.in_proj_qkv.lora.B_cotangent": {
+      "max_abs": 0.0,
+      "sha256": "cf23e20a19722c5514c35699c5cd9500a7aec63de0faa81cb38978ed2bfc9b44"
+    }
+  },
+  "final_outputs": {
+    "v_model.layers.7.Add_658_cotangent": {
+      "max_abs": 0.0,
+      "sha256": "688ff01a9d4fc68cefb5bb9919ff92f69d82c2b2db92c08ca0df221af5cec07c"
+    },
+    "model.layers.8.linear_attn.in_proj_qkv.lora.A_cotangent": {
+      "max_abs": 0.0,
+      "sha256": "e0f7c6f87aff7f7f2a8d82b749e53e9b5ddf070608f98f160487d72f53df4fc4"
+    },
+    "model.layers.8.linear_attn.in_proj_qkv.lora.B_cotangent": {
+      "max_abs": 0.0,
+      "sha256": "cf23e20a19722c5514c35699c5cd9500a7aec63de0faa81cb38978ed2bfc9b44"
+    }
+  },
+  "session_creation_seconds": 0.06387654202990234,
+  "first_execution_seconds": 0.31857316696550697,
+  "warmup": 10,
+  "samples": [
+    0.29210399999283254,
+    0.29172470804769546,
+    0.2942258750554174,
+    0.30511249997653067,
+    0.29388766700867563,
+    0.2939678750699386,
+    0.2929762079147622,
+    0.2970097919460386,
+    0.29527270793914795,
+    0.2943510829936713,
+    0.30059295799583197,
+    0.30034320801496506,
+    0.2895699159707874,
+    0.2953132080147043,
+    0.29010641702916473,
+    0.2806370420148596,
+    0.2922647501109168,
+    0.29057837498839945,
+    0.2970976249780506,
+    0.2956712080631405,
+    0.29466750007122755,
+    0.2949771670391783,
+    0.2922178329899907,
+    0.2845568750053644,
+    0.29370733397081494,
+    0.29284204193390906,
+    0.29176233301404864,
+    0.29459933296311647,
+    0.2978902501054108,
+    0.29513691703323275,
+    0.28905349993146956,
+    0.28646879200823605,
+    0.2972950419643894,
+    0.292559374938719,
+    0.29943187499884516,
+    0.298170292051509,
+    0.28498641692567617,
+    0.2891215840354562,
+    0.2912999999243766,
+    0.29215674998704344,
+    0.2891721249325201,
+    0.2936927500413731,
+    0.297874458017759,
+    0.2936705000465736,
+    0.2953500410076231,
+    0.2931043329881504,
+    0.2843236669432372,
+    0.29427770792972296,
+    0.28802174993325025,
+    0.2917346670292318,
+    0.28964245796669275,
+    0.29685033299028873,
+    0.2955370000563562,
+    0.29461987502872944,
+    0.2955990000627935,
+    0.29382779193110764,
+    0.2949608330382034,
+    0.3012989590642974,
+    0.2967303330078721,
+    0.2957879579626024,
+    0.2951931249117479,
+    0.29777237493544817,
+    0.29973162501119077,
+    0.2993050831137225,
+    0.2929309169994667,
+    0.29139816598035395,
+    0.29103229206521064,
+    0.2921053341124207,
+    0.297184249968268,
+    0.2958004999672994,
+    0.2912122920388356,
+    0.2932418331038207,
+    0.29779287497512996,
+    0.2916736250044778,
+    0.290052333031781,
+    0.2878785829525441,
+    0.2950543329352513,
+    0.296082540997304,
+    0.2940258749295026,
+    0.29195787489879876,
+    0.2966153749730438,
+    0.2976576250512153,
+    0.29058925004210323,
+    0.29188783292192966,
+    0.2950517500285059,
+    0.29099620901979506,
+    0.29142558306921273,
+    0.2931984580354765,
+    0.284128834027797,
+    0.28858233301434666,
+    0.28965933294966817,
+    0.2964128750609234,
+    0.2913303750101477,
+    0.2887377500301227,
+    0.28816529200412333,
+    0.29149462503846735,
+    0.2937507500173524,
+    0.29231124999932945,
+    0.3001381659414619,
+    0.2961770830443129
+  ],
+  "median_seconds": 0.293700042006094,
+  "p95_seconds": 0.29975195205770433,
+  "allocator_before": {
+    "active_bytes": 12266436,
+    "cache_bytes": 536870912,
+    "peak_bytes": 0
+  },
+  "allocator_after": {
+    "active_bytes": 12266436,
+    "cache_bytes": 536870912,
+    "peak_bytes": 3483835364
+  },
+  "window_allocator_peak_bytes": 3483835364,
+  "incremental_allocator_peak_bytes": 3471568928,
+  "process_peak_rss_bytes": 376799232,
+  "physical_memory": {
+    "available": true,
+    "current_bytes": 875103480,
+    "lifetime_peak_bytes": 4226696392,
+    "current_resident_bytes": 378241024,
+    "scope": "macOS kernel whole-process physical footprint; includes setup and runtime"
+  },
+  "memory_scope": "Whole worker including imports, bundle verification, one derivative session and captured CPU arrays; allocator peak reset after qualification/warmup",
+  "timing_scope": "One exported block recomputation/VJP session, including runtime host/device exchange; fixed parameters; excludes other blocks, task loss and optimizer",
+  "ort_graph_optimization": "disabled",
+  "cpu_threads": 1,
+  "platform": "macOS-27.0.1-arm64-arm-64bit",
+  "tool_source_sha256": "428440136f38ae75bce011a596ce09abe063960b9c47f1ea1befdb24e2901e16",
+  "versions": {
+    "numpy": "2.4.6",
+    "onnxruntime": "1.31.1",
+    "mlx": "0.32.4"
+  },
+  "provider": "mlx",
+  "cpu_fallback_disabled": true,
+  "library_sha256": "f6079553459908fa84a090201aaea90f71ccdfcb7700e0c090eb5c5a344efabc",
+  "gated_delta_reverse_fused": true,
+  "runtime_environment": {
+    "ONNXRUNTIME_EP_MLX_NO_COMPILE": "1",
+    "ONNXRUNTIME_EP_MLX_CACHE_LIMIT_BYTES": "536870912"
+  }
+}

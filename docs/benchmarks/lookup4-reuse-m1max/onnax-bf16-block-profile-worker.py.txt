@@ -1,0 +1,8 @@
+import sys
+from examples.huggingface.long_context import memory_limit
+from examples.lora.mlx_runtime import register_library
+library = sys.argv[sys.argv.index('--library') + 1]
+register_library(library)
+memory_limit(library, 20 * 1024**3)
+from examples.huggingface.block_runtime import main
+main()

@@ -1,0 +1,1996 @@
+{
+  "scope": "Static local-function argument identity in pinned Qwen3.5 BF16/NF4 backward graphs; no GPU timing attribution",
+  "graphs": [
+    {
+      "graph": "block_10_backward.onnx",
+      "calls": 16,
+      "unique_weight_arguments": 8,
+      "repeated": [
+        {
+          "arguments": [
+            "model.layers.9.linear_attn.in_proj_qkv.weight_t.nf4",
+            "model.layers.9.linear_attn.in_proj_qkv.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_6144_64",
+            "InputGradBF16_1024_6144_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.9.linear_attn.in_proj_z.weight_t.nf4",
+            "model.layers.9.linear_attn.in_proj_z.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_2048_64",
+            "InputGradBF16_1024_2048_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.9.linear_attn.in_proj_b.weight_t.nf4",
+            "model.layers.9.linear_attn.in_proj_b.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_16_64",
+            "InputGradBF16_1024_16_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.9.linear_attn.in_proj_a.weight_t.nf4",
+            "model.layers.9.linear_attn.in_proj_a.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_16_64",
+            "InputGradBF16_1024_16_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.9.linear_attn.out_proj.weight_t.nf4",
+            "model.layers.9.linear_attn.out_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_2048_1024_64",
+            "InputGradBF16_2048_1024_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.9.mlp.gate_proj.weight_t.nf4",
+            "model.layers.9.mlp.gate_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_3584_64",
+            "InputGradBF16_1024_3584_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.9.mlp.up_proj.weight_t.nf4",
+            "model.layers.9.mlp.up_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_3584_64",
+            "InputGradBF16_1024_3584_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.9.mlp.down_proj.weight_t.nf4",
+            "model.layers.9.mlp.down_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_3584_1024_64",
+            "InputGradBF16_3584_1024_64"
+          ]
+        }
+      ]
+    },
+    {
+      "graph": "block_11_backward.onnx",
+      "calls": 16,
+      "unique_weight_arguments": 8,
+      "repeated": [
+        {
+          "arguments": [
+            "model.layers.10.linear_attn.in_proj_qkv.weight_t.nf4",
+            "model.layers.10.linear_attn.in_proj_qkv.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_6144_64",
+            "InputGradBF16_1024_6144_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.10.linear_attn.in_proj_z.weight_t.nf4",
+            "model.layers.10.linear_attn.in_proj_z.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_2048_64",
+            "InputGradBF16_1024_2048_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.10.linear_attn.in_proj_b.weight_t.nf4",
+            "model.layers.10.linear_attn.in_proj_b.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_16_64",
+            "InputGradBF16_1024_16_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.10.linear_attn.in_proj_a.weight_t.nf4",
+            "model.layers.10.linear_attn.in_proj_a.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_16_64",
+            "InputGradBF16_1024_16_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.10.linear_attn.out_proj.weight_t.nf4",
+            "model.layers.10.linear_attn.out_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_2048_1024_64",
+            "InputGradBF16_2048_1024_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.10.mlp.gate_proj.weight_t.nf4",
+            "model.layers.10.mlp.gate_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_3584_64",
+            "InputGradBF16_1024_3584_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.10.mlp.up_proj.weight_t.nf4",
+            "model.layers.10.mlp.up_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_3584_64",
+            "InputGradBF16_1024_3584_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.10.mlp.down_proj.weight_t.nf4",
+            "model.layers.10.mlp.down_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_3584_1024_64",
+            "InputGradBF16_3584_1024_64"
+          ]
+        }
+      ]
+    },
+    {
+      "graph": "block_12_backward.onnx",
+      "calls": 14,
+      "unique_weight_arguments": 7,
+      "repeated": [
+        {
+          "arguments": [
+            "model.layers.11.self_attn.q_proj.weight_t.nf4",
+            "model.layers.11.self_attn.q_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_4096_64",
+            "InputGradBF16_1024_4096_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.11.self_attn.k_proj.weight_t.nf4",
+            "model.layers.11.self_attn.k_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_512_64",
+            "InputGradBF16_1024_512_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.11.self_attn.v_proj.weight_t.nf4",
+            "model.layers.11.self_attn.v_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_512_64",
+            "InputGradBF16_1024_512_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.11.self_attn.o_proj.weight_t.nf4",
+            "model.layers.11.self_attn.o_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_2048_1024_64",
+            "InputGradBF16_2048_1024_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.11.mlp.gate_proj.weight_t.nf4",
+            "model.layers.11.mlp.gate_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_3584_64",
+            "InputGradBF16_1024_3584_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.11.mlp.up_proj.weight_t.nf4",
+            "model.layers.11.mlp.up_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_3584_64",
+            "InputGradBF16_1024_3584_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.11.mlp.down_proj.weight_t.nf4",
+            "model.layers.11.mlp.down_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_3584_1024_64",
+            "InputGradBF16_3584_1024_64"
+          ]
+        }
+      ]
+    },
+    {
+      "graph": "block_13_backward.onnx",
+      "calls": 16,
+      "unique_weight_arguments": 8,
+      "repeated": [
+        {
+          "arguments": [
+            "model.layers.12.linear_attn.in_proj_qkv.weight_t.nf4",
+            "model.layers.12.linear_attn.in_proj_qkv.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_6144_64",
+            "InputGradBF16_1024_6144_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.12.linear_attn.in_proj_z.weight_t.nf4",
+            "model.layers.12.linear_attn.in_proj_z.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_2048_64",
+            "InputGradBF16_1024_2048_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.12.linear_attn.in_proj_b.weight_t.nf4",
+            "model.layers.12.linear_attn.in_proj_b.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_16_64",
+            "InputGradBF16_1024_16_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.12.linear_attn.in_proj_a.weight_t.nf4",
+            "model.layers.12.linear_attn.in_proj_a.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_16_64",
+            "InputGradBF16_1024_16_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.12.linear_attn.out_proj.weight_t.nf4",
+            "model.layers.12.linear_attn.out_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_2048_1024_64",
+            "InputGradBF16_2048_1024_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.12.mlp.gate_proj.weight_t.nf4",
+            "model.layers.12.mlp.gate_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_3584_64",
+            "InputGradBF16_1024_3584_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.12.mlp.up_proj.weight_t.nf4",
+            "model.layers.12.mlp.up_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_3584_64",
+            "InputGradBF16_1024_3584_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.12.mlp.down_proj.weight_t.nf4",
+            "model.layers.12.mlp.down_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_3584_1024_64",
+            "InputGradBF16_3584_1024_64"
+          ]
+        }
+      ]
+    },
+    {
+      "graph": "block_14_backward.onnx",
+      "calls": 16,
+      "unique_weight_arguments": 8,
+      "repeated": [
+        {
+          "arguments": [
+            "model.layers.13.linear_attn.in_proj_qkv.weight_t.nf4",
+            "model.layers.13.linear_attn.in_proj_qkv.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_6144_64",
+            "InputGradBF16_1024_6144_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.13.linear_attn.in_proj_z.weight_t.nf4",
+            "model.layers.13.linear_attn.in_proj_z.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_2048_64",
+            "InputGradBF16_1024_2048_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.13.linear_attn.in_proj_b.weight_t.nf4",
+            "model.layers.13.linear_attn.in_proj_b.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_16_64",
+            "InputGradBF16_1024_16_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.13.linear_attn.in_proj_a.weight_t.nf4",
+            "model.layers.13.linear_attn.in_proj_a.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_16_64",
+            "InputGradBF16_1024_16_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.13.linear_attn.out_proj.weight_t.nf4",
+            "model.layers.13.linear_attn.out_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_2048_1024_64",
+            "InputGradBF16_2048_1024_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.13.mlp.gate_proj.weight_t.nf4",
+            "model.layers.13.mlp.gate_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_3584_64",
+            "InputGradBF16_1024_3584_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.13.mlp.up_proj.weight_t.nf4",
+            "model.layers.13.mlp.up_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_3584_64",
+            "InputGradBF16_1024_3584_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.13.mlp.down_proj.weight_t.nf4",
+            "model.layers.13.mlp.down_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_3584_1024_64",
+            "InputGradBF16_3584_1024_64"
+          ]
+        }
+      ]
+    },
+    {
+      "graph": "block_15_backward.onnx",
+      "calls": 16,
+      "unique_weight_arguments": 8,
+      "repeated": [
+        {
+          "arguments": [
+            "model.layers.14.linear_attn.in_proj_qkv.weight_t.nf4",
+            "model.layers.14.linear_attn.in_proj_qkv.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_6144_64",
+            "InputGradBF16_1024_6144_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.14.linear_attn.in_proj_z.weight_t.nf4",
+            "model.layers.14.linear_attn.in_proj_z.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_2048_64",
+            "InputGradBF16_1024_2048_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.14.linear_attn.in_proj_b.weight_t.nf4",
+            "model.layers.14.linear_attn.in_proj_b.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_16_64",
+            "InputGradBF16_1024_16_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.14.linear_attn.in_proj_a.weight_t.nf4",
+            "model.layers.14.linear_attn.in_proj_a.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_16_64",
+            "InputGradBF16_1024_16_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.14.linear_attn.out_proj.weight_t.nf4",
+            "model.layers.14.linear_attn.out_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_2048_1024_64",
+            "InputGradBF16_2048_1024_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.14.mlp.gate_proj.weight_t.nf4",
+            "model.layers.14.mlp.gate_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_3584_64",
+            "InputGradBF16_1024_3584_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.14.mlp.up_proj.weight_t.nf4",
+            "model.layers.14.mlp.up_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_3584_64",
+            "InputGradBF16_1024_3584_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.14.mlp.down_proj.weight_t.nf4",
+            "model.layers.14.mlp.down_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_3584_1024_64",
+            "InputGradBF16_3584_1024_64"
+          ]
+        }
+      ]
+    },
+    {
+      "graph": "block_16_backward.onnx",
+      "calls": 14,
+      "unique_weight_arguments": 7,
+      "repeated": [
+        {
+          "arguments": [
+            "model.layers.15.self_attn.q_proj.weight_t.nf4",
+            "model.layers.15.self_attn.q_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_4096_64",
+            "InputGradBF16_1024_4096_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.15.self_attn.k_proj.weight_t.nf4",
+            "model.layers.15.self_attn.k_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_512_64",
+            "InputGradBF16_1024_512_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.15.self_attn.v_proj.weight_t.nf4",
+            "model.layers.15.self_attn.v_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_512_64",
+            "InputGradBF16_1024_512_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.15.self_attn.o_proj.weight_t.nf4",
+            "model.layers.15.self_attn.o_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_2048_1024_64",
+            "InputGradBF16_2048_1024_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.15.mlp.gate_proj.weight_t.nf4",
+            "model.layers.15.mlp.gate_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_3584_64",
+            "InputGradBF16_1024_3584_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.15.mlp.up_proj.weight_t.nf4",
+            "model.layers.15.mlp.up_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_3584_64",
+            "InputGradBF16_1024_3584_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.15.mlp.down_proj.weight_t.nf4",
+            "model.layers.15.mlp.down_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_3584_1024_64",
+            "InputGradBF16_3584_1024_64"
+          ]
+        }
+      ]
+    },
+    {
+      "graph": "block_17_backward.onnx",
+      "calls": 16,
+      "unique_weight_arguments": 8,
+      "repeated": [
+        {
+          "arguments": [
+            "model.layers.16.linear_attn.in_proj_qkv.weight_t.nf4",
+            "model.layers.16.linear_attn.in_proj_qkv.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_6144_64",
+            "InputGradBF16_1024_6144_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.16.linear_attn.in_proj_z.weight_t.nf4",
+            "model.layers.16.linear_attn.in_proj_z.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_2048_64",
+            "InputGradBF16_1024_2048_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.16.linear_attn.in_proj_b.weight_t.nf4",
+            "model.layers.16.linear_attn.in_proj_b.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_16_64",
+            "InputGradBF16_1024_16_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.16.linear_attn.in_proj_a.weight_t.nf4",
+            "model.layers.16.linear_attn.in_proj_a.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_16_64",
+            "InputGradBF16_1024_16_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.16.linear_attn.out_proj.weight_t.nf4",
+            "model.layers.16.linear_attn.out_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_2048_1024_64",
+            "InputGradBF16_2048_1024_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.16.mlp.gate_proj.weight_t.nf4",
+            "model.layers.16.mlp.gate_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_3584_64",
+            "InputGradBF16_1024_3584_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.16.mlp.up_proj.weight_t.nf4",
+            "model.layers.16.mlp.up_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_3584_64",
+            "InputGradBF16_1024_3584_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.16.mlp.down_proj.weight_t.nf4",
+            "model.layers.16.mlp.down_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_3584_1024_64",
+            "InputGradBF16_3584_1024_64"
+          ]
+        }
+      ]
+    },
+    {
+      "graph": "block_18_backward.onnx",
+      "calls": 16,
+      "unique_weight_arguments": 8,
+      "repeated": [
+        {
+          "arguments": [
+            "model.layers.17.linear_attn.in_proj_qkv.weight_t.nf4",
+            "model.layers.17.linear_attn.in_proj_qkv.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_6144_64",
+            "InputGradBF16_1024_6144_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.17.linear_attn.in_proj_z.weight_t.nf4",
+            "model.layers.17.linear_attn.in_proj_z.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_2048_64",
+            "InputGradBF16_1024_2048_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.17.linear_attn.in_proj_b.weight_t.nf4",
+            "model.layers.17.linear_attn.in_proj_b.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_16_64",
+            "InputGradBF16_1024_16_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.17.linear_attn.in_proj_a.weight_t.nf4",
+            "model.layers.17.linear_attn.in_proj_a.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_16_64",
+            "InputGradBF16_1024_16_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.17.linear_attn.out_proj.weight_t.nf4",
+            "model.layers.17.linear_attn.out_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_2048_1024_64",
+            "InputGradBF16_2048_1024_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.17.mlp.gate_proj.weight_t.nf4",
+            "model.layers.17.mlp.gate_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_3584_64",
+            "InputGradBF16_1024_3584_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.17.mlp.up_proj.weight_t.nf4",
+            "model.layers.17.mlp.up_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_3584_64",
+            "InputGradBF16_1024_3584_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.17.mlp.down_proj.weight_t.nf4",
+            "model.layers.17.mlp.down_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_3584_1024_64",
+            "InputGradBF16_3584_1024_64"
+          ]
+        }
+      ]
+    },
+    {
+      "graph": "block_19_backward.onnx",
+      "calls": 16,
+      "unique_weight_arguments": 8,
+      "repeated": [
+        {
+          "arguments": [
+            "model.layers.18.linear_attn.in_proj_qkv.weight_t.nf4",
+            "model.layers.18.linear_attn.in_proj_qkv.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_6144_64",
+            "InputGradBF16_1024_6144_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.18.linear_attn.in_proj_z.weight_t.nf4",
+            "model.layers.18.linear_attn.in_proj_z.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_2048_64",
+            "InputGradBF16_1024_2048_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.18.linear_attn.in_proj_b.weight_t.nf4",
+            "model.layers.18.linear_attn.in_proj_b.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_16_64",
+            "InputGradBF16_1024_16_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.18.linear_attn.in_proj_a.weight_t.nf4",
+            "model.layers.18.linear_attn.in_proj_a.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_16_64",
+            "InputGradBF16_1024_16_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.18.linear_attn.out_proj.weight_t.nf4",
+            "model.layers.18.linear_attn.out_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_2048_1024_64",
+            "InputGradBF16_2048_1024_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.18.mlp.gate_proj.weight_t.nf4",
+            "model.layers.18.mlp.gate_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_3584_64",
+            "InputGradBF16_1024_3584_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.18.mlp.up_proj.weight_t.nf4",
+            "model.layers.18.mlp.up_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_3584_64",
+            "InputGradBF16_1024_3584_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.18.mlp.down_proj.weight_t.nf4",
+            "model.layers.18.mlp.down_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_3584_1024_64",
+            "InputGradBF16_3584_1024_64"
+          ]
+        }
+      ]
+    },
+    {
+      "graph": "block_1_backward.onnx",
+      "calls": 12,
+      "unique_weight_arguments": 8,
+      "repeated": [
+        {
+          "arguments": [
+            "model.layers.0.linear_attn.out_proj.weight_t.nf4",
+            "model.layers.0.linear_attn.out_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_2048_1024_64",
+            "InputGradBF16_2048_1024_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.0.mlp.gate_proj.weight_t.nf4",
+            "model.layers.0.mlp.gate_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_3584_64",
+            "InputGradBF16_1024_3584_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.0.mlp.up_proj.weight_t.nf4",
+            "model.layers.0.mlp.up_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_3584_64",
+            "InputGradBF16_1024_3584_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.0.mlp.down_proj.weight_t.nf4",
+            "model.layers.0.mlp.down_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_3584_1024_64",
+            "InputGradBF16_3584_1024_64"
+          ]
+        }
+      ]
+    },
+    {
+      "graph": "block_20_backward.onnx",
+      "calls": 14,
+      "unique_weight_arguments": 7,
+      "repeated": [
+        {
+          "arguments": [
+            "model.layers.19.self_attn.q_proj.weight_t.nf4",
+            "model.layers.19.self_attn.q_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_4096_64",
+            "InputGradBF16_1024_4096_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.19.self_attn.k_proj.weight_t.nf4",
+            "model.layers.19.self_attn.k_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_512_64",
+            "InputGradBF16_1024_512_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.19.self_attn.v_proj.weight_t.nf4",
+            "model.layers.19.self_attn.v_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_512_64",
+            "InputGradBF16_1024_512_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.19.self_attn.o_proj.weight_t.nf4",
+            "model.layers.19.self_attn.o_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_2048_1024_64",
+            "InputGradBF16_2048_1024_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.19.mlp.gate_proj.weight_t.nf4",
+            "model.layers.19.mlp.gate_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_3584_64",
+            "InputGradBF16_1024_3584_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.19.mlp.up_proj.weight_t.nf4",
+            "model.layers.19.mlp.up_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_3584_64",
+            "InputGradBF16_1024_3584_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.19.mlp.down_proj.weight_t.nf4",
+            "model.layers.19.mlp.down_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_3584_1024_64",
+            "InputGradBF16_3584_1024_64"
+          ]
+        }
+      ]
+    },
+    {
+      "graph": "block_21_backward.onnx",
+      "calls": 16,
+      "unique_weight_arguments": 8,
+      "repeated": [
+        {
+          "arguments": [
+            "model.layers.20.linear_attn.in_proj_qkv.weight_t.nf4",
+            "model.layers.20.linear_attn.in_proj_qkv.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_6144_64",
+            "InputGradBF16_1024_6144_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.20.linear_attn.in_proj_z.weight_t.nf4",
+            "model.layers.20.linear_attn.in_proj_z.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_2048_64",
+            "InputGradBF16_1024_2048_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.20.linear_attn.in_proj_b.weight_t.nf4",
+            "model.layers.20.linear_attn.in_proj_b.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_16_64",
+            "InputGradBF16_1024_16_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.20.linear_attn.in_proj_a.weight_t.nf4",
+            "model.layers.20.linear_attn.in_proj_a.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_16_64",
+            "InputGradBF16_1024_16_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.20.linear_attn.out_proj.weight_t.nf4",
+            "model.layers.20.linear_attn.out_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_2048_1024_64",
+            "InputGradBF16_2048_1024_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.20.mlp.gate_proj.weight_t.nf4",
+            "model.layers.20.mlp.gate_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_3584_64",
+            "InputGradBF16_1024_3584_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.20.mlp.up_proj.weight_t.nf4",
+            "model.layers.20.mlp.up_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_3584_64",
+            "InputGradBF16_1024_3584_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.20.mlp.down_proj.weight_t.nf4",
+            "model.layers.20.mlp.down_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_3584_1024_64",
+            "InputGradBF16_3584_1024_64"
+          ]
+        }
+      ]
+    },
+    {
+      "graph": "block_22_backward.onnx",
+      "calls": 16,
+      "unique_weight_arguments": 8,
+      "repeated": [
+        {
+          "arguments": [
+            "model.layers.21.linear_attn.in_proj_qkv.weight_t.nf4",
+            "model.layers.21.linear_attn.in_proj_qkv.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_6144_64",
+            "InputGradBF16_1024_6144_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.21.linear_attn.in_proj_z.weight_t.nf4",
+            "model.layers.21.linear_attn.in_proj_z.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_2048_64",
+            "InputGradBF16_1024_2048_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.21.linear_attn.in_proj_b.weight_t.nf4",
+            "model.layers.21.linear_attn.in_proj_b.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_16_64",
+            "InputGradBF16_1024_16_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.21.linear_attn.in_proj_a.weight_t.nf4",
+            "model.layers.21.linear_attn.in_proj_a.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_16_64",
+            "InputGradBF16_1024_16_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.21.linear_attn.out_proj.weight_t.nf4",
+            "model.layers.21.linear_attn.out_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_2048_1024_64",
+            "InputGradBF16_2048_1024_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.21.mlp.gate_proj.weight_t.nf4",
+            "model.layers.21.mlp.gate_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_3584_64",
+            "InputGradBF16_1024_3584_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.21.mlp.up_proj.weight_t.nf4",
+            "model.layers.21.mlp.up_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_3584_64",
+            "InputGradBF16_1024_3584_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.21.mlp.down_proj.weight_t.nf4",
+            "model.layers.21.mlp.down_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_3584_1024_64",
+            "InputGradBF16_3584_1024_64"
+          ]
+        }
+      ]
+    },
+    {
+      "graph": "block_23_backward.onnx",
+      "calls": 16,
+      "unique_weight_arguments": 8,
+      "repeated": [
+        {
+          "arguments": [
+            "model.layers.22.linear_attn.in_proj_qkv.weight_t.nf4",
+            "model.layers.22.linear_attn.in_proj_qkv.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_6144_64",
+            "InputGradBF16_1024_6144_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.22.linear_attn.in_proj_z.weight_t.nf4",
+            "model.layers.22.linear_attn.in_proj_z.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_2048_64",
+            "InputGradBF16_1024_2048_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.22.linear_attn.in_proj_b.weight_t.nf4",
+            "model.layers.22.linear_attn.in_proj_b.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_16_64",
+            "InputGradBF16_1024_16_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.22.linear_attn.in_proj_a.weight_t.nf4",
+            "model.layers.22.linear_attn.in_proj_a.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_16_64",
+            "InputGradBF16_1024_16_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.22.linear_attn.out_proj.weight_t.nf4",
+            "model.layers.22.linear_attn.out_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_2048_1024_64",
+            "InputGradBF16_2048_1024_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.22.mlp.gate_proj.weight_t.nf4",
+            "model.layers.22.mlp.gate_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_3584_64",
+            "InputGradBF16_1024_3584_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.22.mlp.up_proj.weight_t.nf4",
+            "model.layers.22.mlp.up_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_3584_64",
+            "InputGradBF16_1024_3584_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.22.mlp.down_proj.weight_t.nf4",
+            "model.layers.22.mlp.down_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_3584_1024_64",
+            "InputGradBF16_3584_1024_64"
+          ]
+        }
+      ]
+    },
+    {
+      "graph": "block_24_backward.onnx",
+      "calls": 14,
+      "unique_weight_arguments": 7,
+      "repeated": [
+        {
+          "arguments": [
+            "model.layers.23.self_attn.q_proj.weight_t.nf4",
+            "model.layers.23.self_attn.q_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_4096_64",
+            "InputGradBF16_1024_4096_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.23.self_attn.k_proj.weight_t.nf4",
+            "model.layers.23.self_attn.k_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_512_64",
+            "InputGradBF16_1024_512_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.23.self_attn.v_proj.weight_t.nf4",
+            "model.layers.23.self_attn.v_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_512_64",
+            "InputGradBF16_1024_512_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.23.self_attn.o_proj.weight_t.nf4",
+            "model.layers.23.self_attn.o_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_2048_1024_64",
+            "InputGradBF16_2048_1024_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.23.mlp.gate_proj.weight_t.nf4",
+            "model.layers.23.mlp.gate_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_3584_64",
+            "InputGradBF16_1024_3584_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.23.mlp.up_proj.weight_t.nf4",
+            "model.layers.23.mlp.up_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_3584_64",
+            "InputGradBF16_1024_3584_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.23.mlp.down_proj.weight_t.nf4",
+            "model.layers.23.mlp.down_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_3584_1024_64",
+            "InputGradBF16_3584_1024_64"
+          ]
+        }
+      ]
+    },
+    {
+      "graph": "block_2_backward.onnx",
+      "calls": 16,
+      "unique_weight_arguments": 8,
+      "repeated": [
+        {
+          "arguments": [
+            "model.layers.1.linear_attn.in_proj_qkv.weight_t.nf4",
+            "model.layers.1.linear_attn.in_proj_qkv.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_6144_64",
+            "InputGradBF16_1024_6144_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.1.linear_attn.in_proj_z.weight_t.nf4",
+            "model.layers.1.linear_attn.in_proj_z.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_2048_64",
+            "InputGradBF16_1024_2048_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.1.linear_attn.in_proj_b.weight_t.nf4",
+            "model.layers.1.linear_attn.in_proj_b.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_16_64",
+            "InputGradBF16_1024_16_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.1.linear_attn.in_proj_a.weight_t.nf4",
+            "model.layers.1.linear_attn.in_proj_a.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_16_64",
+            "InputGradBF16_1024_16_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.1.linear_attn.out_proj.weight_t.nf4",
+            "model.layers.1.linear_attn.out_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_2048_1024_64",
+            "InputGradBF16_2048_1024_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.1.mlp.gate_proj.weight_t.nf4",
+            "model.layers.1.mlp.gate_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_3584_64",
+            "InputGradBF16_1024_3584_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.1.mlp.up_proj.weight_t.nf4",
+            "model.layers.1.mlp.up_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_3584_64",
+            "InputGradBF16_1024_3584_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.1.mlp.down_proj.weight_t.nf4",
+            "model.layers.1.mlp.down_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_3584_1024_64",
+            "InputGradBF16_3584_1024_64"
+          ]
+        }
+      ]
+    },
+    {
+      "graph": "block_3_backward.onnx",
+      "calls": 16,
+      "unique_weight_arguments": 8,
+      "repeated": [
+        {
+          "arguments": [
+            "model.layers.2.linear_attn.in_proj_qkv.weight_t.nf4",
+            "model.layers.2.linear_attn.in_proj_qkv.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_6144_64",
+            "InputGradBF16_1024_6144_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.2.linear_attn.in_proj_z.weight_t.nf4",
+            "model.layers.2.linear_attn.in_proj_z.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_2048_64",
+            "InputGradBF16_1024_2048_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.2.linear_attn.in_proj_b.weight_t.nf4",
+            "model.layers.2.linear_attn.in_proj_b.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_16_64",
+            "InputGradBF16_1024_16_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.2.linear_attn.in_proj_a.weight_t.nf4",
+            "model.layers.2.linear_attn.in_proj_a.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_16_64",
+            "InputGradBF16_1024_16_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.2.linear_attn.out_proj.weight_t.nf4",
+            "model.layers.2.linear_attn.out_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_2048_1024_64",
+            "InputGradBF16_2048_1024_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.2.mlp.gate_proj.weight_t.nf4",
+            "model.layers.2.mlp.gate_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_3584_64",
+            "InputGradBF16_1024_3584_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.2.mlp.up_proj.weight_t.nf4",
+            "model.layers.2.mlp.up_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_3584_64",
+            "InputGradBF16_1024_3584_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.2.mlp.down_proj.weight_t.nf4",
+            "model.layers.2.mlp.down_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_3584_1024_64",
+            "InputGradBF16_3584_1024_64"
+          ]
+        }
+      ]
+    },
+    {
+      "graph": "block_4_backward.onnx",
+      "calls": 14,
+      "unique_weight_arguments": 7,
+      "repeated": [
+        {
+          "arguments": [
+            "model.layers.3.self_attn.q_proj.weight_t.nf4",
+            "model.layers.3.self_attn.q_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_4096_64",
+            "InputGradBF16_1024_4096_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.3.self_attn.k_proj.weight_t.nf4",
+            "model.layers.3.self_attn.k_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_512_64",
+            "InputGradBF16_1024_512_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.3.self_attn.v_proj.weight_t.nf4",
+            "model.layers.3.self_attn.v_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_512_64",
+            "InputGradBF16_1024_512_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.3.self_attn.o_proj.weight_t.nf4",
+            "model.layers.3.self_attn.o_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_2048_1024_64",
+            "InputGradBF16_2048_1024_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.3.mlp.gate_proj.weight_t.nf4",
+            "model.layers.3.mlp.gate_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_3584_64",
+            "InputGradBF16_1024_3584_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.3.mlp.up_proj.weight_t.nf4",
+            "model.layers.3.mlp.up_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_3584_64",
+            "InputGradBF16_1024_3584_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.3.mlp.down_proj.weight_t.nf4",
+            "model.layers.3.mlp.down_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_3584_1024_64",
+            "InputGradBF16_3584_1024_64"
+          ]
+        }
+      ]
+    },
+    {
+      "graph": "block_5_backward.onnx",
+      "calls": 16,
+      "unique_weight_arguments": 8,
+      "repeated": [
+        {
+          "arguments": [
+            "model.layers.4.linear_attn.in_proj_qkv.weight_t.nf4",
+            "model.layers.4.linear_attn.in_proj_qkv.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_6144_64",
+            "InputGradBF16_1024_6144_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.4.linear_attn.in_proj_z.weight_t.nf4",
+            "model.layers.4.linear_attn.in_proj_z.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_2048_64",
+            "InputGradBF16_1024_2048_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.4.linear_attn.in_proj_b.weight_t.nf4",
+            "model.layers.4.linear_attn.in_proj_b.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_16_64",
+            "InputGradBF16_1024_16_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.4.linear_attn.in_proj_a.weight_t.nf4",
+            "model.layers.4.linear_attn.in_proj_a.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_16_64",
+            "InputGradBF16_1024_16_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.4.linear_attn.out_proj.weight_t.nf4",
+            "model.layers.4.linear_attn.out_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_2048_1024_64",
+            "InputGradBF16_2048_1024_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.4.mlp.gate_proj.weight_t.nf4",
+            "model.layers.4.mlp.gate_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_3584_64",
+            "InputGradBF16_1024_3584_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.4.mlp.up_proj.weight_t.nf4",
+            "model.layers.4.mlp.up_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_3584_64",
+            "InputGradBF16_1024_3584_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.4.mlp.down_proj.weight_t.nf4",
+            "model.layers.4.mlp.down_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_3584_1024_64",
+            "InputGradBF16_3584_1024_64"
+          ]
+        }
+      ]
+    },
+    {
+      "graph": "block_6_backward.onnx",
+      "calls": 16,
+      "unique_weight_arguments": 8,
+      "repeated": [
+        {
+          "arguments": [
+            "model.layers.5.linear_attn.in_proj_qkv.weight_t.nf4",
+            "model.layers.5.linear_attn.in_proj_qkv.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_6144_64",
+            "InputGradBF16_1024_6144_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.5.linear_attn.in_proj_z.weight_t.nf4",
+            "model.layers.5.linear_attn.in_proj_z.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_2048_64",
+            "InputGradBF16_1024_2048_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.5.linear_attn.in_proj_b.weight_t.nf4",
+            "model.layers.5.linear_attn.in_proj_b.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_16_64",
+            "InputGradBF16_1024_16_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.5.linear_attn.in_proj_a.weight_t.nf4",
+            "model.layers.5.linear_attn.in_proj_a.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_16_64",
+            "InputGradBF16_1024_16_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.5.linear_attn.out_proj.weight_t.nf4",
+            "model.layers.5.linear_attn.out_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_2048_1024_64",
+            "InputGradBF16_2048_1024_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.5.mlp.gate_proj.weight_t.nf4",
+            "model.layers.5.mlp.gate_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_3584_64",
+            "InputGradBF16_1024_3584_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.5.mlp.up_proj.weight_t.nf4",
+            "model.layers.5.mlp.up_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_3584_64",
+            "InputGradBF16_1024_3584_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.5.mlp.down_proj.weight_t.nf4",
+            "model.layers.5.mlp.down_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_3584_1024_64",
+            "InputGradBF16_3584_1024_64"
+          ]
+        }
+      ]
+    },
+    {
+      "graph": "block_7_backward.onnx",
+      "calls": 16,
+      "unique_weight_arguments": 8,
+      "repeated": [
+        {
+          "arguments": [
+            "model.layers.6.linear_attn.in_proj_qkv.weight_t.nf4",
+            "model.layers.6.linear_attn.in_proj_qkv.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_6144_64",
+            "InputGradBF16_1024_6144_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.6.linear_attn.in_proj_z.weight_t.nf4",
+            "model.layers.6.linear_attn.in_proj_z.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_2048_64",
+            "InputGradBF16_1024_2048_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.6.linear_attn.in_proj_b.weight_t.nf4",
+            "model.layers.6.linear_attn.in_proj_b.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_16_64",
+            "InputGradBF16_1024_16_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.6.linear_attn.in_proj_a.weight_t.nf4",
+            "model.layers.6.linear_attn.in_proj_a.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_16_64",
+            "InputGradBF16_1024_16_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.6.linear_attn.out_proj.weight_t.nf4",
+            "model.layers.6.linear_attn.out_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_2048_1024_64",
+            "InputGradBF16_2048_1024_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.6.mlp.gate_proj.weight_t.nf4",
+            "model.layers.6.mlp.gate_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_3584_64",
+            "InputGradBF16_1024_3584_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.6.mlp.up_proj.weight_t.nf4",
+            "model.layers.6.mlp.up_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_3584_64",
+            "InputGradBF16_1024_3584_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.6.mlp.down_proj.weight_t.nf4",
+            "model.layers.6.mlp.down_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_3584_1024_64",
+            "InputGradBF16_3584_1024_64"
+          ]
+        }
+      ]
+    },
+    {
+      "graph": "block_8_backward.onnx",
+      "calls": 14,
+      "unique_weight_arguments": 7,
+      "repeated": [
+        {
+          "arguments": [
+            "model.layers.7.self_attn.q_proj.weight_t.nf4",
+            "model.layers.7.self_attn.q_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_4096_64",
+            "InputGradBF16_1024_4096_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.7.self_attn.k_proj.weight_t.nf4",
+            "model.layers.7.self_attn.k_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_512_64",
+            "InputGradBF16_1024_512_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.7.self_attn.v_proj.weight_t.nf4",
+            "model.layers.7.self_attn.v_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_512_64",
+            "InputGradBF16_1024_512_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.7.self_attn.o_proj.weight_t.nf4",
+            "model.layers.7.self_attn.o_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_2048_1024_64",
+            "InputGradBF16_2048_1024_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.7.mlp.gate_proj.weight_t.nf4",
+            "model.layers.7.mlp.gate_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_3584_64",
+            "InputGradBF16_1024_3584_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.7.mlp.up_proj.weight_t.nf4",
+            "model.layers.7.mlp.up_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_3584_64",
+            "InputGradBF16_1024_3584_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.7.mlp.down_proj.weight_t.nf4",
+            "model.layers.7.mlp.down_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_3584_1024_64",
+            "InputGradBF16_3584_1024_64"
+          ]
+        }
+      ]
+    },
+    {
+      "graph": "block_9_backward.onnx",
+      "calls": 16,
+      "unique_weight_arguments": 8,
+      "repeated": [
+        {
+          "arguments": [
+            "model.layers.8.linear_attn.in_proj_qkv.weight_t.nf4",
+            "model.layers.8.linear_attn.in_proj_qkv.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_6144_64",
+            "InputGradBF16_1024_6144_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.8.linear_attn.in_proj_z.weight_t.nf4",
+            "model.layers.8.linear_attn.in_proj_z.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_2048_64",
+            "InputGradBF16_1024_2048_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.8.linear_attn.in_proj_b.weight_t.nf4",
+            "model.layers.8.linear_attn.in_proj_b.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_16_64",
+            "InputGradBF16_1024_16_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.8.linear_attn.in_proj_a.weight_t.nf4",
+            "model.layers.8.linear_attn.in_proj_a.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_16_64",
+            "InputGradBF16_1024_16_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.8.linear_attn.out_proj.weight_t.nf4",
+            "model.layers.8.linear_attn.out_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_2048_1024_64",
+            "InputGradBF16_2048_1024_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.8.mlp.gate_proj.weight_t.nf4",
+            "model.layers.8.mlp.gate_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_3584_64",
+            "InputGradBF16_1024_3584_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.8.mlp.up_proj.weight_t.nf4",
+            "model.layers.8.mlp.up_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_1024_3584_64",
+            "InputGradBF16_1024_3584_64"
+          ]
+        },
+        {
+          "arguments": [
+            "model.layers.8.mlp.down_proj.weight_t.nf4",
+            "model.layers.8.mlp.down_proj.weight_t.absmax"
+          ],
+          "calls": [
+            "MatMulBF16_3584_1024_64",
+            "InputGradBF16_3584_1024_64"
+          ]
+        }
+      ]
+    }
+  ],
+  "calls": 368,
+  "unique_weight_arguments_per_graph": 186,
+  "repeated_groups": 182
+}

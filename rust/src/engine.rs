@@ -767,6 +767,8 @@ pub struct TranslationContext<'a> {
     /// must never be retained across Compute calls, while repeated Q/K/V and gate/up projections
     /// should share one explicit activation cast inside the compiled closure.
     astype_cache: HashMap<(usize, u32), mlxsys::mlx_array>,
+    /// Fused-handler intermediates shared only within this graph translation.
+    temporary_arrays: HashMap<String, mlxsys::mlx_array>,
     shape_stream: Option<mlx::Stream>,
     cpu_shape_ops: bool,
     /// Immutable Cast/Transpose/Identity provenance; runtime data never enters this map.
@@ -840,6 +842,7 @@ impl<'a> TranslationContext<'a> {
             arena: Vec::new(),
             input_arena: Vec::new(),
             astype_cache: HashMap::new(),
+            temporary_arrays: HashMap::new(),
             shape_stream: None,
             cpu_shape_ops: std::env::var_os("ONNXRUNTIME_EP_MLX_GPU_SHAPE_OPS")
                 .is_none_or(|v| v != "1"),
@@ -1019,6 +1022,16 @@ impl<'a> TranslationContext<'a> {
         let raw = a.as_raw();
         self.plan.cache.insert(key, a);
         raw
+    }
+
+    /// Borrow an arena-owned intermediate from this graph translation.
+    pub fn temporary_get(&self, key: &str) -> Option<mlxsys::mlx_array> {
+        self.temporary_arrays.get(key).copied()
+    }
+
+    /// Share an already arena-owned intermediate until the evaluation boundary.
+    pub fn temporary_put(&mut self, key: String, value: mlxsys::mlx_array) {
+        self.temporary_arrays.insert(key, value);
     }
 
     /// Bind a node output name to a produced MLX array (visible to downstream nodes and CopyOut).
@@ -2549,6 +2562,7 @@ impl<'a> TranslationContext<'a> {
         // after its final consumer has executed (notably large unpacked lookup matrices).
         self.env.clear();
         self.astype_cache.clear();
+        self.temporary_arrays.clear();
         self.frozen_views.clear();
         self.input_writebacks.clear();
         self.arena.clear();

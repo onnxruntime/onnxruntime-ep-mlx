@@ -549,6 +549,22 @@ fn decoded_gemm(
     pattern: &LookupMatMul,
     x: mlx::mlx_array,
 ) -> Result<mlx::mlx_array, MlxError> {
+    // The canonical decoded matrix is independent of transpose and the final
+    // compute dtype. A primal projection and its input adjoint can share it.
+    let decode_key = format!(
+        "lookup4:{}:{}:{}:{}:{}:{}:{:?}",
+        pattern.packed.cache_key(),
+        pattern.scales.cache_key(),
+        pattern.rows,
+        pattern.cols,
+        pattern.block,
+        pattern.rounding,
+        pattern.book.map(f32::to_bits)
+    );
+    if let Some(weight) = ctx.temporary_get(&decode_key) {
+        ctx.mark_fast("lookup4 reused decode + MLX GEMM");
+        return decoded_weight_gemm(ctx, pattern, x, weight);
+    }
     let packed = ctx.resolve(&pattern.packed)?;
     let scales = ctx.resolve(&pattern.scales)?;
     let key = format!("__lookup4_book__{:?}", pattern.book.map(f32::to_bits));
@@ -641,12 +657,22 @@ fn decoded_gemm(
     if rc != 0 || output.size() != 1 {
         return Err("lookup4 GEMM: decode dispatch failed".into());
     }
-    let mut weight = ctx.keep(output.get(0));
-    weight = rounded_weight(ctx, pattern, weight)?;
+    let weight = ctx.keep(output.get(0));
+    ctx.temporary_put(decode_key, weight);
+    ctx.mark_fast("lookup4 decode + MLX GEMM");
+    decoded_weight_gemm(ctx, pattern, x, weight)
+}
+
+fn decoded_weight_gemm(
+    ctx: &mut TranslationContext,
+    pattern: &LookupMatMul,
+    x: mlx::mlx_array,
+    weight: mlx::mlx_array,
+) -> Result<mlx::mlx_array, MlxError> {
+    let mut weight = rounded_weight(ctx, pattern, weight)?;
     if pattern.transpose {
         weight = ctx.transpose(weight, &[1, 0])?;
     }
-    ctx.mark_fast("lookup4 decode + MLX GEMM");
     ctx.binary(mlx::mlx_matmul, x, weight)
 }
 
