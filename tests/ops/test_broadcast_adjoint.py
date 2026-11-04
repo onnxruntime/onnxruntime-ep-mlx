@@ -6,7 +6,7 @@ import onnxruntime as ort
 import pytest
 
 
-def _function(shape_vector=False):
+def _function():
     gradient, reference = ir.val("Gradient"), ir.val("Reference")
     t = ir.tape.Tape()
 
@@ -16,7 +16,7 @@ def _function(shape_vector=False):
     def constant(value):
         return op("Constant", value=ir.tensor(np.asarray(value, np.int64)))
 
-    shape = reference if shape_vector else op("Shape", reference)
+    shape = reference
     gs = op("Shape", gradient)
     leading = op("Sub", op("Size", gs), op("Size", shape))
     ones = op(
@@ -32,7 +32,7 @@ def _function(shape_vector=False):
     result = op("Reshape", reduced, shape, allowzero=1)
     return ir.Function(
         "pkg.onnax",
-        "SumToShape_v2" if shape_vector else "SumToShape_v1",
+        "SumToShape",
         graph=ir.Graph(
             [gradient, reference], [result], nodes=t.nodes, opset_imports={"": 18}
         ),
@@ -50,29 +50,28 @@ def _bf16(values):
 @pytest.mark.parametrize(
     "dtype", [ir.DataType.FLOAT, ir.DataType.FLOAT16, ir.DataType.BFLOAT16]
 )
-@pytest.mark.parametrize("shape_vector", [False, True])
 @pytest.mark.parametrize("eager", [False, True])
 @pytest.mark.parametrize("ranks", [(2, 2), (2, 1), (2, 0), (0, 0)])
-def test_live_shapes_and_values(dtype, eager, ranks, shape_vector, monkeypatch):
+def test_live_shapes_and_values(dtype, eager, ranks, monkeypatch):
     monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_COMPILE", "1" if eager else "0")
     boundary = ir.DataType.FLOAT if dtype == ir.DataType.BFLOAT16 else dtype
     g = ir.val("g", dtype=boundary, shape=[None] * ranks[0])
     r = ir.val(
         "r",
-        dtype=ir.DataType.INT64 if shape_vector else boundary,
-        shape=[ranks[1]] if shape_vector else [None] * ranks[1],
+        dtype=ir.DataType.INT64,
+        shape=[ranks[1]],
     )
     t = ir.tape.Tape()
     inputs = (
         [
             t.op("Cast", [g], {"to": int(dtype)}),
-            r if shape_vector else t.op("Cast", [r], {"to": int(dtype)}),
+            r,
         ]
         if dtype == ir.DataType.BFLOAT16
         else [g, r]
     )
     y = t.op(
-        "SumToShape_v2" if shape_vector else "SumToShape_v1",
+        "SumToShape",
         inputs,
         domain="pkg.onnax",
         version=1,
@@ -80,7 +79,7 @@ def test_live_shapes_and_values(dtype, eager, ranks, shape_vector, monkeypatch):
     if dtype == ir.DataType.BFLOAT16:
         y = t.op("Cast", [y], {"to": int(boundary)})
     y.name, y.dtype, y.shape = "y", boundary, ir.Shape([None] * ranks[1])
-    f = _function(shape_vector)
+    f = _function()
     model = ir.Model(
         ir.Graph(
             [g, r],
@@ -132,9 +131,7 @@ def test_live_shapes_and_values(dtype, eager, ranks, shape_vector, monkeypatch):
             None,
             {
                 "g": data,
-                "r": np.asarray(target, np.int64)
-                if shape_vector
-                else np.full(target, np.nan, dtype=boundary.numpy()),
+                "r": np.asarray(target, np.int64),
             },
         )[0]
         assert actual.shape == target
@@ -157,26 +154,21 @@ def test_live_shapes_and_values(dtype, eager, ranks, shape_vector, monkeypatch):
                     None,
                     {
                         "g": data,
-                        "r": np.array([2, 2], np.int64)
-                        if shape_vector
-                        else np.ones((2, 2), np.float32),
+                        "r": np.array([2, 2], np.int64),
                     },
                 )
-            if shape_vector:
-                for invalid in ([-1, 3], [2**40, 1]):
-                    with pytest.raises(Exception, match="nonnegative int32"):
-                        runtime.run(
-                            None, {"g": data, "r": np.asarray(invalid, np.int64)}
-                        )
+            for invalid in ([-1, 3], [2**40, 1]):
+                with pytest.raises(Exception, match="nonnegative int32"):
+                    runtime.run(
+                        None, {"g": data, "r": np.asarray(invalid, np.int64)}
+                    )
             # A rejected shape must not poison the previously cached specialization.
             np.testing.assert_allclose(
                 runtime.run(
                     None,
                     {
                         "g": data,
-                        "r": np.asarray(target, np.int64)
-                        if shape_vector
-                        else np.ones(target, np.float32),
+                        "r": np.asarray(target, np.int64),
                     },
                 )[0],
                 expected,

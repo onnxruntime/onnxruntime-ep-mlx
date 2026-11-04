@@ -1,6 +1,6 @@
 # Attention pullbacks for training
 
-The provider executes versioned `pkg.onnax::AttentionVJP_v1_*` local functions
+The provider executes parameterized `pkg.onnax::AttentionVJP_*` local functions
 emitted by onnax's optional deployment pass. Each function also contains an
 ordinary ONNX implementation for other runtimes.
 
@@ -103,12 +103,11 @@ For short forward heads, see [fused attention padding](PADDED_ATTENTION.md).
 
 ## Recomputed short-head pullbacks
 
-`pkg.onnax::AttentionVJP_v2_*` takes Q, K, V, G and Mask. Mask carries a boolean
+`pkg.onnax::AttentionVJPRecompute_*` takes Q, K, V, G and Mask. Mask carries a boolean
 or additive bias; an unmasked function ignores its placeholder value.
-Its portable ONNX body recomputes Y before applying the pullback. The supplied-Y
-v1 interface retains its existing semantics.
+Its portable ONNX body recomputes Y before applying the pullback. `AttentionVJP_*` uses the supplied Y instead.
 
-The native v2 route supports FP32 attention, rank three or four, boolean and
+The native recomputing route supports FP32 attention, rank three or four, boolean and
 additive masks, causal attention, equal Q/K/V head widths from 32 through 256
 in multiples of eight, and GQA. It pads heads to a supported training width,
 preserves the original scale, and invokes MLX's public

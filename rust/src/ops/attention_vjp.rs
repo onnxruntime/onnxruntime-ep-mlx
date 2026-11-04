@@ -10,7 +10,7 @@ use std::ffi::CString;
 mod dense;
 mod native;
 
-const PREFIX: &str = "AttentionVJP_v1_";
+const PREFIX: &str = "AttentionVJP_";
 const F32: mlx::mlx_dtype = mlx::mlx_dtype__MLX_FLOAT32;
 const HEADER: &str = include_str!("attention_vjp/common.h");
 
@@ -33,10 +33,10 @@ impl Config {
     }
 
     fn parse(name: &str) -> Option<Self> {
-        let recompute = name.starts_with("AttentionVJP_v2_");
+        let recompute = name.starts_with("AttentionVJPRecompute_");
         let fields: Vec<_> = name
             .strip_prefix(if recompute {
-                "AttentionVJP_v2_"
+                "AttentionVJPRecompute_"
             } else {
                 PREFIX
             })?
@@ -394,11 +394,11 @@ pub fn register(registry: &mut OpRegistry) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    const VALID: &str = "AttentionVJP_v1_r3_q16_k8_d128_s3db504f3_c1_o012_m1_0123456789abcdef";
+    const VALID: &str = "AttentionVJP_r3_q16_k8_d128_s3db504f3_c1_o012_m1_0123456789abcdef";
 
     #[test]
     fn recomputed_contract_is_explicit() {
-        let name = "AttentionVJP_v2_r3_q4_k2_d40_s3e21e89b_c0_o012_m0_0123456789abcdef";
+        let name = "AttentionVJPRecompute_r3_q4_k2_d40_s3e21e89b_c0_o012_m0_0123456789abcdef";
         let config = Config::parse(name).unwrap();
         assert!(config.recompute);
         for (old, new) in [
@@ -411,7 +411,7 @@ mod tests {
         }
         assert!(!Config::parse(VALID).unwrap().recompute);
         assert!(
-            Config::parse(&VALID.replace("v1_", "v2_"))
+            Config::parse(&VALID.replace("AttentionVJP_", "AttentionVJPRecompute_"))
                 .unwrap()
                 .recompute
         );
@@ -429,7 +429,7 @@ mod tests {
     }
 
     #[test]
-    fn versioned_function_contract() {
+    fn parameterized_function_contract() {
         let c = Config::parse(VALID).unwrap();
         assert_eq!(
             (c.rank, c.hq, c.hk, c.d, c.causal, c.mask),
@@ -437,7 +437,7 @@ mod tests {
         );
         assert_eq!(c.outputs, vec![0, 1, 2]);
         for (old, new) in [
-            ("v1_", "v3_"),
+            ("AttentionVJP_", "AttentionVJP_v1_"),
             ("q16_", "q15_"),
             ("q16_", "q2147483640_"),
             ("d128_", "d512_"),
