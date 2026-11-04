@@ -10,7 +10,13 @@
     "transformers": "5.22.1",
     "onnxruntime": "1.31.1",
     "onnxscript": "0.7.2",
-    "mobius-onnx": "0.1.0"
+    "mobius-onnx": "0.1.0",
+    "numpy": "2.4.6",
+    "onnx": "1.23.2",
+    "onnx-ir": "1.1.0",
+    "onnax": "0.1.0",
+    "mlx": "0.32.4",
+    "mlx-c_homebrew": "0.7.0_1"
   },
   "code_before": "a03960e3799fcd0620618acf1aeb4a19cf88bdf7",
   "code_after": "9e9f3fd97c372456d6966aeacb9069f2d29406f0",
