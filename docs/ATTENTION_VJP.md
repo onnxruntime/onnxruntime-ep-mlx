@@ -107,6 +107,12 @@ For short forward heads, see [fused attention padding](PADDED_ATTENTION.md).
 or additive bias; an unmasked function ignores its placeholder value.
 Its portable ONNX body recomputes Y before applying the pullback. `AttentionVJP_*` uses the supplied Y instead.
 
+An explicit `ONNXRUNTIME_EP_MLX_ATTENTION_VJP_DENSE_LIMIT_BYTES` also applies to
+recomputing pullbacks. Scores within the budget use MLX's native VJP. Larger
+scores reconstruct Y with the shared forward helper and use the tiled pullback.
+Set the budget to `0` to select this memory-bounded path. With the variable
+unset, recomputing pullbacks use native SDPA.
+
 The native recomputing route supports FP32 attention, rank three or four, boolean and
 additive masks, causal attention, equal Q/K/V head widths from 32 through 256
 in multiples of eight, and GQA. It pads heads to a supported training width,
@@ -178,3 +184,29 @@ and parameter arrays, and all five losses, are bitwise equal.
 include the hardware, versions, source/library hashes and original driver
 snapshots. The drivers run from an onnax source checkout with its example
 dependencies installed.
+
+### Recomputed attention memory budget
+
+An explicit `ONNXRUNTIME_EP_MLX_ATTENTION_VJP_DENSE_LIMIT_BYTES` also controls
+recomputed pullbacks. When the score tensor exceeds the budget, the provider
+reconstructs Y and runs the tiled pullback. Leaving the variable unset selects
+the native SDPA derivative.
+
+For FP32 causal GQA with 4096 tokens, 16 query heads, eight KV heads and width
+128 on M1 Max, a zero budget reduces isolated-process peak physical footprint
+from 3.95 GiB to 0.90 GiB. Median execution time changes from 91.40 to
+202.58 ms. Each fresh process uses three warmups and ten samples; both paths
+match independent PyTorch SDPA gradients at `rtol=1e-4, atol=1e-6`.
+[Raw samples and memory counters](benchmarks/recomputed-attention-budget-m1max.json)
+include binary and driver hashes. Timings include the session array boundary;
+peak memory includes process setup and runtime.
+
+The same policy passes a complete Qwen3.5-0.8B decoder-block replay at 4032
+tokens (FP32, eight query heads, two KV heads, width 256, additive causal mask).
+Zero budget reduces whole-process peak physical footprint from 3.74 to
+2.92 GiB; paired forward/backward median changes from 188.83 to 335.56 ms.
+Each process performs ten warmups and 100 measurements. All five captured
+hidden-state/adapter gradients pass the existing `rtol=1e-4, atol=1e-6` checks
+before and after measurement, and captured input arrays remain unchanged.
+[Block reports and driver](benchmarks/recomputed-attention-qwen35-m1max/comparison.json)
+record this replay boundary, runtime identity, input digests and allocator peaks.

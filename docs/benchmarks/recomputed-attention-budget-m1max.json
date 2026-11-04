@@ -1,0 +1,132 @@
+{
+  "scope": "Isolated 4096-token FP32 GQA AttentionVJPRecompute, three warmups and ten synchronous samples per fresh process",
+  "runtime_source_commit": "ce5cfa962cbdd26c6289ad60ee4ee3f8fb5057f7",
+  "default_budget": {
+    "mode": "recompute",
+    "scope": "Isolated Attention VJP Session.run including array boundary",
+    "geometry": {
+      "batch": 1,
+      "sequence": 4096,
+      "query_heads": 16,
+      "kv_heads": 8,
+      "head_dimension": 128,
+      "causal": true
+    },
+    "warmup": 3,
+    "samples": 10,
+    "timings_ms": {
+      "median": 91.39600052731112,
+      "p95": 92.0079312636517,
+      "samples": [
+        91.95024997461587,
+        91.91883297171444,
+        92.0551250455901,
+        91.2622920004651,
+        91.61654196213931,
+        91.50808397680521,
+        90.96091601531953,
+        91.1849580006674,
+        90.91387502849102,
+        91.28391707781702
+      ]
+    },
+    "errors": {
+      "dQ": {
+        "maximum_absolute_error": 1.0477378964424133e-09,
+        "violations": 0
+      },
+      "dK": {
+        "maximum_absolute_error": 1.57160684466362e-08,
+        "violations": 0
+      },
+      "dV": {
+        "maximum_absolute_error": 1.862645149230957e-08,
+        "violations": 0
+      }
+    },
+    "contract": "AttentionVJPRecompute_r3_q16_k8_d128_s3db504f3_c1_o012_m1_f7cc4be7f454a7a2",
+    "physical_footprint": {
+      "available": true,
+      "current_bytes": 4246259176,
+      "lifetime_peak_bytes": 4246259176,
+      "current_resident_bytes": 814448640,
+      "scope": "macOS kernel whole-process physical footprint; includes setup and runtime"
+    },
+    "peak_rss_bytes": 814448640,
+    "library_sha256": "ac242b488814affffad7ddd76b615d35b645032d2ea5d1e0dd6c4684ca045e3c",
+    "driver_sha256": "c46e6a1183f5772890fb3e30ca8e893b0c05b29c371e9ae486c7200a5593a2e0",
+    "source_commit": "72014c1be6f77ce01eb63b7af615aff591bdf6ad",
+    "rtol": 0.0001,
+    "atol": 1e-06,
+    "ort_optimizer": false,
+    "cpu_fallback": false
+  },
+  "zero_budget": {
+    "mode": "recompute",
+    "scope": "Isolated Attention VJP Session.run including array boundary",
+    "geometry": {
+      "batch": 1,
+      "sequence": 4096,
+      "query_heads": 16,
+      "kv_heads": 8,
+      "head_dimension": 128,
+      "causal": true
+    },
+    "warmup": 3,
+    "samples": 10,
+    "timings_ms": {
+      "median": 202.57868751650676,
+      "p95": 203.37279218365438,
+      "samples": [
+        203.42829206492752,
+        202.52554200123996,
+        202.45554100256413,
+        202.43812492117286,
+        202.92650000192225,
+        202.94662495143712,
+        202.63183303177357,
+        201.84949995018542,
+        202.1015000063926,
+        203.30495899543166
+      ]
+    },
+    "errors": {
+      "dQ": {
+        "maximum_absolute_error": 2.066371962428093e-09,
+        "violations": 0
+      },
+      "dK": {
+        "maximum_absolute_error": 2.7939677238464355e-08,
+        "violations": 0
+      },
+      "dV": {
+        "maximum_absolute_error": 2.849847078323364e-07,
+        "violations": 0
+      }
+    },
+    "contract": "AttentionVJPRecompute_r3_q16_k8_d128_s3db504f3_c1_o012_m1_f7cc4be7f454a7a2",
+    "physical_footprint": {
+      "available": true,
+      "current_bytes": 971556232,
+      "lifetime_peak_bytes": 971556232,
+      "current_resident_bytes": 762560512,
+      "scope": "macOS kernel whole-process physical footprint; includes setup and runtime"
+    },
+    "peak_rss_bytes": 762560512,
+    "library_sha256": "ac242b488814affffad7ddd76b615d35b645032d2ea5d1e0dd6c4684ca045e3c",
+    "driver_sha256": "c46e6a1183f5772890fb3e30ca8e893b0c05b29c371e9ae486c7200a5593a2e0",
+    "source_commit": "72014c1be6f77ce01eb63b7af615aff591bdf6ad",
+    "rtol": 0.0001,
+    "atol": 1e-06,
+    "ort_optimizer": false,
+    "cpu_fallback": false
+  },
+  "validation": {
+    "rust": 185,
+    "native": 1292,
+    "onnax_bridge": 74,
+    "independent_reference": "PyTorch MPS SDPA",
+    "rtol": 0.0001,
+    "atol": 1e-06
+  }
+}

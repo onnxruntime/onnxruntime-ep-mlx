@@ -1,0 +1,23 @@
+import hashlib,json,os,subprocess,sys
+from pathlib import Path
+root=Path('/tmp/onnax-recompute-budget-qwen35');root.mkdir(exist_ok=False)
+python='/Users/justinc/Documents/GitHub/onnax/.venv/bin/python'
+lib='/tmp/onnax-recompute-budget-runtime/libonnxruntime_mlx_ep.dylib'
+base=[python,'-m','examples.huggingface.block_recompute','--bundle','/tmp/onnax-qwen35-complete-context4k-sft/export/execution','--captures','/tmp/onnax-qwen35-complete-context4k-block-captures','--block','decoder_3_4','--provider','mlx','--library',lib,'--warmup','10','--samples','100','--checkpoint','--recompute-attention']
+(root/'provenance.json').write_text(json.dumps({'driver_sha256':hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),'runtime_sha256':hashlib.sha256(Path(lib).read_bytes()).hexdigest(),'onnax_commit':subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(),'command':base},indent=2)+'\n')
+for mode in ('default','zero'):
+ env={**os.environ,'PYTHONPATH':'src:.','ONNXRUNTIME_EP_MLX_NO_COMPILE':'1','HF_HUB_OFFLINE':'1','HF_DATASETS_OFFLINE':'1'}
+ for key in ('ONNXRUNTIME_EP_MLX_ATTENTION_VJP_DENSE_LIMIT_BYTES','ONNXRUNTIME_EP_MLX_TRACE','ONNAX_TILED_ATTENTION'):env.pop(key,None)
+ if mode=='zero':env['ONNXRUNTIME_EP_MLX_ATTENTION_VJP_DENSE_LIMIT_BYTES']='0'
+ command=[python,'-m','examples.huggingface.guard','--output-dir',str(root/(mode+'-guard')),'--',*base,'--output',str(root/(mode+'.json'))]
+ print(json.dumps({'phase':mode}),flush=True)
+ with open(root/(mode+'.log'),'w') as log:child=subprocess.Popen(command,cwd='/tmp/onnax-kernel-contracts',env=env,stdout=log,stderr=subprocess.STDOUT)
+ print(json.dumps({'phase':mode,'pid':child.pid}),flush=True)
+ code=child.wait()
+ if code:raise SystemExit(code)
+a=json.loads((root/'default.json').read_text());b=json.loads((root/'zero.json').read_text())
+assert a['input_arrays']==b['input_arrays'] and a['bundle_identity']==b['bundle_identity']
+assert a['samples']==b['samples']==100 and a['warmup']==b['warmup']==10
+assert len(a['gradient_checks'])==len(b['gradient_checks'])==5
+(root/'comparison.json').write_text(json.dumps({'status':'qualified','default_pair_seconds':a['timing_seconds']['paired'],'zero_pair_seconds':b['timing_seconds']['paired'],'default_memory':a['physical_memory'],'zero_memory':b['physical_memory'],'gradients':5,'rtol':1e-4,'atol':1e-6},indent=2)+'\n')
+print((root/'comparison.json').read_text(),flush=True)
