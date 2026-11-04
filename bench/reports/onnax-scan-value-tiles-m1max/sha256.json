@@ -4,6 +4,8 @@
   "baseline.json": "e6936ef894643a077f8ae84fa9eb226d117ec8a6661ba1da16c2bc78f7a12e03",
   "candidate-execution.json": "348bb43900b0b98ec9473f36b37470408f60d2e9a73b00d951706bb11a830a97",
   "candidate.json": "4b52b87af25904dcf41110fc3b60b740e8e0e0a007cba5bf43601fbd27a26468",
+  "captured-block.json": "fb8e663dfe830adcf44ea2db1c0a35615ee7ea1747bbdb10f6e00b126b48cdd1",
+  "clippy.txt": "406856319509b9e5752daac423b020505c7c5dbd4913d3cf93eed9b6f76d02c4",
   "environment.json": "86dabbe1af8398ee59e3efa21783992f1d133420e209256d4240dd930c9c81f4",
   "full4032/baseline-execution.json": "d84590604af7260aecd40219f07a5c061247adb54f9a9cbac03abcbf7c3138b8",
   "full4032/baseline-overrides.json": "d5ddd38b53d888acb0c06131ff6d491af005ede9f251fcdc57bd08de5ea1024a",
@@ -18,5 +20,7 @@
   "onnax-scan-value-tiles-benchmark.py.txt": "997f38f058177539d868569ad3d9b6661a1d1fa4c4cd1717e9988054b3b1776a",
   "onnax-scan-value-tiles-full-check.py.txt": "0b3aa00a5fcc222a195cb3989bcdce1261d02174b0d83e7c084a426642e418b9",
   "onnax-scan-value-tiles-qualification-queue.py.txt": "3d0116cbb3f91fb4595bc5acd7a0003ad28c7cf227e7c21b711b02a16465295c",
+  "onnax-symbolic-native-worker.py.txt": "c1209f04660ff8d7fd7b5c9ec2f10132d9a345164c9459dfebd2e758bb56037b",
+  "rust-tests.txt": "5ef8001ba2275856448935c3966376bd6e4d250458b86c08015d04c23919cd2e",
   "summary.json": "0bd2a60162268f59a4cb041234a3e6f7cf28096674b15db03bb25d8af3a9d237"
 }

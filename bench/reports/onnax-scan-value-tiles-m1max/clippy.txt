@@ -1,0 +1,2 @@
+   Compiling onnxruntime-ep-mlx v0.31.0 (/private/tmp/onnax-mlx-scan-diagnostic/rust)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 8.44s
