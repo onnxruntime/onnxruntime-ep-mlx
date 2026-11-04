@@ -1,0 +1,114 @@
+{
+  "command": [
+    "/Users/justinc/Documents/GitHub/onnax/.venv/bin/python",
+    "/tmp/onnax-head-conversion-probe.py",
+    "--model",
+    "/tmp/onnax-qwen35-real-bf16-canonical-30/training/export/execution/head_gradient.onnx",
+    "--output",
+    "/tmp/onnax-head-next-qualification/mps-stages.json"
+  ],
+  "cwd": "/private/tmp/onnax-decoder-precision-benchmark",
+  "status": "complete",
+  "physical_memory_budget_bytes": 25769803776,
+  "minimum_free_disk_bytes": 5368709120,
+  "observations": [
+    {
+      "utc": "2026-11-04T19:22:26.613031+00:00",
+      "current_bytes": 180344,
+      "peak_bytes": 295032,
+      "free_disk_bytes": 27123216384
+    },
+    {
+      "utc": "2026-11-04T19:22:27.614259+00:00",
+      "current_bytes": 1197065152,
+      "peak_bytes": 1197065152,
+      "free_disk_bytes": 27123384320
+    },
+    {
+      "utc": "2026-11-04T19:22:28.624964+00:00",
+      "current_bytes": 4410688712,
+      "peak_bytes": 4410688712,
+      "free_disk_bytes": 27123335168
+    },
+    {
+      "utc": "2026-11-04T19:22:29.635634+00:00",
+      "current_bytes": 4410688712,
+      "peak_bytes": 4410688712,
+      "free_disk_bytes": 27123314688
+    },
+    {
+      "utc": "2026-11-04T19:22:30.646303+00:00",
+      "current_bytes": 4410705096,
+      "peak_bytes": 4410705096,
+      "free_disk_bytes": 27123134464
+    },
+    {
+      "utc": "2026-11-04T19:22:31.656446+00:00",
+      "current_bytes": 4410721480,
+      "peak_bytes": 4410721480,
+      "free_disk_bytes": 27123048448
+    },
+    {
+      "utc": "2026-11-04T19:22:32.667215+00:00",
+      "current_bytes": 4410705096,
+      "peak_bytes": 4410737864,
+      "free_disk_bytes": 27123036160
+    },
+    {
+      "utc": "2026-11-04T19:22:33.678078+00:00",
+      "current_bytes": 4410705096,
+      "peak_bytes": 4410737864,
+      "free_disk_bytes": 27122958336
+    },
+    {
+      "utc": "2026-11-04T19:22:34.683536+00:00",
+      "current_bytes": 4410705096,
+      "peak_bytes": 4410737864,
+      "free_disk_bytes": 27122946048
+    },
+    {
+      "utc": "2026-11-04T19:22:35.694340+00:00",
+      "current_bytes": 4410705096,
+      "peak_bytes": 4410737864,
+      "free_disk_bytes": 27122851840
+    },
+    {
+      "utc": "2026-11-04T19:22:36.705148+00:00",
+      "current_bytes": 4410705096,
+      "peak_bytes": 4410737864,
+      "free_disk_bytes": 27122847744
+    },
+    {
+      "utc": "2026-11-04T19:22:37.715899+00:00",
+      "current_bytes": 4410721480,
+      "peak_bytes": 4410737864,
+      "free_disk_bytes": 27122806784
+    },
+    {
+      "utc": "2026-11-04T19:22:38.726773+00:00",
+      "current_bytes": 4410721480,
+      "peak_bytes": 4410737864,
+      "free_disk_bytes": 27123011584
+    },
+    {
+      "utc": "2026-11-04T19:22:39.737528+00:00",
+      "current_bytes": 4410721480,
+      "peak_bytes": 4410737864,
+      "free_disk_bytes": 27122958336
+    },
+    {
+      "utc": "2026-11-04T19:22:40.748370+00:00",
+      "current_bytes": 4410737864,
+      "peak_bytes": 4410737864,
+      "free_disk_bytes": 27121647616
+    }
+  ],
+  "memory_source": "proc_pid_rusage/RUSAGE_INFO_V4",
+  "observation_errors": 0,
+  "temporary_directory": "/tmp/onnax-head-next-qualification/mps_stages-guard/worker-tmp-m6jfgfg9",
+  "pid": 40437,
+  "started": "2026-11-04T19:22:26.612108+00:00",
+  "returncode": 0,
+  "finished": "2026-11-04T19:22:41.759069+00:00",
+  "temporary_files_removed": true
+}

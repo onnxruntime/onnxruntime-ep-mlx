@@ -1,0 +1,63 @@
+"""Synchronized stage timings for a frozen exported output head on MPS."""
+import argparse
+import hashlib
+import json
+import os
+import time
+from pathlib import Path
+
+import numpy as np
+import onnx
+import torch
+
+p = argparse.ArgumentParser()
+p.add_argument('--model', type=Path, required=True)
+p.add_argument('--output', type=Path, required=True)
+p.add_argument('--rows', type=int, default=128)
+p.add_argument('--warmup', type=int, default=10)
+p.add_argument('--samples', type=int, default=100)
+a = p.parse_args()
+assert a.rows > 0 and a.warmup >= 0 and a.samples > 0
+assert torch.backends.mps.is_available()
+assert os.environ.get('PYTORCH_ENABLE_MPS_FALLBACK') == '0'
+torch.set_num_threads(1)
+m = onnx.load(a.model, load_external_data=False)
+w = next(t for t in m.graph.initializer if t.name == 'head.weight')
+assert w.data_type == onnx.TensorProto.FLOAT
+external = {e.key: e.value for e in w.external_data}
+path = a.model.parent / external['location']
+array = np.memmap(path, mode='c', dtype=np.float32, offset=int(external['offset']), shape=tuple(w.dims))
+weight = torch.from_numpy(array).to('mps')
+rng = np.random.default_rng(20261104)
+hidden = torch.from_numpy(rng.normal(0, 0.02, (a.rows, w.dims[1])).astype(np.float32)).to('mps')
+labels = torch.from_numpy(rng.integers(0, w.dims[0], a.rows)).to('mps')
+records = []
+for i in range(a.warmup + a.samples):
+    row = {}
+    def measure(name, fn):
+        torch.mps.synchronize()
+        before = time.perf_counter()
+        value = fn()
+        torch.mps.synchronize()
+        row[name] = time.perf_counter() - before
+        return value
+    with torch.no_grad():
+        half = measure('frozen_weight_fp32_to_bf16_seconds', lambda: weight.to(torch.bfloat16))
+        adjoint = measure('frozen_weight_bf16_to_fp32_seconds', lambda: half.float())
+        inputs = measure('activation_fp32_to_bf16_seconds', lambda: hidden.to(torch.bfloat16))
+        logits = measure('projection_seconds', lambda: (inputs @ half.T).float())
+    logits.requires_grad_()
+    loss = measure('native_ce_forward_seconds', lambda: torch.nn.functional.cross_entropy(logits, labels, reduction='sum'))
+    (cotangent,) = measure('native_ce_backward_seconds', lambda: torch.autograd.grad(loss, logits))
+    gradient = measure('hidden_gradient_seconds', lambda: cotangent @ adjoint)
+    assert torch.isfinite(loss).item() and torch.isfinite(gradient).all().item()
+    if i >= a.warmup:
+        records.append(row)
+    del half, adjoint, inputs, logits, loss, cotangent, gradient
+report = {'scope': 'Isolated synchronized stages, real exported frozen FP32 head, synthetic FP32 hidden rows, BF16 projection and FP32 adjoint; diagnostic timings exclude inter-stage overlap',
+          'rows': a.rows, 'weight_shape': list(w.dims), 'warmup': a.warmup,
+          'samples': records, 'timings': {k: {'median': float(np.median([r[k] for r in records])), 'p95': float(np.percentile([r[k] for r in records], 95))} for k in records[0]},
+          'torch_version': torch.__version__, 'model_sha256': hashlib.sha256(a.model.read_bytes()).hexdigest(),
+          'mps_cpu_fallback': False}
+a.output.write_text(json.dumps(report, indent=2) + '\n')
+print(json.dumps(report['timings'], indent=2))

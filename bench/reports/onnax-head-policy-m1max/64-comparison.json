@@ -1,0 +1,186 @@
+{
+  "scope": "Real64-token cold qualification, not steady-state timing",
+  "all60gradients_and_loss_match": true,
+  "checks": {
+    "model.layers.0.linear_attn.in_proj_qkv.lora.A": {
+      "max_abs": 0.0
+    },
+    "model.layers.0.linear_attn.in_proj_qkv.lora.B": {
+      "max_abs": 0.0
+    },
+    "model.layers.1.linear_attn.in_proj_qkv.lora.A": {
+      "max_abs": 0.0
+    },
+    "model.layers.1.linear_attn.in_proj_qkv.lora.B": {
+      "max_abs": 0.0
+    },
+    "model.layers.2.linear_attn.in_proj_qkv.lora.A": {
+      "max_abs": 0.0
+    },
+    "model.layers.2.linear_attn.in_proj_qkv.lora.B": {
+      "max_abs": 0.0
+    },
+    "model.layers.3.self_attn.q_proj.lora.A": {
+      "max_abs": 0.0
+    },
+    "model.layers.3.self_attn.q_proj.lora.B": {
+      "max_abs": 0.0
+    },
+    "model.layers.3.self_attn.v_proj.lora.A": {
+      "max_abs": 0.0
+    },
+    "model.layers.3.self_attn.v_proj.lora.B": {
+      "max_abs": 0.0
+    },
+    "model.layers.4.linear_attn.in_proj_qkv.lora.A": {
+      "max_abs": 0.0
+    },
+    "model.layers.4.linear_attn.in_proj_qkv.lora.B": {
+      "max_abs": 0.0
+    },
+    "model.layers.5.linear_attn.in_proj_qkv.lora.A": {
+      "max_abs": 0.0
+    },
+    "model.layers.5.linear_attn.in_proj_qkv.lora.B": {
+      "max_abs": 0.0
+    },
+    "model.layers.6.linear_attn.in_proj_qkv.lora.A": {
+      "max_abs": 0.0
+    },
+    "model.layers.6.linear_attn.in_proj_qkv.lora.B": {
+      "max_abs": 0.0
+    },
+    "model.layers.7.self_attn.q_proj.lora.A": {
+      "max_abs": 0.0
+    },
+    "model.layers.7.self_attn.q_proj.lora.B": {
+      "max_abs": 0.0
+    },
+    "model.layers.7.self_attn.v_proj.lora.A": {
+      "max_abs": 0.0
+    },
+    "model.layers.7.self_attn.v_proj.lora.B": {
+      "max_abs": 0.0
+    },
+    "model.layers.8.linear_attn.in_proj_qkv.lora.A": {
+      "max_abs": 0.0
+    },
+    "model.layers.8.linear_attn.in_proj_qkv.lora.B": {
+      "max_abs": 0.0
+    },
+    "model.layers.9.linear_attn.in_proj_qkv.lora.A": {
+      "max_abs": 0.0
+    },
+    "model.layers.9.linear_attn.in_proj_qkv.lora.B": {
+      "max_abs": 0.0
+    },
+    "model.layers.10.linear_attn.in_proj_qkv.lora.A": {
+      "max_abs": 0.0
+    },
+    "model.layers.10.linear_attn.in_proj_qkv.lora.B": {
+      "max_abs": 0.0
+    },
+    "model.layers.11.self_attn.q_proj.lora.A": {
+      "max_abs": 0.0
+    },
+    "model.layers.11.self_attn.q_proj.lora.B": {
+      "max_abs": 0.0
+    },
+    "model.layers.11.self_attn.v_proj.lora.A": {
+      "max_abs": 0.0
+    },
+    "model.layers.11.self_attn.v_proj.lora.B": {
+      "max_abs": 0.0
+    },
+    "model.layers.12.linear_attn.in_proj_qkv.lora.A": {
+      "max_abs": 0.0
+    },
+    "model.layers.12.linear_attn.in_proj_qkv.lora.B": {
+      "max_abs": 0.0
+    },
+    "model.layers.13.linear_attn.in_proj_qkv.lora.A": {
+      "max_abs": 0.0
+    },
+    "model.layers.13.linear_attn.in_proj_qkv.lora.B": {
+      "max_abs": 0.0
+    },
+    "model.layers.14.linear_attn.in_proj_qkv.lora.A": {
+      "max_abs": 0.0
+    },
+    "model.layers.14.linear_attn.in_proj_qkv.lora.B": {
+      "max_abs": 0.0
+    },
+    "model.layers.15.self_attn.q_proj.lora.A": {
+      "max_abs": 0.0
+    },
+    "model.layers.15.self_attn.q_proj.lora.B": {
+      "max_abs": 0.0
+    },
+    "model.layers.15.self_attn.v_proj.lora.A": {
+      "max_abs": 0.0
+    },
+    "model.layers.15.self_attn.v_proj.lora.B": {
+      "max_abs": 0.0
+    },
+    "model.layers.16.linear_attn.in_proj_qkv.lora.A": {
+      "max_abs": 0.0
+    },
+    "model.layers.16.linear_attn.in_proj_qkv.lora.B": {
+      "max_abs": 0.0
+    },
+    "model.layers.17.linear_attn.in_proj_qkv.lora.A": {
+      "max_abs": 0.0
+    },
+    "model.layers.17.linear_attn.in_proj_qkv.lora.B": {
+      "max_abs": 0.0
+    },
+    "model.layers.18.linear_attn.in_proj_qkv.lora.A": {
+      "max_abs": 0.0
+    },
+    "model.layers.18.linear_attn.in_proj_qkv.lora.B": {
+      "max_abs": 0.0
+    },
+    "model.layers.19.self_attn.q_proj.lora.A": {
+      "max_abs": 0.0
+    },
+    "model.layers.19.self_attn.q_proj.lora.B": {
+      "max_abs": 0.0
+    },
+    "model.layers.19.self_attn.v_proj.lora.A": {
+      "max_abs": 0.0
+    },
+    "model.layers.19.self_attn.v_proj.lora.B": {
+      "max_abs": 0.0
+    },
+    "model.layers.20.linear_attn.in_proj_qkv.lora.A": {
+      "max_abs": 0.0
+    },
+    "model.layers.20.linear_attn.in_proj_qkv.lora.B": {
+      "max_abs": 0.0
+    },
+    "model.layers.21.linear_attn.in_proj_qkv.lora.A": {
+      "max_abs": 0.0
+    },
+    "model.layers.21.linear_attn.in_proj_qkv.lora.B": {
+      "max_abs": 0.0
+    },
+    "model.layers.22.linear_attn.in_proj_qkv.lora.A": {
+      "max_abs": 0.0
+    },
+    "model.layers.22.linear_attn.in_proj_qkv.lora.B": {
+      "max_abs": 0.0
+    },
+    "model.layers.23.self_attn.q_proj.lora.A": {
+      "max_abs": 0.0
+    },
+    "model.layers.23.self_attn.q_proj.lora.B": {
+      "max_abs": 0.0
+    },
+    "model.layers.23.self_attn.v_proj.lora.A": {
+      "max_abs": 0.0
+    },
+    "model.layers.23.self_attn.v_proj.lora.B": {
+      "max_abs": 0.0
+    }
+  }
+}

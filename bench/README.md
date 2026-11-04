@@ -65,6 +65,14 @@ library, then compare the loss and every named adapter gradient before comparing
 timing. ORT graph optimization and CPU fallback remain disabled by the onnax
 session factory.
 
+The [Qwen3.5 BF16/NF4 qualification reports](reports/onnax-head-policy-m1max)
+cover 64 and 4,032 tokens. Both policies reproduce every adapter gradient bit for bit and match loss
+at `rtol=1e-4, atol=1e-6`. The 4K qualification uses one warmup and three samples per
+independent process. Head-only traces cover changed inputs and 128/63-token
+chunks: the compiled route records an initial miss, a tail-shape retrace and
+cache hits on repeated shapes. The folder also retains synchronized PyTorch
+head-stage diagnostics, process guards and source checksums.
+
 ## Historical model measurements
 
 These results were previously recorded in the root README on an M1 Max.

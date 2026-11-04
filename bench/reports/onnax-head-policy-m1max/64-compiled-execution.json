@@ -1,0 +1,139 @@
+{
+  "command": [
+    "/Users/justinc/Documents/GitHub/onnax/.venv/bin/python",
+    "/tmp/onnax-mlx-head-control/bench/onnax_decoder.py",
+    "--export",
+    "/tmp/onnax-qwen35-real-bf16-canonical-30/training/export",
+    "--cache-dir",
+    "/tmp/onnax-qwen35-real-cache",
+    "--library",
+    "/tmp/onnax-mlx-lookup-reuse-runtime/libonnxruntime_mlx_ep.dylib",
+    "--sequence",
+    "64",
+    "--warmup",
+    "0",
+    "--samples",
+    "1",
+    "--output",
+    "/tmp/onnax-head-next-qualification/compiled.json",
+    "--gradients-output",
+    "/tmp/onnax-head-next-qualification/compiled.npz",
+    "--compile-head"
+  ],
+  "cwd": "/private/tmp/onnax-decoder-precision-benchmark",
+  "status": "complete",
+  "physical_memory_budget_bytes": 25769803776,
+  "minimum_free_disk_bytes": 5368709120,
+  "observations": [
+    {
+      "utc": "2026-11-04T19:23:00.034998+00:00",
+      "current_bytes": 163960,
+      "peak_bytes": 295032,
+      "free_disk_bytes": 27118362624
+    },
+    {
+      "utc": "2026-11-04T19:23:01.040534+00:00",
+      "current_bytes": 222348104,
+      "peak_bytes": 222348104,
+      "free_disk_bytes": 27118276608
+    },
+    {
+      "utc": "2026-11-04T19:23:02.045502+00:00",
+      "current_bytes": 280347488,
+      "peak_bytes": 280347488,
+      "free_disk_bytes": 27118190592
+    },
+    {
+      "utc": "2026-11-04T19:23:03.056080+00:00",
+      "current_bytes": 394347720,
+      "peak_bytes": 394446024,
+      "free_disk_bytes": 27118186496
+    },
+    {
+      "utc": "2026-11-04T19:23:04.064603+00:00",
+      "current_bytes": 444187992,
+      "peak_bytes": 445908312,
+      "free_disk_bytes": 27118182400
+    },
+    {
+      "utc": "2026-11-04T19:23:05.075368+00:00",
+      "current_bytes": 444187992,
+      "peak_bytes": 445908312,
+      "free_disk_bytes": 27118178304
+    },
+    {
+      "utc": "2026-11-04T19:23:06.083562+00:00",
+      "current_bytes": 502990288,
+      "peak_bytes": 502990288,
+      "free_disk_bytes": 27118145536
+    },
+    {
+      "utc": "2026-11-04T19:23:07.088821+00:00",
+      "current_bytes": 503170776,
+      "peak_bytes": 503170776,
+      "free_disk_bytes": 27118374912
+    },
+    {
+      "utc": "2026-11-04T19:23:08.099495+00:00",
+      "current_bytes": 503351264,
+      "peak_bytes": 503351264,
+      "free_disk_bytes": 27118362624
+    },
+    {
+      "utc": "2026-11-04T19:23:09.110134+00:00",
+      "current_bytes": 1565771912,
+      "peak_bytes": 1565771912,
+      "free_disk_bytes": 27117760512
+    },
+    {
+      "utc": "2026-11-04T19:23:10.120806+00:00",
+      "current_bytes": 1779632432,
+      "peak_bytes": 1779632432,
+      "free_disk_bytes": 27117641728
+    },
+    {
+      "utc": "2026-11-04T19:23:11.131459+00:00",
+      "current_bytes": 1901332880,
+      "peak_bytes": 1901332880,
+      "free_disk_bytes": 27116548096
+    },
+    {
+      "utc": "2026-11-04T19:23:12.142095+00:00",
+      "current_bytes": 2050279944,
+      "peak_bytes": 2050279944,
+      "free_disk_bytes": 27116441600
+    },
+    {
+      "utc": "2026-11-04T19:23:13.152766+00:00",
+      "current_bytes": 2094975592,
+      "peak_bytes": 2094975592,
+      "free_disk_bytes": 27116429312
+    },
+    {
+      "utc": "2026-11-04T19:23:14.163577+00:00",
+      "current_bytes": 2095582472,
+      "peak_bytes": 2095582472,
+      "free_disk_bytes": 27116548096
+    },
+    {
+      "utc": "2026-11-04T19:23:15.174341+00:00",
+      "current_bytes": 2797473536,
+      "peak_bytes": 4547268328,
+      "free_disk_bytes": 27116494848
+    },
+    {
+      "utc": "2026-11-04T19:23:16.178566+00:00",
+      "current_bytes": 2361691208,
+      "peak_bytes": 4547268328,
+      "free_disk_bytes": 27113721856
+    }
+  ],
+  "memory_source": "proc_pid_rusage/RUSAGE_INFO_V4",
+  "observation_errors": 0,
+  "temporary_directory": "/tmp/onnax-head-next-qualification/native_compiled-guard/worker-tmp-jfsjtxuw",
+  "pid": 40469,
+  "started": "2026-11-04T19:23:00.034229+00:00",
+  "returncode": 0,
+  "finished": "2026-11-04T19:23:17.189259+00:00",
+  "temporary_files_removed": true
+}
