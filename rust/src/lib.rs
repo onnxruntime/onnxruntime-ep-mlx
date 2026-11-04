@@ -19,6 +19,7 @@
 
 mod capability;
 mod compiled;
+mod config;
 mod engine;
 mod ep;
 mod factory;

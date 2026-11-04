@@ -211,11 +211,16 @@ unsafe fn create_ep_impl(
                 c"MLXExecutionProvider expects exactly one device".as_ptr(),
             );
         }
+        let enable_compile =
+            match crate::config::boolean(&*f.ort_api, session_options, c"ep.mlx.enable_compile") {
+                Ok(value) => value.unwrap_or(true),
+                Err(status) => return status,
+            };
         let status = crate::memory::configure_cache(&*f.ort_api, session_options);
         if !status.is_null() {
             return status;
         }
-        let mlx_ep = MlxEp::new(f.ort_api, f.ep_api, &f.name, logger);
+        let mlx_ep = MlxEp::new(f.ort_api, f.ep_api, &f.name, logger, enable_compile);
         *ep = mlx_ep.as_ptr();
         ptr::null_mut()
     }
