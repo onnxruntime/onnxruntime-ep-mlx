@@ -497,7 +497,7 @@ def _primal_adjoint_model(precision, *, adjoint_precision=None, adjoint_buffers=
     return model, buffers
 
 
-@pytest.mark.parametrize("precision", ["fp16", "bf16"])
+@pytest.mark.parametrize("precision", [None, "fp16", "bf16"], ids=["fp32", "fp16", "bf16"])
 @pytest.mark.parametrize("no_compile", ["0", "1"])
 def test_lut4_shared_primal_adjoint(precision, no_compile, monkeypatch):
     monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_COMPILE", no_compile)
@@ -506,7 +506,8 @@ def test_lut4_shared_primal_adjoint(precision, no_compile, monkeypatch):
     fused = _session(model, "MLXExecutionProvider")
     monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_LUT4_FUSION", "1")
     portable = _session(model, "MLXExecutionProvider")
-    dtype = np.float16 if precision == "fp16" else ml_dtypes.bfloat16
+    dtype = (np.float32 if precision is None else
+             np.float16 if precision == "fp16" else ml_dtypes.bfloat16)
     weight = _reference(buffers["packed"], buffers["scales"], buffers["book"], (67, 37))
     rounded = weight.astype(dtype).astype(np.float32)
     rng = np.random.default_rng(931)
@@ -516,11 +517,17 @@ def test_lut4_shared_primal_adjoint(precision, no_compile, monkeypatch):
         feeds = {"x": x, "seed": seed}
         actual, expected = fused.run(None, feeds), portable.run(None, feeds)
         for a, b in zip(actual, expected, strict=True):
-            np.testing.assert_array_equal(a, b)
+            if precision is None:
+                # The existing small-row FP32 kernel uses a different reduction
+                # from portable GEMM; retain the suite's FP32 comparison policy.
+                np.testing.assert_allclose(a, b, rtol=1e-4, atol=1e-6)
+            else:
+                np.testing.assert_array_equal(a, b)
         np.testing.assert_allclose(actual[0],
                                    (x.astype(dtype).astype(np.float32) @ rounded)
                                    .astype(dtype).astype(np.float32),
-                                   rtol=0.01, atol=0.0001)
+                                   rtol=1e-4 if precision is None else 0.01,
+                                   atol=1e-6 if precision is None else 0.0001)
         # Evaluate the adjoint at the portable forward activation, isolating
         # shared-weight decode semantics from half-GEMM rounding.
         np.testing.assert_allclose(actual[1], (seed * expected[0]) @ rounded.T,
