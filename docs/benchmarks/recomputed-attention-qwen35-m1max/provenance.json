@@ -1,0 +1,26 @@
+{
+  "driver_sha256": "5865ac08cb94932d66810b9bbf7ff2493ee4360c49b0dc23b34ad5d16f34c163",
+  "runtime_sha256": "ac242b488814affffad7ddd76b615d35b645032d2ea5d1e0dd6c4684ca045e3c",
+  "onnax_commit": "1338eb0bf33501193b210c58dcf834d458193211",
+  "command": [
+    "/Users/justinc/Documents/GitHub/onnax/.venv/bin/python",
+    "-m",
+    "examples.huggingface.block_recompute",
+    "--bundle",
+    "/tmp/onnax-qwen35-complete-context4k-sft/export/execution",
+    "--captures",
+    "/tmp/onnax-qwen35-complete-context4k-block-captures",
+    "--block",
+    "decoder_3_4",
+    "--provider",
+    "mlx",
+    "--library",
+    "/tmp/onnax-recompute-budget-runtime/libonnxruntime_mlx_ep.dylib",
+    "--warmup",
+    "10",
+    "--samples",
+    "100",
+    "--checkpoint",
+    "--recompute-attention"
+  ]
+}

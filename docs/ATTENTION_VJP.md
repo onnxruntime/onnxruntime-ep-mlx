@@ -200,3 +200,13 @@ match independent PyTorch SDPA gradients at `rtol=1e-4, atol=1e-6`.
 [Raw samples and memory counters](benchmarks/recomputed-attention-budget-m1max.json)
 include binary and driver hashes. Timings include the session array boundary;
 peak memory includes process setup and runtime.
+
+The same policy passes a complete Qwen3.5-0.8B decoder-block replay at 4032
+tokens (FP32, eight query heads, two KV heads, width 256, additive causal mask).
+Zero budget reduces whole-process peak physical footprint from 3.74 to
+2.92 GiB; paired forward/backward median changes from 188.83 to 335.56 ms.
+Each process performs ten warmups and 100 measurements. All five captured
+hidden-state/adapter gradients pass the existing `rtol=1e-4, atol=1e-6` checks
+before and after measurement, and captured input arrays remain unchanged.
+[Block reports and driver](benchmarks/recomputed-attention-qwen35-m1max/comparison.json)
+record this replay boundary, runtime identity, input digests and allocator peaks.

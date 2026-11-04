@@ -1,0 +1,28 @@
+{
+  "status": "qualified",
+  "default_pair_seconds": {
+    "median": 0.18882506247609854,
+    "p95": 0.18998639822239055
+  },
+  "zero_pair_seconds": {
+    "median": 0.33556272904388607,
+    "p95": 0.3381307562754955
+  },
+  "default_memory": {
+    "available": true,
+    "current_bytes": 4016392568,
+    "lifetime_peak_bytes": 4016392568,
+    "current_resident_bytes": 1150959616,
+    "scope": "macOS kernel whole-process physical footprint; includes setup and runtime"
+  },
+  "zero_memory": {
+    "available": true,
+    "current_bytes": 3132180688,
+    "lifetime_peak_bytes": 3132180688,
+    "current_resident_bytes": 1085964288,
+    "scope": "macOS kernel whole-process physical footprint; includes setup and runtime"
+  },
+  "gradients": 5,
+  "rtol": 0.0001,
+  "atol": 1e-06
+}

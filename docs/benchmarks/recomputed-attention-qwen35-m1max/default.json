@@ -1,0 +1,226 @@
+{
+  "version": 1,
+  "block": "decoder_3_4",
+  "bundle_identity": "684aaefb43b19c36b413661d93120f71971b29425736a57239cc1770844ef076",
+  "input_arrays": {
+    "position_ids": {
+      "shape": [
+        1,
+        4032
+      ],
+      "dtype": "int64",
+      "bytes": 32256,
+      "sha256": "42f147e20f9815324ebaabbe868244b6c405c850c23edca03ee04201121928cc"
+    },
+    "attention_mask": {
+      "shape": [
+        1,
+        4032
+      ],
+      "dtype": "int64",
+      "bytes": 32256,
+      "sha256": "8c04b075483d668ceda5c5381744cb73cb50ae4f9a1d7dbb3e051baecf0d099b"
+    },
+    "input_ids": {
+      "shape": [
+        1,
+        4032
+      ],
+      "dtype": "int64",
+      "bytes": 32256,
+      "sha256": "e7eb188a4c860579198c1e3d31ada13bdaddcfaab5884798ba7f62edad0f996e"
+    },
+    "v_model.layers.2.Add_365": {
+      "shape": [
+        1,
+        4032,
+        1024
+      ],
+      "dtype": "float32",
+      "bytes": 16515072,
+      "sha256": "9b6eab5a1bfaf0a483b664f9a7f63c226fe640e3cf6409425c508de0e4a4ed0f"
+    },
+    "model.layers.3.self_attn.q_proj.lora.A": {
+      "shape": [
+        1024,
+        4
+      ],
+      "dtype": "float32",
+      "bytes": 16384,
+      "sha256": "f7302b561fd3ccc632964d50c0416012987df7a4c4484188329d751b756364b1"
+    },
+    "model.layers.3.self_attn.q_proj.lora.B": {
+      "shape": [
+        4,
+        4096
+      ],
+      "dtype": "float32",
+      "bytes": 65536,
+      "sha256": "cb94461c57de0543b13a33c2d2e23d5de91201cd47eadca75e4f0f98a3d414da"
+    },
+    "model.layers.3.self_attn.v_proj.lora.A": {
+      "shape": [
+        1024,
+        4
+      ],
+      "dtype": "float32",
+      "bytes": 16384,
+      "sha256": "35e88eb6b78dc9e0af086ef4aea249c0088099dc5d53688baddb88ccd481b9b0"
+    },
+    "model.layers.3.self_attn.v_proj.lora.B": {
+      "shape": [
+        4,
+        512
+      ],
+      "dtype": "float32",
+      "bytes": 8192,
+      "sha256": "cdc86ae3b503cf5d02d2b6b86ba82d578816a0d09edf34fc868e755ec8d4abbf"
+    },
+    "v_model.layers.3.Add_402_cotangent": {
+      "shape": [
+        1,
+        4032,
+        1024
+      ],
+      "dtype": "float32",
+      "bytes": 16515072,
+      "sha256": "9a95418f461bff1991a29e68255502dddcad4fdaf3e0edac713c0a81c3b4a0cf"
+    }
+  },
+  "plan": {
+    "version": 1,
+    "strategy": "whole_checkpoint",
+    "recomputed_values": [],
+    "retained_values": [],
+    "replay_inputs": [
+      "position_ids",
+      "attention_mask",
+      "input_ids",
+      "v_model.layers.2.Add_365",
+      "model.layers.3.self_attn.q_proj.lora.A",
+      "model.layers.3.self_attn.q_proj.lora.B",
+      "model.layers.3.self_attn.v_proj.lora.A",
+      "model.layers.3.self_attn.v_proj.lora.B"
+    ],
+    "nodes": [],
+    "invocations_per_backward": 1,
+    "region": "Original exported checkpoint recomputation/VJP",
+    "attention_vjp_calls": [
+      "AttentionVJPRecompute_r3_q8_k2_d256_s3d800000_c1_o012_m2_7280bcc26dfbafa8"
+    ],
+    "recomputed_attention": true,
+    "release_points": []
+  },
+  "retained_activation_bytes": 0,
+  "gradient_checks": {
+    "v_model.layers.2.Add_365_cotangent": {
+      "max_abs": 1.3969838619232178e-09,
+      "sha256": "d3d90826a0b4dda57cf29d55052869990a1edf36527d37d2e8f44c1ac86ff30b"
+    },
+    "model.layers.3.self_attn.q_proj.lora.A_cotangent": {
+      "max_abs": 3.4924596548080444e-10,
+      "sha256": "90d5fc5a7c372e6cfd646c813f4b3a975a28baec42dd4e97c1c51057a6e19e8b"
+    },
+    "model.layers.3.self_attn.q_proj.lora.B_cotangent": {
+      "max_abs": 3.4924596548080444e-10,
+      "sha256": "db21ffb984acaaa04dbd39e32a80db4b62e91b4db3279e3a3bd9ae01d9038423"
+    },
+    "model.layers.3.self_attn.v_proj.lora.A_cotangent": {
+      "max_abs": 0.0,
+      "sha256": "4c8e5de15e69cb308b6c36a00f1e87cf6f4eac61030ac12f4281aa27358e84c5"
+    },
+    "model.layers.3.self_attn.v_proj.lora.B_cotangent": {
+      "max_abs": 0.0,
+      "sha256": "04a8ab8c09cd378e23f01446b6291aa8854249f5b500c424b953af3a829a903c"
+    }
+  },
+  "final_gradient_checks": {
+    "v_model.layers.2.Add_365_cotangent": {
+      "max_abs": 1.3969838619232178e-09,
+      "sha256": "d3d90826a0b4dda57cf29d55052869990a1edf36527d37d2e8f44c1ac86ff30b"
+    },
+    "model.layers.3.self_attn.q_proj.lora.A_cotangent": {
+      "max_abs": 3.4924596548080444e-10,
+      "sha256": "90d5fc5a7c372e6cfd646c813f4b3a975a28baec42dd4e97c1c51057a6e19e8b"
+    },
+    "model.layers.3.self_attn.q_proj.lora.B_cotangent": {
+      "max_abs": 3.4924596548080444e-10,
+      "sha256": "db21ffb984acaaa04dbd39e32a80db4b62e91b4db3279e3a3bd9ae01d9038423"
+    },
+    "model.layers.3.self_attn.v_proj.lora.A_cotangent": {
+      "max_abs": 0.0,
+      "sha256": "4c8e5de15e69cb308b6c36a00f1e87cf6f4eac61030ac12f4281aa27358e84c5"
+    },
+    "model.layers.3.self_attn.v_proj.lora.B_cotangent": {
+      "max_abs": 0.0,
+      "sha256": "04a8ab8c09cd378e23f01446b6291aa8854249f5b500c424b953af3a829a903c"
+    }
+  },
+  "warmup": 10,
+  "samples": 100,
+  "session_creation_seconds": 0.5430007500108331,
+  "timing_seconds": {
+    "forward": {
+      "median": 0.04885991651099175,
+      "p95": 0.04916466012364253
+    },
+    "backward": {
+      "median": 0.14003160450374708,
+      "p95": 0.14081956250593067
+    },
+    "paired": {
+      "median": 0.18882506247609854,
+      "p95": 0.18998639822239055
+    }
+  },
+  "allocator_before": {
+    "active_bytes": 140521748,
+    "cache_bytes": 3490953047,
+    "peak_bytes": 0
+  },
+  "allocator_after": {
+    "active_bytes": 140521748,
+    "cache_bytes": 3490953047,
+    "peak_bytes": 2799340604
+  },
+  "window_allocator_peak_bytes": 2799340604,
+  "physical_memory": {
+    "available": true,
+    "current_bytes": 4016392568,
+    "lifetime_peak_bytes": 4016392568,
+    "current_resident_bytes": 1150959616,
+    "scope": "macOS kernel whole-process physical footprint; includes setup and runtime"
+  },
+  "timing_scope": "Paired split block forward and backward, including runtime exchange and saved-array scheduling; fixed parameters; excludes other blocks, task loss and optimizer",
+  "memory_scope": "One worker, source and derivative graphs, captured CPU arrays and two runtime sessions; allocator peak reset after warmup",
+  "provider": "mlx",
+  "cpu_fallback_disabled": true,
+  "ort_graph_optimization": "disabled",
+  "library_sha256": "ac242b488814affffad7ddd76b615d35b645032d2ea5d1e0dd6c4684ca045e3c",
+  "platform": "macOS-27.0.1-arm64-arm-64bit",
+  "runtime_environment": {
+    "ONNXRUNTIME_EP_MLX_NO_COMPILE": "1",
+    "ONNXRUNTIME_EP_MLX_CACHE_LIMIT_BYTES": null,
+    "ONNXRUNTIME_EP_MLX_ATTENTION_VJP_DENSE_LIMIT_BYTES": null,
+    "ONNXRUNTIME_EP_MLX_TRACE": null
+  },
+  "versions": {
+    "onnx": "1.23.2",
+    "onnx-ir": "1.1.0",
+    "onnxscript": "0.7.2",
+    "onnxruntime": "1.31.1",
+    "numpy": "2.4.6"
+  },
+  "source_sha256": {
+    "block_recompute.py": "f939ddca7b5b859aa9ab4e300c202d6886bce4af532283c2f3dc7a3753fb6a70",
+    "residuals.py": "178eccd2030c3bfbc9508d8cf96f0bf7b09526fde7bd67c996255e338f7b1dce",
+    "recomputation.py": "d991369886f21a9e5aa04510f9cc9aaba80714c4c36a44815ed89b031ce14430",
+    "shape_residuals.py": "1a4ee65e919f1455bca545c5111968e3e2d9aceec539880d168161d782b1d025",
+    "optimization.py": "00c249e221d5b09435f89ae8cc1f168496ac4b9baf712ff792bbeb91e1eb6df9",
+    "attention_vjp.py": "ab863e4d58a50fd3fc01d48cdc02f495ab316ba87ebb5987842483f014734050",
+    "_recomputation.py": "94516a574084943cb9b8bd13291b605a5c68a39356d30ec4f9a5d886b6c1e825",
+    "_residuals.py": "565945df89287b67418bb57975e960bbdbaa483ea4c21d92fdc272b98d1afb77",
+    "_residual_layout.py": "0124d1dc4e86585d6cf013d5b71d49669980bbb2074934973ea7f0807851889b",
+    "_saved_shapes.py": "605b52af9fc7a1c204c3d3cdff09a293132372fd65a691f01e960b3b3a60fb3d"
+  }
+}
