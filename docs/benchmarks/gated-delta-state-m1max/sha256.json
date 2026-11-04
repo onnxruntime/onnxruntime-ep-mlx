@@ -7,7 +7,7 @@
   "fused.json": "d212871c8289600b591ddf447b6b5abc4d3f73550374d6b5ad7a3894588fc707",
   "onnax-gated-delta-state-clippy.txt": "e1add2d297d3af5d96e2b7e6571cb1b15a7036380add58e155f5185e23d2c881",
   "onnax-gated-delta-state-final-tests.txt": "b8c91ff6fd0bf4c567413399079f2834ca84121ba44af793116f2731eeb8c30c",
-  "onnax-gated-delta-state-rust.txt": "520606a6f3649589eaf6ef19cdd7752b985101ce780151013b23b0b1de3b4a52",
+  "onnax-gated-delta-state-rust.txt": "c8f5ec55824e9135c5d2cfec7e7746763b8c18c511e159a514f39896ea77a335",
   "onnax-qwen35-scan-profile.py.txt": "80c6ab4e21c79f3b041bbb33e620441ec040d5ba59ed93e579a28be5c36d4e6d",
   "onnax-qwen35-state-parent.py.txt": "34595ec9491828bec034f8c9a30f1f9b60f993da072a67fb0370c3911aa79792",
   "onnax-qwen35-state-profile.py.txt": "bcf0a6a590cb45c19441b722569e1f484f9a2bda2f2838c799d90424357c8dae",
