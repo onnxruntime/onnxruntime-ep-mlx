@@ -15,9 +15,9 @@ and singleton key broadcasting. Causal attention uses top-left alignment.
 The tiled Metal pullback recomputes log-sum-exp, then computes dQ and grouped
 dK/dV. It uses fixed-size scratch storage and skips causal tiles above the
 diagonal. Fully masked rows produce zero gradients. dK/dV sum shared-head
-contributions without atomic writes. For 256-wide heads, dK/dV use eight key rows
-per threadgroup. Four score tiles and two FP32 accumulators then occupy 20 KiB;
-16 key rows would need 40 KiB. Smaller heads keep their 16-row layout.
+contributions without atomic writes. Heads from 128 through 256 use eight key rows
+per threadgroup. Four score tiles and two FP32 accumulators occupy 12 KiB at
+width 128 and 20 KiB at width 256. Narrower heads use sixteen key rows.
 
 Small score matrices use MLX GEMM and softmax operations. Their intermediates have
 local ownership and expire after their final consumer. The policy is controlled
@@ -151,3 +151,30 @@ eight query heads, two KV heads and head width 256. Paired median/P95 is
 control with a 1 GiB score budget. All five captured gradients pass the existing
 gates, with maximum absolute error 1.40e-9. These measurements cover the block's
 forward/backward calls; optimizer and whole-model execution are separate phases.
+
+## Key-tile workspace and throughput
+
+Eight key rows halve the dK/dV workspace for 128–192-wide heads. On an M1 Max,
+isolated FP32 causal GQA pullbacks with 16 query heads and 8 KV heads measure:
+
+| Sequence / head width | Previous tile median | Eight-row tile median | Throughput ratio |
+| --- | ---: | ---: | ---: |
+| 4096 / 128 | 190.51 ms | 152.51 ms | 1.249× |
+| 1024 / 160 | 18.63 ms | 14.93 ms | 1.248× |
+| 1024 / 192 | 21.09 ms | 17.26 ms | 1.222× |
+
+Each case has three warmups and ten measured synchronous Session.run calls,
+including array exchange. Both tiles match independent PyTorch SDPA gradients;
+their dQ, dK and dV arrays are bitwise equal. The 4096-token process peak remains
+about 0.84 GiB.
+
+A separate Qwen3-0.6B pilot uses 4096 tokens, NF4 frozen decoder weights, FP32
+adapters and AdamW, four-layer checkpoints, a compiled 128-token chunked head
+and eager decoder sessions. After two warmups, three complete training steps
+measure 10.894 s versus 9.757 s median. The first two updates' 448 adapter gradient
+and parameter arrays, and all five losses, are bitwise equal.
+
+[Raw samples and provenance](benchmarks/attention-tile-occupancy-m1max.json)
+include the hardware, versions, source/library hashes and original driver
+snapshots. The drivers run from an onnax source checkout with its example
+dependencies installed.

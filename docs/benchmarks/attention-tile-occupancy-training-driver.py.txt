@@ -1,0 +1,41 @@
+import argparse,hashlib,json,subprocess
+import numpy as np
+from collections import Counter
+from examples.huggingface import benchmark
+from examples.huggingface.bridge import frozen_hashes
+p=argparse.ArgumentParser();p.add_argument('--output',required=True);p.add_argument('--samples',type=int,default=3);p.add_argument('--warmup',type=int,default=2);p.add_argument('--capture',action='store_true');p.add_argument('--compile-head',action='store_true');p.add_argument('--library',required=True);a=p.parse_args()
+prepared={};snapshots={};original=benchmark.prepare
+if a.capture:
+ def prepare(*args,**kwargs):
+  result=original(*args,**kwargs);prepared['model']=result[0]
+  prepared['frozen']=frozen_hashes(result[0].forward_graph)
+  prepared['attention_calls']=dict(Counter(n.op_type for e in result[0].onnx.executions if e.derivative is not None for n in e.derivative.graph if n.domain=='pkg.onnax' and n.op_type.startswith('AttentionVJP')))
+  assert sum(prepared['attention_calls'].values())==28,prepared['attention_calls']
+  assert all(name.startswith('AttentionVJP_') and not name.startswith('AttentionVJP_v') for name in prepared['attention_calls']),prepared['attention_calls']
+  return result
+ benchmark.prepare=prepare
+ def observe(phase,index=None,**kwargs):
+  if phase in ('construction_begin','construction_complete','session_constructed'):
+   print(json.dumps({'phase':phase,**kwargs}),flush=True)
+  if index not in (0,1) or phase not in ('backward_complete','step_complete'):return
+  model=prepared['model'];key='gradient' if phase=='backward_complete' else 'parameter'
+  for name,param in zip(model.onnx.names,model.onnx.adapters,strict=True):
+   value=param.grad if key=='gradient' else param
+   snapshots[f'step{index}:{key}:{name}']=value.detach().numpy().copy()
+else:observe=None
+kwargs={'compile_head':True} if a.compile_head else {}
+r=benchmark.measure('chunked',real=True,samples=a.samples,warmup=a.warmup,batch_size=1,sequence_length=4096,chunk_size=128,nf4=True,projection_precision='fp32',checkpoint_layers=4,train_file='/tmp/onnax-qwen-longalpaca-4k-with-benchmark/benchmark.jsonl',progress_every=1,provider='mlx',library=a.library,mlx_memory_limit_bytes=20*1024**3,fused_ops=True,phase_observer=observe,validate_updates=True,**kwargs)
+r['attention_calls']=prepared['attention_calls']
+r['attention_vjp_dense_limit_bytes']=0
+r['native_tiling']='kv8_from_d128' if '/onnax-key-tiles-runtime/' in a.library else 'kv8_above_d192'
+r['qualification_scope']='Real Qwen3-0.6B 4K tiled-attention training comparison'
+r['source_commit']=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()
+r['driver_sha256']=hashlib.sha256(open(__file__,'rb').read()).hexdigest()
+r['source_sha256']={p:hashlib.sha256(open(p,'rb').read()).hexdigest() for p in ('examples/huggingface/sft.py','examples/huggingface/chunked_loss.py','examples/huggingface/benchmark.py')}
+if snapshots:
+ np.savez(a.output+'.npz',**snapshots)
+ r['frozen_hashes_unchanged']=prepared['frozen']==frozen_hashes(prepared['model'].forward_graph)
+ assert r['frozen_hashes_unchanged']
+ r['frozen_sha256']=hashlib.sha256(json.dumps(prepared['frozen'],sort_keys=True).encode()).hexdigest()
+json.dump(r,open(a.output,'w'),indent=2)
+print(json.dumps({'step':r['timings_ms']['step'],'head':r['timings_ms']['head_loss_gradient_execution'],'body':r['timings_ms']['body_execution']}),flush=True)
