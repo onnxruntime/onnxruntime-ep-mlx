@@ -184,3 +184,19 @@ and parameter arrays, and all five losses, are bitwise equal.
 include the hardware, versions, source/library hashes and original driver
 snapshots. The drivers run from an onnax source checkout with its example
 dependencies installed.
+
+### Recomputed attention memory budget
+
+An explicit `ONNXRUNTIME_EP_MLX_ATTENTION_VJP_DENSE_LIMIT_BYTES` also controls
+recomputed pullbacks. When the score tensor exceeds the budget, the provider
+reconstructs Y and runs the tiled pullback. Leaving the variable unset selects
+the native SDPA derivative.
+
+For FP32 causal GQA with 4096 tokens, 16 query heads, eight KV heads and width
+128 on M1 Max, a zero budget reduces isolated-process peak physical footprint
+from 3.95 GiB to 0.90 GiB. Median execution time changes from 91.40 to
+202.58 ms. Each fresh process uses three warmups and ten samples; both paths
+match independent PyTorch SDPA gradients at `rtol=1e-4, atol=1e-6`.
+[Raw samples and memory counters](benchmarks/recomputed-attention-budget-m1max.json)
+include binary and driver hashes. Timings include the session array boundary;
+peak memory includes process setup and runtime.
