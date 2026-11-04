@@ -22,7 +22,7 @@ pub mod reduction;
 pub mod shape;
 // signal/random/recurrent/ssm/misc/controlflow
 pub mod controlflow;
-pub mod gated_delta_reverse;
+pub mod gated_delta_scan;
 pub mod misc;
 pub mod random;
 pub mod recurrent;

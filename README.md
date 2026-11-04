@@ -58,7 +58,7 @@ Use `session.get_inputs()` to inspect the required input names, shapes, and type
 | For | Guide |
 |---|---|
 | Runtime compatibility, native bindings, decoder tuning | [Integration](docs/INTEGRATION.md) |
-| Fused gated-delta pullbacks and decoder measurement | [Gated-delta reverse scans](docs/GATED_DELTA_REVERSE.md) |
+| Fused gated-delta pullbacks and decoder measurement | [Gated-delta scans](docs/GATED_DELTA_REVERSE.md) |
 | Setting allocator cache budgets | [Memory](docs/MEMORY.md) |
 | Building the plugin or Python wheel | [Build from source](docs/BUILDING.md) |
 | Diagnosing fallback and GPU execution | [Tracing and profiling](examples/traces/README.md) |

@@ -1,4 +1,4 @@
-# Gated-delta reverse scans
+# Gated-delta scans
 
 The provider recognizes the standard ONNX `Scan` data-flow used for gated-delta
 pullbacks. It checks all six output expressions, static axes and the FP32 scale.
@@ -10,7 +10,33 @@ registers across the time loop. SIMD reductions and small threadgroup scratch
 compute the key dot products. The outputs are the final adjoint state and the
 query, key, value, log-decay and beta gradients.
 
-## Shapes and execution
+## State and replay scans
+
+State-only scans compute checkpoint boundaries. Replay scans also return the
+state before each update for the reverse recurrence. The provider recognizes
+both forms and keeps four value columns per thread in registers across time.
+SIMD reductions compute the key/state product once per time step and value tile.
+
+For key `k`, value `v`, log-decay `g`, rate `b` and incoming state `S`, the update is
+
+```text
+F = S * exp(g[..., None])
+r = v - k[..., None, :] @ F
+S_next = F + b[..., None, None] * (k[..., :, None] * r[..., None, :])
+```
+
+The optional replay output is `S`, before the update. All arrays are FP32.
+Key widths are 16, 32, 64 and 128; value widths are 1–128. Log-decay may be
+per-head or per-key. Batch, head and positive sequence lengths are dynamic.
+Sequence axes are zero, input directions agree, and output directions agree.
+The independent input/output direction combinations are supported.
+
+Matching checks the entire body: changed expressions and unrelated operations
+retain generic Scan execution. Shapes and index bounds are checked at dispatch.
+The trace kernel names are `mlx_gated_delta_state_scan` and
+`mlx_gated_delta_replay_scan`.
+
+## Reverse scan shapes and execution
 
 The kernel uses FP32 arrays, key widths 16, 32, 64 or 128, and value widths from
 1 through 128. It supports positive dynamic batch, head and time dimensions,

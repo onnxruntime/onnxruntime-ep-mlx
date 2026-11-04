@@ -21,7 +21,7 @@
 use crate::engine::{
     MlxError, NodeDesc, Src, SubgraphDesc, TensorRef, TranslationContext, mlx_dtype_from_onnx,
 };
-use crate::ops::{gated_delta_reverse, host_scan, selective_scan};
+use crate::ops::{gated_delta_scan, host_scan, selective_scan};
 use crate::registry::{
     ClaimPredicate, ClaimResult, GraphView, K_ANY_OPSET, NodeView, OpHandler, OpRegistration,
     OpRegistry, ValueKind, is_movable,
@@ -344,17 +344,48 @@ fn scan_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
         return Ok(());
     }
 
-    if let Some(scale) = gated_delta_reverse::match_body(&body, num_state, num_scan) {
+    if let Some(history) = gated_delta_scan::match_state_body(&body, num_state, num_scan) {
+        let covered = scan_axes.iter().all(|&axis| axis == 0)
+            && output_axes.iter().all(|&axis| axis == 0)
+            && input_directions.iter().all(|&d| d == input_directions[0])
+            && output_directions.iter().all(|&d| d == output_directions[0]);
+        if covered {
+            let mut inputs = state[..num_state].to_vec();
+            inputs.extend_from_slice(&scans[..num_scan]);
+            if let Some(outputs) = gated_delta_scan::emit_state(
+                ctx,
+                &inputs,
+                history,
+                input_directions[0] == 1,
+                output_directions.first().copied().unwrap_or(0) == 1,
+            )? {
+                for (reference, value) in n.outputs.iter().zip(outputs) {
+                    ctx.bind(reference, value);
+                }
+                ctx.mark_fast(if history {
+                    gated_delta_scan::REPLAY_KERNEL_NAME
+                } else {
+                    gated_delta_scan::STATE_KERNEL_NAME
+                });
+                return Ok(());
+            }
+            ctx.mark_composed("gated-delta state dtype/shape unsupported -> generic Scan");
+        } else {
+            ctx.mark_composed("gated-delta state axes/directions unsupported -> generic Scan");
+        }
+    }
+
+    if let Some(scale) = gated_delta_scan::match_reverse_body(&body, num_state, num_scan) {
         let covered_form = scan_axes.iter().all(|&axis| axis == 0)
             && output_axes.iter().all(|&axis| axis == 0)
             && input_directions.iter().all(|&d| d == input_directions[0])
             && output_directions.iter().all(|&d| d == output_directions[0]);
-        if gated_delta_reverse::disabled() {
+        if gated_delta_scan::reverse_disabled() {
             ctx.mark_composed("gated-delta reverse disabled by kill-switch -> generic Scan");
         } else if covered_form {
             let mut inputs = state[..num_state].to_vec();
             inputs.extend_from_slice(&scans[..num_scan]);
-            if let Some(outputs) = gated_delta_reverse::emit(
+            if let Some(outputs) = gated_delta_scan::emit_reverse(
                 ctx,
                 &inputs,
                 scale,
@@ -364,7 +395,7 @@ fn scan_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
                 for (reference, value) in n.outputs.iter().zip(outputs) {
                     ctx.bind(reference, value);
                 }
-                ctx.mark_fast(gated_delta_reverse::KERNEL_NAME);
+                ctx.mark_fast(gated_delta_scan::REVERSE_KERNEL_NAME);
                 return Ok(());
             }
             ctx.mark_composed("gated-delta reverse dtype/shape unsupported -> generic Scan");
