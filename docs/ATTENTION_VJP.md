@@ -107,6 +107,12 @@ For short forward heads, see [fused attention padding](PADDED_ATTENTION.md).
 or additive bias; an unmasked function ignores its placeholder value.
 Its portable ONNX body recomputes Y before applying the pullback. `AttentionVJP_*` uses the supplied Y instead.
 
+An explicit `ONNXRUNTIME_EP_MLX_ATTENTION_VJP_DENSE_LIMIT_BYTES` also applies to
+recomputing pullbacks. Scores within the budget use MLX's native VJP. Larger
+scores reconstruct Y with the shared forward helper and use the tiled pullback.
+Set the budget to `0` to select this memory-bounded path. With the variable
+unset, recomputing pullbacks use native SDPA.
+
 The native recomputing route supports FP32 attention, rank three or four, boolean and
 additive masks, causal attention, equal Q/K/V head widths from 32 through 256
 in multiples of eight, and GQA. It pads heads to a supported training width,

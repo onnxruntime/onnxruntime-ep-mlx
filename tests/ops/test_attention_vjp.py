@@ -1,6 +1,10 @@
 """Tiled attention VJP contract, checked against independent NumPy reverse mode."""
 
+import json
+import os
 import struct
+import subprocess
+import sys
 
 import _models as m
 import numpy as np
@@ -309,6 +313,7 @@ def test_tiled_attention_live_inputs(
             )
 
 
+@pytest.mark.parametrize("dense_limit", [None, 0])
 @pytest.mark.parametrize("compiled", [False, True])
 @pytest.mark.parametrize("rank", [3, 4])
 @pytest.mark.parametrize("d", [32, 40, 64, 80, 128, 160, 192, 256])
@@ -316,9 +321,14 @@ def test_tiled_attention_live_inputs(
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("selected", [(0,), (1, 2), (0, 1, 2)])
 def test_recomputed_attention_vjp(
-    rank, d, selected, compiled, kind, causal, monkeypatch
+    rank, d, selected, compiled, kind, causal, dense_limit, monkeypatch
 ):
     monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_COMPILE", "0" if compiled else "1")
+    budget_key = "ONNXRUNTIME_EP_MLX_ATTENTION_VJP_DENSE_LIMIT_BYTES"
+    if dense_limit is None:
+        monkeypatch.delenv(budget_key, raising=False)
+    else:
+        monkeypatch.setenv(budget_key, str(dense_limit))
     options = ort.SessionOptions()
     options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
     options.add_session_config_entry("session.disable_cpu_ep_fallback", "1")
@@ -365,3 +375,73 @@ def test_recomputed_attention_vjp(
         actual = session.run(None, feeds)
         for a, i in zip(actual, selected):
             np.testing.assert_allclose(a, expected[i], rtol=1e-4, atol=1e-6)
+
+
+@pytest.mark.parametrize(
+    "budget,kernel",
+    [
+        (None, "mlx_fast_sdpa_recomputed_vjp"),
+        (0, "onnax tiled attention VJP"),
+        (64 * 1024**2, "mlx_fast_sdpa_recomputed_vjp"),
+    ],
+)
+def test_recomputed_budget_selects_execution_path(tmp_path, budget, kernel):
+    trace = tmp_path / "budget.json"
+    environment = {
+        **os.environ,
+        "ONNXRUNTIME_EP_MLX_TRACE": str(trace),
+        "ONNXRUNTIME_EP_MLX_NO_COMPILE": "1",
+    }
+    key = "ONNXRUNTIME_EP_MLX_ATTENTION_VJP_DENSE_LIMIT_BYTES"
+    if budget is None:
+        environment.pop(key, None)
+    else:
+        environment[key] = str(budget)
+    subprocess.run(
+        [sys.executable, __file__, "--probe-budget"],
+        env=environment,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    with open(trace) as stream:
+        events = json.load(stream)
+    calls = [
+        event["args"]["kernel"]
+        for event in events
+        if event.get("cat") == "op.fast"
+        and event.get("args", {})
+        .get("op_type", "")
+        .startswith("AttentionVJPRecompute_")
+    ]
+    assert calls and set(calls) == {kernel}
+
+
+def _budget_probe():
+    ort.register_execution_provider_library(
+        "MLXExecutionProvider", os.environ["ONNXRUNTIME_MLX_EP_LIB"]
+    )
+    options = ort.SessionOptions()
+    options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+    options.add_session_config_entry("session.disable_cpu_ep_fallback", "1")
+    runtime = ort.InferenceSession(
+        _model(4, 64, 4, 2, True, 1, recompute=True),
+        options,
+        providers=["MLXExecutionProvider"],
+    )
+    runtime.disable_fallback()
+    rng = np.random.default_rng(76)
+    for sq, sk in ((5, 7), (7, 9)):
+        q = rng.normal(0, 0.2, (1, 4, sq, 64)).astype(np.float32)
+        k, v = [rng.normal(0, 0.2, (1, 2, sk, 64)).astype(np.float32) for _ in range(2)]
+        g = rng.normal(size=q.shape).astype(np.float32)
+        mask = rng.random((1, 1, sq, sk)) > 0.2
+        mask[:, :, 0] = False
+        _, expected = _reference(q, k, v, g, mask, True, 0.125)
+        actual = runtime.run(None, {"q": q, "k": k, "v": v, "g": g, "mask": mask})
+        for value, reference in zip(actual, expected, strict=True):
+            np.testing.assert_allclose(value, reference, rtol=1e-4, atol=1e-6)
+
+
+if __name__ == "__main__":
+    _budget_probe()

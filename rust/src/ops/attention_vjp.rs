@@ -247,6 +247,19 @@ fn dispatch(
         .collect())
 }
 
+fn use_dense(c: &Config, qs: &[i32], ks: &[i32], explicit_limit: Option<u64>) -> bool {
+    if c.recompute && explicit_limit.is_none() {
+        return true;
+    }
+    let limit = explicit_limit.unwrap_or(64 * 1024 * 1024);
+    [qs[0], c.hq, qs[2], ks[2]]
+        .iter()
+        .try_fold(4u64, |bytes, &dimension| {
+            bytes.checked_mul(dimension as u64)
+        })
+        .is_some_and(|bytes| bytes <= limit)
+}
+
 fn translate(ctx: &mut TranslationContext, node: &NodeDesc) -> Result<(), MlxError> {
     let c = Config::parse(&node.op_type)
         .ok_or_else(|| MlxError::from("Invalid AttentionVJP contract"))?;
@@ -267,7 +280,16 @@ fn translate(ctx: &mut TranslationContext, node: &NodeDesc) -> Result<(), MlxErr
         }
         inputs.push(a);
     }
-    if c.recompute {
+    let explicit_limit = std::env::var("ONNXRUNTIME_EP_MLX_ATTENTION_VJP_DENSE_LIMIT_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok());
+    let dense_path = use_dense(
+        &c,
+        &ctx.shape_of(inputs[0]),
+        &ctx.shape_of(inputs[1]),
+        explicit_limit,
+    );
+    if c.recompute && dense_path {
         let grads = native::execute(ctx, &inputs, &c)?;
         for (output, &index) in node.outputs.iter().zip(&c.outputs) {
             let mut value = grads[index];
@@ -278,6 +300,10 @@ fn translate(ctx: &mut TranslationContext, node: &NodeDesc) -> Result<(), MlxErr
             ctx.bind(output, value);
         }
         return Ok(());
+    }
+    if c.recompute {
+        let y = native::primal(ctx, &inputs, &c)?;
+        inputs.insert(3, y);
     }
     let (q, k, v, y, g, m) = (
         inputs[0], inputs[1], inputs[2], inputs[3], inputs[4], inputs[5],
@@ -304,14 +330,7 @@ fn translate(ctx: &mut TranslationContext, node: &NodeDesc) -> Result<(), MlxErr
             return Err("AttentionVJP incompatible mask broadcast".into());
         }
     }
-    let limit = std::env::var("ONNXRUNTIME_EP_MLX_ATTENTION_VJP_DENSE_LIMIT_BYTES")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(64 * 1024 * 1024);
-    let bytes = [b, c.hq, sq, sk]
-        .iter()
-        .try_fold(4u64, |n, &d| n.checked_mul(d as u64));
-    let grads = if bytes.is_some_and(|n| n <= limit) {
+    let grads = if dense_path {
         let arrays = dense::execute(&inputs, [b, sq, sk], &mask_shape, &c, ctx.stream())?;
         ctx.mark_fast("onnax GEMM attention VJP");
         let mut iter = arrays.into_iter();
@@ -415,6 +434,22 @@ mod tests {
                 .unwrap()
                 .recompute
         );
+    }
+
+    #[test]
+    fn explicit_score_budget_applies_to_recomputed_pullbacks() {
+        let mut c = Config::parse(VALID).unwrap();
+        let query = [1, 16, 4096, 128];
+        let key = [1, 8, 4096, 128];
+        let score_bytes = 1024 * 1024 * 1024;
+        assert!(!use_dense(&c, &query, &key, None));
+        assert!(use_dense(&c, &query, &key, Some(score_bytes)));
+        assert!(!use_dense(&c, &query, &key, Some(score_bytes - 1)));
+        c.recompute = true;
+        assert!(use_dense(&c, &query, &key, None));
+        assert!(use_dense(&c, &query, &key, Some(score_bytes)));
+        assert!(!use_dense(&c, &query, &key, Some(0)));
+        assert!(!use_dense(&c, &query, &key, Some(score_bytes - 1)));
     }
 
     #[test]

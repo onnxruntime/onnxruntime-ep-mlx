@@ -256,12 +256,8 @@ unsafe extern "C" fn thunk(
     }
 }
 
-pub(super) fn execute(
-    ctx: &mut TranslationContext,
-    inputs: &[Raw],
-    c: &Config,
-) -> Result<Vec<Raw>, MlxError> {
-    let [q, k, v, g, mask] = inputs else {
+fn shapes(ctx: &TranslationContext, inputs: &[Raw]) -> Result<(Vec<i32>, Vec<i32>), MlxError> {
+    let [q, k, v, g, _] = inputs else {
         return Err("recomputed SDPA interface mismatch".into());
     };
     let qs = ctx.shape_of(*q);
@@ -269,14 +265,18 @@ pub(super) fn execute(
     if ctx.shape_of(*g) != qs || ctx.shape_of(*v) != ks || qs[0] != ks[0] {
         return Err("recomputed SDPA live shape mismatch".into());
     }
-    if qs[0] == 0 || qs[2] == 0 || ks[2] == 0 {
-        return [qs, ks.clone(), ks]
-            .iter()
-            .map(|shape| ctx.zeros(shape, F32))
-            .collect();
-    }
+    Ok((qs, ks))
+}
+
+fn payload(
+    ctx: &TranslationContext,
+    inputs: &[Raw],
+    c: &Config,
+    qs: &[i32],
+    ks: &[i32],
+) -> Result<Payload, MlxError> {
     if c.mask != 0 {
-        let shape = ctx.shape_of(*mask);
+        let shape = ctx.shape_of(inputs[4]);
         let target = [qs[0], c.hq, qs[2], ks[2]];
         for (i, &dim) in shape.iter().enumerate() {
             let limit = target[4 - shape.len() + i];
@@ -288,9 +288,9 @@ pub(super) fn execute(
     let captured_mask = if c.mask == 0 {
         None
     } else {
-        Some(emit(|out| unsafe { mlx::mlx_array_set(out, *mask) })?)
+        Some(emit(|out| unsafe { mlx::mlx_array_set(out, inputs[4]) })?)
     };
-    let payload = Box::into_raw(Box::new(Payload {
+    Ok(Payload {
         scale: c.scale,
         stream: Stream::retained(ctx.stream())?,
         width: c.d,
@@ -299,7 +299,43 @@ pub(super) fn execute(
         causal: c.causal != 0,
         kind: c.mask,
         mask: captured_mask,
-    }));
+    })
+}
+
+pub(super) fn primal(
+    ctx: &mut TranslationContext,
+    inputs: &[Raw],
+    c: &Config,
+) -> Result<Raw, MlxError> {
+    let (qs, ks) = shapes(ctx, inputs)?;
+    if qs[0] == 0 || qs[2] == 0 || ks[2] == 0 {
+        return ctx.zeros(&qs, F32);
+    }
+    let captured = payload(ctx, inputs, c, &qs, &ks)?;
+    let mut primals = VectorArray::new();
+    for &value in &inputs[..3] {
+        primals.append(value);
+    }
+    let values = forward(primals.as_raw(), &captured)?;
+    if values.size() != 1 {
+        return Err("recomputed SDPA forward output mismatch".into());
+    }
+    Ok(ctx.keep(values.get(0)))
+}
+
+pub(super) fn execute(
+    ctx: &mut TranslationContext,
+    inputs: &[Raw],
+    c: &Config,
+) -> Result<Vec<Raw>, MlxError> {
+    let (qs, ks) = shapes(ctx, inputs)?;
+    if qs[0] == 0 || qs[2] == 0 || ks[2] == 0 {
+        return [qs, ks.clone(), ks]
+            .iter()
+            .map(|shape| ctx.zeros(shape, F32))
+            .collect();
+    }
+    let payload = Box::into_raw(Box::new(payload(ctx, inputs, c, &qs, &ks)?));
     let function = Function(unsafe {
         mlx::mlx_closure_new_func_payload(Some(thunk), payload.cast(), Some(release))
     });
@@ -308,11 +344,11 @@ pub(super) fn execute(
         return Err("recomputed SDPA closure creation failed".into());
     }
     let mut primals = VectorArray::new();
-    for &a in [*q, *k, *v].iter() {
+    for &a in &inputs[..3] {
         primals.append(a);
     }
     let mut seeds = VectorArray::new();
-    seeds.append(*g);
+    seeds.append(inputs[3]);
     let mut values = VectorArray::new();
     let mut gradients = VectorArray::new();
     if unsafe {
