@@ -1,18 +1,16 @@
-//! Exact gated-delta pullback Scan recognition and register-carried Metal execution.
-//! Inputs are the adjoint carry, previous states, q/k/v, scalar log-decay, beta and
-//! output cotangent. One group owns four value columns; each lane carries one key
-//! row through the time loop. Key reductions use SIMD sums and bounded group scratch.
-//! Query/key/decay/beta partials are reduced across value tiles after the kernel.
-//! The original Scan remains the fallback for every other body.
+//! Exact gated-delta state/replay and pullback Scan recognition.
+//! Metal loops carry state in registers, with four value columns per group.
+//! Reverse query/key/decay/beta partials reduce across independent value tiles.
+//! Other bodies retain ordinary Scan execution.
 use crate::engine::{MlxError, NodeDesc, Src, SubgraphDesc, TensorRef, TranslationContext};
 use crate::sys::{mlx, ort};
 use std::collections::HashMap;
 use std::ffi::CString;
 
 const F32: mlx::mlx_dtype = mlx::mlx_dtype__MLX_FLOAT32;
-pub const KERNEL_NAME: &str = "mlx_gated_delta_reverse_scan";
+pub const REVERSE_KERNEL_NAME: &str = "mlx_gated_delta_reverse_scan";
 pub const NO_FUSE_ENV: &str = "ONNXRUNTIME_EP_MLX_NO_GATED_DELTA_REVERSE";
-pub fn disabled() -> bool {
+pub fn reverse_disabled() -> bool {
     std::env::var_os(NO_FUSE_ENV)
         .map(|v| v != "0" && !v.is_empty())
         .unwrap_or(false)
@@ -165,7 +163,7 @@ impl Matcher<'_> {
 
 /// Match all six output expressions, including static axes and the actual scale.
 /// Names, node ordering and common-subexpression sharing do not affect recognition.
-pub fn match_body(body: &SubgraphDesc, num_state: usize, num_scan: usize) -> Option<f32> {
+pub fn match_reverse_body(body: &SubgraphDesc, num_state: usize, num_scan: usize) -> Option<f32> {
     if num_state != 1
         || num_scan != 7
         || body.input_names.len() != 8
@@ -329,7 +327,7 @@ impl Drop for Strings {
 }
 
 /// Emit one register-carried recurrence and reduce the independent value tiles.
-pub fn emit(
+pub fn emit_reverse(
     ctx: &mut TranslationContext,
     inputs: &[mlx::mlx_array],
     scale: f32,
@@ -466,4 +464,321 @@ pub fn emit(
         }
     }
     Ok(Some(result))
+}
+
+pub const STATE_KERNEL_NAME: &str = "mlx_gated_delta_state_scan";
+pub const REPLAY_KERNEL_NAME: &str = "mlx_gated_delta_replay_scan";
+
+/// Recognize the state transition and optional previous-state output exactly.
+pub fn match_state_body(body: &SubgraphDesc, num_state: usize, num_scan: usize) -> Option<bool> {
+    if num_state != 1
+        || num_scan != 4
+        || body.input_names.len() != 5
+        || !(1..=2).contains(&body.output_names.len())
+        || body.nodes.len() > 64
+    {
+        return None;
+    }
+    let producers: HashMap<_, _> = body
+        .nodes
+        .iter()
+        .flat_map(|n| n.outputs.iter().map(move |r| (r.name.as_str(), n)))
+        .collect();
+    let factor = op("Exp", vec![axes("i3", "Unsqueeze", &[-1])]);
+    let faded = bin("Mul", "i0", &factor);
+    let residual = bin("Sub", "i2", &retrieve(&faded, "i1"));
+    let present = bin(
+        "Add",
+        &faded,
+        &bin(
+            "Mul",
+            &axes("i4", "Unsqueeze", &[-1, -2]),
+            &outer("i1", &residual),
+        ),
+    );
+    let mut m = Matcher {
+        body,
+        producers,
+        memo: HashMap::new(),
+    };
+    if m.expr(&body.output_names[0])? != present {
+        return None;
+    }
+    let history = body.output_names.len() == 2;
+    if history && body.output_names[1] != body.input_names[0] {
+        let node = m.producers.get(body.output_names[1].as_str())?;
+        if !node.domain.is_empty()
+            || node.op_type != "Identity"
+            || node.inputs.len() != 1
+            || node.inputs[0].name != body.input_names[0]
+            || node.outputs.len() != 1
+        {
+            return None;
+        }
+        m.memo.insert(body.output_names[1].clone(), "i0".into());
+    }
+    if body.nodes.iter().any(|node| {
+        node.op_type != "Constant"
+            && (node.outputs.len() != 1 || !m.memo.contains_key(&node.outputs[0].name))
+    }) {
+        return None;
+    }
+    Some(history)
+}
+
+const STATE_SOURCE: &str = r#"
+uint ki=thread_index_in_threadgroup;
+uint lane=ki%32u, subgroup=ki/32u;
+const uint NS=(uint)((K<32?32:K)/32);
+uint tile=threadgroup_position_in_grid.x%(uint)NT;
+uint bh=threadgroup_position_in_grid.x/(uint)NT;
+threadgroup float partials[4*4];
+float carry[4];
+for(uint j=0;j<4;++j) {
+ uint vi=tile*4u+j;
+ carry[j]=(ki<(uint)K && vi<(uint)V)?initial[(bh*(uint)K+ki)*(uint)V+vi]:0.0f;
+}
+for(uint step=0;step<(uint)T;++step) {
+ uint ti=IN_REVERSE?(uint)T-1u-step:step;
+ uint tbh=ti*(uint)(B*H)+bh;
+ HISTORY_WRITE
+ float key=ki<(uint)K?keys[tbh*(uint)K+ki]:0.0f;
+ float factor=ki<(uint)K?exp(decays[tbh*(uint)G+(G==1?0u:ki)]):1.0f;
+ float faded[4];
+ for(uint j=0;j<4;++j) {
+  faded[j]=carry[j]*factor;
+  float sum=simd_sum(key*faded[j]);
+  if(lane==0) {partials[j*NS+subgroup]=sum;}
+ }
+ threadgroup_barrier(mem_flags::mem_threadgroup);
+ float rate=betas[tbh];
+ for(uint j=0;j<4;++j) {
+  uint vi=tile*4u+j;
+  float sum=0.0f;
+  for(uint s=0;s<NS;++s) {sum+=partials[j*NS+s];}
+  float residual=(vi<(uint)V?values[tbh*(uint)V+vi]:0.0f)-sum;
+  carry[j]=faded[j]+rate*(key*residual);
+ }
+ threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+for(uint j=0;j<4;++j) {
+ uint vi=tile*4u+j;
+ if(ki<(uint)K && vi<(uint)V) {final[(bh*(uint)K+ki)*(uint)V+vi]=carry[j];}
+}
+"#;
+const HISTORY_WRITE: &str = r#"
+ uint oi=OUT_REVERSE?(uint)T-1u-step:step;
+ for(uint j=0;j<4;++j) {
+  uint vi=tile*4u+j;
+  if(ki<(uint)K && vi<(uint)V) {
+   previous[((oi*(uint)(B*H)+bh)*(uint)K+ki)*(uint)V+vi]=carry[j];
+  }
+ }
+"#;
+
+#[derive(Debug, PartialEq)]
+struct StateGeometry {
+    b: i32,
+    h: i32,
+    k: i32,
+    v: i32,
+    t: i32,
+    g: i32,
+    nt: i32,
+    grid: i32,
+}
+fn state_geometry(shapes: &[Vec<i32>], history: bool) -> Option<StateGeometry> {
+    if shapes.len() != 5 || shapes[0].len() != 4 || shapes[1].len() != 4 {
+        return None;
+    }
+    let (b, h, k, v) = (shapes[0][0], shapes[0][1], shapes[0][2], shapes[0][3]);
+    let t = shapes[1][0];
+    if b <= 0 || h <= 0 || t <= 0 || ![16, 32, 64, 128].contains(&k) || !(1..=128).contains(&v) {
+        return None;
+    }
+    let g = *shapes[3].get(3)?;
+    if ![1, k].contains(&g)
+        || shapes[1] != [t, b, h, k]
+        || shapes[2] != [t, b, h, v]
+        || shapes[3] != [t, b, h, g]
+        || shapes[4] != [t, b, h]
+    {
+        return None;
+    }
+    let nt = (v + 3) / 4;
+    let state = b as i128 * h as i128 * k as i128 * v as i128;
+    let sequence = t as i128 * b as i128 * h as i128 * k.max(v) as i128;
+    let grid = b as i128 * h as i128 * nt as i128 * k.max(32) as i128;
+    if state > u32::MAX as i128
+        || sequence > u32::MAX as i128
+        || (history && state * t as i128 > u32::MAX as i128)
+        || grid > i32::MAX as i128
+    {
+        return None;
+    }
+    Some(StateGeometry {
+        b,
+        h,
+        k,
+        v,
+        t,
+        g,
+        nt,
+        grid: grid as i32,
+    })
+}
+
+/// Recompute state-only or previous-state histories without expanding time steps.
+pub fn emit_state(
+    ctx: &mut TranslationContext,
+    inputs: &[mlx::mlx_array],
+    history: bool,
+    in_reverse: bool,
+    out_reverse: bool,
+) -> Result<Option<Vec<mlx::mlx_array>>, MlxError> {
+    if inputs.iter().any(|&x| ctx.dtype_of(x) != F32) {
+        return Ok(None);
+    }
+    let shapes: Vec<_> = inputs.iter().map(|&x| ctx.shape_of(x)).collect();
+    let Some(c) = state_geometry(&shapes, history) else {
+        return Ok(None);
+    };
+    let name = CString::new(if history {
+        "onnxrt_gated_delta_replay_scan"
+    } else {
+        "onnxrt_gated_delta_state_scan"
+    })
+    .unwrap();
+    let header = CString::new("").unwrap();
+    let source = CString::new(
+        STATE_SOURCE.replace("HISTORY_WRITE", if history { HISTORY_WRITE } else { "" }),
+    )
+    .unwrap();
+    let inn = Strings::new(&["initial", "keys", "values", "decays", "betas"])?;
+    let outn = Strings::new(if history {
+        &["final", "previous"]
+    } else {
+        &["final"]
+    })?;
+    let kernel = unsafe {
+        mlx::mlx_fast_metal_kernel_new(
+            name.as_ptr(),
+            inn.0,
+            outn.0,
+            source.as_ptr(),
+            header.as_ptr(),
+            true,
+            false,
+        )
+    };
+    if kernel.ctx.is_null() {
+        return Ok(None);
+    }
+    let config = unsafe { mlx::mlx_fast_metal_kernel_config_new() };
+    let mut rc = 0;
+    for (key, value) in [
+        ("T", c.t),
+        ("B", c.b),
+        ("H", c.h),
+        ("K", c.k),
+        ("V", c.v),
+        ("G", c.g),
+        ("NT", c.nt),
+        ("IN_REVERSE", in_reverse as i32),
+        ("OUT_REVERSE", out_reverse as i32),
+    ] {
+        let key = CString::new(key).unwrap();
+        rc |= unsafe {
+            mlx::mlx_fast_metal_kernel_config_add_template_arg_int(config, key.as_ptr(), value)
+        };
+    }
+    let mut outs = vec![vec![c.b, c.h, c.k, c.v]];
+    if history {
+        outs.push(vec![c.t, c.b, c.h, c.k, c.v]);
+    }
+    for shape in &outs {
+        rc |= unsafe {
+            mlx::mlx_fast_metal_kernel_config_add_output_arg(
+                config,
+                shape.as_ptr(),
+                shape.len(),
+                F32,
+            )
+        };
+    }
+    let threads = c.k.max(32);
+    rc |= unsafe { mlx::mlx_fast_metal_kernel_config_set_grid(config, c.grid, 1, 1) };
+    rc |= unsafe { mlx::mlx_fast_metal_kernel_config_set_thread_group(config, threads, 1, 1) };
+    let mut args = crate::mlx::VectorArray::new();
+    for &x in inputs {
+        args.append(x);
+    }
+    let mut outputs = crate::mlx::VectorArray::new();
+    if rc == 0 {
+        rc = unsafe {
+            mlx::mlx_fast_metal_kernel_apply(
+                outputs.as_mut_ptr(),
+                kernel,
+                args.as_raw(),
+                config,
+                ctx.stream(),
+            )
+        };
+    }
+    unsafe {
+        mlx::mlx_fast_metal_kernel_config_free(config);
+        mlx::mlx_fast_metal_kernel_free(kernel);
+    }
+    if rc != 0 {
+        return Err("gated-delta state Scan kernel failed".into());
+    }
+    Ok(Some(
+        (0..outs.len())
+            .map(|index| ctx.keep(outputs.get(index)))
+            .collect(),
+    ))
+}
+
+#[cfg(test)]
+mod state_tests {
+    use super::state_geometry;
+    fn shapes(t: i32, k: i32, v: i32, g: i32) -> Vec<Vec<i32>> {
+        vec![
+            vec![1, 2, k, v],
+            vec![t, 1, 2, k],
+            vec![t, 1, 2, v],
+            vec![t, 1, 2, g],
+            vec![t, 1, 2],
+        ]
+    }
+    #[test]
+    fn covered_state_geometry_and_tails() {
+        for k in [16, 32, 64, 128] {
+            for v in [1, 9, 128] {
+                for g in [1, k] {
+                    for history in [false, true] {
+                        let c = state_geometry(&shapes(32, k, v, g), history).unwrap();
+                        assert_eq!(c.nt, (v + 3) / 4);
+                        assert_eq!(c.grid, 2 * c.nt * k.max(32));
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn uncovered_and_overflowing_geometry_declines() {
+        for s in [
+            shapes(0, 32, 9, 1),
+            shapes(7, 17, 9, 1),
+            shapes(7, 32, 129, 1),
+            shapes(7, 32, 9, 2),
+        ] {
+            assert!(state_geometry(&s, true).is_none());
+        }
+        let mut s = shapes(i32::MAX, 128, 128, 1);
+        assert!(state_geometry(&s, true).is_none());
+        s[0][0] = 0;
+        assert!(state_geometry(&s, false).is_none());
+        assert!(state_geometry(&[], false).is_none());
+    }
 }

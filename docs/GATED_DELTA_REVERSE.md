@@ -1,4 +1,4 @@
-# Gated-delta reverse scans
+# Gated-delta scans
 
 The provider recognizes the standard ONNX `Scan` data-flow used for gated-delta
 pullbacks. It checks all six output expressions, static axes and the FP32 scale.
@@ -10,7 +10,33 @@ registers across the time loop. SIMD reductions and small threadgroup scratch
 compute the key dot products. The outputs are the final adjoint state and the
 query, key, value, log-decay and beta gradients.
 
-## Shapes and execution
+## State and replay scans
+
+State-only scans compute checkpoint boundaries. Replay scans also return the
+state before each update for the reverse recurrence. The provider recognizes
+both forms and keeps four value columns per thread in registers across time.
+SIMD reductions compute the key/state product once per time step and value tile.
+
+For key `k`, value `v`, log-decay `g`, rate `b` and incoming state `S`, the update is
+
+```text
+F = S * exp(g[..., None])
+r = v - k[..., None, :] @ F
+S_next = F + b[..., None, None] * (k[..., :, None] * r[..., None, :])
+```
+
+The optional replay output is `S`, before the update. All arrays are FP32.
+Key widths are 16, 32, 64 and 128; value widths are 1–128. Log-decay may be
+per-head or per-key. Batch, head and positive sequence lengths are dynamic.
+Sequence axes are zero, input directions agree, and output directions agree.
+The independent input/output direction combinations are supported.
+
+Matching checks the entire body: changed expressions and unrelated operations
+retain generic Scan execution. Shapes and index bounds are checked at dispatch.
+The trace kernel names are `mlx_gated_delta_state_scan` and
+`mlx_gated_delta_replay_scan`.
+
+## Reverse scan shapes and execution
 
 The kernel uses FP32 arrays, key widths 16, 32, 64 or 128, and value widths from
 1 through 128. It supports positive dynamic batch, head and time dimensions,
@@ -33,6 +59,35 @@ bounded graph and expression sizes, and runtime shapes are checked before dispat
 Set `ONNXRUNTIME_EP_MLX_NO_GATED_DELTA_REVERSE=1` to select the generic Scan control.
 The fast-path trace event is `op.fast` with kernel `mlx_gated_delta_reverse_scan`.
 A matched body taking the generic path records its reason in `op.composed`.
+
+## 4K checkpoint replay measurement
+
+A real Qwen3.5-0.8B linear-attention block at 4,032 tokens ran in independent
+processes on M1 Max. Each process performed 10 warmups and 100 measured calls.
+The timed region is block recomputation and its VJP, including runtime array
+exchange. Parameters are fixed; the other decoder blocks, loss and optimizer
+run outside this measurement.
+
+| State/replay scans | Median / P95 | Process peak physical footprint | MLX window peak |
+|---|---:|---:|---:|
+| Generic, current parent | 851.03 / 863.48 ms | 3.36 GiB | 3.43 GiB |
+| Fused Metal | 280.25 / 285.59 ms | 3.99 GiB | 3.44 GiB |
+
+The median throughput ratio is 3.04.
+Both adapter gradients match the saved independent capture at
+`rtol=1e-4, atol=1e-6`; maximum absolute differences are 1.19e-9 and 1.16e-8.
+Inputs, exported model and gradient mappings are identical. ORT optimization,
+CPU fallback and MLX compilation are disabled, with one CPU thread and a
+512 MiB allocator cache.
+
+A separate trace contains two executions. State and replay each dispatch 252
+fused calls, alongside the existing 252 reverse calls. MatMul dispatches fall
+from 16,162 to 34. These counts include qualification and one measured execution;
+the timings above come from runs with tracing disabled.
+
+[Raw samples, guard observations, hashes, validation logs and trace counts](benchmarks/gated-delta-state-m1max/)
+record the parent and candidate binaries. The process peak includes imports,
+initialization and the runtime; the allocator window is reset after warmup.
 
 ## Real decoder measurement
 
