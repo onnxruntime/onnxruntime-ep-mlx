@@ -34,7 +34,11 @@ Larger FP32 products decode once per execution and use MLX GEMM. FP16/BF16
 products decode directly into the selected half dtype and use MLX GEMM; FP32
 adjoints widen those same rounded weights. Decode buffers remain local to the
 execution. A CPU stream uses a cached decode and ordinary matrix multiplication.
-Cache keys distinguish branch-local initializer storage and lookup values.
+Cache keys distinguish branch-local initializer storage and lookup values. Within one
+evaluation graph, primal and input-adjoint products share the canonical decoded
+matrix before transpose and compute-dtype conversion. The key includes packed
+and scale storage, matrix shape, block size, rounding and lookup values. Borrowed
+handles are cleared before evaluation releases the translation arena.
 See [half-precision execution](ATTENTION_VJP.md#half-precision-lookup-weights)
 for the rounding contract and precision benchmark.
 The exported ONNX graph and public operator registry keep their existing form.
@@ -73,5 +77,41 @@ weights packed throughout matrix execution.
 blocks, nonlinear codebooks, shared outputs, branch-local weights, nonfinite
 inputs and live parameter overrides. A three-projection chain verifies that
 all products dispatch through the packed kernel, and the disable switch
-provides the original-path control. Rust tests exercise CPU-stream cache
+provides the original-path control. Shared primal/adjoint cases cover FP32,
+FP16 and BF16, distinct scales/codebooks/rounding and compiled/eager replay.
+A Qwen3.5 BF16/NF4 audit covers six independent AdamW updates, frozen weights,
+PEFT exchange and exported-model reload. Rust tests exercise CPU-stream cache
 separation and region convexity, cache boundaries and quotient cycles.
+
+
+## Shared decode measurements
+
+On an M1 Max (32 GiB), a pinned Qwen3.5-0.8B BF16/NF4 task uses the same
+adapter snapshot and inputs in independent processes. Each run has ten warmups
+and 100 measured samples, with tracing disabled. ORT graph optimization,
+CPU fallback and MLX compilation are disabled.
+
+| 64-token whole task | Baseline median / P95 | Shared decode median / P95 | Throughput ratio |
+| --- | ---: | ---: | ---: |
+| Baseline then candidate | 390.78 / 447.72 ms | 379.63 / 426.99 ms | 1.029× |
+| Candidate then baseline | 391.21 / 429.37 ms | 375.23 / 406.57 ms | 1.043× |
+
+Timing includes forward, loss, all adapter gradients and runtime exchange.
+Loss and all 60 adapter gradients are byte identical. A separate traced run
+records 554 → 372 decodes and 182 reuse hits per step.
+
+| 4,032-token recomputation/VJP block | Baseline median / P95 | Shared decode median / P95 | MLX window peak, baseline → shared |
+| --- | ---: | ---: | ---: |
+| Linear attention, layer 8 | 293.70 / 299.75 ms | 294.55 / 325.07 ms | 3322.44 → 3338.51 MiB |
+| Full attention, layer 3 | 247.02 / 255.58 ms | 247.90 / 254.54 ms | 3447.61 → 3457.61 MiB |
+
+The long-context block medians are similar. Sharing retains the rounded matrix
+until its final consumer, adding about 10–16 MiB to these allocator peaks. Block
+timing covers the exported recomputation/VJP session and exchange; full-task
+loss and the optimizer execute outside that scope. Every replay output matches
+the captured baseline byte for byte.
+
+[Raw samples, process observations, dispatch counts and drivers](benchmarks/lookup4-reuse-m1max)
+record both execution orders, source/library hashes and memory scopes.
+Reproduction uses the pinned onnax checkout and its Hugging Face example
+dependencies, recorded in `provenance.json`.

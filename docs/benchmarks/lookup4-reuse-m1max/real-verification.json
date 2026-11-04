@@ -1,0 +1,11 @@
+{
+  "kernel_counts": {
+    "lookup4 decode + MLX GEMM": 744,
+    "lookup4 reused decode + MLX GEMM": 364
+  },
+  "steps": 2,
+  "all_60_gradients_exact": true,
+  "loss_exact": true,
+  "input_sha256": "adb02b9e70ef3d72063b25e7bfd7049ea7226797ce7aa642f8420372556eac2a",
+  "adapter_sha256": "e64a72ef8e03d75f39eb9cbb9722121e412fda3edfd80363ad5a0e923e854f94"
+}

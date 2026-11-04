@@ -1,0 +1,25 @@
+import json,os,subprocess
+from pathlib import Path
+root=Path('/tmp/onnax-bf16-lookup-block-pair');root.mkdir(exist_ok=False)
+python='/Users/justinc/Documents/GitHub/onnax/.venv/bin/python'
+libraries={'baseline':'/tmp/onnax-gated-delta-state-runtime/libonnxruntime_mlx_ep.dylib','candidate':'/tmp/onnax-mlx-lookup-reuse-runtime/libonnxruntime_mlx_ep.dylib'}
+env={**os.environ,'PYTHONPATH':'src:.','HF_HUB_OFFLINE':'1','ORT_DISABLE_TELEMETRY':'1'}
+for key in ['ONNXRUNTIME_EP_MLX_TRACE','ONNXRUNTIME_EP_MLX_VERBOSE']:env.pop(key,None)
+rows=[]
+for block,order in [('decoder_8_9',['baseline','candidate']),('decoder_3_4',['candidate','baseline'])]:
+ for label in order:
+  name=block+'-'+label;(root/'status.json').write_text(json.dumps({'phase':name}))
+  command=[python,'/tmp/onnax-bf16-block-profile-worker.py','measure','--bundle','/tmp/onnax-qwen35-real-bf16-canonical-30/training/export/execution','--captures','/tmp/onnax-bf16-lookup-captures4k','--block',block,'--provider','mlx','--library',libraries[label],'--warmup','10','--samples','100','--output',str(root/(name+'.json'))]
+  with (root/(name+'.log')).open('w') as log:r=subprocess.run([python,'-m','examples.huggingface.guard','--output-dir',str(root/(name+'-guard')),'--',*command],env=env,stdout=log,stderr=subprocess.STDOUT)
+  if r.returncode:
+   (root/'status.json').write_text(json.dumps({'phase':'failed','case':name,'returncode':r.returncode}));raise SystemExit(r.returncode)
+ a=json.loads((root/(block+'-baseline.json')).read_text());b=json.loads((root/(block+'-candidate.json')).read_text())
+ for key in ['bundle_identity','executed_model_sha256','input_arrays','output_arrays']:assert a[key]==b[key],key
+ for report in [a,b]:
+  for stage in ['outputs','final_outputs']:
+   assert all(v['max_abs']==0 and v['sha256']==report['output_arrays'][k]['sha256'] for k,v in report[stage].items())
+ row={'block':block,'baseline_median':a['median_seconds'],'candidate_median':b['median_seconds'],'ratio':a['median_seconds']/b['median_seconds'],'baseline_p95':a['p95_seconds'],'candidate_p95':b['p95_seconds'],'baseline_window_allocator_peak':a['window_allocator_peak_bytes'],'candidate_window_allocator_peak':b['window_allocator_peak_bytes'],'exact_capture_outputs':True}
+ for label in libraries:
+  g=json.loads((root/(block+'-'+label+'-guard')/'execution.json').read_text());assert g['status']=='complete' and g['returncode']==0;row[label+'_peak_physical_bytes']=max(o['peak_bytes'] for o in g['observations'])
+ rows.append(row);(root/'comparison.json').write_text(json.dumps(rows,indent=2)+'\n')
+(root/'status.json').write_text(json.dumps({'phase':'complete'}));print(json.dumps(rows),flush=True)

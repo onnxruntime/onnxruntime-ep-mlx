@@ -1,0 +1,16 @@
+{
+  "phase": "complete",
+  "scope": "RealQwen3.5-0.8B64tokensBF16/NF4;fixedparamforward/loss/backward+exchange;10warm100samplesindependentserialprocesses",
+  "baseline": {
+    "median": 0.3907797085121274,
+    "p95": 0.44772445866838095
+  },
+  "candidate": {
+    "median": 0.3796295414795168,
+    "p95": 0.42699414169183
+  },
+  "ratio": 1.0293711785156536,
+  "all60gradients_and_loss_exact": true,
+  "baseline_peak_physical_bytes": 4918480592,
+  "candidate_peak_physical_bytes": 4884598600
+}

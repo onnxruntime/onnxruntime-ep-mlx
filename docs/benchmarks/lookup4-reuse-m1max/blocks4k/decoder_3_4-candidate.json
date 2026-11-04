@@ -1,0 +1,342 @@
+{
+  "version": 1,
+  "block": "decoder_3_4",
+  "bundle_identity": "31bffc9c183e70e2e301a1d705167f2bb32db107d01f55e7779eb7422a834d36",
+  "executed_model_sha256": "ccc8bc57b36f70e362df41542eabebe15914ebd299980df5529a436e67ba5bda",
+  "input_arrays": {
+    "position_ids": {
+      "shape": [
+        1,
+        4032
+      ],
+      "dtype": "int64",
+      "bytes": 32256,
+      "sha256": "42f147e20f9815324ebaabbe868244b6c405c850c23edca03ee04201121928cc"
+    },
+    "attention_mask": {
+      "shape": [
+        1,
+        4032
+      ],
+      "dtype": "int64",
+      "bytes": 32256,
+      "sha256": "646aadd3ddf3e9a0992c91fe5b88345e8dd7c1c16ae132baf1aa97ad6527f818"
+    },
+    "input_ids": {
+      "shape": [
+        1,
+        4032
+      ],
+      "dtype": "int64",
+      "bytes": 32256,
+      "sha256": "d6571cf0cd77faa13bbf2fd93024e0618dcc1a882124fe3e30f8a08ca318a7cd"
+    },
+    "v_model.layers.2.Add_365": {
+      "shape": [
+        1,
+        4032,
+        1024
+      ],
+      "dtype": "float32",
+      "bytes": 16515072,
+      "sha256": "138ccd3fcc4ff1749c1bb7d8f5b7888401ca3f3ac40af707df4e919111c87460"
+    },
+    "model.layers.3.self_attn.q_proj.lora.A": {
+      "shape": [
+        1024,
+        4
+      ],
+      "dtype": "float32",
+      "bytes": 16384,
+      "sha256": "db0914049b9ab10f9dc15f8e7d9720dadfc17bd2e88090c1c0889a60210c525a"
+    },
+    "model.layers.3.self_attn.q_proj.lora.B": {
+      "shape": [
+        4,
+        4096
+      ],
+      "dtype": "float32",
+      "bytes": 65536,
+      "sha256": "d23a9c4118d91ae586fbb49a11a1b65914046328b9cd200ded4cd9588d57171b"
+    },
+    "model.layers.3.self_attn.v_proj.lora.A": {
+      "shape": [
+        1024,
+        4
+      ],
+      "dtype": "float32",
+      "bytes": 16384,
+      "sha256": "1378fe8ea41b6d871c087db60a52f49dfc8125abba9c6ec022bfc6bf26dc6642"
+    },
+    "model.layers.3.self_attn.v_proj.lora.B": {
+      "shape": [
+        4,
+        512
+      ],
+      "dtype": "float32",
+      "bytes": 8192,
+      "sha256": "9974678d28319a0c5289d4d9f2c1affc504e94d5bad8900b42a7947e9f48a045"
+    },
+    "v_model.layers.3.Add_402_cotangent": {
+      "shape": [
+        1,
+        4032,
+        1024
+      ],
+      "dtype": "float32",
+      "bytes": 16515072,
+      "sha256": "3325cca1a703081196d8695c4de34a57bb96aaea8f2cc9f1fc4ef90cc0fe818c"
+    }
+  },
+  "output_arrays": {
+    "v_model.layers.2.Add_365_cotangent": {
+      "shape": [
+        1,
+        4032,
+        1024
+      ],
+      "dtype": "float32",
+      "bytes": 16515072,
+      "sha256": "9da75e8ca151509950c7217d5f34b09d9f38b513eb7dd7808c9ccf001d50c82d"
+    },
+    "model.layers.3.self_attn.q_proj.lora.A_cotangent": {
+      "shape": [
+        1024,
+        4
+      ],
+      "dtype": "float32",
+      "bytes": 16384,
+      "sha256": "11b8c33b08cd259af1e33aaafe52f998dbdbb0a9cf16edcd8a28fe0c5df9040a"
+    },
+    "model.layers.3.self_attn.q_proj.lora.B_cotangent": {
+      "shape": [
+        4,
+        4096
+      ],
+      "dtype": "float32",
+      "bytes": 65536,
+      "sha256": "be8c10c36f6087527edb81bf17cfdcaf8dff0ed1fbd8048ba02060e851c7c066"
+    },
+    "model.layers.3.self_attn.v_proj.lora.A_cotangent": {
+      "shape": [
+        1024,
+        4
+      ],
+      "dtype": "float32",
+      "bytes": 16384,
+      "sha256": "08fdb0bb95e11e6211c777439add9caab4b905ce694a800306b6040776288072"
+    },
+    "model.layers.3.self_attn.v_proj.lora.B_cotangent": {
+      "shape": [
+        4,
+        512
+      ],
+      "dtype": "float32",
+      "bytes": 8192,
+      "sha256": "82cc095c5975a69faae47955587f48f136a22357965011040001d99b541e10b4"
+    }
+  },
+  "dynamic_input_bytes": 33233408,
+  "dynamic_output_bytes": 16621568,
+  "trainable_input_bytes": 106496,
+  "gradient_mapping": {
+    "v_model.layers.2.Add_365": "v_model.layers.2.Add_365_cotangent",
+    "model.layers.3.self_attn.q_proj.lora.A": "model.layers.3.self_attn.q_proj.lora.A_cotangent",
+    "model.layers.3.self_attn.q_proj.lora.B": "model.layers.3.self_attn.q_proj.lora.B_cotangent",
+    "model.layers.3.self_attn.v_proj.lora.A": "model.layers.3.self_attn.v_proj.lora.A_cotangent",
+    "model.layers.3.self_attn.v_proj.lora.B": "model.layers.3.self_attn.v_proj.lora.B_cotangent"
+  },
+  "main_graph_nodes": 567,
+  "onnx_file_bytes": 286515,
+  "declared_initializer_bytes": 77441476,
+  "outputs": {
+    "v_model.layers.2.Add_365_cotangent": {
+      "max_abs": 0.0,
+      "sha256": "9da75e8ca151509950c7217d5f34b09d9f38b513eb7dd7808c9ccf001d50c82d"
+    },
+    "model.layers.3.self_attn.q_proj.lora.A_cotangent": {
+      "max_abs": 0.0,
+      "sha256": "11b8c33b08cd259af1e33aaafe52f998dbdbb0a9cf16edcd8a28fe0c5df9040a"
+    },
+    "model.layers.3.self_attn.q_proj.lora.B_cotangent": {
+      "max_abs": 0.0,
+      "sha256": "be8c10c36f6087527edb81bf17cfdcaf8dff0ed1fbd8048ba02060e851c7c066"
+    },
+    "model.layers.3.self_attn.v_proj.lora.A_cotangent": {
+      "max_abs": 0.0,
+      "sha256": "08fdb0bb95e11e6211c777439add9caab4b905ce694a800306b6040776288072"
+    },
+    "model.layers.3.self_attn.v_proj.lora.B_cotangent": {
+      "max_abs": 0.0,
+      "sha256": "82cc095c5975a69faae47955587f48f136a22357965011040001d99b541e10b4"
+    }
+  },
+  "final_outputs": {
+    "v_model.layers.2.Add_365_cotangent": {
+      "max_abs": 0.0,
+      "sha256": "9da75e8ca151509950c7217d5f34b09d9f38b513eb7dd7808c9ccf001d50c82d"
+    },
+    "model.layers.3.self_attn.q_proj.lora.A_cotangent": {
+      "max_abs": 0.0,
+      "sha256": "11b8c33b08cd259af1e33aaafe52f998dbdbb0a9cf16edcd8a28fe0c5df9040a"
+    },
+    "model.layers.3.self_attn.q_proj.lora.B_cotangent": {
+      "max_abs": 0.0,
+      "sha256": "be8c10c36f6087527edb81bf17cfdcaf8dff0ed1fbd8048ba02060e851c7c066"
+    },
+    "model.layers.3.self_attn.v_proj.lora.A_cotangent": {
+      "max_abs": 0.0,
+      "sha256": "08fdb0bb95e11e6211c777439add9caab4b905ce694a800306b6040776288072"
+    },
+    "model.layers.3.self_attn.v_proj.lora.B_cotangent": {
+      "max_abs": 0.0,
+      "sha256": "82cc095c5975a69faae47955587f48f136a22357965011040001d99b541e10b4"
+    }
+  },
+  "session_creation_seconds": 0.09045012504793704,
+  "first_execution_seconds": 0.2782009580405429,
+  "warmup": 10,
+  "samples": [
+    0.246065792045556,
+    0.24195499997586012,
+    0.2442720839753747,
+    0.24615383299533278,
+    0.24704116699285805,
+    0.25002329098060727,
+    0.24272829096298665,
+    0.24689279193989933,
+    0.25185129093006253,
+    0.25089129200205207,
+    0.2510128750000149,
+    0.24844633298926055,
+    0.2515269999857992,
+    0.252389291068539,
+    0.24881520797498524,
+    0.24989958305377513,
+    0.24794725002720952,
+    0.24784633400849998,
+    0.2498382079647854,
+    0.25284175004344434,
+    0.25050512491725385,
+    0.24565237504430115,
+    0.25130079209338874,
+    0.24683904100675136,
+    0.2553460829658434,
+    0.2444024580763653,
+    0.2498832499841228,
+    0.24539712502155453,
+    0.24859062500763685,
+    0.2528109159320593,
+    0.24919391598086804,
+    0.2516549159772694,
+    0.24884041701443493,
+    0.24710695899557322,
+    0.248739542090334,
+    0.2436908750096336,
+    0.2432999589946121,
+    0.2541460000211373,
+    0.2482665409334004,
+    0.24707212497014552,
+    0.25420083303470165,
+    0.2644185828976333,
+    0.24491358397062868,
+    0.24568674992769957,
+    0.24903683294542134,
+    0.24761004198808223,
+    0.2470578330103308,
+    0.24869449995458126,
+    0.24570041697006673,
+    0.25330541597213596,
+    0.24767620803322643,
+    0.24723229208029807,
+    0.2505896670045331,
+    0.24890825001057237,
+    0.24670379096642137,
+    0.24758800002746284,
+    0.2525313750375062,
+    0.2456463749986142,
+    0.2455422079656273,
+    0.2563931249314919,
+    0.24736045801546425,
+    0.24634850001893938,
+    0.25140974996611476,
+    0.24801025004126132,
+    0.248190583079122,
+    0.25174237496685237,
+    0.24640020891092718,
+    0.24499983293935657,
+    0.24686849990393966,
+    0.24870816699694842,
+    0.24569312506355345,
+    0.25452708289958537,
+    0.24544929107651114,
+    0.24850512493867427,
+    0.24571529205422848,
+    0.2502017910592258,
+    0.2518696659244597,
+    0.24935525003820658,
+    0.29859449993819,
+    0.2480455000186339,
+    0.2548642500769347,
+    0.24576470896136016,
+    0.24483962496742606,
+    0.24607812496833503,
+    0.2504188750172034,
+    0.24234991695266217,
+    0.24427654105238616,
+    0.24689037492498755,
+    0.2435280829668045,
+    0.24494008300825953,
+    0.2438526670448482,
+    0.24265454208943993,
+    0.25178237492218614,
+    0.25168591702822596,
+    0.2507444580551237,
+    0.24726170802023262,
+    0.2438170419773087,
+    0.24333720898721367,
+    0.24383129097986966,
+    0.24486404203344136
+  ],
+  "median_seconds": 0.24789679201785475,
+  "p95_seconds": 0.2545439412584528,
+  "allocator_before": {
+    "active_bytes": 77441348,
+    "cache_bytes": 562429976,
+    "peak_bytes": 0
+  },
+  "allocator_after": {
+    "active_bytes": 77441348,
+    "cache_bytes": 562429976,
+    "peak_bytes": 3625567668
+  },
+  "window_allocator_peak_bytes": 3625567668,
+  "incremental_allocator_peak_bytes": 3548126320,
+  "process_peak_rss_bytes": 434864128,
+  "physical_memory": {
+    "available": true,
+    "current_bytes": 941130952,
+    "lifetime_peak_bytes": 3801629896,
+    "current_resident_bytes": 419201024,
+    "scope": "macOS kernel whole-process physical footprint; includes setup and runtime"
+  },
+  "memory_scope": "Whole worker including imports, bundle verification, one derivative session and captured CPU arrays; allocator peak reset after qualification/warmup",
+  "timing_scope": "One exported block recomputation/VJP session, including runtime host/device exchange; fixed parameters; excludes other blocks, task loss and optimizer",
+  "ort_graph_optimization": "disabled",
+  "cpu_threads": 1,
+  "platform": "macOS-27.0.1-arm64-arm-64bit",
+  "tool_source_sha256": "428440136f38ae75bce011a596ce09abe063960b9c47f1ea1befdb24e2901e16",
+  "versions": {
+    "numpy": "2.4.6",
+    "onnxruntime": "1.31.1",
+    "mlx": "0.32.4"
+  },
+  "provider": "mlx",
+  "cpu_fallback_disabled": true,
+  "library_sha256": "29623bb837f0b70c255380e73f4405111712319b0495d1d46f5fe5cf967bacf3",
+  "gated_delta_reverse_fused": true,
+  "runtime_environment": {
+    "ONNXRUNTIME_EP_MLX_NO_COMPILE": "1",
+    "ONNXRUNTIME_EP_MLX_CACHE_LIMIT_BYTES": "536870912"
+  }
+}

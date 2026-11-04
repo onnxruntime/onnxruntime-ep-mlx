@@ -1,0 +1,298 @@
+{
+  "version": 1,
+  "bundle_identity": "31bffc9c183e70e2e301a1d705167f2bb32db107d01f55e7779eb7422a834d36",
+  "interface_sha256": "80bd1c59961fe891872b8a5856f3444ad70b6f33d65ee1d30fcb99d7e6c7dd96",
+  "batch": {
+    "input_ids": {
+      "shape": [
+        1,
+        4032
+      ],
+      "dtype": "int64",
+      "bytes": 32256,
+      "sha256": "d6571cf0cd77faa13bbf2fd93024e0618dcc1a882124fe3e30f8a08ca318a7cd"
+    },
+    "attention_mask": {
+      "shape": [
+        1,
+        4032
+      ],
+      "dtype": "int64",
+      "bytes": 32256,
+      "sha256": "646aadd3ddf3e9a0992c91fe5b88345e8dd7c1c16ae132baf1aa97ad6527f818"
+    },
+    "position_ids": {
+      "shape": [
+        1,
+        4032
+      ],
+      "dtype": "int64",
+      "bytes": 32256,
+      "sha256": "42f147e20f9815324ebaabbe868244b6c405c850c23edca03ee04201121928cc"
+    },
+    "labels": {
+      "shape": [
+        1,
+        4032
+      ],
+      "dtype": "int64",
+      "bytes": 32256,
+      "sha256": "d6571cf0cd77faa13bbf2fd93024e0618dcc1a882124fe3e30f8a08ca318a7cd"
+    }
+  },
+  "loss": 0.06225002557039261,
+  "blocks": {
+    "decoder_8_9": {
+      "index": 9,
+      "model": "block_9_backward.onnx",
+      "feeds": "block_9_feeds.npz",
+      "outputs": "block_9_outputs.npz",
+      "input_arrays": {
+        "v_Shape_0": {
+          "shape": [
+            1
+          ],
+          "dtype": "int64",
+          "bytes": 8,
+          "sha256": "7c9fa136d4413fa6173637e883b6998d32e1d675f88cddff9dcbcf331820f4b8"
+        },
+        "v_model.layers.7.Add_658": {
+          "shape": [
+            1,
+            4032,
+            1024
+          ],
+          "dtype": "float32",
+          "bytes": 16515072,
+          "sha256": "0646c0a712db3f155cb30cafc0440e9be2caaac67073d4837ace56c8d9913469"
+        },
+        "model.layers.8.linear_attn.in_proj_qkv.lora.A": {
+          "shape": [
+            1024,
+            4
+          ],
+          "dtype": "float32",
+          "bytes": 16384,
+          "sha256": "23029f5a99aa79dc3f23f00a2849a98a742c56226df9d6568a313caabcbe5ed2"
+        },
+        "model.layers.8.linear_attn.in_proj_qkv.lora.B": {
+          "shape": [
+            4,
+            6144
+          ],
+          "dtype": "float32",
+          "bytes": 98304,
+          "sha256": "6550263fbca80f412812f2f15ab8b47c68056dfce7cd9466d937d6a38cafdfb5"
+        },
+        "v_model.layers.8.Add_731_cotangent": {
+          "shape": [
+            1,
+            4032,
+            1024
+          ],
+          "dtype": "float32",
+          "bytes": 16515072,
+          "sha256": "9815d475c757d0b7b512f932856216e96586dfdf1987fcbca152d48be2267db3"
+        }
+      },
+      "output_arrays": {
+        "v_model.layers.7.Add_658_cotangent": {
+          "shape": [
+            1,
+            4032,
+            1024
+          ],
+          "dtype": "float32",
+          "bytes": 16515072,
+          "sha256": "688ff01a9d4fc68cefb5bb9919ff92f69d82c2b2db92c08ca0df221af5cec07c"
+        },
+        "model.layers.8.linear_attn.in_proj_qkv.lora.A_cotangent": {
+          "shape": [
+            1024,
+            4
+          ],
+          "dtype": "float32",
+          "bytes": 16384,
+          "sha256": "e0f7c6f87aff7f7f2a8d82b749e53e9b5ddf070608f98f160487d72f53df4fc4"
+        },
+        "model.layers.8.linear_attn.in_proj_qkv.lora.B_cotangent": {
+          "shape": [
+            4,
+            6144
+          ],
+          "dtype": "float32",
+          "bytes": 98304,
+          "sha256": "cf23e20a19722c5514c35699c5cd9500a7aec63de0faa81cb38978ed2bfc9b44"
+        }
+      },
+      "output_names": [
+        "v_model.layers.7.Add_658_cotangent",
+        "model.layers.8.linear_attn.in_proj_qkv.lora.A_cotangent",
+        "model.layers.8.linear_attn.in_proj_qkv.lora.B_cotangent"
+      ]
+    },
+    "decoder_3_4": {
+      "index": 4,
+      "model": "block_4_backward.onnx",
+      "feeds": "block_4_feeds.npz",
+      "outputs": "block_4_outputs.npz",
+      "input_arrays": {
+        "position_ids": {
+          "shape": [
+            1,
+            4032
+          ],
+          "dtype": "int64",
+          "bytes": 32256,
+          "sha256": "42f147e20f9815324ebaabbe868244b6c405c850c23edca03ee04201121928cc"
+        },
+        "attention_mask": {
+          "shape": [
+            1,
+            4032
+          ],
+          "dtype": "int64",
+          "bytes": 32256,
+          "sha256": "646aadd3ddf3e9a0992c91fe5b88345e8dd7c1c16ae132baf1aa97ad6527f818"
+        },
+        "input_ids": {
+          "shape": [
+            1,
+            4032
+          ],
+          "dtype": "int64",
+          "bytes": 32256,
+          "sha256": "d6571cf0cd77faa13bbf2fd93024e0618dcc1a882124fe3e30f8a08ca318a7cd"
+        },
+        "v_model.layers.2.Add_365": {
+          "shape": [
+            1,
+            4032,
+            1024
+          ],
+          "dtype": "float32",
+          "bytes": 16515072,
+          "sha256": "138ccd3fcc4ff1749c1bb7d8f5b7888401ca3f3ac40af707df4e919111c87460"
+        },
+        "model.layers.3.self_attn.q_proj.lora.A": {
+          "shape": [
+            1024,
+            4
+          ],
+          "dtype": "float32",
+          "bytes": 16384,
+          "sha256": "db0914049b9ab10f9dc15f8e7d9720dadfc17bd2e88090c1c0889a60210c525a"
+        },
+        "model.layers.3.self_attn.q_proj.lora.B": {
+          "shape": [
+            4,
+            4096
+          ],
+          "dtype": "float32",
+          "bytes": 65536,
+          "sha256": "d23a9c4118d91ae586fbb49a11a1b65914046328b9cd200ded4cd9588d57171b"
+        },
+        "model.layers.3.self_attn.v_proj.lora.A": {
+          "shape": [
+            1024,
+            4
+          ],
+          "dtype": "float32",
+          "bytes": 16384,
+          "sha256": "1378fe8ea41b6d871c087db60a52f49dfc8125abba9c6ec022bfc6bf26dc6642"
+        },
+        "model.layers.3.self_attn.v_proj.lora.B": {
+          "shape": [
+            4,
+            512
+          ],
+          "dtype": "float32",
+          "bytes": 8192,
+          "sha256": "9974678d28319a0c5289d4d9f2c1affc504e94d5bad8900b42a7947e9f48a045"
+        },
+        "v_model.layers.3.Add_402_cotangent": {
+          "shape": [
+            1,
+            4032,
+            1024
+          ],
+          "dtype": "float32",
+          "bytes": 16515072,
+          "sha256": "3325cca1a703081196d8695c4de34a57bb96aaea8f2cc9f1fc4ef90cc0fe818c"
+        }
+      },
+      "output_arrays": {
+        "v_model.layers.2.Add_365_cotangent": {
+          "shape": [
+            1,
+            4032,
+            1024
+          ],
+          "dtype": "float32",
+          "bytes": 16515072,
+          "sha256": "9da75e8ca151509950c7217d5f34b09d9f38b513eb7dd7808c9ccf001d50c82d"
+        },
+        "model.layers.3.self_attn.q_proj.lora.A_cotangent": {
+          "shape": [
+            1024,
+            4
+          ],
+          "dtype": "float32",
+          "bytes": 16384,
+          "sha256": "11b8c33b08cd259af1e33aaafe52f998dbdbb0a9cf16edcd8a28fe0c5df9040a"
+        },
+        "model.layers.3.self_attn.q_proj.lora.B_cotangent": {
+          "shape": [
+            4,
+            4096
+          ],
+          "dtype": "float32",
+          "bytes": 65536,
+          "sha256": "be8c10c36f6087527edb81bf17cfdcaf8dff0ed1fbd8048ba02060e851c7c066"
+        },
+        "model.layers.3.self_attn.v_proj.lora.A_cotangent": {
+          "shape": [
+            1024,
+            4
+          ],
+          "dtype": "float32",
+          "bytes": 16384,
+          "sha256": "08fdb0bb95e11e6211c777439add9caab4b905ce694a800306b6040776288072"
+        },
+        "model.layers.3.self_attn.v_proj.lora.B_cotangent": {
+          "shape": [
+            4,
+            512
+          ],
+          "dtype": "float32",
+          "bytes": 8192,
+          "sha256": "82cc095c5975a69faae47955587f48f136a22357965011040001d99b541e10b4"
+        }
+      },
+      "output_names": [
+        "v_model.layers.2.Add_365_cotangent",
+        "model.layers.3.self_attn.q_proj.lora.A_cotangent",
+        "model.layers.3.self_attn.q_proj.lora.B_cotangent",
+        "model.layers.3.self_attn.v_proj.lora.A_cotangent",
+        "model.layers.3.self_attn.v_proj.lora.B_cotangent"
+      ]
+    }
+  },
+  "pretrained_source": {
+    "checkpoint_to_reference_prefix": {
+      "model.language_model.": "model."
+    },
+    "dtype": "float32",
+    "loading": {
+      "error_msgs": [],
+      "mismatched_keys": [],
+      "missing_keys": [],
+      "unexpected_keys": []
+    },
+    "model_id": "Qwen/Qwen3.5-0.8B",
+    "parameter_count": 752393024,
+    "reference_class": "Qwen3_5ForCausalLM",
+    "revision": "2fc06364715b967f1860aea9cf38778875588b17",
+    "version": 1
+  }
+}

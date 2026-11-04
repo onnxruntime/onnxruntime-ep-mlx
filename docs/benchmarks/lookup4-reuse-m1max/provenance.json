@@ -1,0 +1,18 @@
+{
+  "candidate_implementation_commit": "1d6d9dd9cae6d1575632084ea488832af41461c3",
+  "candidate_validation_commit": "0c7107e817b2dbb15bfb872bddf8fa498522450b",
+  "candidate_library_sha256": "29623bb837f0b70c255380e73f4405111712319b0495d1d46f5fe5cf967bacf3",
+  "baseline_commit": "043f1def965fab6b67dea16e692b71951b7331cf",
+  "baseline_library_sha256": "f6079553459908fa84a090201aaea90f71ccdfcb7700e0c090eb5c5a344efabc",
+  "onnax_commit": "c5ce8ee710e9fe003c6fe850db854551b631db01",
+  "hardware": "Apple M1 Max,32GiB,macOS27.0.1",
+  "scope": "Wholemodel64token pairs10warm100samples per independent process; two real4032token blocks10warm100samples per process; timing excludes optimizer; all output hashes exact; ORT optimizer/CPUfallback/MLXcompile disabled",
+  "trace_files": {
+    "/tmp/onnax-qwen35-bf16-native-profile64.trace.json": "5314b9d01190393a48a83ab10eaf2e5f87ec80ac7bc51c6d704cbc63b995602b",
+    "/tmp/onnax-qwen35-bf16-reused-profile64.trace.json": "bb8532a718afb3ab83ec71f8674e02b658f1578a4bd31f5c7ddbf100a72f6a5b"
+  },
+  "rust_files_sha256": {
+    "rust/src/engine.rs": "f73bba788349f24a94f8aeb4b7b6d2662280e671f541e8394722810c24346789",
+    "rust/src/ops/lut4.rs": "c98255fc62b7a67da87708b48d44618df0b7bb50b8ed4685f34ef56b7af943ae"
+  }
+}
