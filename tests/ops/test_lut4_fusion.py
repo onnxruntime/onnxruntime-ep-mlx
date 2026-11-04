@@ -465,3 +465,116 @@ def test_lut4_rounded_actual_dispatch(tmp_path):
             and e.get("args", {}).get("kernel") == "lookup4 decode + MLX GEMM"
         ]
         assert len(calls) == (0 if disabled else 4)
+
+
+def _primal_adjoint_model(precision, *, adjoint_precision=None, adjoint_buffers=None):
+    k, n = 67, 37
+    buffers = _buffers(k, n, 64)
+    x = models.tensor("x", ir.DataType.FLOAT, ["m", k])
+    seed = models.tensor("seed", ir.DataType.FLOAT, ["m", n])
+    primal, adjoint = ir.tape.Tape(), ir.tape.Tape()
+    y, _, _ = _lookup(primal, x, buffers, prefix="primal.", precision=precision)
+    cotangent = adjoint.op("Mul", [seed, y])
+    cotangent.dtype, cotangent.shape = y.dtype, y.shape
+    dx, _, _ = _lookup(adjoint, cotangent,
+                       buffers if adjoint_buffers is None else adjoint_buffers,
+                       prefix="adjoint.", precision=adjoint_precision or precision,
+                       adjoint=True, transpose=True)
+    initializers = {v.name.removeprefix("primal."): v for v in primal.initializers}
+    additional = []
+    for value in adjoint.initializers:
+        first = initializers[value.name.removeprefix("adjoint.")]
+        if np.array_equal(value.const_value.numpy(), first.const_value.numpy()):
+            value.replace_all_uses_with(first)
+        else:
+            additional.append(value)
+    model = ir.Model(ir.Graph([x, seed], [y, dx],
+                              nodes=[*primal.nodes, *adjoint.nodes],
+                              initializers=[*primal.initializers, *additional],
+                              opset_imports={"": 18}, name="primal_adjoint_lookup"),
+                     ir_version=10)
+    onnx.checker.check_model(ir.to_proto(model), full_check=True)
+    return model, buffers
+
+
+@pytest.mark.parametrize("precision", ["fp16", "bf16"])
+@pytest.mark.parametrize("no_compile", ["0", "1"])
+def test_lut4_shared_primal_adjoint(precision, no_compile, monkeypatch):
+    monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_COMPILE", no_compile)
+    monkeypatch.delenv("ONNXRUNTIME_EP_MLX_NO_LUT4_FUSION", raising=False)
+    model, buffers = _primal_adjoint_model(precision)
+    fused = _session(model, "MLXExecutionProvider")
+    monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_LUT4_FUSION", "1")
+    portable = _session(model, "MLXExecutionProvider")
+    dtype = np.float16 if precision == "fp16" else ml_dtypes.bfloat16
+    weight = _reference(buffers["packed"], buffers["scales"], buffers["book"], (67, 37))
+    rounded = weight.astype(dtype).astype(np.float32)
+    rng = np.random.default_rng(931)
+    for m in [1, 17, 128, 129, 0, 3, 1]:
+        x = rng.normal(0, 0.1, (m, 67)).astype(np.float32)
+        seed = rng.normal(0, 0.1, (m, 37)).astype(np.float32)
+        feeds = {"x": x, "seed": seed}
+        actual, expected = fused.run(None, feeds), portable.run(None, feeds)
+        for a, b in zip(actual, expected, strict=True):
+            np.testing.assert_array_equal(a, b)
+        np.testing.assert_allclose(actual[0],
+                                   (x.astype(dtype).astype(np.float32) @ rounded)
+                                   .astype(dtype).astype(np.float32),
+                                   rtol=0.01, atol=0.0001)
+        # Evaluate the adjoint at the portable forward activation, isolating
+        # shared-weight decode semantics from half-GEMM rounding.
+        np.testing.assert_allclose(actual[1], (seed * expected[0]) @ rounded.T,
+                                   rtol=1e-4, atol=1e-6)
+
+
+def test_lut4_shared_decode_dispatch_probe(monkeypatch):
+    monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_COMPILE", "1")
+    monkeypatch.delenv("ONNXRUNTIME_EP_MLX_NO_LUT4_FUSION", raising=False)
+    for precision in ["fp16", "bf16"]:
+        model, _ = _primal_adjoint_model(precision)
+        session = _session(model, "MLXExecutionProvider")
+        session.run(None, {"x": np.ones((3, 67), np.float32),
+                           "seed": np.ones((3, 37), np.float32)})
+
+
+def test_lut4_shared_decode_actual_dispatch(tmp_path):
+    trace = tmp_path / "shared-decode.json"
+    subprocess.run(
+        [sys.executable, "-m", "pytest",
+         f"{Path(__file__)}::test_lut4_shared_decode_dispatch_probe",
+         "-q", "-p", "no:cacheprovider"],
+        env={**os.environ, "ONNXRUNTIME_EP_MLX_TRACE": str(trace)},
+        check=True, timeout=180,
+    )
+    events = json.loads(trace.read_text())
+    variants = [e.get("args", {}).get("kernel_variant") for e in events
+                if e.get("cat") == "op.fast"]
+    assert variants.count("lookup4 decode + MLX GEMM") == 2
+    assert variants.count("lookup4 reused decode + MLX GEMM") == 2
+
+
+@pytest.mark.parametrize("change", ["book", "scales", "precision"])
+def test_lut4_shared_decode_preserves_distinct_weights(change, monkeypatch):
+    other = _buffers(67, 37, 64)
+    if change == "book":
+        other["book"] = other["book"][::-1].copy()
+    elif change == "scales":
+        other["scales"] = other["scales"] * np.float32(0.75)
+    precision = "fp16" if change == "precision" else "bf16"
+    model, _ = _primal_adjoint_model("bf16", adjoint_precision=precision,
+                                     adjoint_buffers=other)
+    monkeypatch.delenv("ONNXRUNTIME_EP_MLX_NO_LUT4_FUSION", raising=False)
+    fused = _session(model, "MLXExecutionProvider")
+    monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_LUT4_FUSION", "1")
+    portable = _session(model, "MLXExecutionProvider")
+    rng = np.random.default_rng(92)
+    feeds = {"x": rng.normal(0, 0.1, (3, 67)).astype(np.float32),
+             "seed": rng.normal(0, 0.1, (3, 37)).astype(np.float32)}
+    actual, expected = fused.run(None, feeds), portable.run(None, feeds)
+    for a, b in zip(actual, expected, strict=True):
+        np.testing.assert_array_equal(a, b)
+    dtype = np.float16 if precision == "fp16" else ml_dtypes.bfloat16
+    weight = _reference(other["packed"], other["scales"], other["book"], (67, 37))
+    rounded = weight.astype(dtype).astype(np.float32)
+    np.testing.assert_allclose(actual[1], (feeds["seed"] * expected[0]) @ rounded.T,
+                               rtol=1e-4, atol=1e-6)
