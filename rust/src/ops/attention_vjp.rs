@@ -28,8 +28,8 @@ struct Config {
 }
 impl Config {
     fn kv_rows(&self) -> i32 {
-        // Two KV_ROWS x D accumulators and score workspace must fit 32 KiB.
-        if self.d > 192 { 8 } else { 16 }
+        // Smaller tiles improve occupancy for wider heads and bound workspace.
+        if self.d >= 128 { 8 } else { 16 }
     }
 
     fn parse(name: &str) -> Option<Self> {
@@ -424,7 +424,7 @@ mod tests {
             let kv = (4 * c.kv_rows() * 32 + 2 * c.kv_rows() * d) * 4;
             let dq = (3 * 16 * 32 + 16 * d) * 4;
             assert!(kv <= 32 * 1024 && dq <= 32 * 1024);
-            assert_eq!(c.kv_rows(), if d > 192 { 8 } else { 16 });
+            assert_eq!(c.kv_rows(), if d >= 128 { 8 } else { 16 });
         }
     }
 
