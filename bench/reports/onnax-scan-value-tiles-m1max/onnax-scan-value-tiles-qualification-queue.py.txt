@@ -1,0 +1,14 @@
+import json,os,subprocess,sys,time
+from pathlib import Path
+root=Path('/tmp/onnax-scan-value-tiles-qualification');root.mkdir(exist_ok=False)
+env={**os.environ,'PYTHONPATH':'src:.','ONNXRUNTIME_EP_MLX_NO_COMPILE':'1','ONNXRUNTIME_EP_MLX_CACHE_LIMIT_BYTES':'536870912','HF_HUB_OFFLINE':'1','HF_DATASETS_OFFLINE':'1'}
+def state(**kw):(root/'status.json').write_text(json.dumps(kw,indent=2)+'\n')
+try:
+ for label,lib in [('baseline','/tmp/onnax-mlx-lookup-reuse-runtime/libonnxruntime_mlx_ep.dylib'),('candidate','/tmp/onnax-scan-value-tiles-runtime/libonnxruntime_mlx_ep.dylib')]:
+  state(phase='block_measurement',label=label)
+  with (root/f'{label}.log').open('w') as log:subprocess.run([sys.executable,'-m','examples.huggingface.guard','--output-dir',str(root/f'{label}-guard'),'--',sys.executable,'/tmp/onnax-scan-value-tiles-benchmark.py','--library',lib,'--output',str(root/label)],env=env,stdout=log,stderr=subprocess.STDOUT,check=True)
+ state(phase='whole_model_correctness',sequence=4032)
+ with (root/'full-model.log').open('w') as log:subprocess.run([sys.executable,'/tmp/onnax-scan-value-tiles-full-check.py'],env={**env,'ONNAX_CHECK_SEQUENCE':'4032','ONNAX_CHECK_WARMUP':'1','ONNAX_CHECK_SAMPLES':'1','ONNAX_CHECK_OUTPUT':str(root/'full4032')},stdout=log,stderr=subprocess.STDOUT,check=True)
+ state(phase='complete')
+except BaseException as error:
+ state(phase='failed',error=repr(error));raise

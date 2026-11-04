@@ -1,0 +1,30 @@
+"""Profile a real simplified backward block with captured fixed inputs."""
+import argparse,hashlib,json,time
+from pathlib import Path
+import numpy as np
+from examples.huggingface.block_runtime import arrays_record,check_outputs,MlxMemory
+from examples.huggingface.long_context import memory_limit
+from examples.lora.mlx_runtime import register_library,session
+p=argparse.ArgumentParser();p.add_argument('--output',required=True);p.add_argument('--block',type=int,default=9);p.add_argument('--library',required=True);a=p.parse_args()
+root=Path(a.output);root.mkdir(exist_ok=False)
+lib=a.library
+register_library(lib);memory_limit(lib,12*1024**3)
+captures=Path('/tmp/onnax-bf16-lookup-captures4k');capture=json.loads((captures/'capture.json').read_text())
+record=next(r for r in capture['blocks'].values() if r['index']==a.block)
+with np.load(captures/record['feeds'],allow_pickle=False) as archive:feeds={k:archive[k] for k in archive.files}
+with np.load(captures/record['outputs'],allow_pickle=False) as archive:expected={k:archive[k] for k in archive.files}
+assert arrays_record(feeds)==record['input_arrays']
+assert arrays_record(expected)==record['output_arrays']
+model=Path(f'/tmp/onnax-symbolic-block{a.block}-candidate/block_{a.block}_backward.onnx')
+model_hash=hashlib.sha256(model.read_bytes()).hexdigest()
+t=time.perf_counter();executor=session(str(model),enable_compile=False);construction=time.perf_counter()-t
+names=[o.name for o in executor.get_outputs()];assert set(v.name for v in executor.get_inputs())==set(feeds)
+samples=[]
+for index in range(110):
+ t=time.perf_counter();actual=executor.run(None,feeds);elapsed=time.perf_counter()-t
+ checks=check_outputs(names,actual,expected)
+ samples.append({'index':index,'seconds':elapsed,'checks':checks})
+assert hashlib.sha256(model.read_bytes()).hexdigest()==model_hash
+assert arrays_record(feeds)==record['input_arrays']
+report={'block':a.block,'sequence':4032,'model_sha256':model_hash,'library_sha256':hashlib.sha256(Path(lib).read_bytes()).hexdigest(),'session_creation_seconds':construction,'scope':'single-block diagnostic: ten warmups and one hundred measured calls; tracing disabled; paired block measurement','samples':samples,'allocator':MlxMemory(lib).snapshot()}
+(root/'report.json').write_text(json.dumps(report,indent=2)+'\n');print(json.dumps(report,indent=2))

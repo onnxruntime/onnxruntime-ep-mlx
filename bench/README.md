@@ -73,6 +73,13 @@ chunks: the compiled route records an initial miss, a tail-shape retrace and
 cache hits on repeated shapes. The folder also retains synchronized PyTorch
 head-stage diagnostics, process guards and source checksums.
 
+## Gated-delta Scan value tiles
+
+The [4032-token backward-block report](reports/onnax-scan-value-tiles-m1max/README.md)
+measures eight-column reverse tiles: 8.0% higher block throughput and 22.5%
+lower MLX allocator peak on M1 Max. The report includes raw samples, numerical
+checks and runtime digests.
+
 ## Historical model measurements
 
 These results were previously recorded in the root README on an M1 Max.

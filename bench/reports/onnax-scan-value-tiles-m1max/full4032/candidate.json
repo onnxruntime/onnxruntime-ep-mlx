@@ -1,0 +1,204 @@
+{
+  "version": 1,
+  "mode": "fused",
+  "scope": "forward, mean shifted-token loss and all adapter gradients; fixed parameters",
+  "component_scope": "block times include native host/device transfers; input_snapshot times CPU buffer cloning",
+  "input_shape": [
+    1,
+    4032
+  ],
+  "prediction_targets_per_step": 4031,
+  "source_identity": "31bffc9c183e70e2e301a1d705167f2bb32db107d01f55e7779eb7422a834d36",
+  "adapter_sha256": "e64a72ef8e03d75f39eb9cbb9722121e412fda3edfd80363ad5a0e923e854f94",
+  "input_sha256": "a56739769a4f12c8cb3309feb2cf0d8cad19ec1284ebcae501c05212c1356f1e",
+  "pretrained_source": {
+    "checkpoint_to_reference_prefix": {
+      "model.language_model.": "model."
+    },
+    "dtype": "float32",
+    "loading": {
+      "error_msgs": [],
+      "mismatched_keys": [],
+      "missing_keys": [],
+      "unexpected_keys": []
+    },
+    "model_id": "Qwen/Qwen3.5-0.8B",
+    "parameter_count": 752393024,
+    "reference_class": "Qwen3_5ForCausalLM",
+    "revision": "2fc06364715b967f1860aea9cf38778875588b17",
+    "version": 1
+  },
+  "checkpoint_boundaries": {
+    "prefix": "v_model.embed_tokens.Gather_109",
+    "decoder_0_1": "v_model.layers.0.Add_219",
+    "decoder_1_2": "v_model.layers.1.Add_292",
+    "decoder_2_3": "v_model.layers.2.Add_365",
+    "decoder_3_4": "v_model.layers.3.Add_402",
+    "decoder_4_5": "v_model.layers.4.Add_475",
+    "decoder_5_6": "v_model.layers.5.Add_548",
+    "decoder_6_7": "v_model.layers.6.Add_621",
+    "decoder_7_8": "v_model.layers.7.Add_658",
+    "decoder_8_9": "v_model.layers.8.Add_731",
+    "decoder_9_10": "v_model.layers.9.Add_804",
+    "decoder_10_11": "v_model.layers.10.Add_877",
+    "decoder_11_12": "v_model.layers.11.Add_914",
+    "decoder_12_13": "v_model.layers.12.Add_987",
+    "decoder_13_14": "v_model.layers.13.Add_1060",
+    "decoder_14_15": "v_model.layers.14.Add_1133",
+    "decoder_15_16": "v_model.layers.15.Add_1170",
+    "decoder_16_17": "v_model.layers.16.Add_1243",
+    "decoder_17_18": "v_model.layers.17.Add_1316",
+    "decoder_18_19": "v_model.layers.18.Add_1389",
+    "decoder_19_20": "v_model.layers.19.Add_1426",
+    "decoder_20_21": "v_model.layers.20.Add_1499",
+    "decoder_21_22": "v_model.layers.21.Add_1572",
+    "decoder_22_23": "v_model.layers.22.Add_1645",
+    "decoder_23_24": "v_model.layers.23.Add_1682"
+  },
+  "bundle_load_and_sessions_seconds": 11.394679582910612,
+  "session_creation_seconds": 6.131447376334108,
+  "session_creation_samples_seconds": [
+    2.9036031670402735,
+    0.04694158292841166,
+    0.050179417012259364,
+    0.05282566708046943,
+    0.05749579204712063,
+    0.039255666895769536,
+    0.055978541960939765,
+    0.19238354091066867,
+    0.1573365000076592,
+    0.05043058400042355,
+    0.05586850002873689,
+    0.049758250010199845,
+    0.056477125035598874,
+    0.051311208051629364,
+    0.05719079205300659,
+    0.04410079203080386,
+    0.04588037508074194,
+    0.049010375048965216,
+    0.056092165992595255,
+    0.048479125020094216,
+    0.05565341701731086,
+    0.047014416893944144,
+    0.0574421250494197,
+    0.03857562493067235,
+    0.04425912501756102,
+    0.04612174991052598,
+    0.05658545810729265,
+    0.048347707954235375,
+    0.05854075006209314,
+    0.05071675009094179,
+    0.057378957979381084,
+    0.04453708289656788,
+    0.04592179204337299,
+    0.04542820795904845,
+    0.06028337497264147,
+    0.053283957997336984,
+    0.058191458927467465,
+    0.056415417115204036,
+    0.05808508303016424,
+    0.04506454197689891,
+    0.046022458001971245,
+    0.046251083025708795,
+    0.062102625030092895,
+    0.048999792081303895,
+    0.05672412505373359,
+    0.05157354206312448,
+    0.057046292000450194,
+    0.04689616698306054,
+    0.03304691694211215,
+    0.0028077909955754876,
+    0.0019677079981192946,
+    0.5295627079904079
+  ],
+  "session_compile_policy": {
+    "body": "eager",
+    "head": "eager"
+  },
+  "warmup_steps": 1,
+  "measured_steps": 1,
+  "samples": [
+    {
+      "gradient_step_seconds": 9.774370250059292,
+      "task_forward_seconds": 3.289917708025314,
+      "task_backward_seconds": 6.484452542033978,
+      "block_forward_seconds": 1.6639652920421213,
+      "block_backward_seconds": 6.479755416861735,
+      "input_snapshot_seconds": 1.8124934285879135e-05,
+      "loss": 0.06225002557039261
+    }
+  ],
+  "platform": "macOS-27.0.1-arm64-arm-64bit",
+  "python": "3.11.17",
+  "native_source": {
+    "commit": "4715d5a3d869156be08ed94baf42fc5a3adb0c91",
+    "dirty": false
+  },
+  "onnax_source": {
+    "commit": "a4b725d93bfc7812dc325cc940497bca70798e39",
+    "dirty": false
+  },
+  "versions": {
+    "onnax": "0.1.0",
+    "onnx": "1.23.2",
+    "onnxruntime": "1.31.1",
+    "torch": "2.15.0",
+    "transformers": "5.22.1",
+    "mobius-onnx": "0.1.0"
+  },
+  "environment": {
+    "ONNXRUNTIME_EP_MLX_NO_COMPILE": "1",
+    "ONNXRUNTIME_EP_MLX_NO_GATED_DELTA_REVERSE": "0",
+    "ONNXRUNTIME_EP_MLX_NO_SHARED_INITIALIZERS": "0",
+    "ONNXRUNTIME_EP_MLX_CACHE_LIMIT_BYTES": "536870912"
+  },
+  "torch_threads": 1,
+  "ort": {
+    "intra_threads": 1,
+    "inter_threads": 1,
+    "graph_optimization": "GraphOptimizationLevel.ORT_DISABLE_ALL",
+    "cpu_fallback_disabled": true
+  },
+  "adapter_bytes": 2703360,
+  "export_bundle_bytes": 3772682593,
+  "primal_graph_nodes": 1754,
+  "status": "complete",
+  "library_sha256": "9668200f1dcb67cd2e1d5244334fa952d5a8e95284f6d3358de37d301791ad66",
+  "benchmark_source_sha256": "c89089f2ca3446aa5fde0a7077bed35075d82b40cd4d025797b4b501c6435d44",
+  "initial_step_seconds": 9.91688187501859,
+  "physical_memory": {
+    "available": true,
+    "current_bytes": 5331685480,
+    "lifetime_peak_bytes": 7781601384,
+    "current_resident_bytes": 3973742592,
+    "scope": "macOS kernel whole-process physical footprint; includes setup and runtime"
+  },
+  "summary": {
+    "gradient_step_seconds": {
+      "median": 9.774370250059292,
+      "p95": 9.774370250059292
+    },
+    "task_forward_seconds": {
+      "median": 3.289917708025314,
+      "p95": 3.289917708025314
+    },
+    "task_backward_seconds": {
+      "median": 6.484452542033978,
+      "p95": 6.484452542033978
+    },
+    "block_forward_seconds": {
+      "median": 1.6639652920421213,
+      "p95": 1.6639652920421213
+    },
+    "block_backward_seconds": {
+      "median": 6.479755416861735,
+      "p95": 6.479755416861735
+    },
+    "input_snapshot_seconds": {
+      "median": 1.8124934285879135e-05,
+      "p95": 1.8124934285879135e-05
+    }
+  },
+  "parameters_unchanged": true,
+  "process_peak_rss_bytes": 4056088576
+}

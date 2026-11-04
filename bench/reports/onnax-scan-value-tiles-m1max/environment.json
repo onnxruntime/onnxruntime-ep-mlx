@@ -1,0 +1,12 @@
+{
+  "platform": "macOS-27.0.1-arm64-arm-64bit-Mach-O",
+  "python": "3.15.1 (main, Oct 21 2026, 05:55:12) [Clang 21.0.0 (clang-2100.3.34.2)]",
+  "candidate_source_commit": "865f97d4d990aa9a065c1818591d6fedd27641c8",
+  "candidate_source_sha256": "bcbadc25d8ea8db412b3903eb6ec76580309042d9d549671566f9ab4a7b8a13a",
+  "protocol": {
+    "warmup": 10,
+    "measured": 100,
+    "scope": "independent processes; full fixed-input linear-attention backward block; ORT optimizer and MLX compilation disabled; caffeinate active"
+  },
+  "frozen_capture_manifest_sha256": "e7eaff2be67c34de7b03c30cc832e6b10804409dd3a463ce5067cd48ac00204a"
+}
