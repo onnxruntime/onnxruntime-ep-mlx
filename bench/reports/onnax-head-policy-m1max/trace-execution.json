@@ -1,0 +1,50 @@
+{
+  "command": [
+    "/Users/justinc/Documents/GitHub/onnax/.venv/bin/python",
+    "/tmp/onnax-head-compile-trace.py"
+  ],
+  "cwd": "/private/tmp/onnax-decoder-precision-benchmark",
+  "status": "complete",
+  "physical_memory_budget_bytes": 25769803776,
+  "minimum_free_disk_bytes": 5368709120,
+  "observations": [
+    {
+      "utc": "2026-11-04T19:31:20.284818+00:00",
+      "current_bytes": 180344,
+      "peak_bytes": 295032,
+      "free_disk_bytes": 27085811712
+    },
+    {
+      "utc": "2026-11-04T19:31:21.286404+00:00",
+      "current_bytes": 88065008,
+      "peak_bytes": 88065008,
+      "free_disk_bytes": 27085819904
+    },
+    {
+      "utc": "2026-11-04T19:31:22.291365+00:00",
+      "current_bytes": 88229088,
+      "peak_bytes": 88229088,
+      "free_disk_bytes": 27085778944
+    },
+    {
+      "utc": "2026-11-04T19:31:23.302061+00:00",
+      "current_bytes": 88393168,
+      "peak_bytes": 88393168,
+      "free_disk_bytes": 27085721600
+    },
+    {
+      "utc": "2026-11-04T19:31:24.312765+00:00",
+      "current_bytes": 3685205840,
+      "peak_bytes": 3920741984,
+      "free_disk_bytes": 27085590528
+    }
+  ],
+  "memory_source": "proc_pid_rusage/RUSAGE_INFO_V4",
+  "observation_errors": 0,
+  "temporary_directory": "/tmp/onnax-head-compile-trace-guard/worker-tmp-yk80jzj4",
+  "pid": 41179,
+  "started": "2026-11-04T19:31:20.284103+00:00",
+  "returncode": 0,
+  "finished": "2026-11-04T19:31:25.323308+00:00",
+  "temporary_files_removed": true
+}

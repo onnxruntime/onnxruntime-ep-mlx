@@ -1,0 +1,144 @@
+{
+  "command": [
+    "/Users/justinc/Documents/GitHub/onnax/.venv/bin/python",
+    "/tmp/onnax-mlx-head-control/bench/onnax_decoder.py",
+    "--export",
+    "/tmp/onnax-qwen35-real-bf16-canonical-30/training/export",
+    "--cache-dir",
+    "/tmp/onnax-qwen35-real-cache",
+    "--library",
+    "/tmp/onnax-mlx-lookup-reuse-runtime/libonnxruntime_mlx_ep.dylib",
+    "--sequence",
+    "64",
+    "--warmup",
+    "0",
+    "--samples",
+    "1",
+    "--output",
+    "/tmp/onnax-head-next-qualification/eager.json",
+    "--gradients-output",
+    "/tmp/onnax-head-next-qualification/eager.npz"
+  ],
+  "cwd": "/private/tmp/onnax-decoder-precision-benchmark",
+  "status": "complete",
+  "physical_memory_budget_bytes": 25769803776,
+  "minimum_free_disk_bytes": 5368709120,
+  "observations": [
+    {
+      "utc": "2026-11-04T19:22:41.829596+00:00",
+      "current_bytes": 180344,
+      "peak_bytes": 295032,
+      "free_disk_bytes": 27121418240
+    },
+    {
+      "utc": "2026-11-04T19:22:42.840110+00:00",
+      "current_bytes": 206340864,
+      "peak_bytes": 206340864,
+      "free_disk_bytes": 27121401856
+    },
+    {
+      "utc": "2026-11-04T19:22:43.840909+00:00",
+      "current_bytes": 233063192,
+      "peak_bytes": 233063192,
+      "free_disk_bytes": 27121385472
+    },
+    {
+      "utc": "2026-11-04T19:22:44.851641+00:00",
+      "current_bytes": 333857776,
+      "peak_bytes": 333857776,
+      "free_disk_bytes": 27121377280
+    },
+    {
+      "utc": "2026-11-04T19:22:45.855876+00:00",
+      "current_bytes": 431441120,
+      "peak_bytes": 431441120,
+      "free_disk_bytes": 27121369088
+    },
+    {
+      "utc": "2026-11-04T19:22:46.856563+00:00",
+      "current_bytes": 442795304,
+      "peak_bytes": 444532008,
+      "free_disk_bytes": 27121295360
+    },
+    {
+      "utc": "2026-11-04T19:22:47.867243+00:00",
+      "current_bytes": 442795304,
+      "peak_bytes": 444532008,
+      "free_disk_bytes": 27121479680
+    },
+    {
+      "utc": "2026-11-04T19:22:48.875588+00:00",
+      "current_bytes": 501532016,
+      "peak_bytes": 501532016,
+      "free_disk_bytes": 27121356800
+    },
+    {
+      "utc": "2026-11-04T19:22:49.880083+00:00",
+      "current_bytes": 501696096,
+      "peak_bytes": 501696096,
+      "free_disk_bytes": 27121459200
+    },
+    {
+      "utc": "2026-11-04T19:22:50.886170+00:00",
+      "current_bytes": 501892992,
+      "peak_bytes": 501892992,
+      "free_disk_bytes": 27121405952
+    },
+    {
+      "utc": "2026-11-04T19:22:51.887309+00:00",
+      "current_bytes": 1544685656,
+      "peak_bytes": 1544685656,
+      "free_disk_bytes": 27121369088
+    },
+    {
+      "utc": "2026-11-04T19:22:52.897946+00:00",
+      "current_bytes": 1734215888,
+      "peak_bytes": 1734215888,
+      "free_disk_bytes": 27121356800
+    },
+    {
+      "utc": "2026-11-04T19:22:53.908567+00:00",
+      "current_bytes": 1859127624,
+      "peak_bytes": 1859127624,
+      "free_disk_bytes": 27121352704
+    },
+    {
+      "utc": "2026-11-04T19:22:54.919218+00:00",
+      "current_bytes": 2027850152,
+      "peak_bytes": 2027850152,
+      "free_disk_bytes": 27121233920
+    },
+    {
+      "utc": "2026-11-04T19:22:55.929963+00:00",
+      "current_bytes": 2088454616,
+      "peak_bytes": 2088454616,
+      "free_disk_bytes": 27121205248
+    },
+    {
+      "utc": "2026-11-04T19:22:56.940690+00:00",
+      "current_bytes": 2089028464,
+      "peak_bytes": 2089258176,
+      "free_disk_bytes": 27121229824
+    },
+    {
+      "utc": "2026-11-04T19:22:57.947058+00:00",
+      "current_bytes": 2289405336,
+      "peak_bytes": 2289405336,
+      "free_disk_bytes": 27121213440
+    },
+    {
+      "utc": "2026-11-04T19:22:58.957815+00:00",
+      "current_bytes": 2941816528,
+      "peak_bytes": 4615360136,
+      "free_disk_bytes": 27118403584
+    }
+  ],
+  "memory_source": "proc_pid_rusage/RUSAGE_INFO_V4",
+  "observation_errors": 0,
+  "temporary_directory": "/tmp/onnax-head-next-qualification/native_eager-guard/worker-tmp-y_hv5_m4",
+  "pid": 40453,
+  "started": "2026-11-04T19:22:41.828647+00:00",
+  "returncode": 0,
+  "finished": "2026-11-04T19:22:59.968484+00:00",
+  "temporary_files_removed": true
+}

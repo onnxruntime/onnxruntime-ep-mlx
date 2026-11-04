@@ -1,0 +1,35 @@
+{
+  "scope": "Real frozen BF16 head; synthetic changed inputs, full and tail chunk cache qualification",
+  "seed": 20261104,
+  "checks": [
+    {
+      "rows": 128,
+      "max_abs": [
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "rows": 128,
+      "max_abs": [
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "rows": 63,
+      "max_abs": [
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "rows": 128,
+      "max_abs": [
+        0.0,
+        0.0
+      ]
+    }
+  ],
+  "model_sha256": "f45c13bd1aca3d813bf202dfac20fb6fc2329c6ad078ae63be7d19420e1aa1ee"
+}

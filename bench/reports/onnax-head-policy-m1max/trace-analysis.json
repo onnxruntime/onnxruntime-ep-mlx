@@ -1,0 +1,80 @@
+{
+  "trace_sha256": "5402d1e9114e7897cf1b34c9b8c5451e4c19730bb9d22a27273c73a383c6e771",
+  "path_counts": [
+    {
+      "path": "eager",
+      "cache": "n/a",
+      "nodes": 63,
+      "count": 4
+    },
+    {
+      "path": "general",
+      "cache": "MISS",
+      "nodes": 63,
+      "count": 1
+    },
+    {
+      "path": "general",
+      "cache": "HIT",
+      "nodes": 63,
+      "count": 2
+    },
+    {
+      "path": "general",
+      "cache": "RETRACE",
+      "nodes": 63,
+      "count": 1
+    }
+  ],
+  "paths": [
+    {
+      "path": "eager",
+      "cache": "n/a",
+      "nodes": 63,
+      "partition_id": "767898c000"
+    },
+    {
+      "path": "eager",
+      "cache": "n/a",
+      "nodes": 63,
+      "partition_id": "767898c000"
+    },
+    {
+      "path": "eager",
+      "cache": "n/a",
+      "nodes": 63,
+      "partition_id": "767898c000"
+    },
+    {
+      "path": "eager",
+      "cache": "n/a",
+      "nodes": 63,
+      "partition_id": "767898c000"
+    },
+    {
+      "path": "general",
+      "cache": "MISS",
+      "nodes": 63,
+      "partition_id": "767898c000"
+    },
+    {
+      "path": "general",
+      "cache": "HIT",
+      "nodes": 63,
+      "partition_id": "767898c000"
+    },
+    {
+      "path": "general",
+      "cache": "RETRACE",
+      "nodes": 63,
+      "partition_id": "767898c000"
+    },
+    {
+      "path": "general",
+      "cache": "HIT",
+      "nodes": 63,
+      "partition_id": "767898c000"
+    }
+  ],
+  "scope": "Head-only input shapes128,128,63,128 with changed labels/hidden; eager then compile-enabled independent sessions; correctness same frozenhead"
+}

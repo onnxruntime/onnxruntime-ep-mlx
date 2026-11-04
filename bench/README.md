@@ -44,6 +44,35 @@ Shared-runner timings are too noisy for reliable regression detection, even when
 both builds use the same runner. Reproduce timing changes locally on an idle machine
 before drawing conclusions. Correctness tests remain automatic and separate.
 
+## onnax decoder workloads
+
+`onnax_decoder.py` loads an exported onnax decoder task and reuses its sessions
+for fixed-parameter forward, token loss and adapter gradients. Run it with the
+onnax checkout on `PYTHONPATH` and that project's Hugging Face dependencies:
+
+```sh
+PYTHONPATH=/path/to/onnax/src:/path/to/onnax python bench/onnax_decoder.py \
+  --export /path/to/export --library /path/to/libonnxruntime_mlx_ep.dylib \
+  --sequence 4032 --warmup 10 --samples 100 \
+  --output /tmp/decoder-eager.json --gradients-output /tmp/decoder-eager.npz
+```
+
+Add `--compile-head` to permit compilation for the chunked output head while
+keeping decoder sessions eager. The default runs both eagerly. The report
+records this per-session policy, session construction, raw step samples and
+memory. Measure each policy in a separate process with the same export and
+library, then compare the loss and every named adapter gradient before comparing
+timing. ORT graph optimization and CPU fallback remain disabled by the onnax
+session factory.
+
+The [Qwen3.5 BF16/NF4 qualification reports](reports/onnax-head-policy-m1max)
+cover 64 and 4,032 tokens. Both policies reproduce every adapter gradient bit for bit and match loss
+at `rtol=1e-4, atol=1e-6`. The 4K qualification uses one warmup and three samples per
+independent process. Head-only traces cover changed inputs and 128/63-token
+chunks: the compiled route records an initial miss, a tail-shape retrace and
+cache hits on repeated shapes. The folder also retains synchronized PyTorch
+head-stage diagnostics, process guards and source checksums.
+
 ## Historical model measurements
 
 These results were previously recorded in the root README on an M1 Max.

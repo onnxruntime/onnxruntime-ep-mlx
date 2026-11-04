@@ -1,0 +1,421 @@
+{
+  "command": [
+    "/Users/justinc/Documents/GitHub/onnax/.venv/bin/python",
+    "/tmp/onnax-mlx-head-control/bench/onnax_decoder.py",
+    "--export",
+    "/tmp/onnax-qwen35-real-bf16-canonical-30/training/export",
+    "--cache-dir",
+    "/tmp/onnax-qwen35-real-cache",
+    "--library",
+    "/tmp/onnax-mlx-lookup-reuse-runtime/libonnxruntime_mlx_ep.dylib",
+    "--sequence",
+    "4032",
+    "--warmup",
+    "1",
+    "--samples",
+    "3",
+    "--output",
+    "/tmp/onnax-native-head-pilot4k/compiled.json",
+    "--gradients-output",
+    "/tmp/onnax-native-head-pilot4k/compiled.npz",
+    "--compile-head"
+  ],
+  "cwd": "/private/tmp/onnax-decoder-precision-benchmark",
+  "status": "complete",
+  "physical_memory_budget_bytes": 25769803776,
+  "minimum_free_disk_bytes": 5368709120,
+  "observations": [
+    {
+      "utc": "2026-11-04T19:27:40.948216+00:00",
+      "current_bytes": 180344,
+      "peak_bytes": 295032,
+      "free_disk_bytes": 27087724544
+    },
+    {
+      "utc": "2026-11-04T19:27:41.950837+00:00",
+      "current_bytes": 200868632,
+      "peak_bytes": 200868632,
+      "free_disk_bytes": 27087818752
+    },
+    {
+      "utc": "2026-11-04T19:27:42.961447+00:00",
+      "current_bytes": 229081928,
+      "peak_bytes": 229081928,
+      "free_disk_bytes": 27087802368
+    },
+    {
+      "utc": "2026-11-04T19:27:43.965959+00:00",
+      "current_bytes": 331957280,
+      "peak_bytes": 331957280,
+      "free_disk_bytes": 27087753216
+    },
+    {
+      "utc": "2026-11-04T19:27:44.974937+00:00",
+      "current_bytes": 427115792,
+      "peak_bytes": 427115792,
+      "free_disk_bytes": 27087732736
+    },
+    {
+      "utc": "2026-11-04T19:27:45.980929+00:00",
+      "current_bytes": 442959216,
+      "peak_bytes": 444630384,
+      "free_disk_bytes": 27087720448
+    },
+    {
+      "utc": "2026-11-04T19:27:46.991672+00:00",
+      "current_bytes": 442959216,
+      "peak_bytes": 444630384,
+      "free_disk_bytes": 27087716352
+    },
+    {
+      "utc": "2026-11-04T19:27:47.999440+00:00",
+      "current_bytes": 501663208,
+      "peak_bytes": 501663208,
+      "free_disk_bytes": 27087769600
+    },
+    {
+      "utc": "2026-11-04T19:27:49.007759+00:00",
+      "current_bytes": 501827288,
+      "peak_bytes": 501827288,
+      "free_disk_bytes": 27087757312
+    },
+    {
+      "utc": "2026-11-04T19:27:50.018458+00:00",
+      "current_bytes": 502007776,
+      "peak_bytes": 502007776,
+      "free_disk_bytes": 27087876096
+    },
+    {
+      "utc": "2026-11-04T19:27:51.023564+00:00",
+      "current_bytes": 1578961032,
+      "peak_bytes": 1578961032,
+      "free_disk_bytes": 27087839232
+    },
+    {
+      "utc": "2026-11-04T19:27:52.034203+00:00",
+      "current_bytes": 1781696816,
+      "peak_bytes": 1781696816,
+      "free_disk_bytes": 27087765504
+    },
+    {
+      "utc": "2026-11-04T19:27:53.041083+00:00",
+      "current_bytes": 1903036792,
+      "peak_bytes": 1903036792,
+      "free_disk_bytes": 27087761408
+    },
+    {
+      "utc": "2026-11-04T19:27:54.047857+00:00",
+      "current_bytes": 2051901960,
+      "peak_bytes": 2051901960,
+      "free_disk_bytes": 27087745024
+    },
+    {
+      "utc": "2026-11-04T19:27:55.058629+00:00",
+      "current_bytes": 2092026400,
+      "peak_bytes": 2092026400,
+      "free_disk_bytes": 27087712256
+    },
+    {
+      "utc": "2026-11-04T19:27:56.066824+00:00",
+      "current_bytes": 2092748016,
+      "peak_bytes": 2092748016,
+      "free_disk_bytes": 27087822848
+    },
+    {
+      "utc": "2026-11-04T19:27:57.077565+00:00",
+      "current_bytes": 3723775672,
+      "peak_bytes": 3723775672,
+      "free_disk_bytes": 27087773696
+    },
+    {
+      "utc": "2026-11-04T19:27:58.088388+00:00",
+      "current_bytes": 4057780088,
+      "peak_bytes": 4346597240,
+      "free_disk_bytes": 27087790080
+    },
+    {
+      "utc": "2026-11-04T19:27:59.091251+00:00",
+      "current_bytes": 4494594056,
+      "peak_bytes": 5567320096,
+      "free_disk_bytes": 27087773696
+    },
+    {
+      "utc": "2026-11-04T19:28:00.102397+00:00",
+      "current_bytes": 4334112776,
+      "peak_bytes": 5567320096,
+      "free_disk_bytes": 27087769600
+    },
+    {
+      "utc": "2026-11-04T19:28:01.113437+00:00",
+      "current_bytes": 5368533000,
+      "peak_bytes": 5567320096,
+      "free_disk_bytes": 27087749120
+    },
+    {
+      "utc": "2026-11-04T19:28:02.116294+00:00",
+      "current_bytes": 4281176096,
+      "peak_bytes": 6519574560,
+      "free_disk_bytes": 27087740928
+    },
+    {
+      "utc": "2026-11-04T19:28:03.127379+00:00",
+      "current_bytes": 5308305440,
+      "peak_bytes": 6746607648,
+      "free_disk_bytes": 27087740928
+    },
+    {
+      "utc": "2026-11-04T19:28:04.138189+00:00",
+      "current_bytes": 4685779000,
+      "peak_bytes": 6749507616,
+      "free_disk_bytes": 27087712256
+    },
+    {
+      "utc": "2026-11-04T19:28:05.149003+00:00",
+      "current_bytes": 4806529056,
+      "peak_bytes": 6752948256,
+      "free_disk_bytes": 27087691776
+    },
+    {
+      "utc": "2026-11-04T19:28:06.153355+00:00",
+      "current_bytes": 3875344416,
+      "peak_bytes": 6752948256,
+      "free_disk_bytes": 27087654912
+    },
+    {
+      "utc": "2026-11-04T19:28:07.164261+00:00",
+      "current_bytes": 5654597664,
+      "peak_bytes": 6752948256,
+      "free_disk_bytes": 27087654912
+    },
+    {
+      "utc": "2026-11-04T19:28:08.175152+00:00",
+      "current_bytes": 3655422008,
+      "peak_bytes": 6754439200,
+      "free_disk_bytes": 27087642624
+    },
+    {
+      "utc": "2026-11-04T19:28:09.177740+00:00",
+      "current_bytes": 3857305632,
+      "peak_bytes": 6754439200,
+      "free_disk_bytes": 27087835136
+    },
+    {
+      "utc": "2026-11-04T19:28:10.188606+00:00",
+      "current_bytes": 4759736376,
+      "peak_bytes": 6754439200,
+      "free_disk_bytes": 27087785984
+    },
+    {
+      "utc": "2026-11-04T19:28:11.199733+00:00",
+      "current_bytes": 5302341664,
+      "peak_bytes": 6754439200,
+      "free_disk_bytes": 27087745024
+    },
+    {
+      "utc": "2026-11-04T19:28:12.210403+00:00",
+      "current_bytes": 4505620512,
+      "peak_bytes": 6754439200,
+      "free_disk_bytes": 27087712256
+    },
+    {
+      "utc": "2026-11-04T19:28:13.221098+00:00",
+      "current_bytes": 5127262240,
+      "peak_bytes": 6754439200,
+      "free_disk_bytes": 27086209024
+    },
+    {
+      "utc": "2026-11-04T19:28:14.229344+00:00",
+      "current_bytes": 5021536288,
+      "peak_bytes": 6754439200,
+      "free_disk_bytes": 27086045184
+    },
+    {
+      "utc": "2026-11-04T19:28:15.233043+00:00",
+      "current_bytes": 4673605664,
+      "peak_bytes": 6754439200,
+      "free_disk_bytes": 27085963264
+    },
+    {
+      "utc": "2026-11-04T19:28:16.243873+00:00",
+      "current_bytes": 4741042208,
+      "peak_bytes": 6754439200,
+      "free_disk_bytes": 27085938688
+    },
+    {
+      "utc": "2026-11-04T19:28:17.254913+00:00",
+      "current_bytes": 4473245728,
+      "peak_bytes": 6754439200,
+      "free_disk_bytes": 27085938688
+    },
+    {
+      "utc": "2026-11-04T19:28:18.265887+00:00",
+      "current_bytes": 4727787552,
+      "peak_bytes": 6754439200,
+      "free_disk_bytes": 27085926400
+    },
+    {
+      "utc": "2026-11-04T19:28:19.276818+00:00",
+      "current_bytes": 5691641888,
+      "peak_bytes": 6754439200,
+      "free_disk_bytes": 27085926400
+    },
+    {
+      "utc": "2026-11-04T19:28:20.283147+00:00",
+      "current_bytes": 4139290656,
+      "peak_bytes": 6754586656,
+      "free_disk_bytes": 27085922304
+    },
+    {
+      "utc": "2026-11-04T19:28:21.291594+00:00",
+      "current_bytes": 4138962976,
+      "peak_bytes": 6754586656,
+      "free_disk_bytes": 27086020608
+    },
+    {
+      "utc": "2026-11-04T19:28:22.302613+00:00",
+      "current_bytes": 4882927648,
+      "peak_bytes": 6754586656,
+      "free_disk_bytes": 27085971456
+    },
+    {
+      "utc": "2026-11-04T19:28:23.313476+00:00",
+      "current_bytes": 5105487904,
+      "peak_bytes": 6754586656,
+      "free_disk_bytes": 27085963264
+    },
+    {
+      "utc": "2026-11-04T19:28:24.324328+00:00",
+      "current_bytes": 4808757280,
+      "peak_bytes": 6754586656,
+      "free_disk_bytes": 27085950976
+    },
+    {
+      "utc": "2026-11-04T19:28:25.335317+00:00",
+      "current_bytes": 5029449808,
+      "peak_bytes": 6754586656,
+      "free_disk_bytes": 27085942784
+    },
+    {
+      "utc": "2026-11-04T19:28:26.346495+00:00",
+      "current_bytes": 5715988512,
+      "peak_bytes": 6754586656,
+      "free_disk_bytes": 27085934592
+    },
+    {
+      "utc": "2026-11-04T19:28:27.357456+00:00",
+      "current_bytes": 4949823520,
+      "peak_bytes": 6754586656,
+      "free_disk_bytes": 27086036992
+    },
+    {
+      "utc": "2026-11-04T19:28:28.362306+00:00",
+      "current_bytes": 5149839392,
+      "peak_bytes": 6755110944,
+      "free_disk_bytes": 27085987840
+    },
+    {
+      "utc": "2026-11-04T19:28:29.373285+00:00",
+      "current_bytes": 4758343712,
+      "peak_bytes": 6755110944,
+      "free_disk_bytes": 27085971456
+    },
+    {
+      "utc": "2026-11-04T19:28:30.384365+00:00",
+      "current_bytes": 4270542880,
+      "peak_bytes": 6755110944,
+      "free_disk_bytes": 27085967360
+    },
+    {
+      "utc": "2026-11-04T19:28:31.395400+00:00",
+      "current_bytes": 4716105760,
+      "peak_bytes": 6755110944,
+      "free_disk_bytes": 27085934592
+    },
+    {
+      "utc": "2026-11-04T19:28:32.406511+00:00",
+      "current_bytes": 4071067704,
+      "peak_bytes": 6755110944,
+      "free_disk_bytes": 27085918208
+    },
+    {
+      "utc": "2026-11-04T19:28:33.417442+00:00",
+      "current_bytes": 3857092640,
+      "peak_bytes": 6755110944,
+      "free_disk_bytes": 27085918208
+    },
+    {
+      "utc": "2026-11-04T19:28:34.419100+00:00",
+      "current_bytes": 5251452960,
+      "peak_bytes": 6755110944,
+      "free_disk_bytes": 27084832768
+    },
+    {
+      "utc": "2026-11-04T19:28:35.430109+00:00",
+      "current_bytes": 4119793696,
+      "peak_bytes": 6755110944,
+      "free_disk_bytes": 27084812288
+    },
+    {
+      "utc": "2026-11-04T19:28:36.441136+00:00",
+      "current_bytes": 5234085920,
+      "peak_bytes": 6755110944,
+      "free_disk_bytes": 27084808192
+    },
+    {
+      "utc": "2026-11-04T19:28:37.443648+00:00",
+      "current_bytes": 4475097120,
+      "peak_bytes": 6755110944,
+      "free_disk_bytes": 27084812288
+    },
+    {
+      "utc": "2026-11-04T19:28:38.454655+00:00",
+      "current_bytes": 4671459360,
+      "peak_bytes": 6755110944,
+      "free_disk_bytes": 27084943360
+    },
+    {
+      "utc": "2026-11-04T19:28:39.465582+00:00",
+      "current_bytes": 5711564832,
+      "peak_bytes": 6755110944,
+      "free_disk_bytes": 27084824576
+    },
+    {
+      "utc": "2026-11-04T19:28:40.467809+00:00",
+      "current_bytes": 4132376608,
+      "peak_bytes": 6756831264,
+      "free_disk_bytes": 27084808192
+    },
+    {
+      "utc": "2026-11-04T19:28:41.478813+00:00",
+      "current_bytes": 6499536928,
+      "peak_bytes": 6756831264,
+      "free_disk_bytes": 27084775424
+    },
+    {
+      "utc": "2026-11-04T19:28:42.489840+00:00",
+      "current_bytes": 3387412512,
+      "peak_bytes": 6756831264,
+      "free_disk_bytes": 27084734464
+    },
+    {
+      "utc": "2026-11-04T19:28:43.496569+00:00",
+      "current_bytes": 6326521888,
+      "peak_bytes": 6756831264,
+      "free_disk_bytes": 27084734464
+    },
+    {
+      "utc": "2026-11-04T19:28:44.505741+00:00",
+      "current_bytes": 2479606688,
+      "peak_bytes": 6756831264,
+      "free_disk_bytes": 27081986048
+    }
+  ],
+  "memory_source": "proc_pid_rusage/RUSAGE_INFO_V4",
+  "observation_errors": 0,
+  "temporary_directory": "/tmp/onnax-native-head-pilot4k/compiled-guard/worker-tmp-34xsvafd",
+  "pid": 40937,
+  "started": "2026-11-04T19:27:40.947594+00:00",
+  "returncode": 0,
+  "finished": "2026-11-04T19:28:45.516494+00:00",
+  "temporary_files_removed": true
+}

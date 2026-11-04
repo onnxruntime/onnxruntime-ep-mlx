@@ -1,0 +1,38 @@
+"""Trace head-only compilation and changing inputs across full/tail chunks."""
+import gc
+import hashlib
+import json
+import os
+from pathlib import Path
+
+os.environ['ONNXRUNTIME_EP_MLX_NO_COMPILE'] = '0'
+os.environ['ONNXRUNTIME_EP_MLX_CACHE_LIMIT_BYTES'] = '536870912'
+os.environ['ONNXRUNTIME_EP_MLX_TRACE'] = '/tmp/onnax-head-compile-trace/trace.json'
+import numpy as np
+from examples.lora.mlx_runtime import register_library, session
+
+root = Path('/tmp/onnax-head-compile-trace')
+root.mkdir(exist_ok=False)
+model = '/tmp/onnax-qwen35-real-bf16-canonical-30/training/export/execution/head_gradient.onnx'
+register_library('/tmp/onnax-mlx-lookup-reuse-runtime/libonnxruntime_mlx_ep.dylib')
+rng = np.random.default_rng(20261104)
+feeds = [{'hidden': rng.normal(0, 0.1, (rows, 1024)).astype(np.float32),
+          'labels': rng.integers(0, 248320, rows, dtype=np.int64)} for rows in (128, 128, 63, 128)]
+expected = []
+checks = []
+for policy in ('eager', 'compiled'):
+    runtime = session(model, enable_compile=policy == 'compiled')
+    for i, feed in enumerate(feeds):
+        outputs = runtime.run(None, feed)
+        assert all(np.isfinite(v).all() for v in outputs)
+        if policy == 'eager':
+            expected.append([v.copy() for v in outputs])
+        else:
+            assert len(outputs) == len(expected[i])
+            for actual, reference in zip(outputs, expected[i], strict=True):
+                assert actual.shape == reference.shape and actual.dtype == reference.dtype
+                np.testing.assert_allclose(actual, reference, rtol=1e-4, atol=1e-6)
+            checks.append({'rows': len(feed['labels']), 'max_abs': [float(np.max(np.abs(a-b))) for a,b in zip(outputs, expected[i], strict=True)]})
+    del runtime
+    gc.collect()
+(root / 'comparison.json').write_text(json.dumps({'scope': 'Real frozen BF16 head; synthetic changed inputs, full and tail chunk cache qualification', 'seed': 20261104, 'checks': checks, 'model_sha256': hashlib.sha256(Path(model).read_bytes()).hexdigest()}, indent=2) + '\n')

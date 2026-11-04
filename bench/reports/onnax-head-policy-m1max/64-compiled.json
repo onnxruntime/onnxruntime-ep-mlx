@@ -1,0 +1,204 @@
+{
+  "version": 1,
+  "mode": "fused",
+  "scope": "forward, mean shifted-token loss and all adapter gradients; fixed parameters",
+  "component_scope": "block times include native host/device transfers; input_snapshot times CPU buffer cloning",
+  "input_shape": [
+    1,
+    64
+  ],
+  "prediction_targets_per_step": 63,
+  "source_identity": "31bffc9c183e70e2e301a1d705167f2bb32db107d01f55e7779eb7422a834d36",
+  "adapter_sha256": "e64a72ef8e03d75f39eb9cbb9722121e412fda3edfd80363ad5a0e923e854f94",
+  "input_sha256": "adb02b9e70ef3d72063b25e7bfd7049ea7226797ce7aa642f8420372556eac2a",
+  "pretrained_source": {
+    "checkpoint_to_reference_prefix": {
+      "model.language_model.": "model."
+    },
+    "dtype": "float32",
+    "loading": {
+      "error_msgs": [],
+      "mismatched_keys": [],
+      "missing_keys": [],
+      "unexpected_keys": []
+    },
+    "model_id": "Qwen/Qwen3.5-0.8B",
+    "parameter_count": 752393024,
+    "reference_class": "Qwen3_5ForCausalLM",
+    "revision": "2fc06364715b967f1860aea9cf38778875588b17",
+    "version": 1
+  },
+  "checkpoint_boundaries": {
+    "prefix": "v_model.embed_tokens.Gather_109",
+    "decoder_0_1": "v_model.layers.0.Add_219",
+    "decoder_1_2": "v_model.layers.1.Add_292",
+    "decoder_2_3": "v_model.layers.2.Add_365",
+    "decoder_3_4": "v_model.layers.3.Add_402",
+    "decoder_4_5": "v_model.layers.4.Add_475",
+    "decoder_5_6": "v_model.layers.5.Add_548",
+    "decoder_6_7": "v_model.layers.6.Add_621",
+    "decoder_7_8": "v_model.layers.7.Add_658",
+    "decoder_8_9": "v_model.layers.8.Add_731",
+    "decoder_9_10": "v_model.layers.9.Add_804",
+    "decoder_10_11": "v_model.layers.10.Add_877",
+    "decoder_11_12": "v_model.layers.11.Add_914",
+    "decoder_12_13": "v_model.layers.12.Add_987",
+    "decoder_13_14": "v_model.layers.13.Add_1060",
+    "decoder_14_15": "v_model.layers.14.Add_1133",
+    "decoder_15_16": "v_model.layers.15.Add_1170",
+    "decoder_16_17": "v_model.layers.16.Add_1243",
+    "decoder_17_18": "v_model.layers.17.Add_1316",
+    "decoder_18_19": "v_model.layers.18.Add_1389",
+    "decoder_19_20": "v_model.layers.19.Add_1426",
+    "decoder_20_21": "v_model.layers.20.Add_1499",
+    "decoder_21_22": "v_model.layers.21.Add_1572",
+    "decoder_22_23": "v_model.layers.22.Add_1645",
+    "decoder_23_24": "v_model.layers.23.Add_1682"
+  },
+  "bundle_load_and_sessions_seconds": 10.991268249927089,
+  "session_creation_seconds": 5.996846919530071,
+  "session_creation_samples_seconds": [
+    2.9015858750790358,
+    0.04570916690863669,
+    0.0440225419588387,
+    0.053547666990198195,
+    0.05534012499265373,
+    0.04248062497936189,
+    0.054955790983513,
+    0.1927486249478534,
+    0.08079412498045713,
+    0.05259249999653548,
+    0.05426791589707136,
+    0.05088324996177107,
+    0.055575332953594625,
+    0.05044854199513793,
+    0.054648791905492544,
+    0.04020133300218731,
+    0.04200083401519805,
+    0.05159470904618502,
+    0.05439925007522106,
+    0.04897004191298038,
+    0.054251749999821186,
+    0.05115054198540747,
+    0.05652650003321469,
+    0.03985725005622953,
+    0.04305024992208928,
+    0.04630129202269018,
+    0.053856041049584746,
+    0.0513912079622969,
+    0.05791287508327514,
+    0.046514624962583184,
+    0.05547000002115965,
+    0.04461741598788649,
+    0.04315133299678564,
+    0.04291724995709956,
+    0.0556808749679476,
+    0.05292808299418539,
+    0.05603170802351087,
+    0.04931420797947794,
+    0.05796233401633799,
+    0.043259209021925926,
+    0.0445899999467656,
+    0.04844341706484556,
+    0.055465125013142824,
+    0.054122083936817944,
+    0.053149209008552134,
+    0.05071745906025171,
+    0.05331941705662757,
+    0.04651645792182535,
+    0.04668216698337346,
+    0.002893083030357957,
+    0.0019104169914498925,
+    0.5101262918906286
+  ],
+  "session_compile_policy": {
+    "body": "eager",
+    "head": "compiled_when_eligible"
+  },
+  "warmup_steps": 0,
+  "measured_steps": 1,
+  "samples": [
+    {
+      "gradient_step_seconds": 0.5959632920566946,
+      "task_forward_seconds": 0.2159898750251159,
+      "task_backward_seconds": 0.3799734170315787,
+      "block_forward_seconds": 0.12037941708695143,
+      "block_backward_seconds": 0.3769832488615066,
+      "input_snapshot_seconds": 4.320789594203234e-05,
+      "loss": 2.794670343399048
+    }
+  ],
+  "platform": "macOS-27.0.1-arm64-arm-64bit",
+  "python": "3.11.17",
+  "native_source": {
+    "commit": "57fbb5c9bd167801b3c92d8c409f56edacdc6dc9",
+    "dirty": false
+  },
+  "onnax_source": {
+    "commit": "c5ce8ee710e9fe003c6fe850db854551b631db01",
+    "dirty": false
+  },
+  "versions": {
+    "onnax": "0.1.0",
+    "onnx": "1.23.2",
+    "onnxruntime": "1.31.1",
+    "torch": "2.15.0",
+    "transformers": "5.22.1",
+    "mobius-onnx": "0.1.0"
+  },
+  "environment": {
+    "ONNXRUNTIME_EP_MLX_NO_COMPILE": "0",
+    "ONNXRUNTIME_EP_MLX_NO_GATED_DELTA_REVERSE": "0",
+    "ONNXRUNTIME_EP_MLX_NO_SHARED_INITIALIZERS": "0",
+    "ONNXRUNTIME_EP_MLX_CACHE_LIMIT_BYTES": "536870912"
+  },
+  "torch_threads": 1,
+  "ort": {
+    "intra_threads": 1,
+    "inter_threads": 1,
+    "graph_optimization": "GraphOptimizationLevel.ORT_DISABLE_ALL",
+    "cpu_fallback_disabled": true
+  },
+  "adapter_bytes": 2703360,
+  "export_bundle_bytes": 3772682593,
+  "primal_graph_nodes": 1754,
+  "status": "complete",
+  "library_sha256": "29623bb837f0b70c255380e73f4405111712319b0495d1d46f5fe5cf967bacf3",
+  "benchmark_source_sha256": "c89089f2ca3446aa5fde0a7077bed35075d82b40cd4d025797b4b501c6435d44",
+  "initial_step_seconds": 0.5959632920566946,
+  "physical_memory": {
+    "available": true,
+    "current_bytes": 2852261704,
+    "lifetime_peak_bytes": 4547268328,
+    "current_resident_bytes": 3465936896,
+    "scope": "macOS kernel whole-process physical footprint; includes setup and runtime"
+  },
+  "summary": {
+    "gradient_step_seconds": {
+      "median": 0.5959632920566946,
+      "p95": 0.5959632920566946
+    },
+    "task_forward_seconds": {
+      "median": 0.2159898750251159,
+      "p95": 0.2159898750251159
+    },
+    "task_backward_seconds": {
+      "median": 0.3799734170315787,
+      "p95": 0.3799734170315787
+    },
+    "block_forward_seconds": {
+      "median": 0.12037941708695143,
+      "p95": 0.12037941708695143
+    },
+    "block_backward_seconds": {
+      "median": 0.3769832488615066,
+      "p95": 0.3769832488615066
+    },
+    "input_snapshot_seconds": {
+      "median": 4.320789594203234e-05,
+      "p95": 4.320789594203234e-05
+    }
+  },
+  "parameters_unchanged": true,
+  "process_peak_rss_bytes": 3466035200
+}

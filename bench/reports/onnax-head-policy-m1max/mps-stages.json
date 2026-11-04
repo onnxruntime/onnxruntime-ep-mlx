@@ -1,0 +1,944 @@
+{
+  "scope": "Isolated synchronized stages, real exported frozen FP32 head, synthetic FP32 hidden rows, BF16 projection and FP32 adjoint; diagnostic timings exclude inter-stage overlap",
+  "rows": 128,
+  "weight_shape": [
+    248320,
+    1024
+  ],
+  "warmup": 10,
+  "samples": [
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.0043557079043239355,
+      "frozen_weight_bf16_to_fp32_seconds": 0.004545208066701889,
+      "activation_fp32_to_bf16_seconds": 0.00027354201301932335,
+      "projection_seconds": 0.02049845806322992,
+      "native_ce_forward_seconds": 0.0018217909382656217,
+      "native_ce_backward_seconds": 0.0022459999890998006,
+      "hidden_gradient_seconds": 0.07965450000483543
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.004356749937869608,
+      "frozen_weight_bf16_to_fp32_seconds": 0.004438749980181456,
+      "activation_fp32_to_bf16_seconds": 0.00027804099954664707,
+      "projection_seconds": 0.020466041984036565,
+      "native_ce_forward_seconds": 0.001817875076085329,
+      "native_ce_backward_seconds": 0.0022270410554483533,
+      "hidden_gradient_seconds": 0.07970099989324808
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.004533416940830648,
+      "frozen_weight_bf16_to_fp32_seconds": 0.004605374997481704,
+      "activation_fp32_to_bf16_seconds": 0.0002820830559358001,
+      "projection_seconds": 0.020599958021193743,
+      "native_ce_forward_seconds": 0.001948125078342855,
+      "native_ce_backward_seconds": 0.0025056670419871807,
+      "hidden_gradient_seconds": 0.07962104107718915
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.004399833036586642,
+      "frozen_weight_bf16_to_fp32_seconds": 0.0045049169566482306,
+      "activation_fp32_to_bf16_seconds": 0.0002847079886123538,
+      "projection_seconds": 0.020676625077612698,
+      "native_ce_forward_seconds": 0.0019622918916866183,
+      "native_ce_backward_seconds": 0.002477375091984868,
+      "hidden_gradient_seconds": 0.07979708397760987
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.004401625017635524,
+      "frozen_weight_bf16_to_fp32_seconds": 0.004451165907084942,
+      "activation_fp32_to_bf16_seconds": 0.0002727080136537552,
+      "projection_seconds": 0.02065108309034258,
+      "native_ce_forward_seconds": 0.0018985409988090396,
+      "native_ce_backward_seconds": 0.002457041060552001,
+      "hidden_gradient_seconds": 0.07950029103085399
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.004389125038869679,
+      "frozen_weight_bf16_to_fp32_seconds": 0.0044792500557377934,
+      "activation_fp32_to_bf16_seconds": 0.0002822920214384794,
+      "projection_seconds": 0.020461500040255487,
+      "native_ce_forward_seconds": 0.0019420420285314322,
+      "native_ce_backward_seconds": 0.0023985420120880008,
+      "hidden_gradient_seconds": 0.07971079205162823
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.004377000033855438,
+      "frozen_weight_bf16_to_fp32_seconds": 0.004440374905243516,
+      "activation_fp32_to_bf16_seconds": 0.0002662910846993327,
+      "projection_seconds": 0.020542584010399878,
+      "native_ce_forward_seconds": 0.0018320420058444142,
+      "native_ce_backward_seconds": 0.0022787500638514757,
+      "hidden_gradient_seconds": 0.07987704104743898
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.0043808340560644865,
+      "frozen_weight_bf16_to_fp32_seconds": 0.004457707982510328,
+      "activation_fp32_to_bf16_seconds": 0.0002525830641388893,
+      "projection_seconds": 0.020424332935363054,
+      "native_ce_forward_seconds": 0.0018387080635875463,
+      "native_ce_backward_seconds": 0.0022678750101476908,
+      "hidden_gradient_seconds": 0.07953758293297142
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.004354708013124764,
+      "frozen_weight_bf16_to_fp32_seconds": 0.004434374975971878,
+      "activation_fp32_to_bf16_seconds": 0.00027466705068945885,
+      "projection_seconds": 0.020441540982574224,
+      "native_ce_forward_seconds": 0.0018049170030280948,
+      "native_ce_backward_seconds": 0.0022424589842557907,
+      "hidden_gradient_seconds": 0.07969437493011355
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.004367916961200535,
+      "frozen_weight_bf16_to_fp32_seconds": 0.0044458749471232295,
+      "activation_fp32_to_bf16_seconds": 0.0002721250057220459,
+      "projection_seconds": 0.020515833981335163,
+      "native_ce_forward_seconds": 0.0018339590169489384,
+      "native_ce_backward_seconds": 0.002269375021569431,
+      "hidden_gradient_seconds": 0.07954404200427234
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.004362458945252001,
+      "frozen_weight_bf16_to_fp32_seconds": 0.004449666943401098,
+      "activation_fp32_to_bf16_seconds": 0.00027650000993162394,
+      "projection_seconds": 0.020473625045269728,
+      "native_ce_forward_seconds": 0.0018280419753864408,
+      "native_ce_backward_seconds": 0.0022605829872190952,
+      "hidden_gradient_seconds": 0.0786749169928953
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.004521665978245437,
+      "frozen_weight_bf16_to_fp32_seconds": 0.004484207951463759,
+      "activation_fp32_to_bf16_seconds": 0.0002888330491259694,
+      "projection_seconds": 0.02050325006712228,
+      "native_ce_forward_seconds": 0.0018542499747127295,
+      "native_ce_backward_seconds": 0.002270999946631491,
+      "hidden_gradient_seconds": 0.08129683299921453
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.004414457944221795,
+      "frozen_weight_bf16_to_fp32_seconds": 0.0046185830142349005,
+      "activation_fp32_to_bf16_seconds": 0.0002877910155802965,
+      "projection_seconds": 0.020388000062666833,
+      "native_ce_forward_seconds": 0.0018388750031590462,
+      "native_ce_backward_seconds": 0.0023721670731902122,
+      "hidden_gradient_seconds": 0.07970795803703368
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.004313208046369255,
+      "frozen_weight_bf16_to_fp32_seconds": 0.004436334013007581,
+      "activation_fp32_to_bf16_seconds": 0.0002684589708223939,
+      "projection_seconds": 0.02055370796006173,
+      "native_ce_forward_seconds": 0.0018684160895645618,
+      "native_ce_backward_seconds": 0.002362582948990166,
+      "hidden_gradient_seconds": 0.08113379206042737
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.004381667007692158,
+      "frozen_weight_bf16_to_fp32_seconds": 0.004454749985598028,
+      "activation_fp32_to_bf16_seconds": 0.00027066690381616354,
+      "projection_seconds": 0.02060554106719792,
+      "native_ce_forward_seconds": 0.0018397499807178974,
+      "native_ce_backward_seconds": 0.002307125017978251,
+      "hidden_gradient_seconds": 0.08247312507592142
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.004371957969851792,
+      "frozen_weight_bf16_to_fp32_seconds": 0.004449415951967239,
+      "activation_fp32_to_bf16_seconds": 0.0002769579878076911,
+      "projection_seconds": 0.02055204100906849,
+      "native_ce_forward_seconds": 0.0018305829726159573,
+      "native_ce_backward_seconds": 0.002307291957549751,
+      "hidden_gradient_seconds": 0.07957533304579556
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.004394832998514175,
+      "frozen_weight_bf16_to_fp32_seconds": 0.004454333917237818,
+      "activation_fp32_to_bf16_seconds": 0.00028958392795175314,
+      "projection_seconds": 0.020518750068731606,
+      "native_ce_forward_seconds": 0.0018258749041706324,
+      "native_ce_backward_seconds": 0.002268749987706542,
+      "hidden_gradient_seconds": 0.07976325007621199
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.0043822500156238675,
+      "frozen_weight_bf16_to_fp32_seconds": 0.004451374989002943,
+      "activation_fp32_to_bf16_seconds": 0.00027020799461752176,
+      "projection_seconds": 0.020581457996740937,
+      "native_ce_forward_seconds": 0.0018543750047683716,
+      "native_ce_backward_seconds": 0.0023005420807749033,
+      "hidden_gradient_seconds": 0.08261187502648681
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.0043894590344280005,
+      "frozen_weight_bf16_to_fp32_seconds": 0.004429124994203448,
+      "activation_fp32_to_bf16_seconds": 0.0002793750027194619,
+      "projection_seconds": 0.020498833036981523,
+      "native_ce_forward_seconds": 0.0018783339764922857,
+      "native_ce_backward_seconds": 0.0023242090828716755,
+      "hidden_gradient_seconds": 0.07942970795556903
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.00436362496111542,
+      "frozen_weight_bf16_to_fp32_seconds": 0.004448333056643605,
+      "activation_fp32_to_bf16_seconds": 0.00027470896020531654,
+      "projection_seconds": 0.020536291995085776,
+      "native_ce_forward_seconds": 0.00183479196857661,
+      "native_ce_backward_seconds": 0.0024634579895064235,
+      "hidden_gradient_seconds": 0.07918200001586229
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.004381458042189479,
+      "frozen_weight_bf16_to_fp32_seconds": 0.004457124974578619,
+      "activation_fp32_to_bf16_seconds": 0.0002645000349730253,
+      "projection_seconds": 0.02052837493829429,
+      "native_ce_forward_seconds": 0.0018281250959262252,
+      "native_ce_backward_seconds": 0.002314874902367592,
+      "hidden_gradient_seconds": 0.07977016700897366
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.004367582965642214,
+      "frozen_weight_bf16_to_fp32_seconds": 0.0046209999127313495,
+      "activation_fp32_to_bf16_seconds": 0.0003058750880882144,
+      "projection_seconds": 0.02053641597740352,
+      "native_ce_forward_seconds": 0.0018301670206710696,
+      "native_ce_backward_seconds": 0.0022586670238524675,
+      "hidden_gradient_seconds": 0.08108579099643975
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.004366165958344936,
+      "frozen_weight_bf16_to_fp32_seconds": 0.004435832961462438,
+      "activation_fp32_to_bf16_seconds": 0.0002462920965626836,
+      "projection_seconds": 0.020502291969023645,
+      "native_ce_forward_seconds": 0.0018243329832330346,
+      "native_ce_backward_seconds": 0.002311208052560687,
+      "hidden_gradient_seconds": 0.08080695907119662
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.004373915959149599,
+      "frozen_weight_bf16_to_fp32_seconds": 0.004519499954767525,
+      "activation_fp32_to_bf16_seconds": 0.0002757080364972353,
+      "projection_seconds": 0.02065320801921189,
+      "native_ce_forward_seconds": 0.0018273339373990893,
+      "native_ce_backward_seconds": 0.002284000045619905,
+      "hidden_gradient_seconds": 0.07953895803075284
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.004371957969851792,
+      "frozen_weight_bf16_to_fp32_seconds": 0.004451667075045407,
+      "activation_fp32_to_bf16_seconds": 0.00028074998408555984,
+      "projection_seconds": 0.020521624945104122,
+      "native_ce_forward_seconds": 0.0018143750494346023,
+      "native_ce_backward_seconds": 0.0022665830329060555,
+      "hidden_gradient_seconds": 0.07964229199569672
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.004492540960200131,
+      "frozen_weight_bf16_to_fp32_seconds": 0.004452583030797541,
+      "activation_fp32_to_bf16_seconds": 0.0003291670000180602,
+      "projection_seconds": 0.020529208006337285,
+      "native_ce_forward_seconds": 0.0018367910524830222,
+      "native_ce_backward_seconds": 0.002251541009172797,
+      "hidden_gradient_seconds": 0.0796860420377925
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.004363915999419987,
+      "frozen_weight_bf16_to_fp32_seconds": 0.004450791981071234,
+      "activation_fp32_to_bf16_seconds": 0.0002697909949347377,
+      "projection_seconds": 0.020509875030256808,
+      "native_ce_forward_seconds": 0.0018544999184086919,
+      "native_ce_backward_seconds": 0.002336291945539415,
+      "hidden_gradient_seconds": 0.08122462499886751
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.004365333006717265,
+      "frozen_weight_bf16_to_fp32_seconds": 0.00443804101087153,
+      "activation_fp32_to_bf16_seconds": 0.0003048329381272197,
+      "projection_seconds": 0.02053862507455051,
+      "native_ce_forward_seconds": 0.0018525419291108847,
+      "native_ce_backward_seconds": 0.002304999972693622,
+      "hidden_gradient_seconds": 0.07954916707240045
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.004454125068150461,
+      "frozen_weight_bf16_to_fp32_seconds": 0.0046247499994933605,
+      "activation_fp32_to_bf16_seconds": 0.0003661250229924917,
+      "projection_seconds": 0.020511541049927473,
+      "native_ce_forward_seconds": 0.002004832960665226,
+      "native_ce_backward_seconds": 0.0025649999734014273,
+      "hidden_gradient_seconds": 0.07965704204980284
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.00435525004286319,
+      "frozen_weight_bf16_to_fp32_seconds": 0.0044426670065149665,
+      "activation_fp32_to_bf16_seconds": 0.00026875000912696123,
+      "projection_seconds": 0.0206073330482468,
+      "native_ce_forward_seconds": 0.0019384580664336681,
+      "native_ce_backward_seconds": 0.00236120808403939,
+      "hidden_gradient_seconds": 0.07955516700167209
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.0043627090053632855,
+      "frozen_weight_bf16_to_fp32_seconds": 0.004461208009161055,
+      "activation_fp32_to_bf16_seconds": 0.0002892500488087535,
+      "projection_seconds": 0.020682208007201552,
+      "native_ce_forward_seconds": 0.0018476250115782022,
+      "native_ce_backward_seconds": 0.002320416970178485,
+      "hidden_gradient_seconds": 0.08096883294638246
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.004455458954907954,
+      "frozen_weight_bf16_to_fp32_seconds": 0.004485958022996783,
+      "activation_fp32_to_bf16_seconds": 0.0003277090145274997,
+      "projection_seconds": 0.02091299998573959,
+      "native_ce_forward_seconds": 0.0019433330744504929,
+      "native_ce_backward_seconds": 0.002824124996550381,
+      "hidden_gradient_seconds": 0.07980695902369916
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.004376458004117012,
+      "frozen_weight_bf16_to_fp32_seconds": 0.004446167033165693,
+      "activation_fp32_to_bf16_seconds": 0.000274333986453712,
+      "projection_seconds": 0.020474541001021862,
+      "native_ce_forward_seconds": 0.0019032920245081186,
+      "native_ce_backward_seconds": 0.0023590829223394394,
+      "hidden_gradient_seconds": 0.07956108404323459
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.004362582927569747,
+      "frozen_weight_bf16_to_fp32_seconds": 0.004510542028583586,
+      "activation_fp32_to_bf16_seconds": 0.000250832992605865,
+      "projection_seconds": 0.02052004192955792,
+      "native_ce_forward_seconds": 0.0018601659685373306,
+      "native_ce_backward_seconds": 0.0022964170202612877,
+      "hidden_gradient_seconds": 0.0795275829732418
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.0043949580285698175,
+      "frozen_weight_bf16_to_fp32_seconds": 0.0044756249990314245,
+      "activation_fp32_to_bf16_seconds": 0.0002960410201922059,
+      "projection_seconds": 0.02062341698911041,
+      "native_ce_forward_seconds": 0.001862665987573564,
+      "native_ce_backward_seconds": 0.002351792063564062,
+      "hidden_gradient_seconds": 0.07968141697347164
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.004428541986271739,
+      "frozen_weight_bf16_to_fp32_seconds": 0.004498208989389241,
+      "activation_fp32_to_bf16_seconds": 0.0003232919843867421,
+      "projection_seconds": 0.020850416971370578,
+      "native_ce_forward_seconds": 0.0018469170900061727,
+      "native_ce_backward_seconds": 0.0022964170202612877,
+      "hidden_gradient_seconds": 0.07968299998901784
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.004363832995295525,
+      "frozen_weight_bf16_to_fp32_seconds": 0.004434750066138804,
+      "activation_fp32_to_bf16_seconds": 0.000275125028565526,
+      "projection_seconds": 0.02052858390379697,
+      "native_ce_forward_seconds": 0.0017742920899763703,
+      "native_ce_backward_seconds": 0.0022002500481903553,
+      "hidden_gradient_seconds": 0.07963370799552649
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.0043706250144168735,
+      "frozen_weight_bf16_to_fp32_seconds": 0.0044382920023053885,
+      "activation_fp32_to_bf16_seconds": 0.00026587501633912325,
+      "projection_seconds": 0.020506208995357156,
+      "native_ce_forward_seconds": 0.0019021249609068036,
+      "native_ce_backward_seconds": 0.002239624969661236,
+      "hidden_gradient_seconds": 0.07965133409015834
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.0043645830592140555,
+      "frozen_weight_bf16_to_fp32_seconds": 0.004456500057131052,
+      "activation_fp32_to_bf16_seconds": 0.0002673750277608633,
+      "projection_seconds": 0.020464958040975034,
+      "native_ce_forward_seconds": 0.001819667057134211,
+      "native_ce_backward_seconds": 0.002251917030662298,
+      "hidden_gradient_seconds": 0.07969495898578316
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.00435691699385643,
+      "frozen_weight_bf16_to_fp32_seconds": 0.004439290962181985,
+      "activation_fp32_to_bf16_seconds": 0.0002763330703601241,
+      "projection_seconds": 0.020489083952270448,
+      "native_ce_forward_seconds": 0.0018306670244783163,
+      "native_ce_backward_seconds": 0.0022377920104190707,
+      "hidden_gradient_seconds": 0.07981758296955377
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.004356957972049713,
+      "frozen_weight_bf16_to_fp32_seconds": 0.004449708038009703,
+      "activation_fp32_to_bf16_seconds": 0.00027345807757228613,
+      "projection_seconds": 0.020450082956813276,
+      "native_ce_forward_seconds": 0.0018284580437466502,
+      "native_ce_backward_seconds": 0.0022552909795194864,
+      "hidden_gradient_seconds": 0.08104145794641227
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.004354040953330696,
+      "frozen_weight_bf16_to_fp32_seconds": 0.004451375105418265,
+      "activation_fp32_to_bf16_seconds": 0.0003100000321865082,
+      "projection_seconds": 0.020413749967701733,
+      "native_ce_forward_seconds": 0.0018115839920938015,
+      "native_ce_backward_seconds": 0.002239791094325483,
+      "hidden_gradient_seconds": 0.07966237503569573
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.004352666903287172,
+      "frozen_weight_bf16_to_fp32_seconds": 0.004437582916580141,
+      "activation_fp32_to_bf16_seconds": 0.0002738330513238907,
+      "projection_seconds": 0.02049358398653567,
+      "native_ce_forward_seconds": 0.0018301669042557478,
+      "native_ce_backward_seconds": 0.0022187919821590185,
+      "hidden_gradient_seconds": 0.08188337495084852
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.0043973339488729835,
+      "frozen_weight_bf16_to_fp32_seconds": 0.0044579580426216125,
+      "activation_fp32_to_bf16_seconds": 0.00028791604563593864,
+      "projection_seconds": 0.02047704195138067,
+      "native_ce_forward_seconds": 0.001838458003476262,
+      "native_ce_backward_seconds": 0.002273417077958584,
+      "hidden_gradient_seconds": 0.07964462507516146
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.004358333069831133,
+      "frozen_weight_bf16_to_fp32_seconds": 0.004439875017851591,
+      "activation_fp32_to_bf16_seconds": 0.00026558293029665947,
+      "projection_seconds": 0.02048425003886223,
+      "native_ce_forward_seconds": 0.0018099169246852398,
+      "native_ce_backward_seconds": 0.002233124920167029,
+      "hidden_gradient_seconds": 0.07958462508395314
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.0043373750522732735,
+      "frozen_weight_bf16_to_fp32_seconds": 0.004476291011087596,
+      "activation_fp32_to_bf16_seconds": 0.00027291697915643454,
+      "projection_seconds": 0.02050641702953726,
+      "native_ce_forward_seconds": 0.001818167045712471,
+      "native_ce_backward_seconds": 0.002231125021353364,
+      "hidden_gradient_seconds": 0.07965145795606077
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.004367041983641684,
+      "frozen_weight_bf16_to_fp32_seconds": 0.004436834016814828,
+      "activation_fp32_to_bf16_seconds": 0.00026029208675026894,
+      "projection_seconds": 0.020425416994839907,
+      "native_ce_forward_seconds": 0.0018138749292120337,
+      "native_ce_backward_seconds": 0.0022004999918863177,
+      "hidden_gradient_seconds": 0.0795059580123052
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.004356084042228758,
+      "frozen_weight_bf16_to_fp32_seconds": 0.004437334020622075,
+      "activation_fp32_to_bf16_seconds": 0.00026908295694738626,
+      "projection_seconds": 0.020548666012473404,
+      "native_ce_forward_seconds": 0.001815208001062274,
+      "native_ce_backward_seconds": 0.0022695829393342137,
+      "hidden_gradient_seconds": 0.07961741695180535
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.004356416990049183,
+      "frozen_weight_bf16_to_fp32_seconds": 0.004433208028785884,
+      "activation_fp32_to_bf16_seconds": 0.00025645794812589884,
+      "projection_seconds": 0.02047408407088369,
+      "native_ce_forward_seconds": 0.001870292006060481,
+      "native_ce_backward_seconds": 0.0023121669655665755,
+      "hidden_gradient_seconds": 0.07952274999115616
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.004478333052247763,
+      "frozen_weight_bf16_to_fp32_seconds": 0.004601542023010552,
+      "activation_fp32_to_bf16_seconds": 0.00038058299105614424,
+      "projection_seconds": 0.020714332931675017,
+      "native_ce_forward_seconds": 0.0019242089474573731,
+      "native_ce_backward_seconds": 0.002366916975006461,
+      "hidden_gradient_seconds": 0.07963770802598447
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.00440137495752424,
+      "frozen_weight_bf16_to_fp32_seconds": 0.004586667055264115,
+      "activation_fp32_to_bf16_seconds": 0.00033662503119558096,
+      "projection_seconds": 0.0208792919293046,
+      "native_ce_forward_seconds": 0.0020323339849710464,
+      "native_ce_backward_seconds": 0.002589917043223977,
+      "hidden_gradient_seconds": 0.07806958304718137
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.004455417045392096,
+      "frozen_weight_bf16_to_fp32_seconds": 0.004492874955758452,
+      "activation_fp32_to_bf16_seconds": 0.0002620420418679714,
+      "projection_seconds": 0.020521749975159764,
+      "native_ce_forward_seconds": 0.001880291965790093,
+      "native_ce_backward_seconds": 0.0023045000853016973,
+      "hidden_gradient_seconds": 0.07959329197183251
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.004390041925944388,
+      "frozen_weight_bf16_to_fp32_seconds": 0.004473541979677975,
+      "activation_fp32_to_bf16_seconds": 0.0003013330278918147,
+      "projection_seconds": 0.0207267499063164,
+      "native_ce_forward_seconds": 0.001884375000372529,
+      "native_ce_backward_seconds": 0.0023698339937254786,
+      "hidden_gradient_seconds": 0.08024270797614008
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.004378500045277178,
+      "frozen_weight_bf16_to_fp32_seconds": 0.004502833005972207,
+      "activation_fp32_to_bf16_seconds": 0.000301457941532135,
+      "projection_seconds": 0.020530915935523808,
+      "native_ce_forward_seconds": 0.0018708748975768685,
+      "native_ce_backward_seconds": 0.0022909999825060368,
+      "hidden_gradient_seconds": 0.07959600002504885
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.004379416932351887,
+      "frozen_weight_bf16_to_fp32_seconds": 0.004444375052116811,
+      "activation_fp32_to_bf16_seconds": 0.0002774170134216547,
+      "projection_seconds": 0.02049966691993177,
+      "native_ce_forward_seconds": 0.0018592909909784794,
+      "native_ce_backward_seconds": 0.0023226250195875764,
+      "hidden_gradient_seconds": 0.08047129202168435
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.0044105000561103225,
+      "frozen_weight_bf16_to_fp32_seconds": 0.004439208074472845,
+      "activation_fp32_to_bf16_seconds": 0.00026070792227983475,
+      "projection_seconds": 0.020603124983608723,
+      "native_ce_forward_seconds": 0.0018465830944478512,
+      "native_ce_backward_seconds": 0.002312458003871143,
+      "hidden_gradient_seconds": 0.0794454999268055
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.004390957998111844,
+      "frozen_weight_bf16_to_fp32_seconds": 0.004439667100086808,
+      "activation_fp32_to_bf16_seconds": 0.00027900002896785736,
+      "projection_seconds": 0.020520874997600913,
+      "native_ce_forward_seconds": 0.001889374922029674,
+      "native_ce_backward_seconds": 0.002337082987651229,
+      "hidden_gradient_seconds": 0.07978941698092967
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.0043735000072047114,
+      "frozen_weight_bf16_to_fp32_seconds": 0.004453249974176288,
+      "activation_fp32_to_bf16_seconds": 0.00028133299201726913,
+      "projection_seconds": 0.02052158396691084,
+      "native_ce_forward_seconds": 0.0018387919990345836,
+      "native_ce_backward_seconds": 0.002265125047415495,
+      "hidden_gradient_seconds": 0.08053037500940263
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.00436608400195837,
+      "frozen_weight_bf16_to_fp32_seconds": 0.004476457950659096,
+      "activation_fp32_to_bf16_seconds": 0.0002795408945530653,
+      "projection_seconds": 0.020530292065814137,
+      "native_ce_forward_seconds": 0.001856916001997888,
+      "native_ce_backward_seconds": 0.0023129170294851065,
+      "hidden_gradient_seconds": 0.08241779101081192
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.004368207999505103,
+      "frozen_weight_bf16_to_fp32_seconds": 0.004444292047992349,
+      "activation_fp32_to_bf16_seconds": 0.0002732920693233609,
+      "projection_seconds": 0.020520083024166524,
+      "native_ce_forward_seconds": 0.0018497910350561142,
+      "native_ce_backward_seconds": 0.0022837499855086207,
+      "hidden_gradient_seconds": 0.08241924992762506
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.004362042061984539,
+      "frozen_weight_bf16_to_fp32_seconds": 0.00442174996715039,
+      "activation_fp32_to_bf16_seconds": 0.0002550829667598009,
+      "projection_seconds": 0.02046395791694522,
+      "native_ce_forward_seconds": 0.0017646660562604666,
+      "native_ce_backward_seconds": 0.0023614169331267476,
+      "hidden_gradient_seconds": 0.08039258304052055
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.004385208012536168,
+      "frozen_weight_bf16_to_fp32_seconds": 0.004449833068065345,
+      "activation_fp32_to_bf16_seconds": 0.0002839580411091447,
+      "projection_seconds": 0.02049724990502,
+      "native_ce_forward_seconds": 0.001836499897763133,
+      "native_ce_backward_seconds": 0.0023037909995764494,
+      "hidden_gradient_seconds": 0.08058000006712973
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.004430249915458262,
+      "frozen_weight_bf16_to_fp32_seconds": 0.004511874984018505,
+      "activation_fp32_to_bf16_seconds": 0.00029670901130884886,
+      "projection_seconds": 0.020531457965262234,
+      "native_ce_forward_seconds": 0.0018921250011771917,
+      "native_ce_backward_seconds": 0.002346541965380311,
+      "hidden_gradient_seconds": 0.08072620804887265
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.0043597499607130885,
+      "frozen_weight_bf16_to_fp32_seconds": 0.004447415936738253,
+      "activation_fp32_to_bf16_seconds": 0.00028133310843259096,
+      "projection_seconds": 0.02055033401120454,
+      "native_ce_forward_seconds": 0.0018829170148819685,
+      "native_ce_backward_seconds": 0.0023197500267997384,
+      "hidden_gradient_seconds": 0.08092650002799928
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.004375749966129661,
+      "frozen_weight_bf16_to_fp32_seconds": 0.004442791920155287,
+      "activation_fp32_to_bf16_seconds": 0.00027075002435594797,
+      "projection_seconds": 0.02050862496253103,
+      "native_ce_forward_seconds": 0.001847374951466918,
+      "native_ce_backward_seconds": 0.002307124901562929,
+      "hidden_gradient_seconds": 0.07980312500149012
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.0043641249649226665,
+      "frozen_weight_bf16_to_fp32_seconds": 0.004453624947927892,
+      "activation_fp32_to_bf16_seconds": 0.0003017500275745988,
+      "projection_seconds": 0.020553625072352588,
+      "native_ce_forward_seconds": 0.0018128339434042573,
+      "native_ce_backward_seconds": 0.002248415956273675,
+      "hidden_gradient_seconds": 0.08061824995093048
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.004370250040665269,
+      "frozen_weight_bf16_to_fp32_seconds": 0.004571042023599148,
+      "activation_fp32_to_bf16_seconds": 0.00028358306735754013,
+      "projection_seconds": 0.020499208942055702,
+      "native_ce_forward_seconds": 0.0019072919385507703,
+      "native_ce_backward_seconds": 0.0022676660446450114,
+      "hidden_gradient_seconds": 0.07975741697009653
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.004384709056466818,
+      "frozen_weight_bf16_to_fp32_seconds": 0.004462791024707258,
+      "activation_fp32_to_bf16_seconds": 0.0002873340854421258,
+      "projection_seconds": 0.02056762494612485,
+      "native_ce_forward_seconds": 0.0018515830161049962,
+      "native_ce_backward_seconds": 0.002330042072571814,
+      "hidden_gradient_seconds": 0.0802120000589639
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.004363292013294995,
+      "frozen_weight_bf16_to_fp32_seconds": 0.004431250039488077,
+      "activation_fp32_to_bf16_seconds": 0.0002635420532897115,
+      "projection_seconds": 0.02052683394867927,
+      "native_ce_forward_seconds": 0.0018974170088768005,
+      "native_ce_backward_seconds": 0.002315749996341765,
+      "hidden_gradient_seconds": 0.0781054999679327
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.004356666933745146,
+      "frozen_weight_bf16_to_fp32_seconds": 0.004431582987308502,
+      "activation_fp32_to_bf16_seconds": 0.00027075002435594797,
+      "projection_seconds": 0.02058570901863277,
+      "native_ce_forward_seconds": 0.001840249984525144,
+      "native_ce_backward_seconds": 0.002260083914734423,
+      "hidden_gradient_seconds": 0.07977175002451986
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.004368165973573923,
+      "frozen_weight_bf16_to_fp32_seconds": 0.004543874994851649,
+      "activation_fp32_to_bf16_seconds": 0.0002908750902861357,
+      "projection_seconds": 0.02053808292839676,
+      "native_ce_forward_seconds": 0.0018262909725308418,
+      "native_ce_backward_seconds": 0.002275708015076816,
+      "hidden_gradient_seconds": 0.08100762497633696
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.004376708995550871,
+      "frozen_weight_bf16_to_fp32_seconds": 0.004440208896994591,
+      "activation_fp32_to_bf16_seconds": 0.0002742090728133917,
+      "projection_seconds": 0.02053029101807624,
+      "native_ce_forward_seconds": 0.0018604170763865113,
+      "native_ce_backward_seconds": 0.002298958017490804,
+      "hidden_gradient_seconds": 0.08100237499456853
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.00437616603448987,
+      "frozen_weight_bf16_to_fp32_seconds": 0.004440790973603725,
+      "activation_fp32_to_bf16_seconds": 0.0002722080098465085,
+      "projection_seconds": 0.020556541974656284,
+      "native_ce_forward_seconds": 0.001818499993532896,
+      "native_ce_backward_seconds": 0.002241416950710118,
+      "hidden_gradient_seconds": 0.07978979195468128
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.004363749991171062,
+      "frozen_weight_bf16_to_fp32_seconds": 0.004439209005795419,
+      "activation_fp32_to_bf16_seconds": 0.00027054199017584324,
+      "projection_seconds": 0.020475291996262968,
+      "native_ce_forward_seconds": 0.0018221669597551227,
+      "native_ce_backward_seconds": 0.0022707500029355288,
+      "hidden_gradient_seconds": 0.07981166604440659
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.004371165996417403,
+      "frozen_weight_bf16_to_fp32_seconds": 0.004447499988600612,
+      "activation_fp32_to_bf16_seconds": 0.00027233303990215063,
+      "projection_seconds": 0.02047699992544949,
+      "native_ce_forward_seconds": 0.001839208067394793,
+      "native_ce_backward_seconds": 0.0022444999776780605,
+      "hidden_gradient_seconds": 0.07949012494646013
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.0043700410751625896,
+      "frozen_weight_bf16_to_fp32_seconds": 0.0044499170035123825,
+      "activation_fp32_to_bf16_seconds": 0.0003345420118421316,
+      "projection_seconds": 0.020472958916798234,
+      "native_ce_forward_seconds": 0.0018102079629898071,
+      "native_ce_backward_seconds": 0.002229207893833518,
+      "hidden_gradient_seconds": 0.07962849992327392
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.004385582986287773,
+      "frozen_weight_bf16_to_fp32_seconds": 0.004440375021658838,
+      "activation_fp32_to_bf16_seconds": 0.0002588339848443866,
+      "projection_seconds": 0.020493374904617667,
+      "native_ce_forward_seconds": 0.0017917499644681811,
+      "native_ce_backward_seconds": 0.0022150829900056124,
+      "hidden_gradient_seconds": 0.08124408405274153
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.004400000092573464,
+      "frozen_weight_bf16_to_fp32_seconds": 0.004466832964681089,
+      "activation_fp32_to_bf16_seconds": 0.0002535830717533827,
+      "projection_seconds": 0.02045383397489786,
+      "native_ce_forward_seconds": 0.0018700830405578017,
+      "native_ce_backward_seconds": 0.0022782080341130495,
+      "hidden_gradient_seconds": 0.07973037497140467
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.004389625042676926,
+      "frozen_weight_bf16_to_fp32_seconds": 0.004434959031641483,
+      "activation_fp32_to_bf16_seconds": 0.00024029193446040154,
+      "projection_seconds": 0.020455457968637347,
+      "native_ce_forward_seconds": 0.0018038750858977437,
+      "native_ce_backward_seconds": 0.002249457989819348,
+      "hidden_gradient_seconds": 0.08117062505334616
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.004383499966934323,
+      "frozen_weight_bf16_to_fp32_seconds": 0.004454749985598028,
+      "activation_fp32_to_bf16_seconds": 0.000269208918325603,
+      "projection_seconds": 0.020525625091977417,
+      "native_ce_forward_seconds": 0.0018198329489678144,
+      "native_ce_backward_seconds": 0.002274833037517965,
+      "hidden_gradient_seconds": 0.08111024997197092
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.004392958013340831,
+      "frozen_weight_bf16_to_fp32_seconds": 0.004450167063623667,
+      "activation_fp32_to_bf16_seconds": 0.0002716669114306569,
+      "projection_seconds": 0.020487415953539312,
+      "native_ce_forward_seconds": 0.0018740840023383498,
+      "native_ce_backward_seconds": 0.002256707986816764,
+      "hidden_gradient_seconds": 0.07961650006473064
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.00437770807184279,
+      "frozen_weight_bf16_to_fp32_seconds": 0.00443916697986424,
+      "activation_fp32_to_bf16_seconds": 0.0002849589800462127,
+      "projection_seconds": 0.020435667014680803,
+      "native_ce_forward_seconds": 0.0018096669809892774,
+      "native_ce_backward_seconds": 0.002220208989456296,
+      "hidden_gradient_seconds": 0.07977924996521324
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.004358000005595386,
+      "frozen_weight_bf16_to_fp32_seconds": 0.004440540913492441,
+      "activation_fp32_to_bf16_seconds": 0.00027066702023148537,
+      "projection_seconds": 0.020471416995860636,
+      "native_ce_forward_seconds": 0.0018366669537499547,
+      "native_ce_backward_seconds": 0.002231332939118147,
+      "hidden_gradient_seconds": 0.0796679169870913
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.004364666994661093,
+      "frozen_weight_bf16_to_fp32_seconds": 0.004450874985195696,
+      "activation_fp32_to_bf16_seconds": 0.0002697499003261328,
+      "projection_seconds": 0.02052979206200689,
+      "native_ce_forward_seconds": 0.0018220000201836228,
+      "native_ce_backward_seconds": 0.002256207983009517,
+      "hidden_gradient_seconds": 0.07957020797766745
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.004363249987363815,
+      "frozen_weight_bf16_to_fp32_seconds": 0.004427333013154566,
+      "activation_fp32_to_bf16_seconds": 0.00027233303990215063,
+      "projection_seconds": 0.02050704206340015,
+      "native_ce_forward_seconds": 0.0018116250867024064,
+      "native_ce_backward_seconds": 0.0022179170046001673,
+      "hidden_gradient_seconds": 0.0796433329815045
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.004424249986186624,
+      "frozen_weight_bf16_to_fp32_seconds": 0.00447241694200784,
+      "activation_fp32_to_bf16_seconds": 0.0002686659572646022,
+      "projection_seconds": 0.020477499929256737,
+      "native_ce_forward_seconds": 0.0018179579637944698,
+      "native_ce_backward_seconds": 0.002190624945797026,
+      "hidden_gradient_seconds": 0.07979200000409037
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.004381833947263658,
+      "frozen_weight_bf16_to_fp32_seconds": 0.0044484169920906425,
+      "activation_fp32_to_bf16_seconds": 0.0002862919354811311,
+      "projection_seconds": 0.020532250055111945,
+      "native_ce_forward_seconds": 0.0018248329870402813,
+      "native_ce_backward_seconds": 0.0022760829888284206,
+      "hidden_gradient_seconds": 0.07964883290696889
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.004371833987534046,
+      "frozen_weight_bf16_to_fp32_seconds": 0.004443041980266571,
+      "activation_fp32_to_bf16_seconds": 0.0002768749836832285,
+      "projection_seconds": 0.020579042029567063,
+      "native_ce_forward_seconds": 0.001866708043962717,
+      "native_ce_backward_seconds": 0.0022160409716889262,
+      "hidden_gradient_seconds": 0.07961137499660254
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.004373667063191533,
+      "frozen_weight_bf16_to_fp32_seconds": 0.004437041934579611,
+      "activation_fp32_to_bf16_seconds": 0.0002709999680519104,
+      "projection_seconds": 0.020548666012473404,
+      "native_ce_forward_seconds": 0.0017987909959629178,
+      "native_ce_backward_seconds": 0.0022196669597178698,
+      "hidden_gradient_seconds": 0.07954329100903124
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.004359083017334342,
+      "frozen_weight_bf16_to_fp32_seconds": 0.004437583964318037,
+      "activation_fp32_to_bf16_seconds": 0.00027883402071893215,
+      "projection_seconds": 0.02051016699988395,
+      "native_ce_forward_seconds": 0.0018250830471515656,
+      "native_ce_backward_seconds": 0.0022667499724775553,
+      "hidden_gradient_seconds": 0.07959008298348635
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.004396291100420058,
+      "frozen_weight_bf16_to_fp32_seconds": 0.004444957943633199,
+      "activation_fp32_to_bf16_seconds": 0.00024524994660168886,
+      "projection_seconds": 0.020359541988000274,
+      "native_ce_forward_seconds": 0.001837334013544023,
+      "native_ce_backward_seconds": 0.0024053340312093496,
+      "hidden_gradient_seconds": 0.07954491605050862
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.004362166975624859,
+      "frozen_weight_bf16_to_fp32_seconds": 0.004465749952942133,
+      "activation_fp32_to_bf16_seconds": 0.0002722080098465085,
+      "projection_seconds": 0.02043987496290356,
+      "native_ce_forward_seconds": 0.0019047919195145369,
+      "native_ce_backward_seconds": 0.0023780829505994916,
+      "hidden_gradient_seconds": 0.07954012509435415
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.004370457958430052,
+      "frozen_weight_bf16_to_fp32_seconds": 0.004501917050220072,
+      "activation_fp32_to_bf16_seconds": 0.00029499991796910763,
+      "projection_seconds": 0.020443832967430353,
+      "native_ce_forward_seconds": 0.0019431250402703881,
+      "native_ce_backward_seconds": 0.002358082914724946,
+      "hidden_gradient_seconds": 0.07963074999861419
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.004341000108979642,
+      "frozen_weight_bf16_to_fp32_seconds": 0.004425125080160797,
+      "activation_fp32_to_bf16_seconds": 0.00027291697915643454,
+      "projection_seconds": 0.0205199170159176,
+      "native_ce_forward_seconds": 0.00181479100137949,
+      "native_ce_backward_seconds": 0.0022886249935254455,
+      "hidden_gradient_seconds": 0.07973720808513463
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.00461712502874434,
+      "frozen_weight_bf16_to_fp32_seconds": 0.004692833055742085,
+      "activation_fp32_to_bf16_seconds": 0.0004580839304253459,
+      "projection_seconds": 0.020641167066060007,
+      "native_ce_forward_seconds": 0.0019494580337777734,
+      "native_ce_backward_seconds": 0.002364792046137154,
+      "hidden_gradient_seconds": 0.07963029097300023
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.00436508294660598,
+      "frozen_weight_bf16_to_fp32_seconds": 0.0044588749296963215,
+      "activation_fp32_to_bf16_seconds": 0.0002613330725580454,
+      "projection_seconds": 0.020421166089363396,
+      "native_ce_forward_seconds": 0.0018424169393256307,
+      "native_ce_backward_seconds": 0.002303167013451457,
+      "hidden_gradient_seconds": 0.07965070800855756
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.00441708299331367,
+      "frozen_weight_bf16_to_fp32_seconds": 0.004480584058910608,
+      "activation_fp32_to_bf16_seconds": 0.0002989169443026185,
+      "projection_seconds": 0.02064125007018447,
+      "native_ce_forward_seconds": 0.0018844170263037086,
+      "native_ce_backward_seconds": 0.0022535829339176416,
+      "hidden_gradient_seconds": 0.07957750000059605
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.004362083040177822,
+      "frozen_weight_bf16_to_fp32_seconds": 0.00442925002425909,
+      "activation_fp32_to_bf16_seconds": 0.0002758749760687351,
+      "projection_seconds": 0.020482084015384316,
+      "native_ce_forward_seconds": 0.001821334008127451,
+      "native_ce_backward_seconds": 0.002291457960382104,
+      "hidden_gradient_seconds": 0.07963845902122557
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.004362165927886963,
+      "frozen_weight_bf16_to_fp32_seconds": 0.004437833093106747,
+      "activation_fp32_to_bf16_seconds": 0.00026633311063051224,
+      "projection_seconds": 0.020708249998278916,
+      "native_ce_forward_seconds": 0.0018386669689789414,
+      "native_ce_backward_seconds": 0.00226995802950114,
+      "hidden_gradient_seconds": 0.08233554207254201
+    },
+    {
+      "frozen_weight_fp32_to_bf16_seconds": 0.004398624994792044,
+      "frozen_weight_bf16_to_fp32_seconds": 0.004471124964766204,
+      "activation_fp32_to_bf16_seconds": 0.00027479103300720453,
+      "projection_seconds": 0.020472042029723525,
+      "native_ce_forward_seconds": 0.001870624953880906,
+      "native_ce_backward_seconds": 0.0023083750857040286,
+      "hidden_gradient_seconds": 0.07779937505256385
+    }
+  ],
+  "timings": {
+    "frozen_weight_fp32_to_bf16_seconds": {
+      "median": 0.004371957969851792,
+      "p95": 0.004456602659774944
+    },
+    "frozen_weight_bf16_to_fp32_seconds": {
+      "median": 0.004450042033568025,
+      "p95": 0.0046017336717341095
+    },
+    "activation_fp32_to_bf16_seconds": {
+      "median": 0.0002746880054473877,
+      "p95": 0.00032943575060926376
+    },
+    "projection_seconds": {
+      "median": 0.02051997947273776,
+      "p95": 0.02070855414494872
+    },
+    "native_ce_forward_seconds": {
+      "median": 0.0018388335010968149,
+      "p95": 0.001943572674645111
+    },
+    "native_ce_backward_seconds": {
+      "median": 0.002283875015564263,
+      "p95": 0.002464153844630346
+    },
+    "hidden_gradient_seconds": {
+      "median": 0.07968220848124474,
+      "p95": 0.08190598330693319
+    }
+  },
+  "torch_version": "2.15.0",
+  "model_sha256": "f45c13bd1aca3d813bf202dfac20fb6fc2329c6ad078ae63be7d19420e1aa1ee",
+  "mps_cpu_fallback": false
+}

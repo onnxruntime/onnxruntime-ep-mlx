@@ -1,0 +1,63 @@
+"""Run head diagnostics only after the existing formal GPU controller exits."""
+import hashlib
+import json
+import os
+from pathlib import Path
+import subprocess
+import time
+
+root = Path('/tmp/onnax-native-head-pilot4k')
+root.mkdir(exist_ok=False)
+python = '/Users/justinc/Documents/GitHub/onnax/.venv/bin/python'
+cwd = '/tmp/onnax-decoder-precision-benchmark'
+library = Path('/tmp/onnax-mlx-lookup-reuse-runtime/libonnxruntime_mlx_ep.dylib')
+export = '/tmp/onnax-qwen35-real-bf16-canonical-30/training/export'
+env = {**os.environ, 'PYTHONPATH': 'src:.', 'HF_HUB_OFFLINE': '1',
+       'HF_DATASETS_OFFLINE': '1', 'PYTORCH_ENABLE_MPS_FALLBACK': '0', 'ORT_DISABLE_TELEMETRY': '1'}
+for key in ('ONNXRUNTIME_EP_MLX_TRACE', 'ONNXRUNTIME_EP_MLX_VERBOSE'):
+    env.pop(key, None)
+
+def status(phase, **extra):
+    (root / 'status.json').write_text(json.dumps({'phase': phase, **extra}, indent=2) + '\n')
+
+def git(directory, *args):
+    return subprocess.check_output(['git', '-c', 'core.fsmonitor=false', '-C', directory, *args], text=True).strip()
+
+def run(name, command):
+    status(name)
+    with (root / (name + '.log')).open('w') as log:
+        subprocess.run([python, '-m', 'examples.huggingface.guard', '--output-dir', str(root / (name + '-guard')), '--', *command], cwd=cwd, env=env, stdout=log, stderr=subprocess.STDOUT, check=True)
+
+try:
+    native = '/tmp/onnax-mlx-head-control'
+    assert git(cwd, 'rev-parse', 'HEAD') == 'c5ce8ee710e9fe003c6fe850db854551b631db01'
+    assert not git(cwd, 'status', '--porcelain')
+    assert git(native, 'rev-parse', 'HEAD') == '57fbb5c9bd167801b3c92d8c409f56edacdc6dc9'
+    assert not git(native, 'status', '--porcelain')
+    assert hashlib.sha256(library.read_bytes()).hexdigest() == '29623bb837f0b70c255380e73f4405111712319b0495d1d46f5fe5cf967bacf3'
+    for policy in ('eager', 'compiled'):
+        command = [python, native + '/bench/onnax_decoder.py', '--export', export, '--cache-dir', '/tmp/onnax-qwen35-real-cache', '--library', str(library), '--sequence', '4032', '--warmup', '1', '--samples', '3', '--output', str(root / (policy + '.json')), '--gradients-output', str(root / (policy + '.npz'))]
+        if policy == 'compiled':
+            command.append('--compile-head')
+        run(policy, command)
+    import numpy as np
+    a = json.loads((root / 'eager.json').read_text())
+    b = json.loads((root / 'compiled.json').read_text())
+    for key in ('input_sha256', 'adapter_sha256'):
+        assert a[key] == b[key], key
+    assert a['input_sha256'] == 'a56739769a4f12c8cb3309feb2cf0d8cad19ec1284ebcae501c05212c1356f1e'
+    assert a['adapter_sha256'] == 'e64a72ef8e03d75f39eb9cbb9722121e412fda3edfd80363ad5a0e923e854f94'
+    np.testing.assert_allclose([s['loss'] for s in a['samples']], [s['loss'] for s in b['samples']], rtol=1e-4, atol=1e-6)
+    rows = {}
+    with np.load(root / 'eager.npz', allow_pickle=False) as x, np.load(root / 'compiled.npz', allow_pickle=False) as y:
+        assert set(x.files) == set(y.files) and len(x.files) == 60
+        for name in x.files:
+            assert x[name].shape == y[name].shape and x[name].dtype == y[name].dtype
+            assert np.isfinite(x[name]).all() and np.isfinite(y[name]).all()
+            np.testing.assert_allclose(x[name], y[name], rtol=1e-4, atol=1e-6, err_msg=name)
+            rows[name] = {'max_abs': float(np.max(np.abs(x[name] - y[name])))}
+    (root / 'comparison.json').write_text(json.dumps({'scope': 'Real4032-token qualification,1warmup3samples each, capacity/numerical check', 'all60gradients_and_loss_match': True, 'checks': rows}, indent=2) + '\n')
+    status('complete')
+except BaseException as error:
+    status('failed', error=repr(error))
+    raise
