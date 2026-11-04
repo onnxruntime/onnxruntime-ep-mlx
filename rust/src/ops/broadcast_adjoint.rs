@@ -7,7 +7,7 @@ use crate::sys::{mlx, ort};
 fn claim(node: &NodeView) -> ClaimResult {
     require!(
         node.num_inputs() == 2 && node.num_outputs() == 1,
-        "SumToShape requires gradient and reference tensors"
+        "SumToShape requires a gradient and target shape vector"
     );
     let gradient = node.input_info(0);
     let reference = node.input_info(1);
@@ -26,29 +26,14 @@ fn claim(node: &NodeView) -> ClaimResult {
         ),
         "SumToShape supports FP32, FP16 and BF16 gradients"
     );
-    if node.op_type() == "SumToShape_v2" {
-        require!(
-            reference.dtype == ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64
-                && reference.shape.len() == 1,
-            "SumToShape_v2 requires an INT64 target shape vector"
-        );
-        require!(
-            reference.shape[0] < 0 || reference.shape[0] as usize <= gradient.shape.len(),
-            "SumToShape reference rank exceeds gradient rank"
-        );
-        return Ok(());
-    }
     require!(
-        gradient.shape.len() >= reference.shape.len(),
-        "SumToShape reference rank exceeds gradient rank"
+        reference.dtype == ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64
+            && reference.shape.len() == 1,
+        "SumToShape requires an INT64 target shape vector"
     );
-    let leading = gradient.shape.len() - reference.shape.len();
     require!(
-        reference.shape.iter().enumerate().all(|(i, &t)| {
-            let g = gradient.shape[leading + i];
-            t < 0 || g < 0 || t == 1 || t == g
-        }),
-        "SumToShape incompatible broadcast extents"
+        reference.shape[0] < 0 || reference.shape[0] as usize <= gradient.shape.len(),
+        "SumToShape target rank exceeds gradient rank"
     );
     Ok(())
 }
@@ -56,7 +41,7 @@ fn claim(node: &NodeView) -> ClaimResult {
 fn translate(ctx: &mut TranslationContext, node: &NodeDesc) -> Result<(), MlxError> {
     let gradient = ctx.resolve(&node.inputs[0])?;
     let source = ctx.shape_of(gradient);
-    let target = if node.op_type == "SumToShape_v2" {
+    let target = {
         ctx.read_ints_eval(&node.inputs[1])?
             .into_iter()
             .map(|dimension| {
@@ -68,9 +53,6 @@ fn translate(ctx: &mut TranslationContext, node: &NodeDesc) -> Result<(), MlxErr
                     })
             })
             .collect::<Result<Vec<_>, MlxError>>()?
-    } else {
-        let reference = ctx.resolve(&node.inputs[1])?;
-        ctx.shape_of(reference)
     };
     if source.len() < target.len() {
         return Err("SumToShape reference rank exceeds gradient rank".into());
@@ -104,17 +86,15 @@ fn translate(ctx: &mut TranslationContext, node: &NodeDesc) -> Result<(), MlxErr
 }
 
 pub fn register(registry: &mut OpRegistry) {
-    for op_type in ["SumToShape_v1", "SumToShape_v2"] {
-        registry.register_shape_keyed(
-            OpRegistration {
-                domain: "pkg.onnax",
-                op_type,
-                min_opset: 1,
-                max_opset: 1,
-                handler: translate,
-                claim,
-            },
-            "host-selected reduction axes are fixed by the trace, beyond Primitive::output_shapes",
-        );
-    }
+    registry.register_shape_keyed(
+        OpRegistration {
+            domain: "pkg.onnax",
+            op_type: "SumToShape",
+            min_opset: 1,
+            max_opset: 1,
+            handler: translate,
+            claim,
+        },
+        "host-selected reduction axes are fixed by the trace, beyond Primitive::output_shapes",
+    );
 }

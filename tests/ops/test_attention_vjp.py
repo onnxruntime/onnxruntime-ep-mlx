@@ -28,7 +28,7 @@ def _model(
         ir.DataType.BOOL if kind != 2 else ir.DataType.FLOAT,
         ["batch", 1, "sq", "width"][-mask_rank:],
     )
-    # Function body uses ordinary ONNX. Native execution is selected by its versioned name.
+    # Function body uses ordinary ONNX. Native execution is selected by its parameterized name.
     t = ir.tape.Tape()
     const = lambda a: t.op(
         "Constant", [], {"value": ir.tensor(np.asarray(a, np.int64))}
@@ -135,7 +135,7 @@ def _model(
             for a, x in zip(grads, [q, k, v])
         ]
     bits = struct.unpack("I", struct.pack("f", scale))[0]
-    name = f"AttentionVJP_v1_r{rank}_q{hq}_k{hk}_d{d}_s{bits:08x}_c{int(causal)}_o{''.join(map(str, selected))}_m{kind}_0000000000000000"
+    name = f"AttentionVJP_r{rank}_q{hq}_k{hk}_d{d}_s{bits:08x}_c{int(causal)}_o{''.join(map(str, selected))}_m{kind}_0000000000000000"
     outputs = [
         m.tensor(
             f"d{i}",
@@ -170,7 +170,7 @@ def _model(
         by.replace_all_uses_with(forward_y)
         body.inputs.remove(by)
         call_inputs.remove(y)
-        name = name.replace("AttentionVJP_v1_", "AttentionVJP_v2_")
+        name = name.replace("AttentionVJP_", "AttentionVJPRecompute_")
     node = ir.node(name, call_inputs, domain="pkg.onnax", outputs=outputs)
     fn = ir.Function("pkg.onnax", name, graph=body, attributes=[])
     model = ir.Model(
