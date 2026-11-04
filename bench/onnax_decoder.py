@@ -14,15 +14,22 @@ import platform
 import subprocess
 import sys
 import time
+from functools import partial
 from importlib.metadata import version
 
 
 def git_state(directory):
     result = subprocess.run(
-        ["git", "-C", directory, "rev-parse", "HEAD"], capture_output=True, text=True
+        ["git", "-C", directory, "rev-parse", "HEAD"],
+        check=False,
+        capture_output=True,
+        text=True,
     )
     status = subprocess.run(
-        ["git", "-C", directory, "status", "--porcelain"], capture_output=True, text=True
+        ["git", "-C", directory, "status", "--porcelain"],
+        check=False,
+        capture_output=True,
+        text=True,
     )
     return {
         "commit": result.stdout.strip() if result.returncode == 0 else None,
@@ -51,20 +58,28 @@ def main():
     parser.add_argument("--batch", type=int, default=1)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--samples", type=int, default=100)
+    parser.add_argument(
+        "--compile-head",
+        action="store_true",
+        help="Compile the frozen output head; keep decoder sessions eager",
+    )
     parser.add_argument("--unfused", action="store_true")
     parser.add_argument("--unshared-initializers", action="store_true")
     args = parser.parse_args()
     if args.sequence < 2 or args.batch < 1 or args.warmup < 0 or args.samples < 1:
-        parser.error("Require sequence >= 2, positive batch/samples and nonnegative warmup")
-    os.environ["ONNXRUNTIME_EP_MLX_NO_GATED_DELTA_REVERSE"] = "1" if args.unfused else "0"
+        parser.error(
+            "Require sequence >= 2, positive batch/samples and nonnegative warmup"
+        )
+    os.environ["ONNXRUNTIME_EP_MLX_NO_GATED_DELTA_REVERSE"] = (
+        "1" if args.unfused else "0"
+    )
     os.environ["ONNXRUNTIME_EP_MLX_NO_SHARED_INITIALIZERS"] = (
         "1" if args.unshared_initializers else "0"
     )
-    os.environ["ONNXRUNTIME_EP_MLX_NO_COMPILE"] = "1"
+    os.environ["ONNXRUNTIME_EP_MLX_NO_COMPILE"] = "0" if args.compile_head else "1"
     os.environ.setdefault("ONNXRUNTIME_EP_MLX_CACHE_LIMIT_BYTES", "536870912")
     import numpy as np
     import torch
-
     from examples.huggingface.decoder_sft import OnnxDecoder
     from examples.huggingface.pretrained import PretrainedSource, load_tokenizer
     from examples.huggingface.sft import tokenizer
@@ -76,13 +91,19 @@ def main():
     start = time.perf_counter()
     session_times = []
 
-    def timed_session(graph):
+    def timed_session(graph, *, enable_compile=False):
         before = time.perf_counter()
-        result = session(graph)
+        result = session(graph, enable_compile=enable_compile)
         session_times.append(time.perf_counter() - before)
         return result
 
-    model = OnnxDecoder.load(args.export, session_factory=timed_session)
+    model = OnnxDecoder.load(
+        args.export,
+        session_factory=timed_session,
+        head_session_factory=(
+            partial(timed_session, enable_compile=True) if args.compile_head else None
+        ),
+    )
     construction = time.perf_counter() - start
     try:
         if args.sequence > model.config.max_position_embeddings:
@@ -105,7 +126,9 @@ def main():
         while len(tokens) < args.sequence:
             tokens = tok.encode(text * repetitions, add_special_tokens=False)
             repetitions *= 2
-        ids = torch.tensor([tokens[: args.sequence]], dtype=torch.int64).repeat(args.batch, 1)
+        ids = torch.tensor([tokens[: args.sequence]], dtype=torch.int64).repeat(
+            args.batch, 1
+        )
         data = {
             "input_ids": ids,
             "attention_mask": torch.ones_like(ids),
@@ -130,6 +153,10 @@ def main():
             "bundle_load_and_sessions_seconds": construction,
             "session_creation_seconds": sum(session_times),
             "session_creation_samples_seconds": session_times,
+            "session_compile_policy": {
+                "body": "eager",
+                "head": "compiled_when_eligible" if args.compile_head else "eager",
+            },
             "warmup_steps": args.warmup,
             "measured_steps": args.samples,
             "samples": [],
@@ -177,7 +204,9 @@ def main():
             )
             == "1",
         }
-        report["adapter_bytes"] = sum(value.nbytes for value in model.onnx.arrays().values())
+        report["adapter_bytes"] = sum(
+            value.nbytes for value in model.onnx.arrays().values()
+        )
         report["export_bundle_bytes"] = sum(
             os.path.getsize(os.path.join(root, name))
             for root, _, names in os.walk(args.export)
@@ -187,7 +216,8 @@ def main():
 
         report["primal_graph_nodes"] = len(
             onnx.load(
-                os.path.join(args.export, "execution", "model.onnx"), load_external_data=False
+                os.path.join(args.export, "execution", "model.onnx"),
+                load_external_data=False,
             ).graph.node
         )
         report["status"] = "running"
@@ -216,7 +246,8 @@ def main():
             if index == 0:
                 report["initial_step_seconds"] = after_backward - before
             if not torch.isfinite(output.loss) or any(
-                p.grad is None or not torch.isfinite(p.grad).all() for p in model.parameters()
+                p.grad is None or not torch.isfinite(p.grad).all()
+                for p in model.parameters()
             ):
                 raise FloatingPointError(
                     "Nonfinite loss or missing/nonfinite adapter gradient"
@@ -252,16 +283,22 @@ def main():
         report["summary"] = {
             key: {
                 "median": float(np.median([row[key] for row in report["samples"]])),
-                "p95": float(np.percentile([row[key] for row in report["samples"]], 95)),
+                "p95": float(
+                    np.percentile([row[key] for row in report["samples"]], 95)
+                ),
             }
             for key in report["samples"][0]
             if key.endswith("seconds")
         }
-        report["parameters_unchanged"] = digest_arrays(model.onnx.arrays()) == original_hash
+        report["parameters_unchanged"] = (
+            digest_arrays(model.onnx.arrays()) == original_hash
+        )
         if not report["parameters_unchanged"]:
             raise AssertionError("Benchmark changed adapter parameters")
         if args.gradients_output:
-            os.makedirs(os.path.dirname(os.path.abspath(args.gradients_output)), exist_ok=True)
+            os.makedirs(
+                os.path.dirname(os.path.abspath(args.gradients_output)), exist_ok=True
+            )
             np.savez(
                 args.gradients_output,
                 **{
