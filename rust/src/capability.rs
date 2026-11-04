@@ -43,6 +43,7 @@ pub(crate) unsafe fn get_capability(
     ep_api: *const ort::OrtEpApi,
     graph: *const ort::OrtGraph,
     support: *mut ort::OrtEpGraphSupportInfo,
+    enable_compile: bool,
 ) -> *mut ort::OrtStatus {
     unsafe {
         let api = &*ort_api;
@@ -230,7 +231,7 @@ pub(crate) unsafe fn get_capability(
         // Capture colours serve no purpose when every plan executes eagerly.
         // Keep dtype/convexity/claim boundaries while avoiding ORT fusion and
         // host-array boundaries created solely for compiled capture modes.
-        if !crate::compiled::compile_enabled(false) {
+        if !enable_compile || !crate::compiled::compile_enabled(false) {
             compile_class.fill(CompilePartitionClass::Eager);
         }
 

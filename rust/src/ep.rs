@@ -22,6 +22,7 @@ pub struct MlxEp {
     /// MLX has no Metal float64 path, so fp64 partitions use this shared CPU
     /// stream for their complete lifetime.
     cpu_stream: Stream,
+    enable_compile: bool,
 }
 
 impl MlxEp {
@@ -30,6 +31,7 @@ impl MlxEp {
         ep_api: *const ort::OrtEpApi,
         name: &CStr,
         _logger: *const ort::OrtLogger,
+        enable_compile: bool,
     ) -> Box<Self> {
         let mut base: ort::OrtEp = unsafe { std::mem::zeroed() };
         base.ort_version_supported = ORT_API_VERSION;
@@ -45,6 +47,7 @@ impl MlxEp {
             name: name.to_owned(),
             stream: Stream::new_default_gpu(),
             cpu_stream: Stream::new_default_cpu(),
+            enable_compile,
         })
     }
 
@@ -92,7 +95,13 @@ unsafe extern "C" fn get_capability(
     let ep = unsafe { &*this(ep) };
     unsafe {
         crate::guard_ffi_status(ep.ort_api, "get_capability", || {
-            crate::capability::get_capability(ep.ort_api, ep.ep_api, graph, support)
+            crate::capability::get_capability(
+                ep.ort_api,
+                ep.ep_api,
+                graph,
+                support,
+                ep.enable_compile,
+            )
         })
     }
 }
@@ -110,8 +119,11 @@ unsafe extern "C" fn compile(
         crate::guard_ffi_status(ep.ort_api, "compile", || {
             crate::runtime::compile(
                 ep.ort_api,
-                ep.stream.as_raw(),
-                ep.cpu_stream.as_raw(),
+                crate::runtime::CompileOptions {
+                    gpu_stream: ep.stream.as_raw(),
+                    cpu_stream: ep.cpu_stream.as_raw(),
+                    enable_compile: ep.enable_compile,
+                },
                 graphs,
                 fused_nodes,
                 count,

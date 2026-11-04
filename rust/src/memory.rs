@@ -28,43 +28,10 @@ pub(crate) unsafe fn configure_cache(
     api: &ort::OrtApi,
     options: *const ort::OrtSessionOptions,
 ) -> *mut ort::OrtStatus {
-    let mut session_value = None;
-    if !options.is_null() {
-        let mut present = 0;
-        let status = unsafe {
-            (api.HasSessionConfigEntry.unwrap())(options, SESSION_KEY.as_ptr(), &mut present)
-        };
-        if !status.is_null() {
-            return status;
-        }
-        if present != 0 {
-            let get = api.GetSessionConfigEntry.unwrap();
-            let mut size = 0;
-            let status = unsafe { get(options, SESSION_KEY.as_ptr(), ptr::null_mut(), &mut size) };
-            if !status.is_null() {
-                return status;
-            }
-            let mut bytes = vec![0u8; size];
-            let status = unsafe {
-                get(
-                    options,
-                    SESSION_KEY.as_ptr(),
-                    bytes.as_mut_ptr().cast(),
-                    &mut size,
-                )
-            };
-            if !status.is_null() {
-                return status;
-            }
-            let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-            session_value = match std::str::from_utf8(&bytes[..end]) {
-                Ok(value) => Some(value.to_owned()),
-                Err(_) => {
-                    return unsafe { invalid(api, "session value must be UTF-8 decimal digits") };
-                }
-            };
-        }
-    }
+    let session_value = match unsafe { crate::config::value(api, options, SESSION_KEY) } {
+        Ok(value) => value,
+        Err(status) => return status,
+    };
     let value = match session_value {
         Some(value) => Some(value),
         None => match std::env::var(ENV_KEY) {

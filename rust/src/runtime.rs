@@ -16,6 +16,13 @@ use crate::mlx::Stream;
 use crate::plan_builder;
 use crate::sys::{mlx, ort};
 
+/// Session-owned execution settings copied into each fused plan.
+pub(crate) struct CompileOptions {
+    pub gpu_stream: mlx::mlx_stream,
+    pub cpu_stream: mlx::mlx_stream,
+    pub enable_compile: bool,
+}
+
 /// Allocate ORT compute-info callback state for compiled fused subgraphs.
 ///
 /// # Safety
@@ -23,8 +30,7 @@ use crate::sys::{mlx, ort};
 /// returned callbacks own their `Plan` until `release_node_compute_infos`.
 pub(crate) unsafe fn compile(
     ort_api: *const ort::OrtApi,
-    gpu_stream: mlx::mlx_stream,
-    cpu_stream: mlx::mlx_stream,
+    options: CompileOptions,
     graphs: *mut *const ort::OrtGraph,
     fused_nodes: *mut *const ort::OrtNode,
     count: usize,
@@ -36,11 +42,16 @@ pub(crate) unsafe fn compile(
             let graph = *graphs.add(index);
             let fused_node = *fused_nodes.add(index);
             match plan_builder::build_plan(api, graph, fused_node) {
-                Ok(plan) => {
+                Ok(mut plan) => {
+                    if !options.enable_compile {
+                        plan.compiled.enabled = false;
+                        plan.prefill.enabled = false;
+                        plan.general.enabled = false;
+                    }
                     let stream = if plan.requires_cpu_stream {
-                        cpu_stream
+                        options.cpu_stream
                     } else {
-                        gpu_stream
+                        options.gpu_stream
                     };
                     *node_compute_infos.add(index) = SubgraphComputeInfo::new(ort_api, stream, plan)
                         as *mut ort::OrtNodeComputeInfo;

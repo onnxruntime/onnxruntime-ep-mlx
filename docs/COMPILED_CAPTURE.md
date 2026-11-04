@@ -106,6 +106,22 @@ every compiled replay. Boundary-provided positions retain compilation; graph-pro
 (or offset spans whose input shape is internal) require eager validation instead of capturing a
 first-call bounds check.
 
+## Select compilation per session
+
+Choose eager execution for an individual ONNX Runtime session:
+
+```python
+options = ort.SessionOptions()
+options.add_session_config_entry("ep.mlx.enable_compile", "0")
+```
+
+`0` disables compiled decode, prefill and general execution for that session and
+uses eager partition colours. `1` (the default) permits the existing compiled
+paths when graph checks allow them. The process-wide
+`ONNXRUNTIME_EP_MLX_NO_COMPILE=1` switch disables compilation for every session.
+These settings let a process combine an eager decoder with a compiled output head.
+Each session retains its policy when calls and input shapes are interleaved.
+
 With `ONNXRUNTIME_EP_MLX_NO_COMPILE=1`, capability partitioning uses one eager
 colour. Compatible supported regions can merge across capture-mode boundaries,
 reducing native kernel boundaries and ORT subgraph initialization work. Float64
