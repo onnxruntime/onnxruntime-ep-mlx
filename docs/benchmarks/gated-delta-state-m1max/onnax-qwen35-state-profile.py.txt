@@ -1,0 +1,6 @@
+from examples.huggingface.long_context import memory_limit
+from examples.lora.mlx_runtime import register_library
+LIB='/tmp/onnax-gated-delta-state-runtime/libonnxruntime_mlx_ep.dylib'
+register_library(LIB);memory_limit(LIB,20*1024**3)
+from examples.huggingface.block_runtime import main
+main()

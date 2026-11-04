@@ -1,0 +1,12 @@
+import os, subprocess, json
+from pathlib import Path
+root=Path('/tmp/onnax-gated-delta-state-measurement');root.mkdir(exist_ok=False)
+python='/Users/justinc/Documents/GitHub/onnax/.venv/bin/python'
+env={**os.environ,'PYTHONPATH':'src:.','ONNXRUNTIME_EP_MLX_NO_COMPILE':'1','ORT_DISABLE_TELEMETRY':'1'}
+env.pop('ONNXRUNTIME_EP_MLX_TRACE',None)
+for name,script,library in [('baseline','/tmp/onnax-qwen35-scan-profile.py','/tmp/onnax-key-tiles-runtime/libonnxruntime_mlx_ep.dylib'),('fused','/tmp/onnax-qwen35-state-profile.py','/tmp/onnax-gated-delta-state-runtime/libonnxruntime_mlx_ep.dylib')]:
+ print(name,flush=True)
+ command=[python,script,'measure','--bundle','/tmp/onnax-qwen35-complete-context4k-sft/export/execution','--captures','/tmp/onnax-qwen35-complete-context4k-block-captures','--block','decoder_0_1','--provider','mlx','--library',library,'--warmup','10','--samples','100','--output',str(root/(name+'.json'))]
+ with open(root/(name+'.log'),'w') as log:
+  subprocess.run([python,'-m','examples.huggingface.guard','--output-dir',str(root/(name+'-guard')),'--',*command],env=env,stdout=log,stderr=subprocess.STDOUT,check=True)
+print('complete',flush=True)

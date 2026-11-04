@@ -1,0 +1,45 @@
+{
+  "candidate_source": "76d27daa8b14e312b58ca2e94baec5658c75fac2",
+  "parent_source": "c135ae525d6459359e8a72d090bd7ab7a378d2ff",
+  "parent_binary_source": "064f28a (Rust tree identical to parent merge)",
+  "earlier_baseline_source": "48b300d (same Rust tree as code-only measured 9e9f3fd)",
+  "onnax_source": "9ea00991df9bff528d44924ccbc5835485b5b5aa",
+  "median_ratio": 3.036687905518186,
+  "latency_reduction": 0.6706938509608356,
+  "scope": "One exported block recomputation/VJP session, including runtime host/device exchange; fixed parameters; excludes other blocks, task loss and optimizer",
+  "tolerance": {
+    "rtol": 0.0001,
+    "atol": 1e-06
+  },
+  "outputs": {
+    "model.layers.0.linear_attn.in_proj_qkv.lora.A_cotangent": {
+      "max_abs": 1.1932570487260818e-09,
+      "sha256": "d71f4ff1f7619ff7c9b61c4bf26b8ba217a1085a6337931e526c2d50f10ab91e"
+    },
+    "model.layers.0.linear_attn.in_proj_qkv.lora.B_cotangent": {
+      "max_abs": 1.1634256225079298e-08,
+      "sha256": "68813e3af31d5918a49246b84a87ebebd9a3b90763ca85d7de4a6898c8422960"
+    }
+  },
+  "machine": "Apple M1 Max, 32 GiB unified memory",
+  "build": {
+    "mlx": "0.32.4",
+    "mlx-c": "0.7.0_1",
+    "ORT_headers": "1.31.0",
+    "optimization": "cargo release",
+    "allocator_limit_bytes": 21474836480,
+    "process_guard_bytes": 25769803776,
+    "disk_reserve_bytes": 5368709120
+  },
+  "validation": {
+    "rust_unit_tests": 187,
+    "native_scan_tests": 344,
+    "clippy": "all targets, warnings denied",
+    "onnx_checker": "all generated state/replay test models, full_check=True",
+    "decoder_family_integration": {
+      "onnax_source": "3754d1362b6559bece23bf10af4aa58a57db84a8",
+      "passed": 6,
+      "scope": "native independent gradients and PEFT interchange; Phi3, Qwen3, Qwen3.5, with/without NF4"
+    }
+  }
+}

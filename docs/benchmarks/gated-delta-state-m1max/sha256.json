@@ -1,0 +1,18 @@
+{
+  "baseline-guard.json": "e7da0b0c880d466e5c7f2970a73f807437d23345beaa0df7e7cc47dcba02e6dc",
+  "baseline.json": "1c4344e096e5187bd9cf07dad67110c6d1845ac3a45f20e5f28d7d1338681110",
+  "comparison.json": "ece95aa70a8518165f5b9784962913b47d16d1cf90f5d3a3dc1d9253afe7b9c0",
+  "decoder-families.txt": "059e82468893e3afc66f243c90e58304ea7b2576be52efcd2c3549362713b7d8",
+  "fused-guard.json": "0266c602ab99ed2002245f37464de1c27db204cc284964519a745fab1022cec9",
+  "fused.json": "d212871c8289600b591ddf447b6b5abc4d3f73550374d6b5ad7a3894588fc707",
+  "onnax-gated-delta-state-clippy.txt": "e1add2d297d3af5d96e2b7e6571cb1b15a7036380add58e155f5185e23d2c881",
+  "onnax-gated-delta-state-final-tests.txt": "b8c91ff6fd0bf4c567413399079f2834ca84121ba44af793116f2731eeb8c30c",
+  "onnax-gated-delta-state-rust.txt": "520606a6f3649589eaf6ef19cdd7752b985101ce780151013b23b0b1de3b4a52",
+  "onnax-qwen35-scan-profile.py.txt": "80c6ab4e21c79f3b041bbb33e620441ec040d5ba59ed93e579a28be5c36d4e6d",
+  "onnax-qwen35-state-parent.py.txt": "34595ec9491828bec034f8c9a30f1f9b60f993da072a67fb0370c3911aa79792",
+  "onnax-qwen35-state-profile.py.txt": "bcf0a6a590cb45c19441b722569e1f484f9a2bda2f2838c799d90424357c8dae",
+  "onnax-state-scan-measure.py.txt": "b117dc5fdab037c074e3e09503828949d6a45421f5e898e200d6256b66b6a9c3",
+  "parent-guard.json": "382a730c3be3cbfc2a8d61f6abaa2dd045a7a28d666fdf7115a064ff9180a7d1",
+  "parent.json": "fc1eaeaf7b71a5034182a1e1d1b68f6d07529e528c4a03ba2cd4541bdda2642c",
+  "trace-counts.json": "b3dcb2b7cd28640c8b858a330118052ef18270070330e2ec6894aba67d904e78"
+}

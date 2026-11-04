@@ -60,6 +60,35 @@ Set `ONNXRUNTIME_EP_MLX_NO_GATED_DELTA_REVERSE=1` to select the generic Scan con
 The fast-path trace event is `op.fast` with kernel `mlx_gated_delta_reverse_scan`.
 A matched body taking the generic path records its reason in `op.composed`.
 
+## 4K checkpoint replay measurement
+
+A real Qwen3.5-0.8B linear-attention block at 4,032 tokens ran in independent
+processes on M1 Max. Each process performed 10 warmups and 100 measured calls.
+The timed region is block recomputation and its VJP, including runtime array
+exchange. Parameters are fixed; the other decoder blocks, loss and optimizer
+run outside this measurement.
+
+| State/replay scans | Median / P95 | Process peak physical footprint | MLX window peak |
+|---|---:|---:|---:|
+| Generic, current parent | 851.03 / 863.48 ms | 3.36 GiB | 3.43 GiB |
+| Fused Metal | 280.25 / 285.59 ms | 3.99 GiB | 3.44 GiB |
+
+The median throughput ratio is 3.04.
+Both adapter gradients match the saved independent capture at
+`rtol=1e-4, atol=1e-6`; maximum absolute differences are 1.19e-9 and 1.16e-8.
+Inputs, exported model and gradient mappings are identical. ORT optimization,
+CPU fallback and MLX compilation are disabled, with one CPU thread and a
+512 MiB allocator cache.
+
+A separate trace contains two executions. State and replay each dispatch 252
+fused calls, alongside the existing 252 reverse calls. MatMul dispatches fall
+from 16,162 to 34. These counts include qualification and one measured execution;
+the timings above come from runs with tracing disabled.
+
+[Raw samples, guard observations, hashes, validation logs and trace counts](benchmarks/gated-delta-state-m1max/)
+record the parent and candidate binaries. The process peak includes imports,
+initialization and the runtime; the allocator window is reset after warmup.
+
 ## Real decoder measurement
 
 [`bench/onnax_decoder.py`](../bench/onnax_decoder.py) measures a reused exported
