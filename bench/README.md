@@ -173,6 +173,38 @@ end-to-end decode to **9.24 tokens/s**, despite matching all 256 tokens. It was
 reverted; its raw samples are retained as a rejected experiment in the follow-up
 report. Fewer materializations alone do not establish an end-to-end win.
 
+### FP32-accumulating vector-decode follow-up
+
+[Raw samples, tokens, hashes, and both provider orders](reports/qwen38-paged-vector-m1max.json)
+retain the same export, prompt, warmups, repetitions, and 256-token completion.
+Eligible short single-query paged attention keeps FP16 Q/K/V buffers while
+MLX 0.32.4's vector kernel accumulates scores, softmax, and weighted values in
+FP32. Other geometries and custom attention modes retain the previous path.
+
+| Round and execution order | MLX reference | MLX vector decode | WebGPU |
+|---|---:|---:|---:|
+| Reference, candidate, WebGPU | 9.54 tokens/s | 10.16 tokens/s | 8.89 tokens/s |
+| WebGPU, candidate after cooldown | - | 10.59 tokens/s | 9.65 tokens/s |
+
+The same-round MLX improvement is **6.5%**, and every measured token matches the
+original qualification. Reverse-order warm TTFT medians are 588 ms for MLX and
+1,281 ms for WebGPU. Both aggregate comparisons favor MLX, but the reverse-order
+WebGPU run includes one 35.65-second decode sample: its other four runs average
+about **10.57 tokens/s**, nearly matching MLX's 10.59. All samples are retained;
+these results do **not** establish a durable steady-state lead.
+
+Head width 192 and contexts of at least 1,024 keys retain FP32 buffers because
+their FP16 paths do not preserve the existing rounding. Large/canceling-value
+tests compare eligible outputs exactly to an FP32 MLX attention reference and
+also check an independent NumPy reference. A separate mask-elision experiment
+matched tokens but measured 7.79 tokens/s and was reverted.
+
+Public [WebGPU source](https://github.com/microsoft/onnxruntime/tree/74e4120bbc307ecb5c81ef84a9cf42f1fe19519e/onnxruntime/contrib_ops/webgpu)
+uses direct paged decode with shared physical-row offsets and real GPU buffer
+allocation/transfers. This source pin is not verified as the installed 0.5.0
+wheel's build commit. Device tensor residency and avoiding dense KV gathers are
+the next structural leads, not evidence that replacing stock MLX QMV will help.
+
 Source research at
 [MLX-LM](https://github.com/ml-explore/mlx-lm/tree/736ab0d8c1d0edc79c3d798044fe6904e2fa23be),
 [MTPLX](https://github.com/youssofal/mtplx/tree/9882703f3105363ddc37eca9f97aa09a1d387112),

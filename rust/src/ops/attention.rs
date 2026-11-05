@@ -4110,13 +4110,46 @@ fn paged_attention_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), 
         // GQA broadcast to full head count, then causal SDPA (query i attends keys [0, past+i]).
         let kh = gqa_repeat_heads(ctx, kh, kv_heads, g, total, head)?; // [1,H,total,head]
         let vh = gqa_repeat_heads(ctx, vh, kv_heads, g, total, v_head)?;
-        let qh = ctx.astype(qh, f32t)?;
-        let kh = ctx.astype(kh, f32t)?;
-        let vh = ctx.astype(vh, f32t)?;
+        let softcap = n.floats.get("softcap").copied().unwrap_or(0.0);
+        let mut compute_dt = f32t;
+        if nq == 1
+            && total < 1024
+            && head == v_head
+            && matches!(head, 64 | 96 | 128 | 256)
+            && head_sink.is_none()
+            && softcap == 0.0
+            && [qh, kh, vh]
+                .iter()
+                .all(|&a| ctx.dtype_of(a) == mlx::mlx_dtype__MLX_FLOAT16)
+        {
+            let mut device = unsafe { mlx::mlx_device_new() };
+            let mut kind = mlx::mlx_device_type__MLX_CPU;
+            let rc = unsafe { mlx::mlx_stream_get_device(&mut device, ctx.stream()) };
+            let rc = if rc == 0 {
+                unsafe { mlx::mlx_device_get_type(&mut kind, device) }
+            } else {
+                rc
+            };
+            unsafe { mlx::mlx_device_free(device) };
+            if rc != 0 {
+                return Err(format!(
+                    "PagedAttention: MLX stream device inspection failed (status {rc}); \
+                     verify the MLX runtime installation and stream initialization"
+                ));
+            }
+            if kind == mlx::mlx_device_type__MLX_GPU {
+                // MLX 0.32.4's single-pass vector kernel keeps all reductions in FP32.
+                // Two-pass attention and head-192 FP16 do not match the FP32 reference.
+                compute_dt = mlx::mlx_dtype__MLX_FLOAT16;
+            }
+        }
+        let qh = ctx.astype(qh, compute_dt)?;
+        let kh = ctx.astype(kh, compute_dt)?;
+        let vh = ctx.astype(vh, compute_dt)?;
         let mut mask = if attr_int(n, "is_causal", 1) != 0 {
-            causal_mask_topleft(ctx, nq, total, pastb, f32t)?
+            causal_mask_topleft(ctx, nq, total, pastb, compute_dt)?
         } else {
-            ctx.zeros(&[nq, total], f32t)?
+            ctx.zeros(&[nq, total], compute_dt)?
         };
         let window = attr_int(n, "local_window_size", -1) as i32;
         if window > 0 {
@@ -4133,17 +4166,9 @@ fn paged_attention_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), 
             let neg = ctx.scalar_f32(f32::NEG_INFINITY);
             mask = ctx.where_(allowed, mask, neg)?;
         }
+        let mask = ctx.astype(mask, compute_dt)?;
         let mask = ctx.reshape(mask, &[1, 1, nq, total])?;
-        let o = paged_sdpa(
-            ctx,
-            qh,
-            kh,
-            vh,
-            scale,
-            mask,
-            head_sink,
-            n.floats.get("softcap").copied().unwrap_or(0.0),
-        )?; // [1,H,nq,head]
+        let o = paged_sdpa(ctx, qh, kh, vh, scale, mask, head_sink, softcap)?; // [1,H,nq,head]
         let o = ctx.transpose(o, &[0, 2, 1, 3])?; // [1,nq,H,head]
         let o = ctx.reshape(o, &[nq, out_hidden])?;
         outs.push(ctx.astype(o, out_dt)?);

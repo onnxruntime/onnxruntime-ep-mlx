@@ -739,6 +739,16 @@ the enclosing changed row interval in each physical block; non-aliased outputs
 retain a full copy. Cache ownership and all observable input/output updates stay
 with ORT.
 
+For single-query GPU paged decode, FP16 Q/K/V stay FP16 when their matching head
+width is 64, 96, 128, or 256 and the gathered context is shorter than 1,024 keys.
+MLX 0.32.4's single-pass vector kernel accumulates scores, softmax, and weighted
+values in FP32 before the final output cast, avoiding separate FP32 Q/K/V
+materializations. Longer contexts, head width 192, CPU streams, other input
+dtypes, unequal Q/V widths, sinks, and softcap retain the FP32 path. The narrower
+eligibility preserves the rounding of the existing implementation: two-pass
+FP16 attention rounds partial outputs, and head-192 FP16 does not match the FP32
+reference. Causal/window masks and cache writeback semantics are unchanged.
+
 Standard causal `Attention` with one query and one current key can attend every
 past/current key. It omits the redundant causal array rather than capturing a
 first-call KV extent during shapeless decode. An external mask still applies,
