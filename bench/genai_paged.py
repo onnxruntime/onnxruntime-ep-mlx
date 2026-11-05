@@ -251,6 +251,9 @@ def main():
                 "ONNXRUNTIME_EP_MLX_NO_GENERAL_COMPILE",
                 "ONNXRUNTIME_EP_MLX_NO_PREFILL_COMPILE",
                 "ONNXRUNTIME_EP_MLX_LAYER_PARTITIONS",
+                "ONNXRUNTIME_EP_MLX_DEVICE_TENSORS",
+                "ONNXRUNTIME_EP_MLX_NO_PAGED_DIRECT",
+                "ONNXRUNTIME_EP_MLX_NO_PAGED_PATCHES",
             )
             if name in os.environ
         },

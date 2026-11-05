@@ -765,7 +765,7 @@ fn matmulnbits_repack(
         // runtime constant inputs still need an owned copy.
         let shape = [big_n as i32, words as i32];
         let arr = if wref.source == Src::Initializer {
-            Array::from_data_managed(host.data, &shape, mlx::mlx_dtype__MLX_UINT32)
+            crate::engine::initializer_array(wref, host.data, &shape, mlx::mlx_dtype__MLX_UINT32)
         } else {
             Array::from_data(host.data, &shape, mlx::mlx_dtype__MLX_UINT32)
         };
@@ -894,7 +894,8 @@ fn matmulnbits_scales(
         }
         let shape = [big_n, nblocks];
         let scales = if scales_ref.source == Src::Initializer {
-            Array::from_data_managed(
+            crate::engine::initializer_array(
+                scales_ref,
                 host.data,
                 &shape,
                 crate::engine::mlx_dtype_from_onnx(host.dtype),

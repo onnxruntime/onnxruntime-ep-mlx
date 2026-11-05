@@ -24,8 +24,8 @@
 //!   * **Pre-sliced cos/sin rows fed as synthetic closure inputs**, so the position offset is DATA
 //!     (not baked) and the compiled graph never slices a cos/sin cache at a runtime position.
 //!
-//! CORRECTNESS: every path here falls back to the eager translator on any doubt (ineligible plan,
-//! missing cache, trace/apply/eval error) — the compiled path never crashes and never diverges.
+//! Ineligible plans and trace/apply failures fall back to the eager translator. Device evaluation
+//! failures abort Run: published outputs may already alias inputs, making eager replay unsafe.
 
 use std::collections::HashSet;
 use std::os::raw::c_void;
@@ -34,7 +34,8 @@ use std::panic::AssertUnwindSafe;
 use crate::engine::{
     DeltaWrite, DynInput, MlxError, NodeDesc, OutRef, Plan, ShapeMode, Slot, Src, SynthRope,
     TracePayload, TranslationContext, attention_cross_kv, attention_past_key, copy_out_raw_delta,
-    dim_i32, is_separate_qkv_attention, mlx_dtype_from_onnx, read_ctx_input_raw, rope_row_key,
+    dim_i32, is_separate_qkv_attention, mlx_dtype_from_onnx, publish_device_output,
+    read_ctx_input_metadata, read_ctx_input_raw, read_ctx_input_value, rope_row_key,
 };
 use crate::mlx::{self, Array, Closure, VectorArray};
 use crate::registry::CompileShapeSafety;
@@ -426,7 +427,7 @@ pub fn detect_seq_len(
             if inp.source == Src::CtxInput
                 && !inp.constant
                 && inp.name == "input_ids"
-                && let Ok((_d, shape, _t)) = read_ctx_input_raw(api, kctx, inp.ctx_index)
+                && let Ok((shape, _t)) = read_ctx_input_metadata(api, kctx, inp.ctx_index)
             {
                 return shape.last().map(|&d| d as i32);
             }
@@ -445,7 +446,7 @@ pub fn detect_seq_len(
             if inp.source == Src::CtxInput
                 && !inp.constant
                 && seen.insert(inp.ctx_index)
-                && let Ok((_d, shape, _t)) = read_ctx_input_raw(api, kctx, inp.ctx_index)
+                && let Ok((shape, _t)) = read_ctx_input_metadata(api, kctx, inp.ctx_index)
                 && shape.len() == 3
                 && shape[1] > 0
             {
@@ -466,7 +467,7 @@ pub fn detect_batch_size(
         if inp.source == Src::CtxInput
             && !inp.constant
             && seen.insert(inp.ctx_index)
-            && let Ok((_data, shape, _dtype)) = read_ctx_input_raw(api, kctx, inp.ctx_index)
+            && let Ok((shape, _dtype)) = read_ctx_input_metadata(api, kctx, inp.ctx_index)
             && inp.name == "input_ids"
         {
             return shape.first().map(|&dim| dim as i32);
@@ -497,7 +498,7 @@ pub fn detect_attention_self_past_len(
         if past.source != Src::CtxInput {
             continue;
         }
-        let (_data, shape, _dtype) = read_ctx_input_raw(api, kctx, past.ctx_index).ok()?;
+        let (shape, _dtype) = read_ctx_input_metadata(api, kctx, past.ctx_index).ok()?;
         return shape.get(2).copied();
     }
     None
@@ -789,7 +790,7 @@ pub fn try_compiled(
     if cfg.shape_mode == ShapeMode::ShapeKeyed {
         let plan = unsafe { &*plan_ptr };
         for di in &slot.get(plan).dyn_inputs {
-            let (_data, shape, _dtype) = read_ctx_input_raw(api, kctx, di.ctx_index)?;
+            let (shape, _dtype) = read_ctx_input_metadata(api, kctx, di.ctx_index)?;
             if shape.contains(&0) || shape.iter().any(|&dim| dim > i32::MAX as i64) {
                 return Ok(false);
             }
@@ -800,6 +801,7 @@ pub fn try_compiled(
     // generation and very large, so separate-QKV attention decoders copy them into MLX once and
     // reuse them for both contrib MHA and native ONNX Attention.
     let mut arena: Vec<Array> = Vec::new();
+    let mut borrowed_inputs = false;
     let mut input = VectorArray::new();
     {
         let dyn_inputs = slot.get(unsafe { &*plan_ptr }).dyn_inputs.clone();
@@ -813,6 +815,12 @@ pub fn try_compiled(
             Vec::new()
         };
         for di in &dyn_inputs {
+            let value = read_ctx_input_value(api, kctx, di.ctx_index)?;
+            if let Some(array) = crate::device::array(unsafe { &*api }, value)? {
+                input.append(array.as_raw());
+                arena.push(array);
+                continue;
+            }
             if stable_cross_indices.contains(&di.ctx_index)
                 && let Some(arr) = slot
                     .get(unsafe { &*plan_ptr })
@@ -852,6 +860,7 @@ pub fn try_compiled(
             // memcpy dominated decode. (ORT KV buffers are 16 KB page-aligned, so Metal takes the
             // true no-copy path; small unaligned inputs fall back to MLX's internal copy.)
             let arr = Array::from_data_managed(data, &ishape, mlx_dtype_from_onnx(dtype));
+            borrowed_inputs = true;
             input.append(arr.as_raw());
             arena.push(arr);
         }
@@ -889,7 +898,7 @@ pub fn try_compiled(
                 }
                 (unsafe { *(data as *const i32) }) - s
             } else if c.shared_kv && c.mask_ctx_index >= 0 {
-                let (_d, shape, _t) = read_ctx_input_raw(api, kctx, c.mask_ctx_index as usize)?;
+                let (shape, _t) = read_ctx_input_metadata(api, kctx, c.mask_ctx_index as usize)?;
                 (*shape.get(1).unwrap_or(&0) as i32) - s
             } else {
                 if c.rope_past_ctx_index < 0 {
@@ -897,7 +906,7 @@ pub fn try_compiled(
                 }
                 let idx = c.rope_past_ctx_index as usize;
                 let axis = c.rope_past_axis as usize;
-                let (_d, shape, _t) = read_ctx_input_raw(api, kctx, idx)?;
+                let (shape, _t) = read_ctx_input_metadata(api, kctx, idx)?;
                 if axis < shape.len() {
                     shape[axis] as i32
                 } else {
@@ -975,13 +984,36 @@ pub fn try_compiled(
     } else {
         None
     };
-    let eval_result = {
+    let ext_len = slot.get(unsafe { &*plan_ptr }).ext_outputs.len();
+    if outs.size() != ext_len {
+        return Err("MLX compiled closure returned an unexpected output count".into());
+    }
+    let mut device_outputs = !borrowed_inputs && ext_len > 0;
+    if device_outputs {
+        for i in 0..ext_len {
+            let output = &slot.get(unsafe { &*plan_ptr }).ext_outputs[i];
+            device_outputs &= publish_device_output(api, kctx, output, &outs.get(i))?;
+        }
+    }
+    let eval_result = if device_outputs {
+        let result = unsafe { mlxsys::mlx_async_eval(outs.as_raw()) };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err("MLX compiled device evaluation failed; inspect GPU availability".into())
+        }
+    } else {
         let _capture = tr.begin_gpu_capture();
         let _eval_region = tr.eval_region();
         mlx::eval(&outs)
     };
-    if eval_result.is_err() {
+    if let Err(error) = eval_result {
         slot.get_mut(unsafe { &mut *plan_ptr }).valid = false;
+        if crate::device::enabled() {
+            return Err(format!(
+                "MLX compiled evaluation failed: {error}; device state may have changed, so reinitialize bound state tensors before retrying with sufficient GPU memory"
+            ));
+        }
         return Ok(false);
     }
     if let Some(t0) = eval_t0 {

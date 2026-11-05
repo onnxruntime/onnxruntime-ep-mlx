@@ -2,7 +2,7 @@
 //! a handler uses to Resolve inputs, Bind outputs, and emit MLX ops. It supports eager translation,
 //! compiled decode/prefill/general closures, and recursively inlined control-flow subgraphs.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::os::raw::c_void;
 
 use crate::mlx::{self, Array, VectorArray};
@@ -16,6 +16,12 @@ pub enum Src {
     Initializer,
     Intermediate,
     Absent,
+}
+
+struct InputWriteback {
+    destination: *mut c_void,
+    array: mlxsys::mlx_array,
+    copies: Vec<(std::ops::Range<usize>, usize)>,
 }
 
 /// A constant initializer payload surfaced at compile time (session-owned storage). For a
@@ -659,6 +665,23 @@ impl Plan {
 
 /// ONNX tensor element type -> MLX dtype (faithful port of `MlxDtypeFromOnnx`). Unknown types fall
 /// back to fp32 so a stray dtype never crashes the wrap.
+pub(crate) fn initializer_array(
+    input: &TensorRef,
+    data: *const c_void,
+    shape: &[i32],
+    dtype: mlxsys::mlx_dtype,
+) -> Array {
+    if !crate::device::enabled() {
+        return Array::from_data_managed(data, shape, dtype);
+    }
+    // Lazy device outputs can outlive the plan that originally owned the initializer.
+    if let Some(storage) = input.init.as_ref().and_then(|init| init.owned.as_ref()) {
+        Array::from_owned_data(storage.clone(), shape, dtype)
+    } else {
+        Array::from_data(data, shape, dtype)
+    }
+}
+
 pub fn mlx_dtype_from_onnx(t: ort::ONNXTensorElementDataType) -> mlxsys::mlx_dtype {
     use ort::*;
     #[allow(non_upper_case_globals)]
@@ -802,7 +825,9 @@ pub struct TranslationContext<'a> {
     kv_deltas: HashMap<String, DeltaWrite>,
     /// Evaluated MLX arrays that must be copied back into mutable ORT input buffers for
     /// side-effecting ops such as PagedAttention's in-place KV-cache update.
-    input_writebacks: Vec<(*mut c_void, mlxsys::mlx_array, Vec<std::ops::Range<usize>>)>,
+    input_writebacks: Vec<InputWriteback>,
+    patched_alias_outputs: HashSet<String>,
+    borrowed_runtime_inputs: bool,
     /// True while translating inside the GENERAL compiled-subgraph closure trace. In this mode the
     /// dynamic inputs are shapeless tracer placeholders with no host data, so any mid-graph host eval
     /// (`contiguous_eval` — the host-computed Det/NonZero/Unique ops) is illegal and must fail the
@@ -855,6 +880,8 @@ impl<'a> TranslationContext<'a> {
             compiled_valid_past: 0,
             kv_deltas: HashMap::new(),
             input_writebacks: Vec::new(),
+            patched_alias_outputs: HashSet::new(),
+            borrowed_runtime_inputs: false,
             in_general_trace: false,
             compiled_kv_present: Vec::new(),
             shape_keyed_compile: false,
@@ -1104,6 +1131,13 @@ impl<'a> TranslationContext<'a> {
         let a = self.contiguous(a)?;
         self.env.insert(input.name.clone(), a);
         self.frozen_views.remove(&input.name);
+        if input.source == Src::CtxInput {
+            let value = read_ctx_input_value(self.ort_api, self.kctx, input.ctx_index)?;
+            let array = std::mem::ManuallyDrop::new(Array::from_raw(a));
+            if crate::device::assign(unsafe { &*self.ort_api }, value, &array)? {
+                return Ok(a);
+            }
+        }
         match input.source {
             Src::CtxInput => {
                 let (data, shape, _) = self.read_ctx_input(input.ctx_index)?;
@@ -1134,12 +1168,103 @@ impl<'a> TranslationContext<'a> {
                         },
                     );
                 }
-                self.input_writebacks.push((data as *mut c_void, a, ranges));
+                self.input_writebacks.push(InputWriteback {
+                    destination: data as *mut c_void,
+                    array: a,
+                    copies: ranges.into_iter().map(|r| (r.clone(), r.start)).collect(),
+                });
             }
             Src::Intermediate => {}
             _ => return Err("MLX: cannot write back an immutable input".to_string()),
         }
         Ok(a)
+    }
+
+    /// Publish small packed cache updates without rooting a full functional scatter.
+    pub fn write_back_input_patches(
+        &mut self,
+        input: &TensorRef,
+        updated: mlxsys::mlx_array,
+        patches: mlxsys::mlx_array,
+        rows: &[usize],
+        output: Option<&OutRef>,
+    ) -> Result<mlxsys::mlx_array, MlxError> {
+        self.env.insert(input.name.clone(), updated);
+        self.frozen_views.remove(&input.name);
+        if input.source == Src::Intermediate {
+            return Ok(updated);
+        }
+        if input.source != Src::CtxInput {
+            return Err("MLX: cache patches require a mutable runtime input".into());
+        }
+        let value = read_ctx_input_value(self.ort_api, self.kctx, input.ctx_index)?;
+        let array = std::mem::ManuallyDrop::new(Array::from_raw(updated));
+        if crate::device::assign(unsafe { &*self.ort_api }, value, &array)? {
+            return Ok(updated);
+        }
+        let (data, shape, dtype) = self.read_ctx_input(input.ctx_index)?;
+        let patches = self.contiguous(patches)?;
+        let array = std::mem::ManuallyDrop::new(Array::from_raw(patches));
+        if shape.len() != 4 || array.dtype() != mlx_dtype_from_onnx(dtype) {
+            return Err(
+                "MLX: cache patches must preserve the rank-4 input dtype and geometry".into(),
+            );
+        }
+        let row_bytes = (shape[2] as usize)
+            .checked_mul(shape[3] as usize)
+            .and_then(|v| v.checked_mul(array.itemsize()))
+            .ok_or("MLX: cache patch row size exceeds address space")?;
+        if rows.len().checked_mul(row_bytes) != Some(array.size() * array.itemsize()) {
+            return Err("MLX: cache patch storage must contain one complete row per slot".into());
+        }
+        let slots = (shape[0] as usize)
+            .checked_mul(shape[1] as usize)
+            .ok_or("MLX: cache slot count exceeds address space")?;
+        if rows.iter().any(|&r| r >= slots) {
+            return Err("MLX: cache patch slot exceeds the input cache capacity".into());
+        }
+        if let Some(output) = output.filter(|o| !o.name.is_empty()) {
+            let api = unsafe { &*self.ort_api };
+            let mut value = std::ptr::null_mut();
+            ort_status(
+                api,
+                unsafe {
+                    (api.KernelContext_GetOutput.unwrap())(
+                        self.kctx,
+                        output.ctx_index,
+                        shape.as_ptr(),
+                        shape.len(),
+                        &mut value,
+                    )
+                },
+                "KernelContext_GetOutput for cache patches",
+            )?;
+            if value.is_null() {
+                return Err(
+                    "MLX: ORT returned no requested cache output; check output bindings".into(),
+                );
+            }
+            let (destination, output_shape, output_dtype) = read_ort_tensor_raw(api, value)?;
+            if output_shape != shape || output_dtype != dtype {
+                return Err(
+                    "MLX: cache output binding must preserve the input shape and dtype".into(),
+                );
+            }
+            if destination == data {
+                self.patched_alias_outputs.insert(output.name.clone());
+            }
+        }
+        let copies = rows
+            .iter()
+            .enumerate()
+            .map(|(i, &row)| (i * row_bytes..(i + 1) * row_bytes, row * row_bytes))
+            .collect();
+        self.input_writebacks.push(InputWriteback {
+            destination: data as *mut c_void,
+            array: patches,
+            copies,
+        });
+        Ok(updated)
     }
 
     /// Emit the per-op trace detail for the node just translated (only when tracing is on).
@@ -1228,6 +1353,17 @@ impl<'a> TranslationContext<'a> {
                 } else if let Some(a) = self.env.get(&r.name) {
                     return Ok(*a);
                 }
+                let value = read_ctx_input_value(self.ort_api, self.kctx, r.ctx_index)?;
+                if let Some(array) = crate::device::array(unsafe { &*self.ort_api }, value)? {
+                    if r.constant {
+                        let raw = array.as_raw();
+                        self.plan.cache.insert(r.name.clone(), array);
+                        return Ok(raw);
+                    }
+                    let raw = self.keep_input(array);
+                    self.env.insert(r.name.clone(), raw);
+                    return Ok(raw);
+                }
                 let (data, shape, dtype) = self.read_ctx_input(r.ctx_index)?;
                 if !crate::registry::is_movable(dtype) {
                     return Err(format!(
@@ -1252,6 +1388,7 @@ impl<'a> TranslationContext<'a> {
                     // mode where the per-token past K/V is a full [B,kv,cap,hd] buffer that
                     // `from_data` used to memcpy every token.
                     let arr = Array::from_data_managed(data, &ishape, mlx_dtype_from_onnx(dtype));
+                    self.borrowed_runtime_inputs = true;
                     let raw = self.keep_input(arr);
                     self.env.insert(r.name.clone(), raw);
                     Ok(raw)
@@ -1287,10 +1424,7 @@ impl<'a> TranslationContext<'a> {
                     self.plan.cache.insert(cache_key, handle);
                     return Ok(raw);
                 }
-                // Compile copied initializer bytes into Plan-owned Arc storage. Borrow that stable
-                // allocation directly for the plan lifetime.
-                let arr =
-                    Array::from_data_managed(init.data, &ishape, mlx_dtype_from_onnx(init.dtype));
+                let arr = initializer_array(r, init.data, &ishape, mlx_dtype_from_onnx(init.dtype));
                 let raw = arr.as_raw();
                 self.plan.cache.insert(cache_key, arr);
                 Ok(raw)
@@ -1380,6 +1514,7 @@ impl<'a> TranslationContext<'a> {
             self.plan.cache.insert(cache_key, array);
             raw
         } else {
+            self.borrowed_runtime_inputs = true;
             self.keep_input(Array::from_data_managed(
                 host.data,
                 &storage_shape,
@@ -2560,6 +2695,7 @@ impl<'a> TranslationContext<'a> {
         for node in nodes {
             for o in &node.outputs {
                 if o.external
+                    && !self.patched_alias_outputs.contains(&o.name)
                     && let Some(&a) = self.env.get(&o.name)
                 {
                     let casted = self.astype(a, mlx_dtype_from_onnx(o.otype))?;
@@ -2574,10 +2710,10 @@ impl<'a> TranslationContext<'a> {
             }
         }
         let mut writebacks = Vec::with_capacity(self.input_writebacks.len());
-        for (dst, a, ranges) in self.input_writebacks.drain(..) {
+        for writeback in self.input_writebacks.drain(..) {
             let index = outs.size();
-            outs.append(a);
-            writebacks.push((dst, index, ranges));
+            outs.append(writeback.array);
+            writebacks.push((writeback.destination, index, writeback.copies));
         }
         // VectorArray owns references to every boundary root, whose lazy graphs keep their
         // dependencies alive. Per-node handles must not pin every intermediate allocation
@@ -2588,6 +2724,24 @@ impl<'a> TranslationContext<'a> {
         self.frozen_views.clear();
         self.input_writebacks.clear();
         self.arena.clear();
+        let mut device_outputs =
+            !ext.is_empty() && writebacks.is_empty() && !self.borrowed_runtime_inputs;
+        if device_outputs {
+            for (index, output) in ext.iter().enumerate() {
+                let array = outs.get(index);
+                device_outputs &= publish_device_output(self.ort_api, self.kctx, output, &array)?;
+            }
+        }
+        if device_outputs {
+            let result = unsafe { mlxsys::mlx_async_eval(outs.as_raw()) };
+            if result != 0 {
+                return Err(
+                    "MLX: asynchronous device output evaluation failed; inspect GPU availability"
+                        .into(),
+                );
+            }
+            return Ok(());
+        }
         // The single synchronous `mlx_eval` boundary: with tracing on this is wrapped
         // in the `mlx.eval` (cat "gpu") span, whose CPU wall time is the GPU-inclusive
         // time of the whole fused subgraph (MLX blocks here until the GPU work lands).
@@ -2615,16 +2769,22 @@ impl<'a> TranslationContext<'a> {
             let a = outs.get(index);
             self.copy_out(o, a.as_raw())?;
         }
-        for (dst, index, ranges) in writebacks {
+        for (dst, index, copies) in writebacks {
             let arr = outs.get(index);
-            for range in ranges {
+            let started = tr.active().then(std::time::Instant::now);
+            let mut bytes = 0;
+            for (range, offset) in copies {
+                bytes += range.len();
                 unsafe {
                     std::ptr::copy(
                         arr.data_bytes().add(range.start),
-                        (dst as *mut u8).add(range.start),
+                        (dst as *mut u8).add(offset),
                         range.len(),
                     );
                 }
+            }
+            if let Some(started) = started {
+                tr.record_copyout(true, bytes as u64, started.elapsed());
             }
         }
         Ok(())
@@ -2657,7 +2817,7 @@ fn ort_status(
     }
 }
 
-fn read_ort_tensor_metadata(
+pub(crate) fn read_ort_tensor_metadata(
     api: &ort::OrtApi,
     value: *const ort::OrtValue,
 ) -> Result<(Vec<i64>, ort::ONNXTensorElementDataType), MlxError> {
@@ -2704,6 +2864,9 @@ fn read_ort_tensor_raw(
     value: *const ort::OrtValue,
 ) -> Result<(*const c_void, Vec<i64>, ort::ONNXTensorElementDataType), MlxError> {
     let (shape, dtype) = read_ort_tensor_metadata(api, value)?;
+    if let Some(data) = crate::device::host_data(api, value)? {
+        return Ok((data, shape, dtype));
+    }
     let mut data = std::ptr::null();
     ort_status(
         api,
@@ -2716,7 +2879,7 @@ fn read_ort_tensor_raw(
     Ok((data, shape, dtype))
 }
 
-fn read_ctx_input_value(
+pub(crate) fn read_ctx_input_value(
     ort_api: *const ort::OrtApi,
     kctx: *mut ort::OrtKernelContext,
     index: usize,
@@ -2736,6 +2899,46 @@ fn read_ctx_input_value(
         }
         Ok(val)
     }
+}
+
+pub(crate) fn read_ctx_input_metadata(
+    ort_api: *const ort::OrtApi,
+    kctx: *mut ort::OrtKernelContext,
+    index: usize,
+) -> Result<(Vec<i64>, ort::ONNXTensorElementDataType), MlxError> {
+    let value = read_ctx_input_value(ort_api, kctx, index)?;
+    read_ort_tensor_metadata(unsafe { &*ort_api }, value)
+}
+
+pub(crate) fn publish_device_output(
+    ort_api: *const ort::OrtApi,
+    kctx: *mut ort::OrtKernelContext,
+    output: &OutRef,
+    array: &Array,
+) -> Result<bool, MlxError> {
+    if !crate::device::enabled() {
+        return Ok(false);
+    }
+    let api = unsafe { &*ort_api };
+    let shape = array.shape();
+    let mut value = std::ptr::null_mut();
+    ort_status(
+        api,
+        unsafe {
+            (api.KernelContext_GetOutput.unwrap())(
+                kctx,
+                output.ctx_index,
+                shape.as_ptr(),
+                shape.len(),
+                &mut value,
+            )
+        },
+        "KernelContext_GetOutput for device tensor",
+    )?;
+    if value.is_null() {
+        return Err("MLX: ORT returned no requested device output; check output bindings".into());
+    }
+    crate::device::assign(api, value, array)
 }
 
 pub(crate) fn read_ctx_input_raw(
@@ -2763,6 +2966,9 @@ pub(crate) fn copy_out_raw_delta(
     let shape = arr.shape();
     let count: usize = shape.iter().map(|&d| d as usize).product();
     let itemsize = arr.itemsize();
+    if publish_device_output(ort_api, kctx, o, &arr)? {
+        return Ok(());
+    }
     unsafe {
         let api = &*ort_api;
         let mut out: *mut ort::OrtValue = std::ptr::null_mut();

@@ -25,6 +25,7 @@ pub struct MlxEpFactory {
     name: CString,
     vendor: CString,
     version: CString,
+    allocator_infos: std::sync::Mutex<Vec<usize>>,
 }
 
 impl MlxEpFactory {
@@ -66,6 +67,7 @@ impl MlxEpFactory {
             // so 0.31.x requires ORT 1.31 or newer (ORT_API_VERSION 31).
             version: CString::new(env!("CARGO_PKG_VERSION"))
                 .expect("CARGO_PKG_VERSION contains an interior nul"),
+            allocator_infos: std::sync::Mutex::new(Vec::new()),
         })
     }
 
@@ -155,6 +157,27 @@ unsafe fn get_supported_devices_impl(
         if !st.is_null() {
             return st;
         }
+        if crate::device::enabled() {
+            let mut owners =
+                match f.allocator_infos.lock() {
+                    Ok(owners) => owners,
+                    Err(_) => return crate::device::status(
+                        ort_api,
+                        "MLX allocator metadata lock is poisoned; recreate the inference process"
+                            .into(),
+                    ),
+                };
+            let info = match crate::device::memory_info(ort_api) {
+                Ok(info) => info,
+                Err(error) => return crate::device::status(ort_api, error),
+            };
+            let status = (ep_api.EpDevice_AddAllocatorInfo.unwrap())(ep_device, info);
+            if !status.is_null() {
+                (ort_api.ReleaseMemoryInfo.unwrap())(info);
+                return status;
+            }
+            owners.push(info as usize);
+        }
         *ep_devices.add(0) = ep_device;
         *num_ep_devices = 1;
         // Device-bind notice: env-gated through the tracer so a normal (traced-off) run stays
@@ -220,7 +243,15 @@ unsafe fn create_ep_impl(
         if !status.is_null() {
             return status;
         }
-        let mlx_ep = MlxEp::new(f.ort_api, f.ep_api, &f.name, logger, enable_compile);
+        let memory = if crate::device::enabled() {
+            match crate::device::memory_info(&*f.ort_api) {
+                Ok(info) => info,
+                Err(error) => return crate::device::status(&*f.ort_api, error),
+            }
+        } else {
+            ptr::null_mut()
+        };
+        let mlx_ep = MlxEp::new(f.ort_api, f.ep_api, &f.name, logger, enable_compile, memory);
         *ep = mlx_ep.as_ptr();
         ptr::null_mut()
     }
@@ -232,28 +263,39 @@ unsafe extern "C" fn release_ep(_p: *mut ort::OrtEpFactory, ep: *mut ort::OrtEp)
     }
 }
 
-// The spike advertises no device memory (I/O stays on the CPU allocator), so these
-// slots are never exercised for real — but ORT calls some of them during library
-// registration, so they must be non-NULL. Safe stubs: hand back nothing.
 unsafe extern "C" fn create_allocator(
-    _p: *mut ort::OrtEpFactory,
-    _memory_info: *const ort::OrtMemoryInfo,
+    p: *mut ort::OrtEpFactory,
+    memory_info: *const ort::OrtMemoryInfo,
     _options: *const ort::OrtKeyValuePairs,
     allocator: *mut *mut ort::OrtAllocator,
 ) -> *mut ort::OrtStatus {
     unsafe { *allocator = ptr::null_mut() };
+    let api = unsafe { &*(*this(p)).ort_api };
+    let mut name = ptr::null();
+    let status = unsafe { (api.MemoryInfoGetName.unwrap())(memory_info, &mut name) };
+    if !status.is_null() {
+        return status;
+    }
+    if !name.is_null() && unsafe { std::ffi::CStr::from_ptr(name) } == c"MLX" {
+        match unsafe { crate::device::create_allocator(api) } {
+            Ok(value) => unsafe { *allocator = value },
+            Err(error) => return crate::device::status(api, error),
+        }
+    }
     ptr::null_mut()
 }
 unsafe extern "C" fn release_allocator(
     _p: *mut ort::OrtEpFactory,
-    _allocator: *mut ort::OrtAllocator,
+    allocator: *mut ort::OrtAllocator,
 ) {
+    unsafe { crate::device::release_allocator(allocator) };
 }
 unsafe extern "C" fn create_data_transfer(
-    _p: *mut ort::OrtEpFactory,
+    p: *mut ort::OrtEpFactory,
     data_transfer: *mut *mut ort::OrtDataTransferImpl,
 ) -> *mut ort::OrtStatus {
-    unsafe { *data_transfer = ptr::null_mut() };
+    let factory = unsafe { &*this(p) };
+    unsafe { *data_transfer = crate::device::create_transfer(factory.ort_api, factory.ep_api) };
     ptr::null_mut()
 }
 unsafe extern "C" fn create_sync_stream_for_device(
@@ -272,7 +314,16 @@ unsafe extern "C" fn create_sync_stream_for_device(
 /// `p` must be a pointer returned by `MlxEpFactory::as_ptr`.
 pub unsafe fn release_factory(p: *mut ort::OrtEpFactory) {
     if !p.is_null() {
-        drop(unsafe { Box::from_raw(p as *mut MlxEpFactory) });
+        let factory = unsafe { Box::from_raw(p as *mut MlxEpFactory) };
+        if let Ok(owners) = factory.allocator_infos.lock() {
+            for &info in owners.iter() {
+                unsafe {
+                    ((*factory.ort_api).ReleaseMemoryInfo.unwrap())(info as *mut ort::OrtMemoryInfo)
+                };
+            }
+        } else {
+            log::error!("MLX allocator metadata lock is poisoned during factory teardown");
+        }
     }
 }
 

@@ -163,7 +163,7 @@ regions rather than splitting at every shapeless/shape-keyed edge. Paged
 attention keeps its separate cache-alias boundary; existing eager and
 live-metadata boundaries remain eager.
 
-### Qwen3.8-27B MTP qualification
+### Qwen3.8-27B compact MTP capture qualification
 
 [Full measurements, tokens, export/library hashes and numerical probes](reports/qwen38-paged-mtp-m1max.json)
 cover genuine MTP on the M1 Max (32 GPU cores, 32 GiB), with ORT 1.31.1,
@@ -200,7 +200,120 @@ regressions, but no exact lossless-token claim is made for end-to-end MTP.
 
 WebGPU EP 0.5.0 fails before the first token because
 `com.microsoft:GatedDeltaNetStateReplay` is not registered. There is no valid
-activated-MTP WebGPU throughput comparison, and no MTP speed-win claim.
+activated-MTP WebGPU throughput comparison, and no MTP-over-WebGPU speed-win claim.
+
+### Persistent public ORT device tensors
+
+`ONNXRUNTIME_EP_MLX_DEVICE_TENSORS=1` enables experimental MLX-owned GPU
+allocations and public ORT data transfers. Set it before registering the plugin
+in a fresh process; the allocator policy is fixed at registration. The default
+CPU-visible interface remains unchanged. This mode retains native arrays across
+compiled and eager partitions instead of copying each boundary output to host.
+Device tensors and their transfers must stay on their producer's inference
+thread. MLX device addresses are opaque allocator identifiers, not host buffers
+or an interop contract with another GPU provider. Use the registered memory
+information, not a hand-constructed memory descriptor:
+
+```python
+device = next(d for d in ort.get_ep_devices() if d.ep_name == "MLXExecutionProvider")
+info = device.memory_info(ort.OrtDeviceMemoryType.DEFAULT)
+state = ort.OrtValue.ortvalue_from_shape_and_type(shape, dtype, memory_info=info)
+state.update_inplace(initial_state)
+binding.bind_ortvalue_input("past.0.recurrent", state)
+binding.bind_ortvalue_output("present.0.recurrent", state)
+```
+
+Allocate each state once and reuse the binding across decode calls. Outputs
+retain their native storage after session teardown. Readback through `.numpy()`
+or a CPU output binding synchronizes and transfers data; device I/O alone does
+not remove an application's explicit readbacks. CPU feeds are uploaded, not
+mutable GPU cache allocations: when a PagedAttention cache output is omitted,
+observe in-place updates through the original **device** OrtValue. CPU-visible
+input/output aliasing continues to work through explicitly bound outputs.
+If a device Run fails, reinitialize bound state before retrying: outputs may
+already alias inputs. Device evaluation errors are reported rather than replayed
+through an eager path that could consume partially updated state.
+
+`ort_paged.py` measures a target-only public-ORT loop with CPU versus persistent
+GPU state ownership on the same unchanged paged export:
+
+```sh
+python -m bench.ort_paged --model /path/to/non-mtp-export \
+  --library "$PWD/rust/target/release/libonnxruntime_mlx_ep.dylib" \
+  --reference /tmp/paged-mlx.json --memory cpu --output /tmp/ort-cpu.json
+python -m bench.ort_paged --model /path/to/non-mtp-export \
+  --library "$PWD/rust/target/release/libonnxruntime_mlx_ep.dylib" \
+  --reference /tmp/paged-mlx.json --memory mlx --output /tmp/ort-device.json
+```
+
+Both processes use the reference report's exact prompt tokens and require every
+generated token to match it. State initialization is outside timing; sampling
+remains CPU first-max argmax over the unchanged logits. This is a different
+driver from GenAI, not evidence that GenAI itself retains final states on GPU.
+The runner rejects enabled MTP configurations rather than silently benchmarking
+their target alone. Use `genai_paged.py --mtp` for activated MTP measurements.
+
+Paged attention also has a direct FP16 single-query path for head widths
+64/96/128/256 and contexts below 1,024 tokens. It reads physical KV pages with
+GQA head mapping, without gathering a dense cache or repeating heads. Other
+geometries, multi-query verification and unsupported attention options keep the
+existing implementation. Packed dirty-row writeback can avoid rooting a full
+GPU cache scatter when cache outputs are omitted or verified to alias the
+CPU-visible input; independent outputs retain the complete updated cache.
+Native device aliases retain functional cache updates rather than mutating
+arrays that could have other owners.
+
+For same-binary diagnostics, `ONNXRUNTIME_EP_MLX_NO_PAGED_DIRECT=1` and
+`ONNXRUNTIME_EP_MLX_NO_PAGED_PATCHES=1` independently disable these changes.
+Collect tracing separately from final latency measurements; public GPU-to-CPU
+transfers and sparse input writebacks are included in copy accounting.
+
+### Qwen state/cache qualification
+
+[Raw samples, tokens, source/library hashes, ownership diagnostics and rejected
+experiments](reports/qwen38-paged-residency-m1max.json) separate each binary and
+driver. Final target-only GenAI measurements use the same unchanged INT4/group-32
+export on the M1 Max (32 GPU cores, 32 GiB), with Python 3.13.5, ORT 1.31.1,
+GenAI 0.19.0, native MLX 0.32.4 and WebGPU EP 0.5.0. Prompt length is 64,
+generation length 256, with three warmups and five measured repetitions in
+fresh sequential processes; tracing and capture are disabled.
+
+| Provider/mode | Warm TTFT median | Decode median | Aggregate decode | Inter-token p95 |
+|---|---:|---:|---:|---:|
+| MLX, `ONNXRUNTIME_EP_MLX_DEVICE_TENSORS=1` | 605 ms | 85.03 ms/token | 11.71 tokens/s | 97.04 ms |
+| WebGPU | 1,283 ms | 95.37 ms/token | 10.48 tokens/s | 94.69 ms |
+
+MLX aggregate decode is **11.8% higher** in this qualification. Every generated
+token matches across all ten measured runs. No stalls are discarded; this is a
+short-context, single-request result, not a claim about every latency percentile
+or longer contexts.
+
+Activated MTP uses the separate unpruned capacity-four export and the default
+CPU-visible interface (`ONNXRUNTIME_EP_MLX_DEVICE_TENSORS=0`): **8.27 tokens/s**,
+versus **7.70 tokens/s** with both direct paging and packed patches disabled on
+the same binary (**7.4% higher decode throughput**). Warm TTFT is 10,010 ms
+versus 8,941 ms for that control; inter-token p95 is 370 versus 394 ms.
+Each run completes 89 rounds,
+evaluates 236 draft tokens and accepts 166, with zero failures. All 256 tokens
+match the committed MTP reference, including its known FP16 tie-dependent
+difference from target-only decoding. WebGPU still lacks
+`GatedDeltaNetStateReplay`, so no activated-MTP WebGPU speed comparison exists.
+
+Allocator enablement alone is **not GenAI state residency**. Separate four-token
+traces find 192 three-MiB recurrent-state readbacks in GenAI in either memory
+mode. Explicit public GPU state bindings eliminate those readbacks and download
+only 1,986,560 logits bytes in total. The older public-loop ownership A/B is
+archived separately; its timings must not be mixed with GenAI measurements.
+Keep GenAI MTP CPU-visible for now: its allocator-only GPU-mode series included
+a 595.65-second decode stall in GPU-to-CPU transfer. All five samples are
+retained, with the CPU-sampling and memory-pressure diagnostic disclosed.
+
+Boundary reduction remains unresolved. There are **33 total ORT regions**,
+including 16 PagedAttention boundaries, not 33 compiled regions plus another 16.
+The four-call trace records 16 compiled and 17 eager executions per call.
+A genuine single-partition hybrid retained compilation but regressed
+11.89 to 11.23 tokens/s; deferred GPU-only submission regressed 11.73 to 10.42.
+Both experiments were removed.
 
 ### Qwen3.8-27B initial local qualification
 

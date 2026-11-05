@@ -185,6 +185,10 @@ impl Array {
         self.raw
     }
 
+    pub(crate) fn as_mut_ptr(&mut self) -> *mut mlx::mlx_array {
+        &mut self.raw
+    }
+
     pub fn ndim(&self) -> usize {
         unsafe { mlx::mlx_array_ndim(self.raw) }
     }

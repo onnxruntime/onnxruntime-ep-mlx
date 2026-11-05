@@ -23,6 +23,7 @@ pub struct MlxEp {
     /// stream for their complete lifetime.
     cpu_stream: Stream,
     enable_compile: bool,
+    memory_info: *mut ort::OrtMemoryInfo,
 }
 
 impl MlxEp {
@@ -32,6 +33,7 @@ impl MlxEp {
         name: &CStr,
         _logger: *const ort::OrtLogger,
         enable_compile: bool,
+        memory_info: *mut ort::OrtMemoryInfo,
     ) -> Box<Self> {
         let mut base: ort::OrtEp = unsafe { std::mem::zeroed() };
         base.ort_version_supported = ORT_API_VERSION;
@@ -48,6 +50,7 @@ impl MlxEp {
             stream: Stream::new_default_gpu(),
             cpu_stream: Stream::new_default_cpu(),
             enable_compile,
+            memory_info,
         })
     }
 
@@ -64,6 +67,9 @@ impl Drop for MlxEp {
         tracer.log_slowest_ops();
         tracer.log_summary();
         tracer.export();
+        if !self.memory_info.is_null() {
+            unsafe { ((*self.ort_api).ReleaseMemoryInfo.unwrap())(self.memory_info) };
+        }
     }
 }
 
@@ -77,12 +83,16 @@ unsafe extern "C" fn get_name(ep: *const ort::OrtEp) -> *const c_char {
 }
 
 unsafe extern "C" fn get_default_memory_device(
-    _ep: *const ort::OrtEp,
+    ep: *const ort::OrtEp,
     device: *mut *const ort::OrtMemoryDevice,
 ) -> *mut ort::OrtStatus {
     unsafe {
-        // I/O remains on ORT's CPU allocator in unified memory.
-        *device = ptr::null();
+        let ep = &*this(ep);
+        *device = if ep.memory_info.is_null() {
+            ptr::null()
+        } else {
+            ((*ep.ep_api).MemoryInfo_GetMemoryDevice.unwrap())(ep.memory_info)
+        };
         ptr::null_mut()
     }
 }

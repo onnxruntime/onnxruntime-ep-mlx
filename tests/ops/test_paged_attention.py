@@ -334,8 +334,8 @@ def test_paged_attention_metadata_sources(source, eager, monkeypatch):
 
 @pytest.mark.parametrize("outputs", ["omitted", "separate", "aliased"])
 @pytest.mark.parametrize("remap", [False, True])
-def test_paged_attention_partial_cache_writeback(outputs, remap):
-    geometry = (4, 2, 16, 16, 4, 2)
+@pytest.mark.parametrize("geometry", [(4, 2, 16, 16, 4, 2), (24, 4, 256, 5, 256, 1)])
+def test_paged_attention_partial_cache_writeback(outputs, remap, geometry):
     h, kv, d, nb, block, _ = geometry
     proto = onnx.load_from_string(_model(*geometry, 0, 0))
     if outputs != "omitted":
@@ -361,29 +361,75 @@ def test_paged_attention_partial_cache_writeback(outputs, remap):
     session.disable_fallback()
     for seed in [87, 88, 89]:
         feeds, _ = _inputs(*geometry, 0, 0, seed)
+        if geometry[-1] == 1 and seed != 88:
+            for name in ["query", "key", "value"]:
+                feeds[name] = feeds[name][:1]
+            feeds["cumulative_sequence_length"] = np.array([0, 1], np.int32)
         slots = None
         if remap:
             nt = feeds["query"].shape[0]
-            slots = np.random.default_rng(seed).permutation(nb * block)[:nt].astype(np.int32)
-            slots[0] = -1
+            slots = (
+                np.random.default_rng(seed)
+                .permutation(nb * block)[:nt]
+                .astype(np.int32)
+            )
+            slots[0] = (
+                int(feeds["block_table"][0, 0]) * block
+                if geometry[-1] == 1 and seed == 89
+                else -1
+            )
             feeds["slot_mapping"] = slots
         expected = _paged_ref(
-            *(feeds[name] for name in [
-                "query", "key", "value", "key_cache", "value_cache",
-                "cumulative_sequence_length", "past_seqlens", "block_table",
-            ]),
-            h, kv, d, slot_mapping=slots, return_cache=True,
+            *(
+                feeds[name]
+                for name in [
+                    "query",
+                    "key",
+                    "value",
+                    "key_cache",
+                    "value_cache",
+                    "cumulative_sequence_length",
+                    "past_seqlens",
+                    "block_table",
+                ]
+            ),
+            h,
+            kv,
+            d,
+            slot_mapping=slots,
+            return_cache=True,
         )
         binding = session.io_binding()
+        device_caches = {}
+        device_info = None
+        if os.environ.get("ONNXRUNTIME_EP_MLX_DEVICE_TENSORS") == "1":
+            device = next(
+                d for d in ort.get_ep_devices() if d.ep_name == "MLXExecutionProvider"
+            )
+            device_info = device.memory_info(ort.OrtDeviceMemoryType.DEFAULT)
         for name, value in feeds.items():
-            binding.bind_cpu_input(name, value)
+            if device_info is not None and name in ("key_cache", "value_cache"):
+                device_value = ort.OrtValue.ortvalue_from_shape_and_type(
+                    value.shape, value.dtype, memory_info=device_info
+                )
+                device_value.update_inplace(value)
+                device_caches[name] = device_value
+                binding.bind_ortvalue_input(name, device_value)
+            else:
+                binding.bind_cpu_input(name, value)
         binding.bind_output("output", "cpu")
         for name in ["key_cache", "value_cache"] if outputs != "omitted" else []:
             if outputs == "aliased":
+                if name in device_caches:
+                    binding.bind_ortvalue_output(name + "_out", device_caches[name])
+                    continue
                 value = feeds[name]
                 binding.bind_output(
-                    name + "_out", "cpu", element_type=np.float16,
-                    shape=value.shape, buffer_ptr=value.ctypes.data,
+                    name + "_out",
+                    "cpu",
+                    element_type=np.float16,
+                    shape=value.shape,
+                    buffer_ptr=value.ctypes.data,
                 )
             else:
                 binding.bind_output(name + "_out", "cpu")
@@ -391,9 +437,69 @@ def test_paged_attention_partial_cache_writeback(outputs, remap):
         actual = binding.copy_outputs_to_cpu()
         np.testing.assert_allclose(actual[0], expected[0], rtol=2e-2, atol=2e-2)
         for index, name in enumerate(["key_cache", "value_cache"], 1):
-            np.testing.assert_array_equal(feeds[name], expected[index])
+            updated = (
+                device_caches[name].numpy() if name in device_caches else feeds[name]
+            )
+            np.testing.assert_array_equal(updated, expected[index])
             if outputs != "omitted":
                 np.testing.assert_array_equal(actual[index], expected[index])
+
+
+def test_duplicate_cache_slots_preserve_input_output_coherence():
+    proto = onnx.load_from_string(_model(1, 1, 64, 2, 16, 1, 0, 0))
+    proto.graph.node[0].input.extend(["", "", "slot_mapping"])
+    proto.graph.input.append(
+        onnx.helper.make_tensor_value_info("slot_mapping", onnx.TensorProto.INT32, [2])
+    )
+    for name in ("key_cache_out", "value_cache_out"):
+        proto.graph.node[0].output.append(name)
+        proto.graph.output.append(
+            onnx.helper.make_tensor_value_info(
+                name, onnx.TensorProto.FLOAT16, [2, 16, 1, 64]
+            )
+        )
+    feeds, _ = _inputs(1, 1, 64, 2, 16, 1, 0, 0, 42)
+    feeds.update(
+        query=np.ones((2, 64), np.float16),
+        key=np.stack([np.full(64, 1), np.full(64, 2)]).astype(np.float16),
+        value=np.stack([np.full(64, 3), np.full(64, 4)]).astype(np.float16),
+        cumulative_sequence_length=np.array([0, 2], np.int32),
+        past_seqlens=np.array([0], np.int32),
+        slot_mapping=np.array([0, 0], np.int32),
+    )
+    options = ort.SessionOptions()
+    options.add_session_config_entry("session.disable_cpu_ep_fallback", "1")
+    session = ort.InferenceSession(
+        proto.SerializeToString(), options, providers=["MLXExecutionProvider"]
+    )
+    session.disable_fallback()
+    binding = session.io_binding()
+    caches = {}
+    for name, value in feeds.items():
+        if os.environ.get("ONNXRUNTIME_EP_MLX_DEVICE_TENSORS") == "1" and name in (
+            "key_cache",
+            "value_cache",
+        ):
+            device = next(
+                d for d in ort.get_ep_devices() if d.ep_name == "MLXExecutionProvider"
+            )
+            state = ort.OrtValue.ortvalue_from_shape_and_type(
+                value.shape,
+                value.dtype,
+                memory_info=device.memory_info(ort.OrtDeviceMemoryType.DEFAULT),
+            )
+            state.update_inplace(value)
+            caches[name] = state
+            binding.bind_ortvalue_input(name, state)
+        else:
+            binding.bind_cpu_input(name, value)
+    for name in ("output", "key_cache_out", "value_cache_out"):
+        binding.bind_output(name, "cpu")
+    session.run_with_iobinding(binding)
+    actual = binding.copy_outputs_to_cpu()
+    for i, name in enumerate(("key_cache", "value_cache"), 1):
+        state = caches[name].numpy() if name in caches else feeds[name]
+        np.testing.assert_array_equal(state, actual[i])
 
 
 # --- RoPE (structured cache), non-interleaved + interleaved --------------------------------------
@@ -708,6 +814,13 @@ def test_paged_attention_ort129_optional_inputs_and_cache_outputs():
         one_output_model,
         {name: value.copy() for name, value in one_output_feeds.items()},
     )
-    m.run_mlx(one_output_model, one_output_feeds)
-    np.testing.assert_allclose(one_output_feeds["key_cache"], expected[1], rtol=2e-3, atol=2e-3)
-    np.testing.assert_allclose(one_output_feeds["value_cache"], expected[2], rtol=2e-3, atol=2e-3)
+    one_output = m.run_mlx(one_output_model, one_output_feeds)
+    np.testing.assert_allclose(one_output[0], expected[0], rtol=2e-2, atol=2e-2)
+    for index, name in enumerate(["key_cache", "value_cache"], 1):
+        # A CPU feed is uploaded, not aliased, when the EP advertises GPU memory.
+        want = (
+            feeds[name]
+            if os.environ.get("ONNXRUNTIME_EP_MLX_DEVICE_TENSORS") == "1"
+            else expected[index]
+        )
+        np.testing.assert_allclose(one_output_feeds[name], want, rtol=2e-3, atol=2e-3)
