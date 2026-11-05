@@ -168,6 +168,11 @@ every measured run and the initial qualification. PagedAttention writes only
 updated physical input slots; aliased cache outputs copy an enclosing changed
 row interval, while independent outputs still receive the full cache.
 
+A native grouped-SDPA variant avoided repeated KV-head views but reduced
+end-to-end decode to **9.24 tokens/s**, despite matching all 256 tokens. It was
+reverted; its raw samples are retained as a rejected experiment in the follow-up
+report. Fewer materializations alone do not establish an end-to-end win.
+
 Source research at
 [MLX-LM](https://github.com/ml-explore/mlx-lm/tree/736ab0d8c1d0edc79c3d798044fe6904e2fa23be),
 [MTPLX](https://github.com/youssofal/mtplx/tree/9882703f3105363ddc37eca9f97aa09a1d387112),

@@ -242,6 +242,11 @@ def test_paged_attention_core(H, KV, batch):
     _check(H, KV, 16, nb=8 * batch, blk=4, batch=batch, seed=H * 10 + KV + batch)
 
 
+@pytest.mark.parametrize("kv", [1, 4])
+def test_paged_attention_grouped_head256(kv):
+    _check(24, kv, 256, nb=4, blk=64, batch=1, seed=256 + kv)
+
+
 # --- multi-block gather (large past spanning several physical blocks) ----------------------------
 @pytest.mark.parametrize("blk", [2, 8])
 def test_paged_attention_multiblock(blk):
