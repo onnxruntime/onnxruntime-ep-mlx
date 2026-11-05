@@ -1,0 +1,26 @@
+{
+  "baseline": {
+    "median_seconds": 10.677144916029647,
+    "p95_seconds": 10.677144916029647,
+    "tokens_per_second": 377.5353834477081,
+    "physical_memory": {
+      "available": true,
+      "current_bytes": 5626368128,
+      "lifetime_peak_bytes": 8490291328,
+      "current_resident_bytes": 2360737792,
+      "scope": "macOS kernel whole-process physical footprint; includes setup and runtime"
+    }
+  },
+  "candidate": {
+    "median_seconds": 9.774370250059292,
+    "p95_seconds": 9.774370250059292,
+    "tokens_per_second": 412.40508563460116,
+    "physical_memory": {
+      "available": true,
+      "current_bytes": 5331685480,
+      "lifetime_peak_bytes": 7781601384,
+      "current_resident_bytes": 3973742592,
+      "scope": "macOS kernel whole-process physical footprint; includes setup and runtime"
+    }
+  }
+}

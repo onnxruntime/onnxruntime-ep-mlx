@@ -1,0 +1,16 @@
+{
+  "baseline": {
+    "median_seconds": 0.29269279196159914,
+    "p95_seconds": 0.29981871314230374,
+    "mlx_peak_bytes": 3738491876,
+    "maximum_output_error": 0.0
+  },
+  "candidate": {
+    "median_seconds": 0.2710495204664767,
+    "p95_seconds": 0.2759089002967812,
+    "mlx_peak_bytes": 2898779108,
+    "maximum_output_error": 6.984919309616089e-10
+  },
+  "throughput_ratio": 1.0798498793057238,
+  "mlx_peak_reduction_fraction": 0.22461270369228425
+}

@@ -154,7 +154,8 @@ def run(model, feeds, *, cpu=False):
 
 
 @pytest.mark.parametrize(
-    "width,value_width,time", [(16, 5, 1), (32, 9, 7), (64, 64, 17), (128, 128, 32)]
+    "width,value_width,time",
+    [(16, 5, 1), (32, 7, 7), (32, 8, 7), (32, 9, 7), (64, 17, 17), (64, 64, 17), (128, 128, 32)]
 )
 def test_products_match_cpu(width, value_width, time):
     model, feeds = model_and_feeds(width=width, value_width=value_width, time=time)

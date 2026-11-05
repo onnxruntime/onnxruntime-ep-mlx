@@ -1,5 +1,5 @@
 //! Exact gated-delta state/replay and pullback Scan recognition.
-//! Metal loops carry state in registers, with four value columns per group.
+//! Metal loops carry state in registers; reverse groups cover eight value columns.
 //! Reverse query/key/decay/beta partials reduce across independent value tiles.
 //! Other bodies retain ordinary Scan execution.
 use crate::engine::{MlxError, NodeDesc, Src, SubgraphDesc, TensorRef, TranslationContext};
@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::ffi::CString;
 
 const F32: mlx::mlx_dtype = mlx::mlx_dtype__MLX_FLOAT32;
+const REVERSE_VALUE_COLUMNS: i32 = 8;
 pub const REVERSE_KERNEL_NAME: &str = "mlx_gated_delta_reverse_scan";
 pub const NO_FUSE_ENV: &str = "ONNXRUNTIME_EP_MLX_NO_GATED_DELTA_REVERSE";
 pub fn reverse_disabled() -> bool {
@@ -241,12 +242,12 @@ uint lane = ki % 32u;
 uint tile = threadgroup_position_in_grid.x % (uint)NT;
 uint bh = threadgroup_position_in_grid.x / (uint)NT;
 const uint NS = (uint)((K < 32 ? 32 : K) / 32);
-threadgroup float scratch[4*4*2];
-threadgroup float sums[4*2];
+threadgroup float scratch[VALUE_COLUMNS*4*2];
+threadgroup float sums[VALUE_COLUMNS*2];
 threadgroup float gparts[4];
-float carry[4];
-for (uint j=0;j<4;++j) {
- uint vi=tile*4u+j;
+float carry[VALUE_COLUMNS];
+for (uint j=0;j<VALUE_COLUMNS;++j) {
+ uint vi=tile*(uint)VALUE_COLUMNS+j;
  carry[j]=(ki<(uint)K && vi<(uint)V)?c0[(bh*(uint)K+ki)*(uint)V+vi]:0.0f;
 }
 for (uint step=0;step<(uint)T;++step) {
@@ -258,9 +259,9 @@ for (uint step=0;step<(uint)T;++step) {
  float query=ki<(uint)K?q[tv*(uint)K+ki]:0.0f;
  float factor=precise::exp(g[tv]);
  float rate=beta[tv];
- float faded[4],total[4],dy[4];
- for (uint j=0;j<4;++j) {
-  uint vi=tile*4u+j;
+ float faded[VALUE_COLUMNS],total[VALUE_COLUMNS],dy[VALUE_COLUMNS];
+ for (uint j=0;j<VALUE_COLUMNS;++j) {
+  uint vi=tile*(uint)VALUE_COLUMNS+j;
   dy[j]=vi<(uint)V?gy[tv*(uint)V+vi]:0.0f;
   faded[j]=(ki<(uint)K && vi<(uint)V)?previous[(tv*(uint)K+ki)*(uint)V+vi]*factor:0.0f;
   total[j]=carry[j]+(query*SCALE)*dy[j];
@@ -269,15 +270,15 @@ for (uint step=0;step<(uint)T;++step) {
   if (lane==0) { scratch[j*8u+subgroup]=a;scratch[j*8u+4u+subgroup]=b; }
  }
  threadgroup_barrier(mem_flags::mem_threadgroup);
- if (ki<4) {
+ if (ki<(uint)VALUE_COLUMNS) {
   float a=0.0f,b=0.0f;
   for(uint s=0;s<NS;++s) {a+=scratch[ki*8u+s];b+=scratch[ki*8u+4u+s];}
   sums[ki*2u]=a;sums[ki*2u+1u]=b;
  }
  threadgroup_barrier(mem_flags::mem_threadgroup);
  float dqv=0.0f,dkv=0.0f,dgv=0.0f,dbv=0.0f;
- for (uint j=0;j<4;++j) {
-  uint vi=tile*4u+j;
+ for (uint j=0;j<VALUE_COLUMNS;++j) {
+  uint vi=tile*(uint)VALUE_COLUMNS+j;
   float residual=(vi<(uint)V?v[tv*(uint)V+vi]:0.0f)-sums[j*2u];
   float product=sums[j*2u+1u];
   float dr=rate*product;
@@ -303,8 +304,8 @@ for (uint step=0;step<(uint)T;++step) {
  }
  threadgroup_barrier(mem_flags::mem_threadgroup);
 }
-for(uint j=0;j<4;++j) {
- uint vi=tile*4u+j;
+for(uint j=0;j<VALUE_COLUMNS;++j) {
+ uint vi=tile*(uint)VALUE_COLUMNS+j;
  if(ki<(uint)K && vi<(uint)V) {cfinal[(bh*(uint)K+ki)*(uint)V+vi]=carry[j];}
 }
 "#;
@@ -359,7 +360,7 @@ pub fn emit_reverse(
     if shapes != want {
         return Ok(None);
     }
-    let nt = (v + 3) / 4;
+    let nt = (v + REVERSE_VALUE_COLUMNS - 1) / REVERSE_VALUE_COLUMNS;
     let elements = t as i128 * b as i128 * h as i128 * k as i128 * v as i128;
     let grid = b as i128 * h as i128 * nt as i128 * k.max(32) as i128;
     if elements > u32::MAX as i128 || grid > i32::MAX as i128 {
@@ -399,6 +400,7 @@ pub fn emit_reverse(
         ("K", k),
         ("V", v),
         ("NT", nt),
+        ("VALUE_COLUMNS", REVERSE_VALUE_COLUMNS),
         ("IN_REVERSE", in_reverse as i32),
         ("OUT_REVERSE", out_reverse as i32),
     ] {

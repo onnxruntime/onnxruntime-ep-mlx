@@ -1,0 +1,89 @@
+{
+  "index": 9,
+  "model": "block_9_backward.onnx",
+  "feeds": "block_9_feeds.npz",
+  "outputs": "block_9_outputs.npz",
+  "input_arrays": {
+    "v_Shape_0": {
+      "shape": [
+        1
+      ],
+      "dtype": "int64",
+      "bytes": 8,
+      "sha256": "7c9fa136d4413fa6173637e883b6998d32e1d675f88cddff9dcbcf331820f4b8"
+    },
+    "v_model.layers.7.Add_658": {
+      "shape": [
+        1,
+        4032,
+        1024
+      ],
+      "dtype": "float32",
+      "bytes": 16515072,
+      "sha256": "0646c0a712db3f155cb30cafc0440e9be2caaac67073d4837ace56c8d9913469"
+    },
+    "model.layers.8.linear_attn.in_proj_qkv.lora.A": {
+      "shape": [
+        1024,
+        4
+      ],
+      "dtype": "float32",
+      "bytes": 16384,
+      "sha256": "23029f5a99aa79dc3f23f00a2849a98a742c56226df9d6568a313caabcbe5ed2"
+    },
+    "model.layers.8.linear_attn.in_proj_qkv.lora.B": {
+      "shape": [
+        4,
+        6144
+      ],
+      "dtype": "float32",
+      "bytes": 98304,
+      "sha256": "6550263fbca80f412812f2f15ab8b47c68056dfce7cd9466d937d6a38cafdfb5"
+    },
+    "v_model.layers.8.Add_731_cotangent": {
+      "shape": [
+        1,
+        4032,
+        1024
+      ],
+      "dtype": "float32",
+      "bytes": 16515072,
+      "sha256": "9815d475c757d0b7b512f932856216e96586dfdf1987fcbca152d48be2267db3"
+    }
+  },
+  "output_arrays": {
+    "v_model.layers.7.Add_658_cotangent": {
+      "shape": [
+        1,
+        4032,
+        1024
+      ],
+      "dtype": "float32",
+      "bytes": 16515072,
+      "sha256": "688ff01a9d4fc68cefb5bb9919ff92f69d82c2b2db92c08ca0df221af5cec07c"
+    },
+    "model.layers.8.linear_attn.in_proj_qkv.lora.A_cotangent": {
+      "shape": [
+        1024,
+        4
+      ],
+      "dtype": "float32",
+      "bytes": 16384,
+      "sha256": "e0f7c6f87aff7f7f2a8d82b749e53e9b5ddf070608f98f160487d72f53df4fc4"
+    },
+    "model.layers.8.linear_attn.in_proj_qkv.lora.B_cotangent": {
+      "shape": [
+        4,
+        6144
+      ],
+      "dtype": "float32",
+      "bytes": 98304,
+      "sha256": "cf23e20a19722c5514c35699c5cd9500a7aec63de0faa81cb38978ed2bfc9b44"
+    }
+  },
+  "output_names": [
+    "v_model.layers.7.Add_658_cotangent",
+    "model.layers.8.linear_attn.in_proj_qkv.lora.A_cotangent",
+    "model.layers.8.linear_attn.in_proj_qkv.lora.B_cotangent"
+  ]
+}

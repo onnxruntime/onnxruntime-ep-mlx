@@ -1,0 +1,17 @@
+"""Replay the benchmark with an explicit, recorded derivative-path override."""
+import hashlib, json, os, runpy
+from pathlib import Path
+from examples.lora import mlx_runtime
+original=mlx_runtime.session
+selected=[]
+manifest=json.loads(Path('/tmp/onnax-symbolic-all-blocks.json').read_text()) if os.environ.get('ONNAX_SYMBOLIC_CANDIDATE')=='1' else None
+replacements={f"block_{r['index']}_backward.onnx":r['model'] for r in manifest['blocks']} if manifest else {}
+def session(graph,**kwargs):
+    if isinstance(graph,(str,os.PathLike)) and (replacement:=replacements.get(Path(graph).name)):
+        selected.append({'original':os.fspath(graph),'replacement':replacement,'sha256':hashlib.sha256(Path(replacement).read_bytes()).hexdigest()})
+        graph=replacement
+    return original(graph,**kwargs)
+mlx_runtime.session=session
+runpy.run_path('/tmp/onnax-mlx-head-control/bench/onnax_decoder.py',run_name='__main__')
+if manifest: assert len(selected)==len(replacements), (len(selected),len(replacements))
+Path(os.environ['ONNAX_SYMBOLIC_OVERRIDE_REPORT']).write_text(json.dumps({'overrides':selected},indent=2)+'\n')
