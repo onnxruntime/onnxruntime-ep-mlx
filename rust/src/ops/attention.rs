@@ -3682,13 +3682,14 @@ fn shape_keyed(
 // GQA SDPA in fp32, and pack the outputs back. Causality is optional; RoPE uses exact cache rows.
 // SEPARATE packed QKV, softcap, and left windows compose on this eager path.
 
-/// Read an integer input tensor (int32 or int64) to a host `Vec<i64>`, normalizing dtype through
-/// MLX (astype + eval) — unlike `read_ints`, which reinterprets the raw bytes as i64 and so mangles
-/// an int32 tensor. PagedAttention's control tensors (cum_seqlens/past_seqlens/block_table) are int32.
+/// Read host integer metadata directly; evaluate MLX only for graph-produced values.
 fn read_int_input(
     ctx: &mut TranslationContext,
     r: &crate::engine::TensorRef,
 ) -> Result<Vec<i64>, MlxError> {
+    if matches!(r.source, Src::Initializer | Src::CtxInput) {
+        return ctx.read_ints(r);
+    }
     let a = ctx.resolve(r)?;
     let a = ctx.astype(a, mlx::mlx_dtype__MLX_INT64)?;
     let a = ctx.contiguous_eval(a)?;
@@ -3947,6 +3948,7 @@ fn paged_attention_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), 
         None
     };
     let mut cache_updated = false;
+    let mut written_slots = Vec::new();
 
     // The cache is [max_seq, rotary_dim/2]; consume its exact values, including reduced precision.
     let rope = if do_rotary {
@@ -4019,6 +4021,7 @@ fn paged_attention_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), 
             }
         }
         if !write_slots.is_empty() {
+            written_slots.extend(write_slots.iter().map(|&slot| slot as usize));
             let row_idx = i32_host_array(ctx, &write_rows);
             let slot_idx = i32_host_array(ctx, &write_slots);
             let knew = ctx.transpose(kh_new, &[0, 2, 1, 3])?;
@@ -4161,9 +4164,16 @@ fn paged_attention_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), 
         }
     };
     if cache_updated {
-        kcache = ctx.write_back_input(&n.inputs[3], kcache)?;
+        kcache =
+            ctx.write_back_input_rows(&n.inputs[3], kcache, 1, &written_slots, n.outputs.get(1))?;
         if let Some(current_vcache) = vcache {
-            vcache = Some(ctx.write_back_input(&n.inputs[4], current_vcache)?);
+            vcache = Some(ctx.write_back_input_rows(
+                &n.inputs[4],
+                current_vcache,
+                1,
+                &written_slots,
+                n.outputs.get(2),
+            )?);
         }
     }
     ctx.bind(&n.outputs[0], output);

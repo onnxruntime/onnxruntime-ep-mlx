@@ -121,7 +121,7 @@ Hybrid packed-SSM decoders coalesce capture-compatible neighbours into
 shape-keyed regions rather than splitting at every shapeless/shape-keyed edge.
 Paged attention keeps its separate cache-alias boundary.
 
-### Qwen3.8-27B local qualification
+### Qwen3.8-27B initial local qualification
 
 [Raw samples, tokens, options and model/plugin hashes](reports/qwen38-paged-m1max.json)
 cover the same INT4/block-32 paged export on an M1 Max (32 GPU cores, 32 GiB).
@@ -149,6 +149,33 @@ do not establish long-prompt or concurrent-request performance. On this 32 GiB
 host, export required external-backed staging and column-batched LM-head
 quantization to avoid memory exhaustion; the quantization algorithm and options
 were unchanged, with column batching checked for bit-identical results.
+
+### Paged-cache writeback follow-up
+
+[Follow-up raw samples and hashes](reports/qwen38-paged-writeback-m1max.json)
+use the same model and measurement settings, with a fresh WebGPU run:
+
+| Provider/build | Warm TTFT median | Aggregate decode | Inter-token p95 |
+|---|---:|---:|---:|
+| MLX direct host metadata, full cache writes | 715 ms | 8.10 tokens/s | 138 ms |
+| MLX sparse cache writeback | 612 ms | 9.77 tokens/s | 109 ms |
+| WebGPU recheck | 1,281 ms | 10.42 tokens/s | 102 ms |
+
+Sparse writeback improves decode by **20.6%** over the metadata-only reference.
+WebGPU still leads decode by **6.6%** in this round; its fresh result, rather
+than the earlier 9.02 tokens/s, is the comparison. All 256 greedy tokens match
+every measured run and the initial qualification. PagedAttention writes only
+updated physical input slots; aliased cache outputs copy an enclosing changed
+row interval, while independent outputs still receive the full cache.
+
+Source research at
+[MLX-LM](https://github.com/ml-explore/mlx-lm/tree/736ab0d8c1d0edc79c3d798044fe6904e2fa23be),
+[MTPLX](https://github.com/youssofal/mtplx/tree/9882703f3105363ddc37eca9f97aa09a1d387112),
+and [Lithos Metal](https://github.com/lithos-ai/lithos-metal/tree/6653b7df5f2c4392ec7b038960f2796b1499923f)
+prioritizes cache ownership/traffic, projection concatenation with library GEMV,
+and fusion between projections. Their native GPU state/sampling interfaces,
+different quantization, speculative projections, and newer-chip measurements
+are not interchangeable with this standard-ORT, M1, group-32 comparison.
 
 ## Historical model measurements
 

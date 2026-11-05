@@ -17,12 +17,12 @@ import json
 import math
 import os
 
+import _models as m
 import numpy as np
+import onnx
 import onnxruntime as ort
 import pytest
 from onnx_ir import DataType as DT
-
-import _models as m
 
 
 # ---------------- numpy reference (port of ORT's attention_ref + paged cache) --------------------
@@ -246,6 +246,116 @@ def test_paged_attention_core(H, KV, batch):
 @pytest.mark.parametrize("blk", [2, 8])
 def test_paged_attention_multiblock(blk):
     _check(8, 2, 32, nb=8 * 2, blk=blk, batch=2, seed=blk + 7)
+
+
+@pytest.mark.parametrize("source", ["runtime", "initializer", "intermediate"])
+@pytest.mark.parametrize("eager", [False, True])
+def test_paged_attention_metadata_sources(source, eager, monkeypatch):
+    monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_COMPILE", "1" if eager else "0")
+    geometry = (4, 2, 16, 16, 4, 2)
+    proto = onnx.load_from_string(_model(*geometry, 0, 0))
+    metadata = ["cumulative_sequence_length", "past_seqlens", "block_table"]
+    initial, _ = _inputs(*geometry, 0, 0, 87)
+    if source == "initializer":
+        for value in list(proto.graph.input):
+            if value.name in metadata:
+                proto.graph.input.remove(value)
+                proto.graph.initializer.append(
+                    onnx.numpy_helper.from_array(initial[value.name], value.name)
+                )
+    elif source == "intermediate":
+        attention = proto.graph.node[0]
+        prefix = []
+        proto.graph.initializer.append(
+            onnx.numpy_helper.from_array(np.array(0, dtype=np.int32), "zero")
+        )
+        for name in metadata:
+            output = name + "_computed"
+            prefix.append(onnx.helper.make_node("Add", [name, "zero"], [output]))
+            for i, input_name in enumerate(attention.input):
+                if input_name == name:
+                    attention.input[i] = output
+        nodes = [*prefix, *proto.graph.node]
+        del proto.graph.node[:]
+        proto.graph.node.extend(nodes)
+    options = ort.SessionOptions()
+    options.add_session_config_entry("session.disable_cpu_ep_fallback", "1")
+    session = ort.InferenceSession(
+        proto.SerializeToString(), options, providers=["MLXExecutionProvider"]
+    )
+    session.disable_fallback()
+    for seed in [87, 88, 89]:
+        feeds, reference = _inputs(
+            *geometry, 0, 0, 87 if source == "initializer" else seed
+        )
+        if source == "initializer":
+            feeds = {name: value for name, value in feeds.items() if name not in metadata}
+        actual = session.run(None, feeds)[0]
+        np.testing.assert_allclose(actual, reference, rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.parametrize("outputs", ["omitted", "separate", "aliased"])
+@pytest.mark.parametrize("remap", [False, True])
+def test_paged_attention_partial_cache_writeback(outputs, remap):
+    geometry = (4, 2, 16, 16, 4, 2)
+    h, kv, d, nb, block, _ = geometry
+    proto = onnx.load_from_string(_model(*geometry, 0, 0))
+    if outputs != "omitted":
+        for name in ["key_cache_out", "value_cache_out"]:
+            proto.graph.node[0].output.append(name)
+            proto.graph.output.append(
+                onnx.helper.make_tensor_value_info(
+                    name, onnx.TensorProto.FLOAT16, [nb, block, kv, d]
+                )
+            )
+    if remap:
+        proto.graph.node[0].input.extend(["", "", "slot_mapping"])
+        proto.graph.input.append(
+            onnx.helper.make_tensor_value_info(
+                "slot_mapping", onnx.TensorProto.INT32, ["nt"]
+            )
+        )
+    options = ort.SessionOptions()
+    options.add_session_config_entry("session.disable_cpu_ep_fallback", "1")
+    session = ort.InferenceSession(
+        proto.SerializeToString(), options, providers=["MLXExecutionProvider"]
+    )
+    session.disable_fallback()
+    for seed in [87, 88, 89]:
+        feeds, _ = _inputs(*geometry, 0, 0, seed)
+        slots = None
+        if remap:
+            nt = feeds["query"].shape[0]
+            slots = np.random.default_rng(seed).permutation(nb * block)[:nt].astype(np.int32)
+            slots[0] = -1
+            feeds["slot_mapping"] = slots
+        expected = _paged_ref(
+            *(feeds[name] for name in [
+                "query", "key", "value", "key_cache", "value_cache",
+                "cumulative_sequence_length", "past_seqlens", "block_table",
+            ]),
+            h, kv, d, slot_mapping=slots, return_cache=True,
+        )
+        binding = session.io_binding()
+        for name, value in feeds.items():
+            binding.bind_cpu_input(name, value)
+        binding.bind_output("output", "cpu")
+        for name in ["key_cache", "value_cache"] if outputs != "omitted" else []:
+            if outputs == "aliased":
+                value = feeds[name]
+                binding.bind_output(
+                    name + "_out", "cpu", element_type=np.float16,
+                    shape=value.shape, buffer_ptr=value.ctypes.data,
+                )
+            else:
+                binding.bind_output(name + "_out", "cpu")
+        session.run_with_iobinding(binding)
+        actual = binding.copy_outputs_to_cpu()
+        np.testing.assert_allclose(actual[0], expected[0], rtol=2e-2, atol=2e-2)
+        for index, name in enumerate(["key_cache", "value_cache"], 1):
+            np.testing.assert_array_equal(feeds[name], expected[index])
+            if outputs != "omitted":
+                np.testing.assert_array_equal(actual[index], expected[index])
 
 
 # --- RoPE (structured cache), non-interleaved + interleaved --------------------------------------

@@ -730,6 +730,15 @@ The translator maps it to:
 
 The backend writes present K/V to the same ORT context outputs in `[B, kv_heads, total_seq, head]` native-float layout. This preserves the runtime-owned KV-cache handoff across the prefill→decode boundary.
 
+`PagedAttention` reads CPU boundary/initializer integer metadata directly and
+evaluates graph-produced metadata before reading it. Its eager cache writeback
+copies only the physical slots updated by the current call, coalescing adjacent
+slots and preserving skipped slots. Declared cache outputs still return the full
+cache. When an output actually aliases its cache input, boundary copy-out uses
+the enclosing changed row interval in each physical block; non-aliased outputs
+retain a full copy. Cache ownership and all observable input/output updates stay
+with ORT.
+
 Standard causal `Attention` with one query and one current key can attend every
 past/current key. It omits the redundant causal array rather than capturing a
 first-call KV extent during shapeless decode. An external mask still applies,
