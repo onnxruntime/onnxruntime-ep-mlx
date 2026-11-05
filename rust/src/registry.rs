@@ -363,6 +363,7 @@ fn register_builtin_ops(registry: &mut OpRegistry) {
     crate::ops::random::register(registry);
     crate::ops::recurrent::register(registry);
     crate::ops::ssm::register(registry);
+    crate::ops::paged_ssm::register(registry);
     crate::ops::misc::register(registry);
     crate::ops::controlflow::register(registry);
     // norm+attention
@@ -2004,6 +2005,8 @@ mod tests {
     fn known_missing_output_shape_emitters_cannot_be_shapeless() {
         let always_shape_keyed = [
             ("com.microsoft", "PagedAttention", 1),
+            ("com.microsoft", "GatedDeltaNet", 1),
+            ("com.microsoft", "VarlenCausalConvWithState", 1),
             ("com.microsoft", "Attention", 1),
             ("com.microsoft", "PackedMultiHeadAttention", 1),
             ("", "RotaryEmbedding", 23),

@@ -16,6 +16,7 @@ pub mod nonzero;
 pub mod norm;
 pub mod onnx_ml_linear;
 pub mod onnx_ml_preprocess;
+pub mod paged_ssm;
 pub(crate) mod qdq;
 pub mod quant;
 pub mod reduction;

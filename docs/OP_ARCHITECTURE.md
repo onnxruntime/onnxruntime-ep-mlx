@@ -599,6 +599,7 @@ The **core Rust modules** register:
 | `conv.rs` | Conv/ConvTranspose/DeformConv and local/global pooling |
 | `quant.rs` | MatMulNBits, GatherBlockQuantized, Quantize/Dequantize/DynamicQuantize, MatMulInteger, ConvInteger, QLinearMatMul, QLinearConv |
 | `ssm.rs` | TensorScatter (opset 24), CausalConvWithState, LinearAttention (linear/gated/delta/gated_delta, GQA) |
+| `paged_ssm.rs` | Packed VarlenCausalConvWithState and GatedDeltaNet; device-resident sequence offsets, FP32 V-major recurrence, empty rows preserve initial state, no compact transition capture |
 | `selective_scan.rs` | Mamba-1 selective scan: recognises the `Scan` body and replaces the per-timestep unroll with one custom Metal kernel (state kept in registers) |
 | `nonzero.rs` | Exact eager NonZero host scan with live cardinality and int64 coordinates |
 | `unique.rs` / `host_scan.rs` | Exact eager Unique grouping/axis slices; shared checked live host payload access |
@@ -729,6 +730,27 @@ The translator maps it to:
 
 The backend writes present K/V to the same ORT context outputs in `[B, kv_heads, total_seq, head]` native-float layout. This preserves the runtime-owned KV-cache handoff across the prefill→decode boundary.
 
+`PagedAttention` reads CPU boundary/initializer integer metadata directly and
+evaluates graph-produced metadata before reading it. Its eager cache writeback
+copies only the physical slots updated by the current call, coalescing adjacent
+slots and preserving skipped slots. Declared cache outputs still return the full
+cache. When an output actually aliases its cache input, boundary copy-out uses
+the enclosing changed row interval in each physical block; non-aliased outputs
+retain a full copy. Cache ownership and all observable input/output updates stay
+with ORT.
+
+For single-query GPU paged decode, FP16 Q/K/V stay FP16 when their matching head
+width is 64, 96, 128, or 256 and the gathered context is shorter than 1,024 keys.
+MLX 0.32.4's single-pass vector kernel accumulates scores, softmax, and weighted
+values in FP32 before the final output cast, avoiding separate FP32 Q/K/V
+materializations. Longer contexts, head width 192, CPU streams, other input
+dtypes, unequal Q/V widths, sinks, and softcap retain the FP32 path. The narrower
+eligibility preserves the rounding of the existing implementation: two-pass
+FP16 attention rounds partial outputs, and head-192 FP16 does not match the FP32
+reference. In the eligible single-query path, all gathered keys are visible when
+there is no local window, so the redundant zero mask is omitted. Windows and
+other paths retain their masks; cache writeback semantics are unchanged.
+
 Standard causal `Attention` with one query and one current key can attend every
 past/current key. It omits the redundant causal array rather than capturing a
 first-call KV extent during shapeless decode. An external mask still applies,
@@ -786,7 +808,7 @@ backend limitation.
 
 `GatherBlockQuantized` is claimed for both the symmetric int4 embedding form (three inputs, `zp=8`, `w=(q-8)·scale`) and the asymmetric four-input form with explicit `zero_points` (`w=(q-zp)·scale`). The backend performs gather plus int4 dequant, uses the schema's default block size of 128, and returns zero slices for out-of-range indices as required by ORT 1.31. Bounds are checked before narrowing int64 indices, and the result retains the scale tensor's dtype.
 
-`GatedRMSNorm` supports the ORT 1.31 `activation` attribute: `silu` (default), its `swish` alias, and `sigmoid`. Unknown activations are not claimed.
+`GatedRMSNorm` supports the ORT 1.31 `activation` attribute: `silu` (default), its `swish` alias, and `sigmoid`. Unknown activations are not claimed. Dynamic leading dimensions are supported with a static feature width; compilation is shape-keyed because grouped reshapes capture concrete runtime geometry. `MRotaryEmbedding` likewise accepts dynamic batch/sequence dimensions with static head and rotary widths.
 
 ### 3.5 Softmax and elementwise
 

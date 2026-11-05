@@ -80,6 +80,169 @@ measures eight-column reverse tiles: 8.0% higher block throughput and 22.5%
 lower MLX allocator peak on M1 Max. The report includes raw samples, numerical
 checks and runtime digests.
 
+## Paged GenAI inference
+
+`genai_paged.py` measures a current GenAI Engine export with MTP disabled. Use
+the exact same exported directory for both providers, in separate sequential
+processes, with tracing and GPU capture disabled:
+
+```sh
+python bench/genai_paged.py --model /path/to/export --ep mlx \
+  --library "$PWD/rust/target/release/libonnxruntime_mlx_ep.dylib" \
+  --output /tmp/paged-mlx.json
+python bench/genai_paged.py --model /path/to/export --ep webgpu \
+  --output /tmp/paged-webgpu.json
+```
+
+Install compatible `onnxruntime`, `onnxruntime-genai` and
+`onnxruntime-ep-webgpu` versions in one environment. The runner defaults to
+three warmups, five repetitions and 256 generated tokens. It reports warm TTFT,
+decode ms/token, aggregate decode tokens/s and inter-token p95, and retains
+greedy tokens, raw timing samples, runtime versions and plugin/config hashes.
+Compare prompt and generated token arrays before comparing speed. A fresh Engine
+per repetition prevents cross-run prefix-cache reuse while model sessions stay
+warm. TTFT includes request submission; decode excludes the first generated token.
+
+The current upstream builder rejects `exclude_mtp=false` together with
+`prune_lm_head=true`. For a non-speculative baseline use `exclude_mtp=true`.
+Do not substitute an older installed builder: versions without
+`use_paged_attention` can accept that extra option without producing a paged graph.
+
+MLX supports packed `GatedDeltaNet` with scalar-per-value-head gates, FP32
+V-major state and key widths up to 256, plus packed
+`VarlenCausalConvWithState`. These GPU kernels keep cumulative sequence lengths
+on-device. Compact state-update capture (`state_update_capacity > 0`) is not
+implemented; unsupported forms are declined explicitly.
+
+Packed exports can leave batch/token dimensions symbolic. `GatedRMSNorm` and
+`MRotaryEmbedding` claim these forms without CPU boundaries; concrete reshape
+and slice geometry remains shape-keyed across prefill and decode.
+Hybrid packed-SSM decoders coalesce capture-compatible neighbours into
+shape-keyed regions rather than splitting at every shapeless/shape-keyed edge.
+Paged attention keeps its separate cache-alias boundary.
+
+### Qwen3.8-27B initial local qualification
+
+[Raw samples, tokens, options and model/plugin hashes](reports/qwen38-paged-m1max.json)
+cover the same INT4/block-32 paged export on an M1 Max (32 GPU cores, 32 GiB).
+Runtime versions: ORT 1.31.1, GenAI 0.19.0, WebGPU EP 0.5.0 and native MLX 0.32.4.
+MTP is disabled and LM-head pruning retained. Batch size is one, with 64 prompt
+tokens, 256 generated tokens, three warmups and five measured repetitions per EP.
+Providers run in separate sequential processes, without tracing or GPU capture.
+
+| Provider/build | Warm TTFT median | Aggregate decode | Inter-token p95 |
+|---|---:|---:|---:|
+| MLX runnable baseline | 1,636 ms | 3.60 tokens/s | 292 ms |
+| MLX optimized | 615 ms | 7.91 tokens/s | 132 ms |
+| WebGPU | 1,395 ms | 9.02 tokens/s | 126 ms |
+
+The runnable baseline already includes the new packed SSM kernels; it is not an
+unmodified-main measurement. Dynamic norm/rotary claims and capture coalescing
+raise placement from 1,382/1,462 to 1,462/1,462 nodes and reduce fused partitions
+from 641 to 33. Decode improves **2.20x**, but WebGPU still leads decode by **14%**.
+MLX TTFT is **2.27x faster** than WebGPU for this prompt.
+
+All 256 greedy tokens match across every run, both MLX builds and WebGPU.
+A same-binary `ONNXRUNTIME_EP_MLX_NO_COMPILE=1` comparison gives 7.28 tokens/s
+and 1,045 ms TTFT, so the compiled-region policy is retained. These measurements
+do not establish long-prompt or concurrent-request performance. On this 32 GiB
+host, export required external-backed staging and column-batched LM-head
+quantization to avoid memory exhaustion; the quantization algorithm and options
+were unchanged, with column batching checked for bit-identical results.
+
+### Paged-cache writeback follow-up
+
+[Follow-up raw samples and hashes](reports/qwen38-paged-writeback-m1max.json)
+use the same model and measurement settings, with a fresh WebGPU run:
+
+| Provider/build | Warm TTFT median | Aggregate decode | Inter-token p95 |
+|---|---:|---:|---:|
+| MLX direct host metadata, full cache writes | 715 ms | 8.10 tokens/s | 138 ms |
+| MLX sparse cache writeback | 612 ms | 9.77 tokens/s | 109 ms |
+| WebGPU recheck | 1,281 ms | 10.42 tokens/s | 102 ms |
+
+Sparse writeback improves decode by **20.6%** over the metadata-only reference.
+WebGPU still leads decode by **6.6%** in this round; its fresh result, rather
+than the earlier 9.02 tokens/s, is the comparison. All 256 greedy tokens match
+every measured run and the initial qualification. PagedAttention writes only
+updated physical input slots; aliased cache outputs copy an enclosing changed
+row interval, while independent outputs still receive the full cache.
+
+A native grouped-SDPA variant avoided repeated KV-head views but reduced
+end-to-end decode to **9.24 tokens/s**, despite matching all 256 tokens. It was
+reverted; its raw samples are retained as a rejected experiment in the follow-up
+report. Fewer materializations alone do not establish an end-to-end win.
+
+### FP32-accumulating vector-decode follow-up
+
+[Raw samples, tokens, hashes, and both provider orders](reports/qwen38-paged-vector-m1max.json)
+retain the same export, prompt, warmups, repetitions, and 256-token completion.
+Eligible short single-query paged attention keeps FP16 Q/K/V buffers while
+MLX 0.32.4's vector kernel accumulates scores, softmax, and weighted values in
+FP32. Other geometries and custom attention modes retain the previous path.
+
+| Round and execution order | MLX reference | MLX vector decode | WebGPU |
+|---|---:|---:|---:|
+| Reference, candidate, WebGPU | 9.54 tokens/s | 10.16 tokens/s | 8.89 tokens/s |
+| WebGPU, candidate after cooldown | - | 10.59 tokens/s | 9.65 tokens/s |
+
+The same-round MLX improvement is **6.5%**, and every measured token matches the
+original qualification. Reverse-order warm TTFT medians are 588 ms for MLX and
+1,281 ms for WebGPU. Both aggregate comparisons favor MLX, but the reverse-order
+WebGPU run includes one 35.65-second decode sample: its other four runs average
+about **10.57 tokens/s**, nearly matching MLX's 10.59. All samples are retained;
+these results do **not** establish a durable steady-state lead.
+
+Head width 192 and contexts of at least 1,024 keys retain FP32 buffers because
+their FP16 paths do not preserve the existing rounding. Large/canceling-value
+tests compare eligible outputs exactly to an FP32 MLX attention reference and
+also check an independent NumPy reference. A separate mask-elision experiment
+matched tokens but measured 7.79 tokens/s and was reverted.
+
+Public [WebGPU source](https://github.com/microsoft/onnxruntime/tree/74e4120bbc307ecb5c81ef84a9cf42f1fe19519e/onnxruntime/contrib_ops/webgpu)
+uses direct paged decode with shared physical-row offsets and real GPU buffer
+allocation/transfers. This source pin is not verified as the installed 0.5.0
+wheel's build commit. Device tensor residency and avoiding dense KV gathers are
+the next structural leads, not evidence that replacing stock MLX QMV will help.
+
+### Qualified typed-mask decode lead
+
+[Complete samples, tokens, hashes, and reverse-order confirmation](reports/qwen38-paged-typed-mask-m1max.json)
+omit the redundant zero mask only within the validated short, single-query FP16
+GPU vector path without a local window. FP32 accumulation, state/cache outputs,
+prefill, windows, long contexts, and custom attention modes are preserved.
+
+| Build, WebGPU-first round | Warm TTFT median | Aggregate decode | Inter-token p95 |
+|---|---:|---:|---:|
+| WebGPU | 1,280 ms | 10.56 tokens/s | 94.54 ms |
+| MLX vector reference | 595 ms | 10.47 tokens/s | 100.81 ms |
+| MLX typed-mask decode | 586 ms | **10.94 tokens/s** | 95.31 ms |
+
+The candidate improves same-round MLX decode by **4.5%** and leads fresh WebGPU
+by **3.5%**. Every candidate decode sample is faster than every WebGPU sample in
+this round, without dropping samples. Reversing provider order after cooldown
+gives MLX **10.87 tokens/s** versus WebGPU **8.63 tokens/s**; WebGPU slows in that
+round, so the smaller WebGPU-first lead is the primary comparison.
+
+Every measured 256-token sequence matches the original qualification. This is
+an end-to-end, non-speculative batch-one prompt64/output256 result, not evidence
+for longer contexts, concurrent requests, or the external 15-17 tokens/s claim.
+Expanded reference coverage includes causal/bidirectional windows, the model's
+24-query/4-KV head layout, subnormal queries, wide values, and fallback geometry.
+
+Intervening controls remain in the vector report: typed native GQA did not beat
+the repeated-head reference and was reverted. The exact vector-buffer-only build
+also measured 10.36 versus WebGPU 10.43 tokens/s before this mask follow-up.
+
+Source research at
+[MLX-LM](https://github.com/ml-explore/mlx-lm/tree/736ab0d8c1d0edc79c3d798044fe6904e2fa23be),
+[MTPLX](https://github.com/youssofal/mtplx/tree/9882703f3105363ddc37eca9f97aa09a1d387112),
+and [Lithos Metal](https://github.com/lithos-ai/lithos-metal/tree/6653b7df5f2c4392ec7b038960f2796b1499923f)
+prioritizes cache ownership/traffic, projection concatenation with library GEMV,
+and fusion between projections. Their native GPU state/sampling interfaces,
+different quantization, speculative projections, and newer-chip measurements
+are not interchangeable with this standard-ORT, M1, group-32 comparison.
+
 ## Historical model measurements
 
 These results were previously recorded in the root README on an M1 Max.

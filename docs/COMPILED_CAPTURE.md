@@ -79,7 +79,7 @@ The MLX 0.32.2 audit found these missing-`output_shapes` primitives in current l
 | `Split` | ONNX Split |
 | `View` | BitCast |
 | `FFT` | DFT/STFT |
-| `CustomKernel` | the fused selective-scan branch inside ONNX Scan |
+| `CustomKernel` | the fused selective-scan branch inside ONNX Scan; packed VarlenCausalConvWithState and GatedDeltaNet |
 
 RoiAlign's fixed-ratio floating grids retain shape-keyed compilation and validate live
 boundary ROIs/batch indices before every apply. Adaptive/default sampling is eager:

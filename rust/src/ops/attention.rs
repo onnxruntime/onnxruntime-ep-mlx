@@ -2244,6 +2244,13 @@ fn mrotary_embedding_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<()
     let sin_cache = ctx.resolve(&n.inputs[3])?;
     let xs = ctx.shape_of(x);
     let rank = xs.len();
+    let sequence_axis = if rank == 4 { 2 } else { 1 };
+    if ctx.shape_of(pos) != [3, xs[0], xs[sequence_axis]] {
+        return Err(
+            "MRotaryEmbedding: position_ids must have shape [3,batch,sequence] matching input"
+                .into(),
+        );
+    }
     let (b, nh, s, hd, x4) = if rank == 4 {
         (xs[0], xs[1], xs[2], xs[3], x)
     } else {
@@ -3560,9 +3567,15 @@ fn mrotary_embedding_claim(node: &NodeView) -> ClaimResult {
     );
     require!(
         (x.shape.len() == 3 || x.shape.len() == 4)
-            && x.shape.iter().all(|&d| d > 0)
-            && out.shape == x.shape,
-        "input/output must have equal static positive rank-3/rank-4 shapes"
+            && x.shape.iter().all(|&d| d != 0)
+            && *x.shape.last().unwrap() > 0
+            && out.shape.len() == x.shape.len()
+            && out
+                .shape
+                .iter()
+                .zip(&x.shape)
+                .all(|(&a, &b)| a < 0 || b < 0 || a == b),
+        "input/output must have compatible nonempty rank-3/rank-4 shapes and static positive width"
     );
     let (b, s, hd) = if x.shape.len() == 4 {
         (x.shape[0], x.shape[2], x.shape[3])
@@ -3576,7 +3589,12 @@ fn mrotary_embedding_claim(node: &NodeView) -> ClaimResult {
     };
     require!(
         pos.dtype == ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64
-            && pos.shape == [3, b, s],
+            && pos.shape.len() == 3
+            && pos
+                .shape
+                .iter()
+                .zip([3, b, s])
+                .all(|(&a, b)| a < 0 || b < 0 || a == b),
         "position_ids must be int64 [3,B,S]"
     );
     require!(
@@ -3664,13 +3682,14 @@ fn shape_keyed(
 // GQA SDPA in fp32, and pack the outputs back. Causality is optional; RoPE uses exact cache rows.
 // SEPARATE packed QKV, softcap, and left windows compose on this eager path.
 
-/// Read an integer input tensor (int32 or int64) to a host `Vec<i64>`, normalizing dtype through
-/// MLX (astype + eval) — unlike `read_ints`, which reinterprets the raw bytes as i64 and so mangles
-/// an int32 tensor. PagedAttention's control tensors (cum_seqlens/past_seqlens/block_table) are int32.
+/// Read host integer metadata directly; evaluate MLX only for graph-produced values.
 fn read_int_input(
     ctx: &mut TranslationContext,
     r: &crate::engine::TensorRef,
 ) -> Result<Vec<i64>, MlxError> {
+    if matches!(r.source, Src::Initializer | Src::CtxInput) {
+        return ctx.read_ints(r);
+    }
     let a = ctx.resolve(r)?;
     let a = ctx.astype(a, mlx::mlx_dtype__MLX_INT64)?;
     let a = ctx.contiguous_eval(a)?;
@@ -3723,15 +3742,21 @@ fn paged_sdpa(
     k: mlx::mlx_array,
     v: mlx::mlx_array,
     scale: f32,
-    mask: mlx::mlx_array,
+    mask: Option<mlx::mlx_array>,
     head_sink: Option<mlx::mlx_array>,
     softcap: f32,
 ) -> Result<mlx::mlx_array, MlxError> {
     if head_sink.is_none() && softcap == 0.0 {
-        return sdpa(ctx, q, k, v, scale, b"array\0", mask);
+        return match mask {
+            Some(mask) => sdpa(ctx, q, k, v, scale, b"array\0", mask),
+            None => sdpa(ctx, q, k, v, scale, b"\0", empty_array()),
+        };
     }
     let scores = capped_attention_logits(ctx, q, k, scale, softcap)?;
-    let scores = ctx.add(scores, mask)?;
+    let scores = match mask {
+        Some(mask) => ctx.add(scores, mask)?,
+        None => scores,
+    };
     let probs = attention_probs_with_sink(ctx, scores, head_sink)?;
     ctx.matmul(probs, v)
 }
@@ -3929,6 +3954,7 @@ fn paged_attention_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), 
         None
     };
     let mut cache_updated = false;
+    let mut written_slots = Vec::new();
 
     // The cache is [max_seq, rotary_dim/2]; consume its exact values, including reduced precision.
     let rope = if do_rotary {
@@ -4001,6 +4027,7 @@ fn paged_attention_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), 
             }
         }
         if !write_slots.is_empty() {
+            written_slots.extend(write_slots.iter().map(|&slot| slot as usize));
             let row_idx = i32_host_array(ctx, &write_rows);
             let slot_idx = i32_host_array(ctx, &write_slots);
             let knew = ctx.transpose(kh_new, &[0, 2, 1, 3])?;
@@ -4089,40 +4116,70 @@ fn paged_attention_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), 
         // GQA broadcast to full head count, then causal SDPA (query i attends keys [0, past+i]).
         let kh = gqa_repeat_heads(ctx, kh, kv_heads, g, total, head)?; // [1,H,total,head]
         let vh = gqa_repeat_heads(ctx, vh, kv_heads, g, total, v_head)?;
-        let qh = ctx.astype(qh, f32t)?;
-        let kh = ctx.astype(kh, f32t)?;
-        let vh = ctx.astype(vh, f32t)?;
-        let mut mask = if attr_int(n, "is_causal", 1) != 0 {
-            causal_mask_topleft(ctx, nq, total, pastb, f32t)?
-        } else {
-            ctx.zeros(&[nq, total], f32t)?
-        };
-        let window = attr_int(n, "local_window_size", -1) as i32;
-        if window > 0 {
-            let key_pos = ctx.arange(0.0, total as f64, 1.0, mlx::mlx_dtype__MLX_INT32)?;
-            let key_pos = ctx.reshape(key_pos, &[1, total])?;
-            let left = ctx.arange(
-                (pastb - window + 1) as f64,
-                (pastb + nq - window + 1) as f64,
-                1.0,
-                mlx::mlx_dtype__MLX_INT32,
-            )?;
-            let left = ctx.reshape(left, &[nq, 1])?;
-            let allowed = ctx.less_equal(left, key_pos)?;
-            let neg = ctx.scalar_f32(f32::NEG_INFINITY);
-            mask = ctx.where_(allowed, mask, neg)?;
+        let softcap = n.floats.get("softcap").copied().unwrap_or(0.0);
+        let mut compute_dt = f32t;
+        if nq == 1
+            && total < 1024
+            && head == v_head
+            && matches!(head, 64 | 96 | 128 | 256)
+            && head_sink.is_none()
+            && softcap == 0.0
+            && [qh, kh, vh]
+                .iter()
+                .all(|&a| ctx.dtype_of(a) == mlx::mlx_dtype__MLX_FLOAT16)
+        {
+            let mut device = unsafe { mlx::mlx_device_new() };
+            let mut kind = mlx::mlx_device_type__MLX_CPU;
+            let rc = unsafe { mlx::mlx_stream_get_device(&mut device, ctx.stream()) };
+            let rc = if rc == 0 {
+                unsafe { mlx::mlx_device_get_type(&mut kind, device) }
+            } else {
+                rc
+            };
+            unsafe { mlx::mlx_device_free(device) };
+            if rc != 0 {
+                return Err(format!(
+                    "PagedAttention: MLX stream device inspection failed (status {rc}); \
+                     verify the MLX runtime installation and stream initialization"
+                ));
+            }
+            if kind == mlx::mlx_device_type__MLX_GPU {
+                // MLX 0.32.4's single-pass vector kernel keeps all reductions in FP32.
+                // Two-pass attention and head-192 FP16 do not match the FP32 reference.
+                compute_dt = mlx::mlx_dtype__MLX_FLOAT16;
+            }
         }
-        let mask = ctx.reshape(mask, &[1, 1, nq, total])?;
-        let o = paged_sdpa(
-            ctx,
-            qh,
-            kh,
-            vh,
-            scale,
-            mask,
-            head_sink,
-            n.floats.get("softcap").copied().unwrap_or(0.0),
-        )?; // [1,H,nq,head]
+        let qh = ctx.astype(qh, compute_dt)?;
+        let kh = ctx.astype(kh, compute_dt)?;
+        let vh = ctx.astype(vh, compute_dt)?;
+        let window = attr_int(n, "local_window_size", -1) as i32;
+        let mask = if compute_dt == mlx::mlx_dtype__MLX_FLOAT16 && window <= 0 {
+            None
+        } else {
+            let mut mask = if attr_int(n, "is_causal", 1) != 0 {
+                causal_mask_topleft(ctx, nq, total, pastb, compute_dt)?
+            } else {
+                ctx.zeros(&[nq, total], compute_dt)?
+            };
+            if window > 0 {
+                let key_pos = ctx.arange(0.0, total as f64, 1.0, mlx::mlx_dtype__MLX_INT32)?;
+                let key_pos = ctx.reshape(key_pos, &[1, total])?;
+                let left = ctx.arange(
+                    (pastb - window + 1) as f64,
+                    (pastb + nq - window + 1) as f64,
+                    1.0,
+                    mlx::mlx_dtype__MLX_INT32,
+                )?;
+                let left = ctx.reshape(left, &[nq, 1])?;
+                let allowed = ctx.less_equal(left, key_pos)?;
+                let neg = ctx.scalar_f32(f32::NEG_INFINITY);
+                mask = ctx.where_(allowed, mask, neg)?;
+            }
+            let mask = ctx.astype(mask, compute_dt)?;
+            let mask = ctx.reshape(mask, &[1, 1, nq, total])?;
+            Some(mask)
+        };
+        let o = paged_sdpa(ctx, qh, kh, vh, scale, mask, head_sink, softcap)?; // [1,H,nq,head]
         let o = ctx.transpose(o, &[0, 2, 1, 3])?; // [1,nq,H,head]
         let o = ctx.reshape(o, &[nq, out_hidden])?;
         outs.push(ctx.astype(o, out_dt)?);
@@ -4143,9 +4200,16 @@ fn paged_attention_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), 
         }
     };
     if cache_updated {
-        kcache = ctx.write_back_input(&n.inputs[3], kcache)?;
+        kcache =
+            ctx.write_back_input_rows(&n.inputs[3], kcache, 1, &written_slots, n.outputs.get(1))?;
         if let Some(current_vcache) = vcache {
-            vcache = Some(ctx.write_back_input(&n.inputs[4], current_vcache)?);
+            vcache = Some(ctx.write_back_input_rows(
+                &n.inputs[4],
+                current_vcache,
+                1,
+                &written_slots,
+                n.outputs.get(2),
+            )?);
         }
     }
     ctx.bind(&n.outputs[0], output);

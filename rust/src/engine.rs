@@ -802,7 +802,7 @@ pub struct TranslationContext<'a> {
     kv_deltas: HashMap<String, DeltaWrite>,
     /// Evaluated MLX arrays that must be copied back into mutable ORT input buffers for
     /// side-effecting ops such as PagedAttention's in-place KV-cache update.
-    input_writebacks: Vec<(*mut c_void, mlxsys::mlx_array, usize)>,
+    input_writebacks: Vec<(*mut c_void, mlxsys::mlx_array, Vec<std::ops::Range<usize>>)>,
     /// True while translating inside the GENERAL compiled-subgraph closure trace. In this mode the
     /// dynamic inputs are shapeless tracer placeholders with no host data, so any mid-graph host eval
     /// (`contiguous_eval` — the host-computed Det/NonZero/Unique ops) is illegal and must fail the
@@ -1093,10 +1093,13 @@ impl<'a> TranslationContext<'a> {
         Ok(self.cache_put(key, packed))
     }
 
-    pub fn write_back_input(
+    pub fn write_back_input_rows(
         &mut self,
         input: &TensorRef,
         a: mlxsys::mlx_array,
+        axis: usize,
+        rows: &[usize],
+        output: Option<&OutRef>,
     ) -> Result<mlxsys::mlx_array, MlxError> {
         let a = self.contiguous(a)?;
         self.env.insert(input.name.clone(), a);
@@ -1105,14 +1108,33 @@ impl<'a> TranslationContext<'a> {
             Src::CtxInput => {
                 let (data, shape, _) = self.read_ctx_input(input.ctx_index)?;
                 let arr = std::mem::ManuallyDrop::new(Array::from_raw(a));
-                let count = shape.iter().try_fold(1usize, |count, &dim| {
-                    usize::try_from(dim)
-                        .ok()
-                        .and_then(|dim| count.checked_mul(dim))
-                        .ok_or_else(|| "MLX: input writeback shape overflow".to_string())
-                })?;
-                self.input_writebacks
-                    .push((data as *mut c_void, a, count * arr.itemsize()));
+                let ranges = input_writeback_ranges(&shape, arr.itemsize(), axis, rows)?;
+                if arr.shape() != shape {
+                    return Err(format!(
+                        "MLX: input writeback {} shape {:?} differs from input {shape:?}; preserve input geometry for in-place updates",
+                        input.name,
+                        arr.shape()
+                    ));
+                }
+                if let Some(output) = output.filter(|out| !out.name.is_empty())
+                    && !rows.is_empty()
+                {
+                    let axis_len = shape[axis] as usize;
+                    let first = rows.iter().map(|row| row % axis_len).min().unwrap();
+                    let last = rows.iter().map(|row| row % axis_len).max().unwrap();
+                    // Copy the enclosing row interval in every slab only when ORT actually
+                    // aliases this output to the input. All other rows are unchanged.
+                    self.kv_deltas.insert(
+                        output.name.clone(),
+                        DeltaWrite {
+                            axis,
+                            offset: first as i64,
+                            count: (last - first + 1) as i64,
+                            alias_ptr: data as usize,
+                        },
+                    );
+                }
+                self.input_writebacks.push((data as *mut c_void, a, ranges));
             }
             Src::Intermediate => {}
             _ => return Err("MLX: cannot write back an immutable input".to_string()),
@@ -2552,10 +2574,10 @@ impl<'a> TranslationContext<'a> {
             }
         }
         let mut writebacks = Vec::with_capacity(self.input_writebacks.len());
-        for &(dst, a, bytes) in &self.input_writebacks {
+        for (dst, a, ranges) in self.input_writebacks.drain(..) {
             let index = outs.size();
             outs.append(a);
-            writebacks.push((dst, index, bytes));
+            writebacks.push((dst, index, ranges));
         }
         // VectorArray owns references to every boundary root, whose lazy graphs keep their
         // dependencies alive. Per-node handles must not pin every intermediate allocation
@@ -2593,10 +2615,16 @@ impl<'a> TranslationContext<'a> {
             let a = outs.get(index);
             self.copy_out(o, a.as_raw())?;
         }
-        for &(dst, index, bytes) in &writebacks {
+        for (dst, index, ranges) in writebacks {
             let arr = outs.get(index);
-            unsafe {
-                std::ptr::copy_nonoverlapping(arr.data_bytes(), dst as *mut u8, bytes);
+            for range in ranges {
+                unsafe {
+                    std::ptr::copy(
+                        arr.data_bytes().add(range.start),
+                        (dst as *mut u8).add(range.start),
+                        range.len(),
+                    );
+                }
             }
         }
         Ok(())
@@ -2828,9 +2856,79 @@ pub(crate) fn copy_out_raw_delta(
     Ok(())
 }
 
+fn input_writeback_ranges(
+    shape: &[i64],
+    itemsize: usize,
+    axis: usize,
+    rows: &[usize],
+) -> Result<Vec<std::ops::Range<usize>>, MlxError> {
+    let invalid = || {
+        format!(
+            "MLX: input writeback rows exceed shape {shape:?} at axis {axis} with {itemsize}-byte elements; check cache geometry and slot mapping"
+        )
+    };
+    if axis >= shape.len() || itemsize == 0 {
+        return Err(invalid());
+    }
+    let dims = shape
+        .iter()
+        .map(|&dim| usize::try_from(dim).map_err(|_| invalid()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let row_count = dims[..=axis]
+        .iter()
+        .try_fold(1usize, |n, &dim| n.checked_mul(dim))
+        .ok_or_else(invalid)?;
+    let row_bytes = dims[axis + 1..]
+        .iter()
+        .try_fold(itemsize, |n, &dim| n.checked_mul(dim))
+        .ok_or_else(invalid)?;
+    row_count.checked_mul(row_bytes).ok_or_else(invalid)?;
+    let mut rows = rows.to_vec();
+    rows.sort_unstable();
+    rows.dedup();
+    let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
+    for row in rows {
+        if row >= row_count {
+            return Err(invalid());
+        }
+        if row_bytes == 0 {
+            continue;
+        }
+        let start = row * row_bytes;
+        let end = start + row_bytes;
+        if let Some(last) = ranges.last_mut()
+            && last.end == start
+        {
+            last.end = end;
+        } else {
+            ranges.push(start..end);
+        }
+    }
+    Ok(ranges)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn input_writeback_rows_are_checked_sorted_and_coalesced() {
+        let ranges = input_writeback_ranges(&[3, 4, 2, 8], 2, 1, &[9, 2, 1, 2]).unwrap();
+        assert_eq!(ranges, vec![32..96, 288..320]);
+        assert_eq!(
+            input_writeback_ranges(&[2, 3], 4, 0, &[1]).unwrap(),
+            vec![12..24]
+        );
+        assert!(
+            input_writeback_ranges(&[3, 4, 2, 8], 2, 1, &[])
+                .unwrap()
+                .is_empty()
+        );
+        assert!(input_writeback_ranges(&[3, 4, 2, 8], 2, 1, &[12]).is_err());
+        assert!(input_writeback_ranges(&[3, 4], 2, 2, &[0]).is_err());
+        assert!(input_writeback_ranges(&[3, -1], 2, 0, &[0]).is_err());
+        assert!(input_writeback_ranges(&[i64::MAX, 4], 8, 0, &[0]).is_err());
+    }
 
     fn empty_context(plan: &mut Plan) -> TranslationContext<'_> {
         TranslationContext::new(
