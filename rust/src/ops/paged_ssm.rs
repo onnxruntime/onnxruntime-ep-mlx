@@ -30,7 +30,7 @@ const CONV: &str = r#"
     if (b >= B) return;
     int start = offsets[b], end = offsets[b + 1];
     if (offsets[0] != 0 || offsets[B] != N ||
-        start < 0 || end <= start || end > N) return;
+        start < 0 || end < start || end > N) return;
     for (int t = start; t < end; ++t) {
         float sum = BIAS ? float(bias[c]) : 0.0f;
         for (int j = 0; j < K; ++j) {
@@ -58,7 +58,7 @@ const DELTA: &str = r#"
     uint kh = h / (H / HQ);
     int start = offsets[b], end = offsets[b + 1];
     if (offsets[0] != 0 || offsets[B] != N ||
-        start < 0 || end <= start || end > N) return;
+        start < 0 || end < start || end > N) return;
     float state[(K + 31) / 32];
     for (uint j = 0; j < (K + 31) / 32; ++j) {
         uint ki = lane + 32 * j;

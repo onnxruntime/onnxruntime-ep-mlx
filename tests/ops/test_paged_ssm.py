@@ -215,8 +215,9 @@ def test_varlen_conv(dtype, activation, kernel, dilation, with_bias):
         serialized = proto.SerializeToString()
         feeds.pop("bias")
     session = strict_session(runtime_model(serialized, dtype))
-    for offsets in ([0, 2, 7], [0, 6, 7], [0, 1, 2]):
-        feeds["input"] = feeds["input"][: offsets[-1]]
+    initial_input = feeds["input"]
+    for offsets in ([0, 2, 7], [0, 0, 7], [0, 7, 7], [0, 6, 7], [0, 0, 0], [0, 1, 2]):
+        feeds["input"] = initial_input[: offsets[-1]]
         feeds["offsets"] = np.array(offsets, np.int32)
         expected = np.empty_like(feeds["input"])
         state = np.empty_like(feeds["state"])
@@ -336,16 +337,28 @@ def test_packed_delta(dtype, rule, geometry, fused, norm, with_gates):
         domain="com.microsoft",
     )
     session = strict_session(runtime_model(serialized, dtype))
-    for offsets in ([0, 1, tokens], [0, 4, tokens], [0, 1, 2]):
-        for name in ("qkv", "decay", "beta"):
-            if name in feeds:
-                feeds[name] = feeds[name][: offsets[-1]]
+    initial_tokens = {
+        name: feeds[name] for name in ("qkv", "decay", "beta") if name in feeds
+    }
+    for offsets in (
+        [0, 1, tokens],
+        [0, 0, tokens],
+        [0, tokens, tokens],
+        [0, 4, tokens],
+        [0, 0, 0],
+        [0, 1, 2],
+    ):
+        for name, array in initial_tokens.items():
+            feeds[name] = array[: offsets[-1]]
         feeds["offsets"] = np.array(offsets, np.int32)
         expected = delta_reference(feeds, hq, h, k, v, rule, fused, norm, scale)
         actual = session.run(None, runtime_feeds(feeds))
         for result, reference in zip(actual, expected):
             tolerance = 8e-3 if dtype == ml_dtypes.bfloat16 else 3e-3
             np.testing.assert_allclose(result, reference, rtol=tolerance, atol=3e-5)
+        for b, (start, end) in enumerate(pairwise(offsets)):
+            if start == end:
+                np.testing.assert_array_equal(actual[1][b], feeds["state"][b])
         feeds["state"] = actual[1]
     if dtype == np.float16 and fused and rule == "gated_delta" and k == 128:
         expected = delta_reference(feeds, hq, h, k, v, rule, fused, norm, scale)
