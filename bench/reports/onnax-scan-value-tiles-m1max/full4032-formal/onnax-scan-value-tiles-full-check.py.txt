@@ -1,0 +1,39 @@
+import json, os, subprocess, sys
+from pathlib import Path
+import numpy as np
+seq=int(os.environ.get('ONNAX_CHECK_SEQUENCE','64'))
+warmup=int(os.environ.get('ONNAX_CHECK_WARMUP','1'))
+samples=int(os.environ.get('ONNAX_CHECK_SAMPLES','1'))
+root=Path(os.environ.get('ONNAX_CHECK_OUTPUT',f'/tmp/onnax-symbolic-native-full{seq}'));root.mkdir(exist_ok=False)
+env={**os.environ,'HF_HUB_OFFLINE':'1','HF_DATASETS_OFFLINE':'1'}
+for label in ['baseline','candidate']:
+    child_env={**env,'ONNAX_SYMBOLIC_CANDIDATE':'1','ONNAX_SYMBOLIC_OVERRIDE_REPORT':str(root/f'{label}-overrides.json')}
+    cmd=[sys.executable,'/tmp/onnax-symbolic-native-worker.py','--export','/tmp/onnax-qwen35-real-bf16-canonical-30/training/export','--cache-dir','/tmp/onnax-qwen35-real-cache','--library',('/tmp/onnax-mlx-lookup-reuse-runtime/libonnxruntime_mlx_ep.dylib' if label=='baseline' else '/tmp/onnax-scan-value-tiles-runtime/libonnxruntime_mlx_ep.dylib'),'--sequence',str(seq),'--warmup',str(warmup),'--samples',str(samples),'--output',str(root/f'{label}.json'),'--gradients-output',str(root/f'{label}.npz')]
+    subprocess.run([sys.executable,'-m','examples.huggingface.guard','--output-dir',str(root/f'{label}-guard'),'--',*cmd],env=child_env,check=True)
+a,b=[json.loads((root/f'{label}.json').read_text()) for label in ['baseline','candidate']]
+for key in ['input_sha256','adapter_sha256','input_shape','prediction_targets_per_step','source_identity','pretrained_source','checkpoint_boundaries','session_compile_policy','platform','python','versions','environment','torch_threads','ort','adapter_bytes','benchmark_source_sha256']:
+    assert a[key]==b[key], key
+for report in [a,b]:
+    assert report['measured_steps']==samples and len(report['samples'])==samples
+    assert report['warmup_steps']==warmup
+    for row in report['samples']:
+        assert all(np.isfinite(value) for value in row.values())
+        assert row['gradient_step_seconds']>0
+np.testing.assert_allclose([s['loss'] for s in a['samples']],[s['loss'] for s in b['samples']],rtol=1e-4,atol=1e-6)
+checks={}
+with np.load(root/'baseline.npz') as x,np.load(root/'candidate.npz') as y:
+    assert set(x.files)==set(y.files) and len(x.files)==60
+    for name in x.files:
+        assert x[name].shape==y[name].shape and x[name].dtype==y[name].dtype
+        assert np.isfinite(x[name]).all() and np.isfinite(y[name]).all()
+        np.testing.assert_allclose(y[name],x[name],rtol=1e-4,atol=1e-6,err_msg=name)
+        checks[name]={'max_abs':float(np.max(np.abs(x[name]-y[name]))),'byte_equal':x[name].tobytes()==y[name].tobytes()}
+summaries={}
+for label,report in [('baseline',a),('candidate',b)]:
+    values=np.array([r['gradient_step_seconds'] for r in report['samples']])
+    guard=json.loads((root/f'{label}-guard/execution.json').read_text())
+    assert guard['status']=='complete' and guard['returncode']==0
+    summaries[label]={'median_seconds':float(np.median(values)),'p95_seconds':float(np.percentile(values,95)),'tokens_per_second':report['prediction_targets_per_step']/float(np.median(values)),'physical_memory':report['physical_memory']}
+(root/'timing-summary.json').write_text(json.dumps(summaries,indent=2)+'\n')
+(root/'comparison.json').write_text(json.dumps({'sequence':seq,'all60_gradients_match':True,'checks':checks,'warmup':warmup,'samples':samples,'scope':'paired full-model gradient correctness check: same symbolic backward graphs; original and eight-column reverse kernel libraries; fixed inputs and adapter'},indent=2)+'\n')
+print('All 60 adapter gradients and token loss match',flush=True)

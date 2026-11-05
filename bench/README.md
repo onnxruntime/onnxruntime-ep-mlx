@@ -77,8 +77,9 @@ head-stage diagnostics, process guards and source checksums.
 
 The [4032-token backward-block report](reports/onnax-scan-value-tiles-m1max/README.md)
 measures eight-column reverse tiles: 8.0% higher block throughput and 22.5%
-lower MLX allocator peak on M1 Max. The report includes raw samples, numerical
-checks and runtime digests.
+lower MLX allocator peak on M1 Max. The full decoder pair records an 8.8%
+lower process peak and 10.501 / 10.675 second step medians. The report includes
+raw samples, numerical checks and runtime digests.
 
 ## Historical model measurements
 
