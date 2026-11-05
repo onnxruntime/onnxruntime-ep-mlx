@@ -497,26 +497,40 @@ def test_paged_attention_latent_layout_and_rotary_offset():
 
 @pytest.mark.parametrize("d", [64, 96, 128, 192, 256])
 @pytest.mark.parametrize("length,window", [(1, -1), (319, -1), (1023, 3), (1024, -1)])
-def test_paged_attention_vector_decode_fp32_reductions(d, length, window):
-    h, kv, nb, block = 6, 2, 5, 256
+@pytest.mark.parametrize("h,kv", [(6, 2), (24, 4), (64, 1)])
+@pytest.mark.parametrize("tiny_queries", [False, True])
+@pytest.mark.parametrize("causal", [False, True])
+def test_paged_attention_vector_decode_fp32_reductions(
+    d, length, window, h, kv, tiny_queries, causal
+):
+    nb, block = 5, 256
     geometry = (h, kv, d, nb, block, 1)
     proto = onnx.load_from_string(_model(*geometry, 0, 0))
     proto.graph.node[0].attribute.append(
         onnx.helper.make_attribute("local_window_size", window)
     )
+    proto.graph.node[0].attribute.append(
+        onnx.helper.make_attribute("is_causal", int(causal))
+    )
     rng = np.random.default_rng(1329)
     feeds, _ = _inputs(*geometry, 0, 0, 1329)
     for name, width in [("query", h * d), ("key", kv * d), ("value", kv * d)]:
         scale = 2000 if name == "value" else 0.3
+        if tiny_queries and name == "query":
+            scale = 2**-18
+        elif tiny_queries and name == "key":
+            scale = 4096
         feeds[name] = (rng.standard_normal((1, width)) * scale).astype(np.float16)
     feeds["value_cache"] *= np.float16(2000)
+    if tiny_queries:
+        feeds["key_cache"] *= np.float16(8192)
     feeds["cumulative_sequence_length"] = np.array([0, 1], dtype=np.int32)
     feeds["past_seqlens"] = np.array([length - 1], dtype=np.int32)
     reference = _paged_ref(
         feeds["query"], feeds["key"], feeds["value"],
         feeds["key_cache"], feeds["value_cache"],
         feeds["cumulative_sequence_length"], feeds["past_seqlens"],
-        feeds["block_table"], h, kv, d, local_window_size=window,
+        feeds["block_table"], h, kv, d, local_window_size=window, is_causal=causal,
     )
     actual = m.run_mlx(
         proto.SerializeToString(), {name: value.copy() for name, value in feeds.items()}
@@ -544,7 +558,7 @@ def test_paged_attention_vector_decode_fp32_reductions(d, length, window):
             m.tensor("mask", DT.FLOAT, [1, 1, 1, length]),
         ],
         [m.tensor("Y", DT.FLOAT, shape_q)],
-        attributes={"scale": 1 / math.sqrt(d)},
+        attributes={"scale": float(np.float32(1) / np.sqrt(np.float32(d)))},
         opset=23,
     )
     fp32_feeds = {
@@ -560,7 +574,12 @@ def test_paged_attention_vector_decode_fp32_reductions(d, length, window):
     )
     session.disable_fallback()
     fp32_output = session.run(None, fp32_feeds)[0]
-    np.testing.assert_array_equal(actual, fp32_output.reshape(1, h * d).astype(np.float16))
+    fp32_output = fp32_output.reshape(1, h * d).astype(np.float16)
+    if d == 192:
+        # The unchanged FP32 fallback can select a different reduction layout.
+        np.testing.assert_allclose(actual, fp32_output, rtol=2e-3, atol=2e-2)
+    else:
+        np.testing.assert_array_equal(actual, fp32_output)
 
 
 def test_paged_attention_ort129_optional_inputs_and_cache_outputs():

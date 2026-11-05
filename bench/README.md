@@ -205,6 +205,35 @@ allocation/transfers. This source pin is not verified as the installed 0.5.0
 wheel's build commit. Device tensor residency and avoiding dense KV gathers are
 the next structural leads, not evidence that replacing stock MLX QMV will help.
 
+### Qualified typed-mask decode lead
+
+[Complete samples, tokens, hashes, and reverse-order confirmation](reports/qwen38-paged-typed-mask-m1max.json)
+omit the redundant zero mask only within the validated short, single-query FP16
+GPU vector path without a local window. FP32 accumulation, state/cache outputs,
+prefill, windows, long contexts, and custom attention modes are preserved.
+
+| Build, WebGPU-first round | Warm TTFT median | Aggregate decode | Inter-token p95 |
+|---|---:|---:|---:|
+| WebGPU | 1,280 ms | 10.56 tokens/s | 94.54 ms |
+| MLX vector reference | 595 ms | 10.47 tokens/s | 100.81 ms |
+| MLX typed-mask decode | 586 ms | **10.94 tokens/s** | 95.31 ms |
+
+The candidate improves same-round MLX decode by **4.5%** and leads fresh WebGPU
+by **3.5%**. Every candidate decode sample is faster than every WebGPU sample in
+this round, without dropping samples. Reversing provider order after cooldown
+gives MLX **10.87 tokens/s** versus WebGPU **8.63 tokens/s**; WebGPU slows in that
+round, so the smaller WebGPU-first lead is the primary comparison.
+
+Every measured 256-token sequence matches the original qualification. This is
+an end-to-end, non-speculative batch-one prompt64/output256 result, not evidence
+for longer contexts, concurrent requests, or the external 15-17 tokens/s claim.
+Expanded reference coverage includes causal/bidirectional windows, the model's
+24-query/4-KV head layout, subnormal queries, wide values, and fallback geometry.
+
+Intervening controls remain in the vector report: typed native GQA did not beat
+the repeated-head reference and was reverted. The exact vector-buffer-only build
+also measured 10.36 versus WebGPU 10.43 tokens/s before this mask follow-up.
+
 Source research at
 [MLX-LM](https://github.com/ml-explore/mlx-lm/tree/736ab0d8c1d0edc79c3d798044fe6904e2fa23be),
 [MTPLX](https://github.com/youssofal/mtplx/tree/9882703f3105363ddc37eca9f97aa09a1d387112),

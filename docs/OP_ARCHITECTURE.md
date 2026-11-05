@@ -747,7 +747,9 @@ materializations. Longer contexts, head width 192, CPU streams, other input
 dtypes, unequal Q/V widths, sinks, and softcap retain the FP32 path. The narrower
 eligibility preserves the rounding of the existing implementation: two-pass
 FP16 attention rounds partial outputs, and head-192 FP16 does not match the FP32
-reference. Causal/window masks and cache writeback semantics are unchanged.
+reference. In the eligible single-query path, all gathered keys are visible when
+there is no local window, so the redundant zero mask is omitted. Windows and
+other paths retain their masks; cache writeback semantics are unchanged.
 
 Standard causal `Attention` with one query and one current key can attend every
 past/current key. It omits the redundant causal array rather than capturing a

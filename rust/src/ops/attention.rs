@@ -3742,15 +3742,21 @@ fn paged_sdpa(
     k: mlx::mlx_array,
     v: mlx::mlx_array,
     scale: f32,
-    mask: mlx::mlx_array,
+    mask: Option<mlx::mlx_array>,
     head_sink: Option<mlx::mlx_array>,
     softcap: f32,
 ) -> Result<mlx::mlx_array, MlxError> {
     if head_sink.is_none() && softcap == 0.0 {
-        return sdpa(ctx, q, k, v, scale, b"array\0", mask);
+        return match mask {
+            Some(mask) => sdpa(ctx, q, k, v, scale, b"array\0", mask),
+            None => sdpa(ctx, q, k, v, scale, b"\0", empty_array()),
+        };
     }
     let scores = capped_attention_logits(ctx, q, k, scale, softcap)?;
-    let scores = ctx.add(scores, mask)?;
+    let scores = match mask {
+        Some(mask) => ctx.add(scores, mask)?,
+        None => scores,
+    };
     let probs = attention_probs_with_sink(ctx, scores, head_sink)?;
     ctx.matmul(probs, v)
 }
@@ -4146,28 +4152,33 @@ fn paged_attention_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), 
         let qh = ctx.astype(qh, compute_dt)?;
         let kh = ctx.astype(kh, compute_dt)?;
         let vh = ctx.astype(vh, compute_dt)?;
-        let mut mask = if attr_int(n, "is_causal", 1) != 0 {
-            causal_mask_topleft(ctx, nq, total, pastb, compute_dt)?
-        } else {
-            ctx.zeros(&[nq, total], compute_dt)?
-        };
         let window = attr_int(n, "local_window_size", -1) as i32;
-        if window > 0 {
-            let key_pos = ctx.arange(0.0, total as f64, 1.0, mlx::mlx_dtype__MLX_INT32)?;
-            let key_pos = ctx.reshape(key_pos, &[1, total])?;
-            let left = ctx.arange(
-                (pastb - window + 1) as f64,
-                (pastb + nq - window + 1) as f64,
-                1.0,
-                mlx::mlx_dtype__MLX_INT32,
-            )?;
-            let left = ctx.reshape(left, &[nq, 1])?;
-            let allowed = ctx.less_equal(left, key_pos)?;
-            let neg = ctx.scalar_f32(f32::NEG_INFINITY);
-            mask = ctx.where_(allowed, mask, neg)?;
-        }
-        let mask = ctx.astype(mask, compute_dt)?;
-        let mask = ctx.reshape(mask, &[1, 1, nq, total])?;
+        let mask = if compute_dt == mlx::mlx_dtype__MLX_FLOAT16 && window <= 0 {
+            None
+        } else {
+            let mut mask = if attr_int(n, "is_causal", 1) != 0 {
+                causal_mask_topleft(ctx, nq, total, pastb, compute_dt)?
+            } else {
+                ctx.zeros(&[nq, total], compute_dt)?
+            };
+            if window > 0 {
+                let key_pos = ctx.arange(0.0, total as f64, 1.0, mlx::mlx_dtype__MLX_INT32)?;
+                let key_pos = ctx.reshape(key_pos, &[1, total])?;
+                let left = ctx.arange(
+                    (pastb - window + 1) as f64,
+                    (pastb + nq - window + 1) as f64,
+                    1.0,
+                    mlx::mlx_dtype__MLX_INT32,
+                )?;
+                let left = ctx.reshape(left, &[nq, 1])?;
+                let allowed = ctx.less_equal(left, key_pos)?;
+                let neg = ctx.scalar_f32(f32::NEG_INFINITY);
+                mask = ctx.where_(allowed, mask, neg)?;
+            }
+            let mask = ctx.astype(mask, compute_dt)?;
+            let mask = ctx.reshape(mask, &[1, 1, nq, total])?;
+            Some(mask)
+        };
         let o = paged_sdpa(ctx, qh, kh, vh, scale, mask, head_sink, softcap)?; // [1,H,nq,head]
         let o = ctx.transpose(o, &[0, 2, 1, 3])?; // [1,nq,H,head]
         let o = ctx.reshape(o, &[nq, out_hidden])?;
