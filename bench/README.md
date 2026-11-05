@@ -80,6 +80,76 @@ measures eight-column reverse tiles: 8.0% higher block throughput and 22.5%
 lower MLX allocator peak on M1 Max. The report includes raw samples, numerical
 checks and runtime digests.
 
+## Paged GenAI inference
+
+`genai_paged.py` measures a current GenAI Engine export with MTP disabled. Use
+the exact same exported directory for both providers, in separate sequential
+processes, with tracing and GPU capture disabled:
+
+```sh
+python bench/genai_paged.py --model /path/to/export --ep mlx \
+  --library "$PWD/rust/target/release/libonnxruntime_mlx_ep.dylib" \
+  --output /tmp/paged-mlx.json
+python bench/genai_paged.py --model /path/to/export --ep webgpu \
+  --output /tmp/paged-webgpu.json
+```
+
+Install compatible `onnxruntime`, `onnxruntime-genai` and
+`onnxruntime-ep-webgpu` versions in one environment. The runner defaults to
+three warmups, five repetitions and 256 generated tokens. It reports warm TTFT,
+decode ms/token, aggregate decode tokens/s and inter-token p95, and retains
+greedy tokens, raw timing samples, runtime versions and plugin/config hashes.
+Compare prompt and generated token arrays before comparing speed. A fresh Engine
+per repetition prevents cross-run prefix-cache reuse while model sessions stay
+warm. TTFT includes request submission; decode excludes the first generated token.
+
+The current upstream builder rejects `exclude_mtp=false` together with
+`prune_lm_head=true`. For a non-speculative baseline use `exclude_mtp=true`.
+Do not substitute an older installed builder: versions without
+`use_paged_attention` can accept that extra option without producing a paged graph.
+
+MLX supports packed `GatedDeltaNet` with scalar-per-value-head gates, FP32
+V-major state and key widths up to 256, plus packed
+`VarlenCausalConvWithState`. These GPU kernels keep cumulative sequence lengths
+on-device. Compact state-update capture (`state_update_capacity > 0`) is not
+implemented; unsupported forms are declined explicitly.
+
+Packed exports can leave batch/token dimensions symbolic. `GatedRMSNorm` and
+`MRotaryEmbedding` claim these forms without CPU boundaries; concrete reshape
+and slice geometry remains shape-keyed across prefill and decode.
+Hybrid packed-SSM decoders coalesce capture-compatible neighbours into
+shape-keyed regions rather than splitting at every shapeless/shape-keyed edge.
+Paged attention keeps its separate cache-alias boundary.
+
+### Qwen3.8-27B local qualification
+
+[Raw samples, tokens, options and model/plugin hashes](reports/qwen38-paged-m1max.json)
+cover the same INT4/block-32 paged export on an M1 Max (32 GPU cores, 32 GiB).
+Runtime versions: ORT 1.31.1, GenAI 0.19.0, WebGPU EP 0.5.0 and native MLX 0.32.4.
+MTP is disabled and LM-head pruning retained. Batch size is one, with 64 prompt
+tokens, 256 generated tokens, three warmups and five measured repetitions per EP.
+Providers run in separate sequential processes, without tracing or GPU capture.
+
+| Provider/build | Warm TTFT median | Aggregate decode | Inter-token p95 |
+|---|---:|---:|---:|
+| MLX runnable baseline | 1,636 ms | 3.60 tokens/s | 292 ms |
+| MLX optimized | 615 ms | 7.91 tokens/s | 132 ms |
+| WebGPU | 1,395 ms | 9.02 tokens/s | 126 ms |
+
+The runnable baseline already includes the new packed SSM kernels; it is not an
+unmodified-main measurement. Dynamic norm/rotary claims and capture coalescing
+raise placement from 1,382/1,462 to 1,462/1,462 nodes and reduce fused partitions
+from 641 to 33. Decode improves **2.20x**, but WebGPU still leads decode by **14%**.
+MLX TTFT is **2.27x faster** than WebGPU for this prompt.
+
+All 256 greedy tokens match across every run, both MLX builds and WebGPU.
+A same-binary `ONNXRUNTIME_EP_MLX_NO_COMPILE=1` comparison gives 7.28 tokens/s
+and 1,045 ms TTFT, so the compiled-region policy is retained. These measurements
+do not establish long-prompt or concurrent-request performance. On this 32 GiB
+host, export required external-backed staging and column-batched LM-head
+quantization to avoid memory exhaustion; the quantization algorithm and options
+were unchanged, with column batching checked for bit-identical results.
+
 ## Historical model measurements
 
 These results were previously recorded in the root README on an M1 Max.

@@ -228,6 +228,24 @@ pub(crate) unsafe fn get_capability(
                 }
             })
             .collect();
+        let packed_ssm_decoder = decoder_graph
+            && node_order
+                .iter()
+                .zip(&supported)
+                .any(|(&node, &supported)| {
+                    let metadata = &snapshot.nodes[&node];
+                    supported
+                        && metadata.domain == "com.microsoft"
+                        && metadata.op_type == "GatedDeltaNet"
+                });
+        if packed_ssm_decoder {
+            // Packed recurrence already requires shape-keyed capture. Promote its
+            // shapeless neighbours instead of copying activations at every colour boundary.
+            for (&node, class) in node_order.iter().zip(&mut compile_class) {
+                let metadata = &snapshot.nodes[&node];
+                *class = packed_ssm_partition_class(*class, &metadata.domain, &metadata.op_type);
+            }
+        }
         // Capture colours serve no purpose when every plan executes eagerly.
         // Keep dtype/convexity/claim boundaries while avoiding ORT fusion and
         // host-array boundaries created solely for compiled capture modes.
@@ -434,6 +452,19 @@ fn packed_qdq_eager_nodes(
     result
 }
 
+fn packed_ssm_partition_class(
+    class: CompilePartitionClass,
+    domain: &str,
+    op_type: &str,
+) -> CompilePartitionClass {
+    match (domain, op_type, class) {
+        // Paged cache aliasing is not supported by general capture.
+        ("com.microsoft", "PagedAttention", _) => CompilePartitionClass::Eager,
+        (_, _, CompilePartitionClass::Shapeless) => CompilePartitionClass::ShapeKeyed,
+        _ => class,
+    }
+}
+
 fn select_layer_partition_span(value: Option<&str>, layer_count: usize) -> Option<usize> {
     match value.map(str::trim) {
         Some("0" | "off" | "false") => None,
@@ -513,7 +544,27 @@ unsafe fn graph_metadata_value(
 
 #[cfg(test)]
 mod tests {
-    use super::{native_candidate_claim, select_layer_partition_span};
+    use super::{native_candidate_claim, packed_ssm_partition_class, select_layer_partition_span};
+    use crate::registry::CompilePartitionClass;
+
+    #[test]
+    fn packed_ssm_capture_promotes_only_safe_neighbours() {
+        use CompilePartitionClass::{Eager, ShapeKeyed, Shapeless};
+        for class in [Eager, ShapeKeyed, Shapeless] {
+            assert_eq!(
+                packed_ssm_partition_class(class, "com.microsoft", "PagedAttention"),
+                Eager
+            );
+            assert_eq!(
+                packed_ssm_partition_class(class, "", "Mul"),
+                if class == Shapeless {
+                    ShapeKeyed
+                } else {
+                    class
+                }
+            );
+        }
+    }
     use crate::ops::shape::validate_tile_payload;
     use crate::registry::{ClaimResult, SlotInfo};
     use crate::sys::ort::*;

@@ -1761,7 +1761,18 @@ fn gated_rms_norm_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), M
     let out_dt = ctx.dtype_of(x);
     let x_shape = ctx.shape_of(x);
     let c = ctx.dim(scale, 0);
-    let rows = ctx.size_of(x) as i32 / c;
+    if c <= 0
+        || x_shape.is_empty()
+        || x_shape.last().unwrap() % c != 0
+        || ctx.shape_of(gate) != x_shape
+    {
+        return Err(
+            "GatedRMSNorm: gate must match X and the positive scale width must divide X's last dimension"
+                .into(),
+        );
+    }
+    let rows = i32::try_from(ctx.size_of(x) / c as usize)
+        .map_err(|_| "GatedRMSNorm: grouped row count exceeds int32; reduce the input size")?;
 
     let x32 = ctx.astype(x, mlx::mlx_dtype__MLX_FLOAT32)?;
     let x2 = ctx.reshape(x32, &[rows, c])?;
@@ -1820,11 +1831,11 @@ fn gated_rms_norm_claim(node: &NodeView) -> ClaimResult {
         "X, scale, gate, and Y must share one MLX float dtype"
     );
     require!(
-        !x.shape.is_empty() && x.shape.iter().all(|&d| d > 0),
-        "X must have a static positive shape"
+        !x.shape.is_empty() && x.shape.iter().all(|&d| d != 0) && *x.shape.last().unwrap() > 0,
+        "X must have a static positive final dimension and nonempty leading dimensions"
     );
     require!(
-        gate.shape == x.shape && out.shape == x.shape,
+        compatible_shape(&gate.shape, &x.shape) && compatible_shape(&out.shape, &x.shape),
         "gate and Y must have the same shape as X"
     );
     require!(
@@ -1905,27 +1916,25 @@ pub fn register(registry: &mut OpRegistry) {
         },
         "conservatively validates concrete gate/parameter geometry",
     );
-    for (op_type, handler, claim) in [
-        (
-            "GatedAdd",
-            gated_add_op as OpHandler,
-            gated_add_claim as ClaimPredicate,
-        ),
-        (
-            "GatedRMSNorm",
-            gated_rms_norm_op as OpHandler,
-            gated_rms_norm_claim as ClaimPredicate,
-        ),
-    ] {
-        registry.register_shapeless(OpRegistration {
+    registry.register_shapeless(OpRegistration {
+        domain: "com.microsoft",
+        op_type: "GatedAdd",
+        min_opset: K_ANY_OPSET,
+        max_opset: K_ANY_OPSET,
+        handler: gated_add_op,
+        claim: gated_add_claim,
+    });
+    registry.register_shape_keyed(
+        OpRegistration {
             domain: "com.microsoft",
-            op_type,
+            op_type: "GatedRMSNorm",
             min_opset: K_ANY_OPSET,
             max_opset: K_ANY_OPSET,
-            handler,
-            claim,
-        });
-    }
+            handler: gated_rms_norm_op,
+            claim: gated_rms_norm_claim,
+        },
+        "conservatively captures concrete grouped reshape geometry",
+    );
 }
 
 #[cfg(test)]

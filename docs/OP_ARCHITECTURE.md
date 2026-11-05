@@ -599,6 +599,7 @@ The **core Rust modules** register:
 | `conv.rs` | Conv/ConvTranspose/DeformConv and local/global pooling |
 | `quant.rs` | MatMulNBits, GatherBlockQuantized, Quantize/Dequantize/DynamicQuantize, MatMulInteger, ConvInteger, QLinearMatMul, QLinearConv |
 | `ssm.rs` | TensorScatter (opset 24), CausalConvWithState, LinearAttention (linear/gated/delta/gated_delta, GQA) |
+| `paged_ssm.rs` | Packed VarlenCausalConvWithState and GatedDeltaNet; device-resident sequence offsets, FP32 V-major recurrence, no compact transition capture |
 | `selective_scan.rs` | Mamba-1 selective scan: recognises the `Scan` body and replaces the per-timestep unroll with one custom Metal kernel (state kept in registers) |
 | `nonzero.rs` | Exact eager NonZero host scan with live cardinality and int64 coordinates |
 | `unique.rs` / `host_scan.rs` | Exact eager Unique grouping/axis slices; shared checked live host payload access |
@@ -786,7 +787,7 @@ backend limitation.
 
 `GatherBlockQuantized` is claimed for both the symmetric int4 embedding form (three inputs, `zp=8`, `w=(q-8)·scale`) and the asymmetric four-input form with explicit `zero_points` (`w=(q-zp)·scale`). The backend performs gather plus int4 dequant, uses the schema's default block size of 128, and returns zero slices for out-of-range indices as required by ORT 1.31. Bounds are checked before narrowing int64 indices, and the result retains the scale tensor's dtype.
 
-`GatedRMSNorm` supports the ORT 1.31 `activation` attribute: `silu` (default), its `swish` alias, and `sigmoid`. Unknown activations are not claimed.
+`GatedRMSNorm` supports the ORT 1.31 `activation` attribute: `silu` (default), its `swish` alias, and `sigmoid`. Unknown activations are not claimed. Dynamic leading dimensions are supported with a static feature width; compilation is shape-keyed because grouped reshapes capture concrete runtime geometry. `MRotaryEmbedding` likewise accepts dynamic batch/sequence dimensions with static head and rotary widths.
 
 ### 3.5 Softmax and elementwise
 

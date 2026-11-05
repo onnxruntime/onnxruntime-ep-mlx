@@ -2244,6 +2244,13 @@ fn mrotary_embedding_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<()
     let sin_cache = ctx.resolve(&n.inputs[3])?;
     let xs = ctx.shape_of(x);
     let rank = xs.len();
+    let sequence_axis = if rank == 4 { 2 } else { 1 };
+    if ctx.shape_of(pos) != [3, xs[0], xs[sequence_axis]] {
+        return Err(
+            "MRotaryEmbedding: position_ids must have shape [3,batch,sequence] matching input"
+                .into(),
+        );
+    }
     let (b, nh, s, hd, x4) = if rank == 4 {
         (xs[0], xs[1], xs[2], xs[3], x)
     } else {
@@ -3560,9 +3567,15 @@ fn mrotary_embedding_claim(node: &NodeView) -> ClaimResult {
     );
     require!(
         (x.shape.len() == 3 || x.shape.len() == 4)
-            && x.shape.iter().all(|&d| d > 0)
-            && out.shape == x.shape,
-        "input/output must have equal static positive rank-3/rank-4 shapes"
+            && x.shape.iter().all(|&d| d != 0)
+            && *x.shape.last().unwrap() > 0
+            && out.shape.len() == x.shape.len()
+            && out
+                .shape
+                .iter()
+                .zip(&x.shape)
+                .all(|(&a, &b)| a < 0 || b < 0 || a == b),
+        "input/output must have compatible nonempty rank-3/rank-4 shapes and static positive width"
     );
     let (b, s, hd) = if x.shape.len() == 4 {
         (x.shape[0], x.shape[2], x.shape[3])
@@ -3576,7 +3589,12 @@ fn mrotary_embedding_claim(node: &NodeView) -> ClaimResult {
     };
     require!(
         pos.dtype == ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64
-            && pos.shape == [3, b, s],
+            && pos.shape.len() == 3
+            && pos
+                .shape
+                .iter()
+                .zip([3, b, s])
+                .all(|(&a, b)| a < 0 || b < 0 || a == b),
         "position_ids must be int64 [3,B,S]"
     );
     require!(
