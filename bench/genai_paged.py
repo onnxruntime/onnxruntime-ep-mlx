@@ -34,11 +34,17 @@ def summarize(runs):
     }
 
 
-def run_once(og, model, tokens, generated):
+def run_once(og, model, tokens, generated, *, require_mtp=False):
     import numpy as np
 
     # A fresh Engine avoids cross-run prefix-cache hits; the model's sessions stay warm.
     engine = og.Engine(model)
+    if require_mtp and not engine.max_draft_tokens_per_proposal():
+        raise RuntimeError(
+            "GenAI Engine reports max_draft_tokens_per_proposal=0: this model cannot "
+            "execute MTP verification. Re-export hybrid models with positive "
+            "state_update_capacity and use a provider supporting compact state replay"
+        )
     options = og.RequestOptions()
     options.set_max_session_tokens(len(tokens) + generated)
     request = engine.create_request(options=options)
@@ -76,10 +82,30 @@ def run_once(og, model, tokens, generated):
         "ttft_seconds": timestamps[0] - start,
         "decode_seconds": timestamps[-1] - timestamps[0],
         "decode_intervals_seconds": [b - a for a, b in pairwise(timestamps)],
+        "speculative_stats": engine.get_speculative_stats(),
+        "max_draft_tokens_per_proposal": engine.max_draft_tokens_per_proposal(),
     }
     del request, engine
     gc.collect()
     return result
+
+
+def validate_speculation(run):
+    stats = run["speculative_stats"]
+    if stats["mtp_failures"]:
+        raise RuntimeError(
+            f"MTP reported {stats['mtp_failures']} failures; inspect runtime logs "
+            "and resolve draft execution errors before comparing performance"
+        )
+    if not (
+        stats["draft_forward_passes"]
+        and stats["draft_tokens_evaluated"]
+        and stats["completed_rounds"]
+    ):
+        raise RuntimeError(
+            "MTP did not complete draft verification rounds; "
+            "check MTP configuration and increase --tokens before comparing performance"
+        )
 
 
 def main():
@@ -94,6 +120,15 @@ def main():
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--repetitions", type=int, default=5)
     parser.add_argument(
+        "--mtp", action="store_true", help="Require an enabled and active MTP drafter"
+    )
+    parser.add_argument(
+        "--max-draft-tokens",
+        type=int,
+        choices=range(1, 17),
+        help="Override the MTP draft limit without changing the exported model",
+    )
+    parser.add_argument(
         "--prompt",
         default="Explain how a compiler transforms source code into machine code.",
     )
@@ -102,6 +137,8 @@ def main():
         parser.error("require tokens >= 2, warmup >= 3, and repetitions >= 1")
     if args.ep == "mlx" and (args.library is None or not args.library.is_file()):
         parser.error("--library must point to the development MLX EP dylib")
+    if args.max_draft_tokens is not None and not args.mtp:
+        parser.error("--max-draft-tokens requires --mtp")
     for name in ("ONNXRUNTIME_EP_MLX_TRACE", "ONNXRUNTIME_EP_MLX_GPU_CAPTURE"):
         if os.environ.get(name):
             parser.error(f"unset {name} before collecting final latency measurements")
@@ -115,8 +152,14 @@ def main():
 
     config_path = args.model / "genai_config.json"
     exported = json.loads(config_path.read_text())
-    if exported.get("model", {}).get("mtp", {}).get("enabled"):
-        parser.error("disable MTP in the export for a non-speculative EP comparison")
+    mtp_enabled = bool(exported.get("model", {}).get("mtp", {}).get("enabled"))
+    if mtp_enabled != args.mtp:
+        parser.error(
+            "MTP export requires --mtp"
+            if mtp_enabled
+            else "--mtp requires an export with model.mtp.enabled=true; re-export "
+            "with exclude_mtp=false prune_lm_head=false"
+        )
     if args.ep == "mlx":
         library = args.library.resolve()
         provider = "MLXExecutionProvider"
@@ -129,6 +172,10 @@ def main():
     config = og.Config(str(args.model.resolve()))
     config.clear_providers()
     config.append_provider(provider)
+    overlay = {}
+    if args.max_draft_tokens is not None:
+        overlay = {"speculative": {"max_draft_tokens": args.max_draft_tokens}}
+        config.overlay(json.dumps(overlay))
     started = time.perf_counter()
     model = og.Model(config)
     construction_seconds = time.perf_counter() - started
@@ -138,18 +185,33 @@ def main():
         add_generation_prompt=True,
     )
     tokens = [int(token) for token in tokenizer.encode(prompt)]
-    for _ in range(args.warmup):
-        run_once(og, model, tokens, args.tokens)
+    for warmup in range(args.warmup):
+        run = run_once(og, model, tokens, args.tokens, require_mtp=args.mtp)
+        if args.mtp:
+            validate_speculation(run)
+        print(
+            json.dumps(
+                {
+                    "warmup": warmup + 1,
+                    "ttft_seconds": run["ttft_seconds"],
+                    "decode_seconds": run["decode_seconds"],
+                }
+            ),
+            flush=True,
+        )
     runs = []
     for _ in range(args.repetitions):
-        run = run_once(og, model, tokens, args.tokens)
+        run = run_once(og, model, tokens, args.tokens, require_mtp=args.mtp)
+        if args.mtp:
+            validate_speculation(run)
         runs.append(run)
         print(
             json.dumps(
                 {
                     k: v
                     for k, v in run.items()
-                    if k not in ("tokens", "decode_intervals_seconds")
+                    if k
+                    not in ("tokens", "decode_intervals_seconds", "speculative_stats")
                 }
             ),
             flush=True,
@@ -196,6 +258,14 @@ def main():
         "model_directory": str(args.model.resolve()),
         "plugin_sha256": hashlib.sha256(library.read_bytes()).hexdigest(),
         "config_sha256": hashlib.sha256(config_path.read_bytes()).hexdigest(),
+        "mode": "mtp" if args.mtp else "non_speculative",
+        "runtime_overlay": overlay,
+        "initializer_sharing": {
+            name: bool(
+                exported.get("model", {}).get(name, {}).get("shared_initializers")
+            )
+            for name in ("decoder", "mtp")
+        },
         "prompt_tokens": list(tokens),
         "generated_tokens": args.tokens,
         "warmups": args.warmup,

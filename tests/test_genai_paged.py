@@ -28,14 +28,20 @@ def test_summary_rejects_missing_decode_measurement(tokens, seconds):
         summarize([{"tokens": tokens, "ttft_seconds": 0.1, "decode_seconds": seconds}])
 
 
-def test_report_serializes_numpy_tokenizer_ids(monkeypatch, tmp_path):
+@pytest.mark.parametrize("mtp,draft_limit", [(False, None), (True, None), (True, 2)])
+def test_report_serializes_numpy_tokenizer_ids(monkeypatch, tmp_path, mtp, draft_limit):
     monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_COMPILE", "0")
-    (tmp_path / "genai_config.json").write_text("{}")
+    (tmp_path / "genai_config.json").write_text(
+        json.dumps({"model": {"mtp": {"enabled": mtp}}})
+    )
     library = tmp_path / "plugin.dylib"
     library.write_bytes(b"test")
     output = tmp_path / "report.json"
+    overlays = []
     config = SimpleNamespace(
-        clear_providers=lambda: None, append_provider=lambda _: None
+        clear_providers=lambda: None,
+        append_provider=lambda _: None,
+        overlay=lambda value: overlays.append(json.loads(value)),
     )
     tokenizer = SimpleNamespace(
         apply_chat_template=lambda **_: "prompt",
@@ -51,13 +57,21 @@ def test_report_serializes_numpy_tokenizer_ids(monkeypatch, tmp_path):
     monkeypatch.setattr(genai_paged, "version", lambda _: "test")
     monkeypatch.setattr(genai_paged.subprocess, "check_output", lambda *_, **__: "32")
 
-    def run_once(og, model, tokens, generated):
+    def run_once(og, model, tokens, generated, *, require_mtp=False):
         assert all(type(token) is int for token in tokens)
+        assert require_mtp == mtp
         return {
             "tokens": [5, 6],
             "ttft_seconds": 0.1,
             "decode_seconds": 0.01,
             "decode_intervals_seconds": [0.01],
+            "speculative_stats": {
+                "mtp_failures": 0,
+                "draft_forward_passes": int(mtp),
+                "draft_tokens_evaluated": int(mtp),
+                "completed_rounds": int(mtp),
+                "target_verify_forward_passes": int(mtp),
+            },
         }
 
     monkeypatch.setattr(genai_paged, "run_once", run_once)
@@ -78,9 +92,99 @@ def test_report_serializes_numpy_tokenizer_ids(monkeypatch, tmp_path):
             "2",
             "--repetitions",
             "1",
+            *(["--mtp"] if mtp else []),
+            *(["--max-draft-tokens", str(draft_limit)] if draft_limit else []),
         ],
     )
     genai_paged.main()
     report = json.loads(output.read_text())
     assert report["prompt_tokens"] == [3, 4]
     assert report["mlx_options"]["ONNXRUNTIME_EP_MLX_NO_COMPILE"] == "0"
+    assert report["mode"] == ("mtp" if mtp else "non_speculative")
+    expected_overlay = (
+        {"speculative": {"max_draft_tokens": draft_limit}} if draft_limit else {}
+    )
+    assert report["runtime_overlay"] == expected_overlay
+    assert overlays == ([expected_overlay] if draft_limit else [])
+    assert report["runs"][0]["speculative_stats"]["draft_forward_passes"] == int(mtp)
+
+
+@pytest.mark.parametrize(
+    "failures,draft,verify,rounds,message",
+    [
+        (1, 1, 1, 1, "failures"),
+        (0, 0, 1, 1, "did not complete"),
+        (0, 1, 0, 1, "did not complete"),
+        (0, 1, 1, 0, "did not complete"),
+    ],
+)
+def test_mtp_rejects_failed_or_inactive_speculation(
+    failures, draft, verify, rounds, message
+):
+    with pytest.raises(RuntimeError, match=message):
+        genai_paged.validate_speculation(
+            {
+                "speculative_stats": {
+                    "mtp_failures": failures,
+                    "draft_forward_passes": draft,
+                    "target_verify_forward_passes": verify,
+                    "draft_tokens_evaluated": verify,
+                    "completed_rounds": rounds,
+                }
+            }
+        )
+
+
+def test_mtp_accepts_completed_rounds_without_granular_verify_counter():
+    genai_paged.validate_speculation(
+        {
+            "speculative_stats": {
+                "mtp_failures": 0,
+                "draft_forward_passes": 18,
+                "target_verify_forward_passes": 0,
+                "draft_tokens_evaluated": 14,
+                "completed_rounds": 5,
+            }
+        }
+    )
+
+
+@pytest.mark.parametrize("enabled,opt_in", [(True, False), (False, True)])
+def test_mtp_requires_matching_export_and_opt_in(
+    monkeypatch, tmp_path, capsys, enabled, opt_in
+):
+    (tmp_path / "genai_config.json").write_text(
+        json.dumps({"model": {"mtp": {"enabled": enabled}}})
+    )
+    monkeypatch.setitem(sys.modules, "onnxruntime_genai", SimpleNamespace())
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "genai_paged",
+            "--model",
+            str(tmp_path),
+            "--ep",
+            "webgpu",
+            "--output",
+            str(tmp_path / "report.json"),
+            *(["--mtp"] if opt_in else []),
+        ],
+    )
+    with pytest.raises(SystemExit) as exc:
+        genai_paged.main()
+    assert exc.value.code == 2
+    expected = (
+        "MTP export requires --mtp"
+        if enabled
+        else "--mtp requires an export with model.mtp.enabled=true"
+    )
+    assert expected in capsys.readouterr().err
+
+
+def test_mtp_rejects_zero_engine_capacity_before_request_creation():
+    og = SimpleNamespace(
+        Engine=lambda _: SimpleNamespace(max_draft_tokens_per_proposal=lambda: 0)
+    )
+    with pytest.raises(RuntimeError, match="state_update_capacity"):
+        genai_paged.run_once(og, object(), [1], 256, require_mtp=True)

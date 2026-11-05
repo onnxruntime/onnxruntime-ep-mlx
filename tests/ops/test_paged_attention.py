@@ -500,9 +500,11 @@ def test_paged_attention_latent_layout_and_rotary_offset():
 @pytest.mark.parametrize("h,kv", [(6, 2), (24, 4), (64, 1)])
 @pytest.mark.parametrize("tiny_queries", [False, True])
 @pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("nq", [1, 2, 5, 8, 9])
 def test_paged_attention_vector_decode_fp32_reductions(
-    d, length, window, h, kv, tiny_queries, causal
+    d, length, window, h, kv, tiny_queries, causal, nq
 ):
+    length = max(length, nq)
     nb, block = 5, 256
     geometry = (h, kv, d, nb, block, 1)
     proto = onnx.load_from_string(_model(*geometry, 0, 0))
@@ -520,12 +522,12 @@ def test_paged_attention_vector_decode_fp32_reductions(
             scale = 2**-18
         elif tiny_queries and name == "key":
             scale = 4096
-        feeds[name] = (rng.standard_normal((1, width)) * scale).astype(np.float16)
+        feeds[name] = (rng.standard_normal((nq, width)) * scale).astype(np.float16)
     feeds["value_cache"] *= np.float16(2000)
     if tiny_queries:
         feeds["key_cache"] *= np.float16(8192)
-    feeds["cumulative_sequence_length"] = np.array([0, 1], dtype=np.int32)
-    feeds["past_seqlens"] = np.array([length - 1], dtype=np.int32)
+    feeds["cumulative_sequence_length"] = np.array([0, nq], dtype=np.int32)
+    feeds["past_seqlens"] = np.array([length - nq], dtype=np.int32)
     reference = _paged_ref(
         feeds["query"], feeds["key"], feeds["value"],
         feeds["key_cache"], feeds["value_cache"],
@@ -539,30 +541,35 @@ def test_paged_attention_vector_decode_fp32_reductions(
 
     keys = np.empty((length, kv, d), dtype=np.float32)
     values = np.empty_like(keys)
-    for p in range(length - 1):
+    for p in range(length - nq):
         physical = int(feeds["block_table"][0, p // block])
         keys[p] = feeds["key_cache"][physical, p % block]
         values[p] = feeds["value_cache"][physical, p % block]
-    keys[-1] = feeds["key"].reshape(kv, d)
-    values[-1] = feeds["value"].reshape(kv, d)
-    shape_q, shape_kv = [1, h, 1, d], [1, h, length, d]
-    mask = np.zeros((1, 1, 1, length), dtype=np.float32)
+    keys[-nq:] = feeds["key"].reshape(nq, kv, d)
+    values[-nq:] = feeds["value"].reshape(nq, kv, d)
+    shape_q, shape_kv = [1, h, nq, d], [1, h, length, d]
+    rows = (length - nq + np.arange(nq))[:, None]
+    cols = np.arange(length)[None, :]
+    mask = np.zeros((nq, length), dtype=np.float32)
+    if causal:
+        mask[cols > rows] = -np.inf
     if window > 0:
-        mask[..., :max(0, length - window)] = -np.inf
+        mask[cols < rows - window + 1] = -np.inf
+    mask = mask[None, None]
     fp32_model = m.make_model(
         "Attention",
         [
             m.tensor("Q", DT.FLOAT, shape_q),
             m.tensor("K", DT.FLOAT, shape_kv),
             m.tensor("V", DT.FLOAT, shape_kv),
-            m.tensor("mask", DT.FLOAT, [1, 1, 1, length]),
+            m.tensor("mask", DT.FLOAT, [1, 1, nq, length]),
         ],
         [m.tensor("Y", DT.FLOAT, shape_q)],
         attributes={"scale": float(np.float32(1) / np.sqrt(np.float32(d)))},
         opset=23,
     )
     fp32_feeds = {
-        "Q": feeds["query"].astype(np.float32).reshape(shape_q),
+        "Q": feeds["query"].astype(np.float32).reshape(nq, h, d).transpose(1, 0, 2)[None],
         "K": np.repeat(keys, h // kv, axis=1).transpose(1, 0, 2)[None],
         "V": np.repeat(values, h // kv, axis=1).transpose(1, 0, 2)[None],
         "mask": mask,
@@ -574,9 +581,9 @@ def test_paged_attention_vector_decode_fp32_reductions(
     )
     session.disable_fallback()
     fp32_output = session.run(None, fp32_feeds)[0]
-    fp32_output = fp32_output.reshape(1, h * d).astype(np.float16)
-    if d == 192:
-        # The unchanged FP32 fallback can select a different reduction layout.
+    fp32_output = fp32_output[0].transpose(1, 0, 2).reshape(nq, h * d).astype(np.float16)
+    if d == 192 or nq > 8:
+        # Unchanged FP32 fallbacks can select a different reduction layout.
         np.testing.assert_allclose(actual, fp32_output, rtol=2e-3, atol=2e-2)
     else:
         np.testing.assert_array_equal(actual, fp32_output)

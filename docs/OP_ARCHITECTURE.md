@@ -599,7 +599,7 @@ The **core Rust modules** register:
 | `conv.rs` | Conv/ConvTranspose/DeformConv and local/global pooling |
 | `quant.rs` | MatMulNBits, GatherBlockQuantized, Quantize/Dequantize/DynamicQuantize, MatMulInteger, ConvInteger, QLinearMatMul, QLinearConv |
 | `ssm.rs` | TensorScatter (opset 24), CausalConvWithState, LinearAttention (linear/gated/delta/gated_delta, GQA) |
-| `paged_ssm.rs` | Packed VarlenCausalConvWithState and GatedDeltaNet; device-resident sequence offsets, FP32 V-major recurrence, empty rows preserve initial state, no compact transition capture |
+| `paged_ssm.rs` | Packed VarlenCausalConvWithState and GatedDeltaNet; device-resident offsets, FP32 V-major recurrence, empty rows preserve initial state, compact prefix-transition capture up to capacity 8 |
 | `selective_scan.rs` | Mamba-1 selective scan: recognises the `Scan` body and replaces the per-timestep unroll with one custom Metal kernel (state kept in registers) |
 | `nonzero.rs` | Exact eager NonZero host scan with live cardinality and int64 coordinates |
 | `unique.rs` / `host_scan.rs` | Exact eager Unique grouping/axis slices; shared checked live host payload access |
