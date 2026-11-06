@@ -4097,7 +4097,7 @@ fn paged_attention_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), 
             && vquant.is_none()
             && head_sink.is_none()
             && n.floats.get("softcap").copied().unwrap_or(0.0) == 0.0
-            && direct_window.is_some()
+            && direct_window.is_some_and(|window| window <= 0)
             && [qh, kh_new, vh_new, kcache, vcache.unwrap()]
                 .iter()
                 .all(|&a| ctx.dtype_of(a) == mlx::mlx_dtype__MLX_FLOAT16)
@@ -4136,7 +4136,6 @@ fn paged_attention_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), 
                 nq,
                 total,
                 attr_int(n, "is_causal", 1) != 0,
-                direct_window.unwrap(),
                 scale,
             )?;
             let o = ctx.transpose(o, &[0, 2, 1, 3])?;
@@ -4149,7 +4148,13 @@ fn paged_attention_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), 
         // skipped/remapped current slots. It must not attend to the unquantized new K/V.
         let read_len = if kquant.is_some() { total } else { pastb };
         let window = attr_int(n, "local_window_size", -1) as i32;
-        let first = if window > 0 {
+        let first = if window > 0
+            && nq > 8
+            && !latent
+            && kquant.is_none()
+            && vquant.is_none()
+            && out_dt == mlx::mlx_dtype__MLX_FLOAT16
+        {
             (pastb - window + 1).max(0)
         } else {
             0
