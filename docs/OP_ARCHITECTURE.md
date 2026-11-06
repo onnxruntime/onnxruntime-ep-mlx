@@ -1,5 +1,14 @@
 # ONNX→MLX Op Translation Architecture
 
+The experimental `ONNXRUNTIME_EP_MLX_SMALL_M_MMA=1` route is default-off and
+eager-only: symmetric INT4/block32, seven/eight flattened rows, FP16 activation
+and scales, K divisible by 64 and N divisible by 32, on a GPU stream. It consumes
+the existing aligned constant Uint32 repack; other forms retain upstream
+quantized matmul. Dequantization rounds to FP16, matrix accumulation remains
+FP32, and the declared output remains FP16. Activation reads are scalar global
+loads so contiguous FP16 views need not have vector-aligned starting offsets.
+No FP16-accumulation experiment is included.
+
 **Status:** Final Rust post-pivot architecture
 **Date:** 2026-07-13
 **Repo:** `onnxruntime-mlx`

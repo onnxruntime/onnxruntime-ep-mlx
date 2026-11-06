@@ -1117,10 +1117,10 @@ fn matmulnbits_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxE
     if ashape.last().copied() != Some(k as i32) {
         return Err("MatMulNBits: activation last dimension must equal K".to_string());
     }
-    let mut m: i32 = 1;
-    for &d in &ashape[..ashape.len().saturating_sub(1)] {
-        m *= d;
-    }
+    let m = ashape[..ashape.len().saturating_sub(1)]
+        .iter()
+        .try_fold(1i32, |rows, &dim| rows.checked_mul(dim))
+        .ok_or("MatMulNBits: flattened row count exceeds int32")?;
     let act_dt = ctx.dtype_of(a);
 
     // Host repacking must never capture live boundary/intermediate bytes as trace constants.
@@ -1138,7 +1138,14 @@ fn matmulnbits_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxE
             matmulnbits_symmetric_biases(ctx, n, big_n as i32, nblocks, bits, scales2d)?
         };
 
-        if explicit_fp16_qmm_eligible(
+        if block == 32
+            && bits == 4
+            && !has_zp
+            && let Some(y) =
+                super::small_m_matmul::try_emit(ctx, a, w, scales2d, m, big_n as i32, k as i32)?
+        {
+            y
+        } else if explicit_fp16_qmm_eligible(
             ctx,
             ashape.len(),
             m,

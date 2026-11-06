@@ -22,6 +22,7 @@ pub(crate) mod qdq;
 pub mod quant;
 pub mod reduction;
 pub mod shape;
+mod small_m_matmul;
 // signal/random/recurrent/ssm/misc/controlflow
 pub mod controlflow;
 pub mod gated_delta_scan;

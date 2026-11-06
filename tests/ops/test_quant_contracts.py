@@ -18,6 +18,109 @@ from test_matmulnbits_asym import _matmulnbits_model
 from test_qmoe import _qmoe_model
 
 
+def _freeze_nbits_parameters(model, feeds):
+    proto = onnx.load_from_string(model)
+    for name in list(feeds):
+        if name != "a":
+            proto.graph.initializer.append(numpy_helper.from_array(feeds.pop(name), name))
+    inputs = [value for value in proto.graph.input if value.name == "a"]
+    del proto.graph.input[:]
+    proto.graph.input.extend(inputs)
+    return proto.SerializeToString()
+
+
+@pytest.mark.parametrize("rows,k,n,asymmetric", [
+    (7, 64, 32, False), (8, 128, 64, False), (8, 5120, 96, False),
+    (8, 128, 64, True), (8, 128, 33, False), (8, 96, 32, False),
+    (1, 64, 32, False),
+])
+def test_small_m_mma_fp16_reference_and_fallbacks(monkeypatch, rows, k, n, asymmetric):
+    monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_COMPILE", "1")
+    monkeypatch.setenv("ONNXRUNTIME_EP_MLX_SMALL_M_MMA", "1")
+    model, feeds = _matmulnbits_model(
+        M=rows, K=k, N=n, block=32, asymmetric=asymmetric, dtype=m.DataType.FLOAT16,
+    )
+    packed = feeds["b"]
+    quantized = np.stack([packed & 15, packed >> 4], axis=-1).reshape(n, -1)[:, :k]
+    blocks = (k + 31) // 32
+    if asymmetric:
+        packed_zp = feeds["zero_points"].reshape(n, -1)
+        zero_points = np.stack([packed_zp & 15, packed_zp >> 4], axis=-1)
+        zero_points = zero_points.reshape(n, -1)[:, :blocks].repeat(32, axis=1)[:, :k]
+    else:
+        zero_points = 8
+    scales = feeds["scales"].reshape(n, blocks).repeat(32, axis=1)[:, :k]
+    weights = (quantized.astype(np.int16) - zero_points).astype(np.float16) * scales
+    expected = feeds["a"].astype(np.float32) @ weights.astype(np.float32).T
+    model = _freeze_nbits_parameters(model, feeds)
+    session = ort.InferenceSession(model, providers=m.EP_PROVIDERS)
+    session.disable_fallback()
+    m.assert_mlx_claims(model, feeds)
+    np.testing.assert_allclose(session.run(None, feeds)[0], expected, rtol=2e-3, atol=5e-3)
+
+
+@pytest.mark.parametrize("rows,selected", [(7, True), (1, False)])
+def test_small_m_mma_dispatch_trace(tmp_path, rows, selected):
+    trace = tmp_path / "mma.json"
+    subprocess.run(
+        [sys.executable, "-m", "pytest",
+         f"{Path(__file__)}::test_small_m_mma_fp16_reference_and_fallbacks[{rows}-64-32-False]",
+         "-q", "-p", "no:cacheprovider"],
+        check=True, timeout=120,
+        env={**os.environ, "ONNXRUNTIME_EP_MLX_TRACE": str(trace)},
+    )
+    events = json.loads(trace.read_text())
+    assert ("mlx_int4_small_m_mma_fp32" in json.dumps(events)) == selected
+
+
+def test_small_m_mma_keeps_fp32_running_sums(monkeypatch):
+    monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_COMPILE", "1")
+    monkeypatch.setenv("ONNXRUNTIME_EP_MLX_SMALL_M_MMA", "1")
+    model, feeds = _matmulnbits_model(
+        M=8, K=5120, N=32, block=32, asymmetric=False, dtype=m.DataType.FLOAT16,
+    )
+    feeds["b"].fill(0xff)
+    feeds["scales"].fill(1)
+    feeds["a"].fill(32)
+    feeds["a"][:, :, 2560:] = -32
+    model = _freeze_nbits_parameters(model, feeds)
+    session = ort.InferenceSession(model, providers=m.EP_PROVIDERS)
+    session.disable_fallback()
+    actual = session.run(None, feeds)[0]
+    np.testing.assert_array_equal(actual, np.zeros((1, 8, 32), np.float16))
+
+
+@pytest.mark.parametrize("offset", [1, 3])
+@pytest.mark.parametrize("mma", [False, True])
+def test_small_m_mma_contiguous_offset_activation(monkeypatch, offset, mma):
+    monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_COMPILE", "1")
+    monkeypatch.setenv("ONNXRUNTIME_EP_MLX_SMALL_M_MMA", str(int(mma)))
+    model, feeds = _matmulnbits_model(
+        M=8, K=64, N=32, block=32, asymmetric=False, dtype=m.DataType.FLOAT16,
+    )
+    feeds["b"].fill(0x99)
+    feeds["scales"].fill(0.125)
+    expected = feeds["a"].astype(np.float32).sum(axis=-1, keepdims=True) * 0.125
+    expected = np.repeat(expected, 32, axis=-1)
+    model = _freeze_nbits_parameters(model, feeds)
+    proto = onnx.load_from_string(model)
+    proto.graph.node[0].input[0] = "offset_a"
+    proto.graph.initializer.extend([
+        numpy_helper.from_array(np.array([offset], np.int64), "starts"),
+        numpy_helper.from_array(np.array([offset + 512], np.int64), "ends"),
+        numpy_helper.from_array(np.array([2], np.int64), "axes"),
+        numpy_helper.from_array(np.array([1, 8, 64], np.int64), "shape"),
+    ])
+    proto.graph.node.insert(0, helper.make_node("Reshape", ["flat_a", "shape"], ["offset_a"]))
+    proto.graph.node.insert(0, helper.make_node("Slice", ["a", "starts", "ends", "axes"], ["flat_a"]))
+    proto.graph.input[0].CopyFrom(helper.make_tensor_value_info(
+        "a", TensorProto.FLOAT16, [1, 1, offset + 512]))
+    feeds["a"] = np.pad(feeds["a"].reshape(-1), (offset, 0)).reshape(1, 1, -1)
+    session = ort.InferenceSession(proto.SerializeToString(), providers=m.EP_PROVIDERS)
+    session.disable_fallback()
+    np.testing.assert_allclose(session.run(None, feeds)[0], expected, rtol=2e-3, atol=2e-3)
+
+
 @pytest.mark.parametrize("eager", [False, True])
 @pytest.mark.parametrize("k", [64, 51])
 @pytest.mark.parametrize("intermediate", [False, True])
