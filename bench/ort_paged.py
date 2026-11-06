@@ -28,9 +28,13 @@ def state_output(name):
     raise ValueError(f"{name!r} is not a paged state input")
 
 
-def run_once(session, prompt, generated, *, info, blocks, block_size):
+def run_once(
+    session, prompt, generated, *, info, blocks, block_size, prefill_chunk_size=None
+):
     import onnxruntime as ort
 
+    if len(prompt) == 0 or (prefill_chunk_size is not None and prefill_chunk_size <= 0):
+        raise ValueError("Provide a nonempty prompt and a positive prefill chunk size")
     dimensions = {
         "num_blocks": blocks,
         "block_size": block_size,
@@ -69,6 +73,12 @@ def run_once(session, prompt, generated, *, info, blocks, block_size):
     logits = ort.OrtValue.ortvalue_from_shape_and_type(
         [1, logits_desc.shape[-1]], dtype
     )
+    chunk_size = prefill_chunk_size or len(prompt)
+    empty_logits = (
+        ort.OrtValue.ortvalue_from_shape_and_type([0, logits_desc.shape[-1]], dtype)
+        if chunk_size < len(prompt)
+        else None
+    )
     binding.bind_ortvalue_output("logits", logits)
     inputs = {v.name for v in session.get_inputs()}
     metadata_names = {
@@ -100,10 +110,11 @@ def run_once(session, prompt, generated, *, info, blocks, block_size):
     table = np.arange(blocks, dtype=np.int32)[None]
     binding.bind_cpu_input("block_table", table)
     tokens, times = [], []
-    current, past = prompt, 0
+    current, past = prompt[:chunk_size], 0
     started = time.perf_counter()
-    for _ in range(generated):
+    while len(tokens) < generated:
         n = len(current)
+        intermediate = past + n < len(prompt)
         if past + n > blocks * block_size:
             raise ValueError(
                 "Prompt plus generation exceeds paged capacity; increase --blocks"
@@ -114,16 +125,23 @@ def run_once(session, prompt, generated, *, info, blocks, block_size):
             "cumulative_sequence_lengths": np.array([0, n], np.int32),
             "past_sequence_lengths": np.array([past], np.int32),
             "attention_metadata": np.array([n, past + n, 0], np.int32),
-            "logits_indices": np.array([n - 1], np.int32),
+            "logits_indices": np.array([] if intermediate else [n - 1], np.int32),
         }
         for name, value in feeds.items():
             if name in inputs:
                 binding.bind_cpu_input(name, value)
+        binding.bind_ortvalue_output(
+            "logits", empty_logits if intermediate else logits
+        )
         session.run_with_iobinding(binding)
+        past += n
+        if intermediate:
+            current = prompt[past : past + chunk_size]
+            continue
         token = int(logits.numpy().reshape(-1).argmax())
         times.append(time.perf_counter())
         tokens.append(token)
-        current, past = [token], past + n
+        current = [token]
     return {
         "tokens": tokens,
         "ttft_seconds": times[0] - started,
@@ -149,11 +167,18 @@ def main():
     parser.add_argument("--repetitions", type=int, default=5)
     parser.add_argument("--blocks", type=int, default=8)
     parser.add_argument("--block-size", type=int, default=256)
+    parser.add_argument(
+        "--prefill-chunk-size",
+        type=int,
+        help="Prefill in bounded chunks, retaining state bindings and skipping intermediate logits",
+    )
     args = parser.parse_args()
     if args.tokens < 2 or args.warmup < 3 or args.repetitions < 1:
         parser.error("require tokens >= 2, warmup >= 3 and repetitions >= 1")
     if args.blocks < 1 or args.block_size < 1:
         parser.error("require positive --blocks and --block-size")
+    if args.prefill_chunk_size is not None and args.prefill_chunk_size <= 0:
+        parser.error("--prefill-chunk-size must be positive")
     if any(
         os.environ.get(k)
         for k in ("ONNXRUNTIME_EP_MLX_TRACE", "ONNXRUNTIME_EP_MLX_GPU_CAPTURE")
@@ -206,6 +231,7 @@ def main():
             info=info,
             blocks=args.blocks,
             block_size=args.block_size,
+            prefill_chunk_size=args.prefill_chunk_size,
         )
         if result["tokens"] != expected:
             mismatch = next(
@@ -242,6 +268,7 @@ def main():
         "repetitions": args.repetitions,
         "blocks": args.blocks,
         "block_size": args.block_size,
+        "prefill_chunk_size": args.prefill_chunk_size,
         "model_directory": str(args.model.resolve()),
         "config_sha256": hashlib.sha256(
             (args.model / "genai_config.json").read_bytes()
@@ -252,7 +279,8 @@ def main():
             for key, value in sorted(os.environ.items())
             if key.startswith("ONNXRUNTIME_EP_MLX_")
         },
-        "onnxruntime": version("onnxruntime"),
+        "onnxruntime": ort.__version__,
+        "onnxruntime_distribution": version("onnxruntime"),
         "python": platform.python_version(),
         "platform": platform.platform(),
         "hardware": subprocess.check_output(

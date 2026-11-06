@@ -71,8 +71,17 @@ def test_invalid_prompt_fails_before_loading_runtime(
 )
 @pytest.mark.parametrize("prompt_file", [False, True])
 @pytest.mark.parametrize("scheduling", [False, True])
+@pytest.mark.parametrize("prefill_chunk", [None, 512])
 def test_report_serializes_numpy_tokenizer_ids(
-    monkeypatch, tmp_path, mtp, draft_limit, disabled, provider, prompt_file, scheduling
+    monkeypatch,
+    tmp_path,
+    mtp,
+    draft_limit,
+    disabled,
+    provider,
+    prompt_file,
+    scheduling,
+    prefill_chunk,
 ):
     monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_COMPILE", "0")
     (tmp_path / "genai_config.json").write_text(
@@ -172,6 +181,7 @@ def test_report_serializes_numpy_tokenizer_ids(
             *(["--disable-mtp"] if disabled else []),
             *(["--max-draft-tokens", str(draft_limit)] if draft_limit else []),
             *(["--prompt-file", str(prompt_path)] if prompt_file else []),
+            *(["--prefill-chunk-size", str(prefill_chunk)] if prefill_chunk else []),
             *(
                 ["--num-blocks", "128", "--max-scheduled-tokens", "256"]
                 if scheduling
@@ -210,11 +220,81 @@ def test_report_serializes_numpy_tokenizer_ids(
         expected_overlay["engine"] = {
             "dynamic_batching": {"num_blocks": 128, "max_scheduled_tokens": 256}
         }
+    if prefill_chunk is not None:
+        expected_overlay["search"] = {"chunk_size": prefill_chunk}
     assert report["runtime_overlay"] == expected_overlay
     assert overlays == ([expected_overlay] if expected_overlay else [])
     assert report["runs"][0]["speculative_stats"]["draft_forward_passes"] == int(
         mtp and not disabled
     )
+
+
+@pytest.mark.parametrize(
+    "option", ["--num-blocks", "--max-scheduled-tokens", "--prefill-chunk-size"]
+)
+@pytest.mark.parametrize("value", ["0", "-1"])
+def test_invalid_scheduling_fails_before_runtime(
+    monkeypatch, tmp_path, capsys, option, value
+):
+    monkeypatch.setitem(sys.modules, "onnxruntime_genai", None)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "genai_paged",
+            "--model",
+            str(tmp_path),
+            "--ep",
+            "webgpu",
+            "--output",
+            str(tmp_path / "report.json"),
+            option,
+            value,
+        ],
+    )
+    with pytest.raises(SystemExit) as exc:
+        genai_paged.main()
+    assert exc.value.code == 2
+    assert "must be positive" in capsys.readouterr().err
+
+
+def test_prefill_chunk_requires_dynamic_batching(monkeypatch, tmp_path, capsys):
+    (tmp_path / "genai_config.json").write_text(json.dumps({"model": {}}))
+    library = tmp_path / "plugin.dylib"
+    library.write_bytes(b"test")
+    config = SimpleNamespace(
+        clear_providers=lambda: None, append_provider=lambda _: None
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "onnxruntime_genai",
+        SimpleNamespace(
+            register_execution_provider_library=lambda *_: None,
+            Config=lambda _: config,
+        ),
+    )
+    monkeypatch.setitem(sys.modules, "onnxruntime", SimpleNamespace())
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "genai_paged",
+            "--model",
+            str(tmp_path),
+            "--ep",
+            "mlx",
+            "--library",
+            str(library),
+            "--output",
+            str(tmp_path / "report.json"),
+            "--prefill-chunk-size",
+            "512",
+        ],
+    )
+    with pytest.raises(SystemExit) as exc:
+        genai_paged.main()
+    assert exc.value.code == 2
+    assert "re-export with use_paged_attention=true" in capsys.readouterr().err
 
 
 def test_non_speculative_run_rejects_actual_drafting():

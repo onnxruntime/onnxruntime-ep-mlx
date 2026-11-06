@@ -169,6 +169,20 @@ both providers and for the `--disable-mtp` control. Measure long-context TTFT
 and decode separately, record memory pressure, and do not compare different
 Apple GPU generations as an EP speedup.
 
+Prefill has **two independent limits**: the Engine's total token budget
+(`--max-scheduled-tokens`) and the request's `search.chunk_size`
+(`--prefill-chunk-size`). The smaller limit wins for a single request; concurrent
+requests also share the total budget. Raising only the scheduling budget above
+the export's chunk cap does not produce larger prefill calls. For example, this
+export retained 256-row GDN inputs with a 1,024-token scheduling budget until
+`search.chunk_size` was also raised. To test actual 512-token chunks, use both
+`--max-scheduled-tokens 512 --prefill-chunk-size 512`. These options change only
+the recorded runtime overlay, not the exported model. Larger chunks can increase
+working memory and delay other requests, and are not automatically faster.
+The runner also records the explicit `ONNXRUNTIME_EP_MLX_CACHE_LIMIT_BYTES`
+allocator setting when present; its process-wide effects are described in
+[`MEMORY.md`](../docs/MEMORY.md).
+
 The plugin's minimum ABI version is not sufficient to establish operator-schema
 compatibility. Main revision `0e21de25ea368aa3dff00daabee9bd0399ec4bed` requires a
 matching ORT 1.32.0 runtime for its `GatedDeltaNet` type constraints; the installed
@@ -228,13 +242,19 @@ verification calls, retain the existing recurrence. The block kernel
 keeps state and matrix arithmetic in FP32, uses direct decay products without
 clamping or dividing by a decay, and supports ragged tails, empty sequences and
 compact prefix capture. Its reassociated reductions are not bitwise identical
-to token-serial recurrence. The default remains off pending full-model
-qualification; an isolated kernel speedup is not an end-to-end TTFT claim.
+to token-serial recurrence. The default remains off; an isolated kernel speedup is not an end-to-end TTFT claim.
 The [initial full-model qualification](reports/qwen38-paged-chunked-prefill-mtp-m1max.json)
 preserved all generated tokens and speculative statistics, but median TTFT
 regressed from 18.430 to 23.961 seconds. A scheduler-256 short pilot did not
 establish a robust improvement either. These results do not qualify the
-experimental route for default enablement or a performance release.
+experimental route for default enablement.
+The separate [GPU-resident target-only qualification](reports/qwen38-public-chunked-prefill-m1max.json)
+uses the public ORT chunked driver at the same 64-token chunk size. Its full
+1K-input/256-output run improved median warm TTFT from 7.836 to 7.433 seconds,
+with every token matching the independent reference. A reversed-order short
+screen showed a smaller 1.6% TTFT reduction; all samples and timing caveats are
+retained. Use `ONNXRUNTIME_EP_MLX_CHUNKED_PREFILL=1` with that resident-state
+driver to opt in. This is not an MTP or WebGPU speedup claim.
 Compare this option at fixed `--max-scheduled-tokens` before tuning the
 scheduler budget, and compare generated tokens and speculative statistics.
 `ONNXRUNTIME_EP_MLX_NO_GDN_PREPARE=1` also disables the block route.
@@ -329,6 +349,14 @@ python -m bench.ort_paged --model /path/to/non-mtp-export \
   --library "$PWD/rust/target/release/libonnxruntime_mlx_ep.dylib" \
   --reference /tmp/paged-mlx.json --memory mlx --output /tmp/ort-device.json
 ```
+
+Add `--prefill-chunk-size 64` to the public ORT driver for bounded prefill.
+Every chunk reuses the same state/input/output OrtValues. Intermediate chunks
+request an empty `logits_indices` tensor and bind a zero-row logits output, so
+they update state without evaluating an unnecessary output head or sampling a
+token. Only the final prefill chunk requests logits; TTFT includes all chunks.
+The default remains unsegmented prefill. This driver requires a pruned,
+target-only export and does not run MTP.
 
 Both processes use the reference report's exact prompt tokens and require every
 generated token to match it. State initialization is outside timing; sampling

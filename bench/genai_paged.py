@@ -136,6 +136,11 @@ def main():
         type=int,
         help="Override the Engine's token scheduling budget, including prefill",
     )
+    parser.add_argument(
+        "--prefill-chunk-size",
+        type=int,
+        help="Override search.chunk_size; prefill is also capped by the scheduling budget",
+    )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--tokens", type=int, default=256)
     parser.add_argument("--warmup", type=int, default=3)
@@ -182,9 +187,15 @@ def main():
         parser.error("--max-draft-tokens requires --mtp")
     if any(
         value is not None and value <= 0
-        for value in (args.num_blocks, args.max_scheduled_tokens)
+        for value in (
+            args.num_blocks,
+            args.max_scheduled_tokens,
+            args.prefill_chunk_size,
+        )
     ):
-        parser.error("--num-blocks and --max-scheduled-tokens must be positive")
+        parser.error(
+            "--num-blocks, --max-scheduled-tokens and --prefill-chunk-size must be positive"
+        )
     for name in ("ONNXRUNTIME_EP_MLX_TRACE", "ONNXRUNTIME_EP_MLX_GPU_CAPTURE"):
         if os.environ.get(name):
             parser.error(f"unset {name} before collecting final latency measurements")
@@ -255,12 +266,17 @@ def main():
         )
         if value is not None
     }
+    if (scheduling or args.prefill_chunk_size is not None) and not exported.get(
+        "engine", {}
+    ).get("dynamic_batching"):
+        parser.error(
+            "prefill chunking and scheduling overrides require an export with "
+            "engine.dynamic_batching; re-export with use_paged_attention=true"
+        )
     if scheduling:
-        if not exported.get("engine", {}).get("dynamic_batching"):
-            parser.error(
-                "scheduling overrides require an export with engine.dynamic_batching"
-            )
         overlay["engine"] = {"dynamic_batching": scheduling}
+    if args.prefill_chunk_size is not None:
+        overlay["search"] = {"chunk_size": args.prefill_chunk_size}
     if overlay:
         config.overlay(json.dumps(overlay))
     started = time.perf_counter()
@@ -347,6 +363,7 @@ def main():
                 "ONNXRUNTIME_EP_MLX_NO_PAGED_PATCHES",
                 "ONNXRUNTIME_EP_MLX_NO_GDN_PREPARE",
                 "ONNXRUNTIME_EP_MLX_CHUNKED_PREFILL",
+                "ONNXRUNTIME_EP_MLX_CACHE_LIMIT_BYTES",
             )
             if name in os.environ
         },
