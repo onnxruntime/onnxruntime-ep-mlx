@@ -19,7 +19,12 @@ The registered EP name is **`MLXExecutionProvider`** (the name passed to `Regist
 - Crate: `rust/`
 - Dylib: `rust/target/release/libonnxruntime_mlx_ep.dylib`
 
-There are no active `.metal` kernels, no Metal shader registry, and no dtype/MSL specialization scaffold. Op translations live in the modular registry described in §2.2 — adding an op is one handler + one claim predicate + one registration line in a single `rust/src/ops/<family>.rs` module, with **zero `ep.rs` under `rust/src/` edits**.
+There is no independent Metal backend or shader registry. Specialized kernels,
+including the opt-in packed GDN chunk kernel in `paged_ssm_chunked.metal`, run
+through MLX's custom-kernel API. Op translations live in the modular registry
+described in §2.2 — adding an op is one handler + one claim predicate + one
+registration line in a single `rust/src/ops/<family>.rs` module, with **zero
+`ep.rs` under `rust/src/` edits**.
 
 ---
 
