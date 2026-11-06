@@ -116,6 +116,9 @@ The separate [multi-query MTP A/B](reports/qwen38-paged-multiquery-mtp-m1max.jso
 preserves five full 256-token samples per mode. Its aggregate throughput improved,
 but median decode latency and TTFT did not; it does not establish a robust
 short-context speedup, a WebGPU lead, or a 16K end-to-end result.
+The [grouped-KV prefill experiment](reports/qwen38-paged-prefill-gqa-rejected-m1max.json)
+was removed after its isolated attention gains did not survive full-model MTP
+qualification; all timing samples, including the stall, remain in the report.
 
 The current upstream builder rejects `exclude_mtp=false` together with
 `prune_lm_head=true`. For a non-speculative baseline use `exclude_mtp=true`.

@@ -286,6 +286,96 @@ def test_paged_attention_multiblock(blk):
     _check(8, 2, 32, nb=8 * 2, blk=blk, batch=2, seed=blk + 7)
 
 
+@pytest.mark.parametrize("past", [4095, 16383])
+@pytest.mark.parametrize("queries", [1, 5, 8])
+def test_paged_vector_long_context(past, queries, monkeypatch):
+    heads, kv_heads, width, block = 24, 4, 256, 256
+    blocks = (past + queries + block - 1) // block
+    geometry = (heads, kv_heads, width, blocks, block, 1)
+    proto = _model(*geometry, 0, 0)
+    feeds, _ = _inputs(*geometry, 0, 0, 412)
+    rng = np.random.default_rng(413)
+    for name, count in [("query", heads), ("key", kv_heads), ("value", kv_heads)]:
+        feeds[name] = (rng.standard_normal((queries, count * width)) * 0.3).astype(np.float16)
+    feeds["cumulative_sequence_length"] = np.array([0, queries], dtype=np.int32)
+    feeds["past_seqlens"] = np.array([past], dtype=np.int32)
+    reference = _paged_ref(
+        *(feeds[name] for name in [
+            "query", "key", "value", "key_cache", "value_cache",
+            "cumulative_sequence_length", "past_seqlens", "block_table",
+        ]),
+        heads, kv_heads, width,
+    )
+    results = []
+    for direct in ("0", "1"):
+        monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_PAGED_DIRECT", direct)
+        options = ort.SessionOptions()
+        options.add_session_config_entry("session.disable_cpu_ep_fallback", "1")
+        session = ort.InferenceSession(proto, options, providers=["MLXExecutionProvider"])
+        actual = session.run(None, {name: value.copy() for name, value in feeds.items()})[0]
+        np.testing.assert_allclose(actual, reference, rtol=3e-3, atol=2e-4)
+        results.append(actual)
+    np.testing.assert_array_equal(results[0], results[1])
+
+
+@pytest.mark.parametrize("causal", [True, False])
+@pytest.mark.parametrize("mapping", ["normal", "overwrite", "skip"])
+def test_paged_vector_multiquery_cache_overlay(causal, mapping, monkeypatch):
+    geometry = (4, 2, 64, 8, 256, 1)
+    proto = onnx.load_from_string(_model(*geometry, 0, 0))
+    proto.graph.node[0].attribute.append(onnx.helper.make_attribute("is_causal", int(causal)))
+    queries, past = 5, 1022
+    feeds, _ = _inputs(*geometry, 0, 0, 417)
+    rng = np.random.default_rng(418)
+    for name, count in [("query", 4), ("key", 2), ("value", 2)]:
+        feeds[name] = (rng.standard_normal((queries, count * 64)) * 0.3).astype(np.float16)
+    feeds["cumulative_sequence_length"] = np.array([0, queries], dtype=np.int32)
+    feeds["past_seqlens"] = np.array([past], dtype=np.int32)
+    slots = None
+    if mapping != "normal":
+        slots = np.full(queries, -1, dtype=np.int32)
+        if mapping == "overwrite":
+            # Future query rows overwrite cached-prefix slots visible to earlier causal rows.
+            slots = feeds["block_table"][0, 0] * 256 + np.arange(queries, dtype=np.int32)
+        proto.graph.input.append(onnx.helper.make_tensor_value_info("slots", onnx.TensorProto.INT32, [queries]))
+        proto.graph.node[0].input.extend(["", "", "slots"])
+        feeds["slots"] = slots
+    reference = _paged_ref(
+        *(feeds[name] for name in [
+            "query", "key", "value", "key_cache", "value_cache",
+            "cumulative_sequence_length", "past_seqlens", "block_table",
+        ]),
+        4, 2, 64, slot_mapping=slots, is_causal=causal, return_cache=True,
+    )
+    monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_PAGED_DIRECT", "0")
+    options = ort.SessionOptions()
+    options.add_session_config_entry("session.disable_cpu_ep_fallback", "1")
+    session = ort.InferenceSession(proto.SerializeToString(), options, providers=["MLXExecutionProvider"])
+    binding = session.io_binding()
+    device_caches = {}
+    device_info = None
+    if os.environ.get("ONNXRUNTIME_EP_MLX_DEVICE_TENSORS") == "1":
+        device = next(d for d in ort.get_ep_devices() if d.ep_name == "MLXExecutionProvider")
+        device_info = device.memory_info(ort.OrtDeviceMemoryType.DEFAULT)
+    for name, value in feeds.items():
+        if device_info is not None and name in ("key_cache", "value_cache"):
+            device_value = ort.OrtValue.ortvalue_from_shape_and_type(
+                value.shape, value.dtype, memory_info=device_info
+            )
+            device_value.update_inplace(value)
+            device_caches[name] = device_value
+            binding.bind_ortvalue_input(name, device_value)
+        else:
+            binding.bind_cpu_input(name, value)
+    binding.bind_output("output", "cpu")
+    session.run_with_iobinding(binding)
+    actual = binding.copy_outputs_to_cpu()[0]
+    np.testing.assert_allclose(actual, reference[0], rtol=3e-3, atol=2e-4)
+    for index, name in enumerate(("key_cache", "value_cache"), 1):
+        updated = device_caches[name].numpy() if name in device_caches else feeds[name]
+        np.testing.assert_array_equal(updated, reference[index])
+
+
 @pytest.mark.parametrize("source", ["runtime", "initializer", "intermediate"])
 @pytest.mark.parametrize("eager", [False, True])
 def test_paged_attention_metadata_sources(source, eager, monkeypatch):

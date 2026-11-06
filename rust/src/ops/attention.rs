@@ -4074,11 +4074,21 @@ fn paged_attention_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), 
         prepared.push((b, nq, pastb, qh, kh_new, vh_new));
     }
 
+    let cache_patches = batch == 1
+        && kquant.is_none()
+        && vquant.is_none()
+        && !latent
+        && written_slots
+            .iter()
+            .enumerate()
+            .all(|(i, slot)| !written_slots[..i].contains(slot))
+        && !std::env::var_os("ONNXRUNTIME_EP_MLX_NO_PAGED_PATCHES")
+            .is_some_and(|v| v != "0" && !v.is_empty());
     let mut outs: Vec<mlx::mlx_array> = Vec::new();
     for (b, nq, pastb, qh, kh_new, vh_new) in prepared {
         let total = pastb + nq;
-        if nq == 1
-            && total < 1024
+        if (1..=8).contains(&nq)
+            && std::env::var_os("MLX_SDPA_BLOCKS").is_none()
             && head == v_head
             && matches!(head, 64 | 96 | 128 | 256)
             && !latent
@@ -4094,16 +4104,21 @@ fn paged_attention_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), 
                 .is_some_and(|v| v != "0" && !v.is_empty())
             && super::paged_attention::gpu_stream(ctx)?
         {
-            let direct_patches = batch == 1
-                && !std::env::var_os("ONNXRUNTIME_EP_MLX_NO_PAGED_PATCHES")
-                    .is_some_and(|v| v != "0" && !v.is_empty());
-            let slot = if direct_patches {
-                written_slots.first().map_or(-1, |&slot| slot as i32)
-            } else {
-                -1
-            };
-            let position = i32_host_array(ctx, &[pastb, slot]);
-            let (read_k, read_v) = if direct_patches {
+            let mut positions = vec![pastb];
+            for row in 0..nq as usize {
+                let slot = if !cache_patches {
+                    -1
+                } else if let Some(mapping) = &slot_mapping {
+                    mapping[cum[b] as usize + row] as i32
+                } else {
+                    let logical = pastb as usize + row;
+                    let physical = bt[b * max_blocks + logical / block_size as usize] as i32;
+                    physical * block_size + (logical % block_size as usize) as i32
+                };
+                positions.push(slot);
+            }
+            let position = i32_host_array(ctx, &positions);
+            let (read_k, read_v) = if cache_patches {
                 (original_kcache, original_vcache.unwrap())
             } else {
                 (kcache, vcache.unwrap())
@@ -4117,8 +4132,12 @@ fn paged_attention_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), 
                 block_size,
                 max_blocks as i32,
                 b as i32,
+                nq,
+                total,
+                attr_int(n, "is_causal", 1) != 0,
                 scale,
             )?;
+            let o = ctx.transpose(o, &[0, 2, 1, 3])?;
             let o = ctx.reshape(o, &[nq, out_hidden])?;
             outs.push(o);
             continue;
@@ -4252,17 +4271,7 @@ fn paged_attention_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), 
         }
     };
     if cache_updated {
-        let patches = batch == 1
-            && kquant.is_none()
-            && vquant.is_none()
-            && !latent
-            && written_slots
-                .iter()
-                .enumerate()
-                .all(|(i, slot)| !written_slots[..i].contains(slot))
-            && !std::env::var_os("ONNXRUNTIME_EP_MLX_NO_PAGED_PATCHES")
-                .is_some_and(|v| v != "0" && !v.is_empty());
-        if patches {
+        if cache_patches {
             kcache = ctx.write_back_input_patches(
                 &n.inputs[3],
                 kcache,

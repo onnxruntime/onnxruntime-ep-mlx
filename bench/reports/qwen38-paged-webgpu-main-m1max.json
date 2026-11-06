@@ -38,6 +38,37 @@
     ],
     "external_m4_pro_64gb_16k_result_reproduced": false
   },
+  "mlx_long_context_admission": {
+    "scope": "Aborted diagnostics, not a qualified provider comparison; all partial logs retained.",
+    "original": {
+      "plugin_sha256": "8783ef6a5db4847114826038b8c4cef2cd6407e30d6e3643cfd8097f6de028be",
+      "num_blocks": 128,
+      "max_scheduled_tokens": 256,
+      "status": "Stopped after more than 480 seconds without a completed warmup.",
+      "sampled_process_footprint_gib": 22.0,
+      "cpu_sample": "Compiled evaluation waiting on mlx::core::Event::wait; not a root-cause diagnosis."
+    },
+    "reduced_capacity_retry": {
+      "plugin_sha256": "f84a18a6cbb648395feac3e3cb083a53af65a68ddfd029e2b67da97a45902d92",
+      "num_blocks": 32,
+      "max_scheduled_tokens": 64,
+      "native_prefill_gqa": true,
+      "status": "Stopped after first warmup, before any final measurement.",
+      "first_warmup_ttft_seconds": 295.9412746670423,
+      "first_warmup_decode_seconds": 93.33826270792633,
+      "generated_tokens_requested": 32,
+      "caveat": "Capacity, scheduler and native binary differ from the original screen. Do not attribute the outcome to GQA or compare this warmup against WebGPU's measured sample."
+    },
+    "raw_session_artifacts": [
+      "qwen-mlx-main-4096-mtp-admission-aborted.json",
+      "qwen-mlx-main-4096-mtp-admission-system-memory.jsonl",
+      "qwen-mlx-4096-admission-cpu-sample.txt",
+      "qwen-mlx-4k-small-capacity-aborted.json",
+      "qwen-mlx-main-4096-mtp-admission-b32-s64-t32-gqa1.log",
+      "qwen-mlx-main-4096-mtp-admission-b32-s64-t32-gqa1-system-memory.jsonl"
+    ],
+    "sixteen_k_qualification": "Not attempted after the 4K admission problems."
+  },
   "source": {
     "repository": "https://github.com/microsoft/onnxruntime",
     "commit": "0e21de25ea368aa3dff00daabee9bd0399ec4bed",

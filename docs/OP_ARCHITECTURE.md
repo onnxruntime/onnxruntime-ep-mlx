@@ -739,17 +739,20 @@ the enclosing changed row interval in each physical block; non-aliased outputs
 retain a full copy. Cache ownership and all observable input/output updates stay
 with ORT.
 
-For single-query GPU paged decode, FP16 Q/K/V stay FP16 when their matching head
-width is 64, 96, 128, or 256 and the gathered context is shorter than 1,024 keys.
-MLX 0.32.4's single-pass vector kernel accumulates scores, softmax, and weighted
-values in FP32 before the final output cast, avoiding separate FP32 Q/K/V
-materializations. Longer contexts, head width 192, CPU streams, other input
-dtypes, unequal Q/V widths, sinks, and softcap retain the FP32 path. The narrower
-eligibility preserves the rounding of the existing implementation: two-pass
-FP16 attention rounds partial outputs, and head-192 FP16 does not match the FP32
-reference. In the eligible single-query path, all gathered keys are visible when
-there is no local window, so the redundant zero mask is omitted. Windows and
-other paths retain their masks; cache writeback semantics are unchanged.
+Eligible GPU paged attention reads physical KV pages directly for one to eight
+query rows, without dense gathers or repeating KV heads. FP16 Q/K/V stay FP16
+when their matching head width is 64, 96, 128, or 256, with no sinks, softcap, or
+local window. Scores, softmax, weighted values, and two-pass partial outputs
+accumulate in FP32; only the final output is cast to FP16. Architecture-dependent
+one/two-pass dispatch, partition counts, and reduction order match the FP32
+dense fallback with its already-expanded KV heads. This avoids the intermediate
+FP16 rounding in MLX's ordinary two-pass FP16 attention.
+
+Single-batch unique cache writes can read original pages plus the current
+query rows, including writes that overwrite cached-prefix slots. Duplicate
+writes and multiple sequences retain functional updated-cache reads. Other
+geometries and an explicit `MLX_SDPA_BLOCKS` override retain dense attention
+lowering; all existing masks and cache writeback semantics are preserved.
 
 Standard causal `Attention` with one query and one current key can attend every
 past/current key. It omits the redundant causal array rather than capturing a

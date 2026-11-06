@@ -663,8 +663,6 @@ impl Plan {
     }
 }
 
-/// ONNX tensor element type -> MLX dtype (faithful port of `MlxDtypeFromOnnx`). Unknown types fall
-/// back to fp32 so a stray dtype never crashes the wrap.
 pub(crate) fn initializer_array(
     input: &TensorRef,
     data: *const c_void,
@@ -682,6 +680,8 @@ pub(crate) fn initializer_array(
     }
 }
 
+/// ONNX tensor element type -> MLX dtype (faithful port of `MlxDtypeFromOnnx`). Unknown types fall
+/// back to fp32 so a stray dtype never crashes the wrap.
 pub fn mlx_dtype_from_onnx(t: ort::ONNXTensorElementDataType) -> mlxsys::mlx_dtype {
     use ort::*;
     #[allow(non_upper_case_globals)]
