@@ -319,7 +319,10 @@ def delta_reference(feeds, hq, h, k, v, rule, fused, norm, scale=0.0, capacity=0
 
 
 @pytest.mark.parametrize("dtype", [np.float32, np.float16, ml_dtypes.bfloat16])
-@pytest.mark.parametrize("geometry", [(2, 6, 16, 32), (16, 48, 128, 128)])
+@pytest.mark.parametrize(
+    "geometry",
+    [(2, 6, 8, 8), (2, 6, 16, 32), (16, 48, 128, 128), (2, 6, 256, 64)],
+)
 @pytest.mark.parametrize("capacity", [0, 4, 8])
 def test_chunked_delta_dynamic(dtype, geometry, capacity, monkeypatch):
     hq, h, k, v = geometry
@@ -409,6 +412,16 @@ def test_chunked_delta_dynamic(dtype, geometry, capacity, monkeypatch):
         control = baseline.run(None, runtime_feeds(feeds))
         monkeypatch.setenv("ONNXRUNTIME_EP_MLX_CHUNKED_PREFILL", "1")
         actual = candidate.run(None, runtime_feeds(feeds))
+        if tokens == 65:
+            with monkeypatch.context() as default_environment:
+                default_environment.delenv(
+                    "ONNXRUNTIME_EP_MLX_CHUNKED_PREFILL", raising=False
+                )
+                default = strict_session(serialized).run(None, runtime_feeds(feeds))
+            for result, enabled in zip(default, actual, strict=True):
+                np.testing.assert_array_equal(
+                    result.view(np.uint8), enabled.view(np.uint8)
+                )
         tolerance = 8e-3 if dtype == ml_dtypes.bfloat16 else 1e-3
         np.testing.assert_allclose(
             actual[0], expected[0], rtol=tolerance, atol=tolerance
@@ -437,11 +450,18 @@ def test_chunked_delta_dynamic(dtype, geometry, capacity, monkeypatch):
                     "offsets": np.array([0, 0, prefix + 1], np.int32),
                 }
                 prefix_state = delta_reference(
-                    prefix_feeds, hq, h, k, v, "gated_delta", True, True, scale, capacity
+                    prefix_feeds,
+                    hq,
+                    h,
+                    k,
+                    v,
+                    "gated_delta",
+                    True,
+                    True,
+                    scale,
+                    capacity,
                 )[1][1]
-                np.testing.assert_allclose(
-                    replayed, prefix_state, rtol=2e-5, atol=2e-6
-                )
+                np.testing.assert_allclose(replayed, prefix_state, rtol=2e-5, atol=2e-6)
         if tokens < 32:
             for result, reference in zip(actual, control, strict=True):
                 np.testing.assert_array_equal(
