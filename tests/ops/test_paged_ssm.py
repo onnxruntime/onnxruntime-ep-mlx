@@ -189,7 +189,8 @@ def model(op, feeds, outputs, attrs, dtype):
 @pytest.mark.parametrize("activation", ["none", "silu"])
 @pytest.mark.parametrize("kernel,dilation", [(1, 1), (4, 1), (3, 2)])
 @pytest.mark.parametrize("with_bias", [False, True])
-def test_varlen_conv(dtype, activation, kernel, dilation, with_bias):
+@pytest.mark.parametrize("capacity", [0, 1, 4, 8])
+def test_varlen_conv(dtype, activation, kernel, dilation, with_bias, capacity):
     rng = np.random.default_rng(42)
     channels, lengths = 19, [2, 5]
     carry = (kernel - 1) * dilation
@@ -201,11 +202,20 @@ def test_varlen_conv(dtype, activation, kernel, dilation, with_bias):
         "state": rng.normal(size=(2, channels, carry)).astype(dtype),
     }
     dt = storage_type(dtype)
+    outputs = [
+        ("output", dt, ["tokens", channels]),
+        ("final", dt, [2, channels, carry]),
+    ]
+    attrs = {"activation": activation, "dilation": dilation}
+    if capacity:
+        feeds["counts"] = np.array([2, 99], np.int32)
+        outputs.append(("updates", dt, [2, capacity, channels]))
+        attrs["state_update_capacity"] = capacity
     serialized = model(
         "VarlenCausalConvWithState",
         feeds,
-        [("output", dt, ["tokens", channels]), ("final", dt, [2, channels, carry])],
-        {"activation": activation, "dilation": dilation},
+        outputs,
+        attrs,
         dt,
     )
     if not with_bias:
@@ -216,9 +226,15 @@ def test_varlen_conv(dtype, activation, kernel, dilation, with_bias):
         feeds.pop("bias")
     session = strict_session(runtime_model(serialized, dtype))
     initial_input = feeds["input"]
-    for offsets in ([0, 2, 7], [0, 0, 7], [0, 7, 7], [0, 6, 7], [0, 0, 0], [0, 1, 2]):
+    for iteration, offsets in enumerate(
+        ([0, 2, 7], [0, 0, 7], [0, 7, 7], [0, 6, 7], [0, 0, 0], [0, 1, 2])
+    ):
         feeds["input"] = initial_input[: offsets[-1]]
         feeds["offsets"] = np.array(offsets, np.int32)
+        if capacity:
+            feeds["counts"] = np.array(
+                [2, 99] if iteration % 2 == 0 else [-1, 3], np.int32
+            )
         expected = np.empty_like(feeds["input"])
         state = np.empty_like(feeds["state"])
         for b, (start, end) in enumerate(pairwise(offsets)):
@@ -234,15 +250,22 @@ def test_varlen_conv(dtype, activation, kernel, dilation, with_bias):
                     y = y / (1 + np.exp(-y))
                 expected[start + t] = y
             state[b] = history[-carry:].T if carry else history[:0].T
-        output, final = session.run(None, runtime_feeds(feeds))
+        actual = session.run(None, runtime_feeds(feeds))
+        output, final = actual[:2]
         tolerance = 8e-3 if dtype == ml_dtypes.bfloat16 else 3e-3
         np.testing.assert_allclose(
             output, expected.astype(np.float32), rtol=tolerance, atol=tolerance
         )
         np.testing.assert_array_equal(final, state)
+        if capacity:
+            updates = np.zeros((2, capacity, channels), dtype=dtype)
+            for b, (start, end) in enumerate(pairwise(offsets)):
+                count = max(0, min(int(feeds["counts"][b]), capacity, end - start))
+                updates[b, :count] = feeds["input"][start : start + count]
+            np.testing.assert_array_equal(actual[2], updates)
 
 
-def delta_reference(feeds, hq, h, k, v, rule, fused, norm, scale=0.0):
+def delta_reference(feeds, hq, h, k, v, rule, fused, norm, scale=0.0, capacity=0):
     packed = feeds["qkv"].astype(np.float64)
     query = packed[:, : hq * k].reshape(-1, hq, k)
     key = packed[:, hq * k : 2 * hq * k].reshape(-1, hq, k)
@@ -254,15 +277,18 @@ def delta_reference(feeds, hq, h, k, v, rule, fused, norm, scale=0.0):
     key = np.repeat(key, h // hq, axis=1)
     output = np.empty((len(packed), h, v), np.float64)
     final = feeds["state"].astype(np.float64).copy()
+    capsules = np.zeros((len(final), capacity * (h + hq * k + h * v)), np.float64)
     for b, (start, end) in enumerate(pairwise(feeds["offsets"])):
         for t in range(start, end):
+            effective_decay = np.ones(h, np.float64)
             if "decay" in feeds and rule in ("gated", "gated_delta"):
                 g = feeds["decay"][t].astype(np.float64)
                 if fused:
                     g = -np.exp(feeds["a_log"].astype(np.float64)) * np.logaddexp(
                         0, g + feeds["dt_bias"]
                     )
-                final[b] *= np.exp(g)[:, None, None]
+                effective_decay = np.exp(g)
+                final[b] *= effective_decay[:, None, None]
             delta = value[t].copy()
             if rule in ("delta", "gated_delta"):
                 retrieved = np.einsum("hvk,hk->hv", final[b], key[t])
@@ -272,11 +298,24 @@ def delta_reference(feeds, hq, h, k, v, rule, fused, norm, scale=0.0):
                 if fused:
                     beta = 1 / (1 + np.exp(-beta))
                 delta *= beta[:, None]
+            slot = t - start
+            if (
+                capacity
+                and feeds.get("active", [1])[0]
+                and slot < min(int(feeds["counts"][b]), capacity)
+            ):
+                capsules[b, : capacity * h].reshape(capacity, h)[slot] = effective_decay
+                capsules[b, capacity * h : capacity * (h + hq * k)].reshape(
+                    capacity, hq, k
+                )[slot] = key[t, :: h // hq]
+                capsules[b, capacity * (h + hq * k) :].reshape(capacity, h, v)[slot] = (
+                    delta
+                )
             final[b] += delta[:, :, None] * key[t, :, None, :]
             output[t] = np.einsum("hvk,hk->hv", final[b], query[t]) * (
                 scale or 1 / np.sqrt(k)
             )
-    return output, final
+    return (output, final, capsules) if capacity else (output, final)
 
 
 @pytest.mark.parametrize("dtype", [np.float32, np.float16, ml_dtypes.bfloat16])
@@ -284,10 +323,11 @@ def delta_reference(feeds, hq, h, k, v, rule, fused, norm, scale=0.0):
 @pytest.mark.parametrize("geometry", [(1, 1, 1, 3), (2, 6, 33, 5), (2, 6, 128, 128)])
 @pytest.mark.parametrize("fused,norm", [(False, False), (True, True)])
 @pytest.mark.parametrize("with_gates", [False, True])
-def test_packed_delta(dtype, rule, geometry, fused, norm, with_gates):
+@pytest.mark.parametrize("capacity,active", [(0, None), (1, None), (4, 1), (8, 0)])
+def test_packed_delta(dtype, rule, geometry, fused, norm, with_gates, capacity, active):
     hq, h, k, v = geometry
     rng = np.random.default_rng(613)
-    tokens = 5
+    tokens = 9 if capacity else 5
     feeds = {
         "qkv": (rng.normal(size=(tokens, 2 * hq * k + h * v)) * 0.1).astype(dtype),
         "offsets": np.array([0, 1, tokens], np.int32),
@@ -326,42 +366,174 @@ def test_packed_delta(dtype, rule, geometry, fused, norm, with_gates):
         ir.Attr("qk_l2_norm", ir.AttributeType.INT, int(norm)),
         ir.Attr("scale", ir.AttributeType.FLOAT, scale),
     ]
+    outputs = [
+        m.tensor("output", dt, ["tokens", h, v]),
+        m.tensor("final", ir.DataType.FLOAT, [2, h, v, k]),
+    ]
+    if capacity:
+        feeds["counts"] = np.array([2, 99], np.int32)
+        inputs.append(m.tensor("counts", ir.DataType.INT32, [2]))
+        if active is not None:
+            feeds["active"] = np.array([active], np.int32)
+            inputs.append(m.tensor("active", ir.DataType.INT32, [1]))
+        attrs.append(ir.Attr("state_update_capacity", ir.AttributeType.INT, capacity))
+        outputs.append(
+            m.tensor("updates", ir.DataType.FLOAT, [2, capacity * (h + hq * k + h * v)])
+        )
     serialized = build(
         "GatedDeltaNet",
         inputs,
-        [
-            m.tensor("output", dt, ["tokens", h, v]),
-            m.tensor("final", ir.DataType.FLOAT, [2, h, v, k]),
-        ],
+        outputs,
         attrs=attrs,
         domain="com.microsoft",
     )
     session = strict_session(runtime_model(serialized, dtype))
+    uncaptured = None
+    if capacity:
+        proto = onnx.load_from_string(serialized)
+        node = next(n for n in proto.graph.node if n.op_type == "GatedDeltaNet")
+        next(a for a in node.attribute if a.name == "state_update_capacity").i = 0
+        del node.input[9:]
+        del node.output[2:]
+        del proto.graph.output[2:]
+        base_inputs = [
+            v for v in proto.graph.input if v.name not in ("counts", "active")
+        ]
+        del proto.graph.input[:]
+        proto.graph.input.extend(base_inputs)
+        uncaptured = strict_session(runtime_model(proto.SerializeToString(), dtype))
     initial_tokens = {
         name: feeds[name] for name in ("qkv", "decay", "beta") if name in feeds
     }
-    for offsets in (
-        [0, 1, tokens],
-        [0, 0, tokens],
-        [0, tokens, tokens],
-        [0, 4, tokens],
-        [0, 0, 0],
-        [0, 1, 2],
+    for iteration, offsets in enumerate(
+        (
+            [0, 1, tokens],
+            [0, 0, tokens],
+            [0, tokens, tokens],
+            [0, 4, tokens],
+            [0, 0, 0],
+            [0, 1, 2],
+        )
     ):
         for name, array in initial_tokens.items():
             feeds[name] = array[: offsets[-1]]
         feeds["offsets"] = np.array(offsets, np.int32)
-        expected = delta_reference(feeds, hq, h, k, v, rule, fused, norm, scale)
+        if capacity:
+            feeds["counts"] = np.array(
+                [2, 99] if iteration % 2 == 0 else [-1, 99], np.int32
+            )
+            if active is not None:
+                feeds["active"] = np.array([(active + iteration) % 2], np.int32)
+        expected = delta_reference(
+            feeds, hq, h, k, v, rule, fused, norm, scale, capacity
+        )
         actual = session.run(None, runtime_feeds(feeds))
-        for result, reference in zip(actual, expected):
+        if uncaptured is not None:
+            baseline = uncaptured.run(
+                None,
+                runtime_feeds(
+                    {k: v for k, v in feeds.items() if k not in ("counts", "active")}
+                ),
+            )
+            for result, reference in zip(actual[:2], baseline):
+                np.testing.assert_array_equal(
+                    result.view(np.uint8), reference.view(np.uint8)
+                )
+        for result, reference in zip(actual[:2], expected[:2]):
             tolerance = 8e-3 if dtype == ml_dtypes.bfloat16 else 3e-3
             np.testing.assert_allclose(result, reference, rtol=tolerance, atol=3e-5)
         for b, (start, end) in enumerate(pairwise(offsets)):
             if start == end:
                 np.testing.assert_array_equal(actual[1][b], feeds["state"][b])
+        if capacity:
+            if not feeds.get("active", [1])[0]:
+                np.testing.assert_array_equal(actual[2], np.zeros_like(actual[2]))
+            else:
+                for b, (start, end) in enumerate(pairwise(offsets)):
+                    count = max(0, min(int(feeds["counts"][b]), capacity, end - start))
+                    for lo, width in [
+                        (0, h),
+                        (capacity * h, hq * k),
+                        (capacity * (h + hq * k), h * v),
+                    ]:
+                        np.testing.assert_allclose(
+                            actual[2][b, lo : lo + count * width],
+                            expected[2][b, lo : lo + count * width],
+                            rtol=2e-3,
+                            atol=3e-5,
+                        )
+                    decay = actual[2][b, : capacity * h].reshape(capacity, h)
+                    key = actual[2][b, capacity * h : capacity * (h + hq * k)].reshape(
+                        capacity, hq, k
+                    )
+                    delta = actual[2][b, capacity * (h + hq * k) :].reshape(
+                        capacity, h, v
+                    )
+                    replayed = feeds["state"][b].copy()
+                    replayed_fma = replayed.copy()
+                    for accepted in range(1, count + 1):
+                        i = accepted - 1
+                        replayed *= decay[i, :, None, None]
+                        replayed += (
+                            delta[i, :, :, None]
+                            * np.repeat(key[i], h // hq, axis=0)[:, None, :]
+                        )
+                        prefix = {
+                            name: (
+                                array[start : start + accepted]
+                                if name in ("qkv", "decay", "beta")
+                                else array
+                            )
+                            for name, array in feeds.items()
+                        }
+                        prefix["state"] = feeds["state"][b : b + 1]
+                        prefix["offsets"] = np.array([0, accepted], np.int32)
+                        prefix_state = delta_reference(
+                            prefix, hq, h, k, v, rule, fused, norm, scale
+                        )[1][0]
+                        np.testing.assert_allclose(
+                            replayed, prefix_state, rtol=3e-3, atol=3e-5
+                        )
+                        if (
+                            dtype == np.float16
+                            and fused
+                            and with_gates
+                            and rule == "gated_delta"
+                            and k == v == 128
+                        ):
+                            # GenAI replays FP32 state with an explicitly fused multiply-add.
+                            replayed_fma *= decay[i, :, None, None]
+                            replayed_fma = (
+                                replayed_fma.astype(np.float64)
+                                + delta[i, :, :, None].astype(np.float64)
+                                * np.repeat(key[i], h // hq, axis=0)[:, None, :].astype(
+                                    np.float64
+                                )
+                            ).astype(np.float32)
+                            prefix["state"] = feeds["state"]
+                            prefix["offsets"] = np.array(
+                                [0, accepted, accepted] if b == 0 else [0, 0, accepted],
+                                np.int32,
+                            )
+                            gpu_prefix = uncaptured.run(
+                                None,
+                                runtime_feeds(
+                                    {
+                                        name: value
+                                        for name, value in prefix.items()
+                                        if name not in ("counts", "active")
+                                    }
+                                ),
+                            )[1][b]
+                            np.testing.assert_array_equal(
+                                replayed_fma.view(np.uint32),
+                                gpu_prefix.view(np.uint32),
+                            )
         feeds["state"] = actual[1]
     if dtype == np.float16 and fused and rule == "gated_delta" and k == 128:
-        expected = delta_reference(feeds, hq, h, k, v, rule, fused, norm, scale)
+        expected = delta_reference(
+            feeds, hq, h, k, v, rule, fused, norm, scale, capacity
+        )
         binding = session.io_binding()
         for name, array in feeds.items():
             binding.bind_cpu_input(name, array)
@@ -374,6 +546,8 @@ def test_packed_delta(dtype, rule, geometry, fused, norm, with_gates):
             feeds["state"].shape,
             feeds["state"].ctypes.data,
         )
+        if capacity:
+            binding.bind_output("updates", "cpu")
         session.run_with_iobinding(binding)
         for result, reference in zip(binding.copy_outputs_to_cpu(), expected):
             np.testing.assert_allclose(result, reference, rtol=3e-3, atol=3e-5)

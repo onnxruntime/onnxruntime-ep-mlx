@@ -1,0 +1,261 @@
+{
+  "scope": "Same-binary short-context MLX MTP A/B; not a WebGPU or 16K LLM comparison.",
+  "interpretation": "Aggregate throughput increased 6.05%, but median decode latency and TTFT did not improve. Five samples show material variance; no robust short-context speedup or 50% MTP gain is established.",
+  "hardware": "Apple M1 Max",
+  "memory_bytes": 34359738368,
+  "python": "3.13.5",
+  "versions": {
+    "onnxruntime": "1.32.0",
+    "onnxruntime-genai": "0.19.0"
+  },
+  "native_mlx_version": "0.32.4",
+  "base_commit": "a9d1aebe7560f8bf572f1deed00ba8fdc63bac97",
+  "native_patch_sha256": "d787acdfdb45ddfec04f37ac03cb7d91e6beadda6ef4748ee92db3ee6e685b59",
+  "native_source_sha256": {
+    "rust/src/ops/attention.rs": "29151e08c61c7cd84e602f8f8858adb83923229c71149bb94af10febbb78e97d",
+    "rust/src/ops/paged_attention.rs": "73a6558e08579cc89c3b59dd381de3846517bdc933b4f42fc1285914a41f04ee"
+  },
+  "plugin_sha256": "8783ef6a5db4847114826038b8c4cef2cd6407e30d6e3643cfd8097f6de028be",
+  "config_sha256": "a24c3545bf68f066da3456fcdc032169c928a6f49620b0517c00b58185b0e559",
+  "runtime_overlay": {
+    "speculative": {
+      "max_draft_tokens": 4
+    },
+    "engine": {
+      "dynamic_batching": {
+        "num_blocks": 8,
+        "max_scheduled_tokens": 64
+      }
+    }
+  },
+  "initializer_sharing": {
+    "decoder": false,
+    "mtp": false
+  },
+  "prompt_token_count": 64,
+  "prompt_tokens": [
+    248045,
+    8678,
+    198,
+    24342,
+    286,
+    4879,
+    369,
+    716,
+    310,
+    830,
+    11553,
+    13,
+    5044,
+    1683,
+    15060,
+    1472,
+    279,
+    3274,
+    11,
+    9307,
+    1328,
+    30800,
+    11,
+    2814,
+    47675,
+    25605,
+    11,
+    321,
+    60445,
+    55404,
+    11,
+    27224,
+    11,
+    321,
+    30246,
+    303,
+    279,
+    1534,
+    4087,
+    13,
+    248046,
+    198,
+    248045,
+    846,
+    198,
+    814,
+    20139,
+    1204,
+    264,
+    18826,
+    27545,
+    2450,
+    1970,
+    1083,
+    5484,
+    1970,
+    13,
+    248046,
+    198,
+    248045,
+    74455,
+    198,
+    248068,
+    198
+  ],
+  "generated_tokens": 256,
+  "warmups": 3,
+  "repetitions": 5,
+  "methodology": {
+    "order": [
+      "direct_disabled",
+      "direct_enabled"
+    ],
+    "fresh_sequential_processes": true,
+    "other_gpu_workloads": false,
+    "tracing_and_capture": false,
+    "genai_state_outputs": "CPU-visible; no allocator-only GPU MTP claim",
+    "aggregate_formula": "sum(len(tokens)-1) / sum(decode_seconds)",
+    "raw_session_artifacts": [
+      "qwen-mtp-multiquery-qualified-1.json",
+      "qwen-mtp-multiquery-qualified-0.json"
+    ]
+  },
+  "all_generated_tokens_and_speculative_statistics_equal": true,
+  "speculative_stats_per_run": {
+    "rounds": 89,
+    "completed_rounds": 89,
+    "interrupted_rounds": 0,
+    "active_rounds": 0,
+    "draft_tokens_proposed": 355,
+    "draft_tokens_evaluated": 236,
+    "draft_tokens_accepted": 166,
+    "correction_tokens": 0,
+    "bonus_tokens": 0,
+    "tokens_queued": 0,
+    "tokens_emitted": 0,
+    "tokens_discarded": 0,
+    "tokens_buffered": 0,
+    "draft_forward_passes": 355,
+    "target_forward_passes": 90,
+    "effective_k": 0,
+    "adaptive_k_increases": 0,
+    "adaptive_k_decreases": 0,
+    "adaptive_k_observations": 0,
+    "adaptive_k_probes": 0,
+    "cooldown_entries": 0,
+    "cooldown_steps": 0,
+    "cooldown_remaining": 0,
+    "standard_fallback_steps": 0,
+    "mtp_failures": 0,
+    "dflash2_failures": 0,
+    "dflash2_disables": 0,
+    "dflash2_admission_misses": 0,
+    "full_accept_rounds": 19,
+    "partial_accept_rounds": 51,
+    "zero_accept_rounds": 19,
+    "target_verify_forward_passes": 0,
+    "target_reanchor_forward_passes": 0,
+    "target_reconciliation_forward_passes": 0,
+    "ngram_lookup_hits": 0,
+    "ngram_lookup_misses": 0,
+    "ngram_lookup_tokens_proposed": 0,
+    "ngram_chained_tokens_proposed": 0,
+    "ngram_grammar_candidate_rejections": 0,
+    "ngram_history_syncs": 0,
+    "ngram_history_tokens_synced": 0,
+    "formula_supported": false,
+    "total_draft_ms": 0.0,
+    "total_target_ms": 0.0,
+    "total_reconciliation_ms": 0.0,
+    "total_target_verify_ms": 0.0,
+    "total_target_reanchor_ms": 0.0,
+    "total_ngram_history_sync_ms": 0.0,
+    "total_ngram_lookup_ms": 0.0,
+    "avg_draft_ms_per_token": 0.0,
+    "acceptance_rate": 0.7033898234367371,
+    "avg_draft_tokens_per_round": 3.9887640476226807,
+    "mean_emitted_tokens_per_round": 0.0,
+    "expected_tokens_per_round": 0.0,
+    "avg_target_ms_per_round": 0.0,
+    "target_baseline_ms_per_token": 0.0,
+    "target_overhead_ratio": 0.0,
+    "estimated_speedup": 0.0,
+    "observed_speedup": 0.0,
+    "adaptive_k_throughput": 0.0,
+    "acceptance_length_histogram": [
+      19,
+      24,
+      14,
+      14,
+      18,
+      0,
+      0,
+      0
+    ]
+  },
+  "results": {
+    "direct_disabled": {
+      "warm_ttft_median_ms": 9784.784708055668,
+      "decode_median_ms_per_token": 118.61442745087997,
+      "aggregate_decode_tokens_per_second": 8.204688239086254,
+      "decode_interval_p95_ms": 375.7803123793565,
+      "runs": [
+        {
+          "ttft_seconds": 10.459752457914874,
+          "decode_seconds": 35.94977916707285,
+          "generated_tokens_sha256": "9eabb6dad5d8b2e40db3fcff1442fbec71f8ff8f207017e6a4809a2786b284ef"
+        },
+        {
+          "ttft_seconds": 11.403472292004153,
+          "decode_seconds": 28.625341624952853,
+          "generated_tokens_sha256": "9eabb6dad5d8b2e40db3fcff1442fbec71f8ff8f207017e6a4809a2786b284ef"
+        },
+        {
+          "ttft_seconds": 9.784784708055668,
+          "decode_seconds": 31.66787512495648,
+          "generated_tokens_sha256": "9eabb6dad5d8b2e40db3fcff1442fbec71f8ff8f207017e6a4809a2786b284ef"
+        },
+        {
+          "ttft_seconds": 9.68935587501619,
+          "decode_seconds": 30.246678999974392,
+          "generated_tokens_sha256": "9eabb6dad5d8b2e40db3fcff1442fbec71f8ff8f207017e6a4809a2786b284ef"
+        },
+        {
+          "ttft_seconds": 8.779496749979444,
+          "decode_seconds": 28.90928270900622,
+          "generated_tokens_sha256": "9eabb6dad5d8b2e40db3fcff1442fbec71f8ff8f207017e6a4809a2786b284ef"
+        }
+      ]
+    },
+    "direct_enabled": {
+      "warm_ttft_median_ms": 10205.375291057862,
+      "decode_median_ms_per_token": 119.42171160012995,
+      "aggregate_decode_tokens_per_second": 8.701077841217387,
+      "decode_interval_p95_ms": 344.96979132527485,
+      "runs": [
+        {
+          "ttft_seconds": 10.177871874999255,
+          "decode_seconds": 27.78672891599126,
+          "generated_tokens_sha256": "9eabb6dad5d8b2e40db3fcff1442fbec71f8ff8f207017e6a4809a2786b284ef"
+        },
+        {
+          "ttft_seconds": 10.205375291057862,
+          "decode_seconds": 31.71318766695913,
+          "generated_tokens_sha256": "9eabb6dad5d8b2e40db3fcff1442fbec71f8ff8f207017e6a4809a2786b284ef"
+        },
+        {
+          "ttft_seconds": 11.826252541970462,
+          "decode_seconds": 30.476015374995768,
+          "generated_tokens_sha256": "9eabb6dad5d8b2e40db3fcff1442fbec71f8ff8f207017e6a4809a2786b284ef"
+        },
+        {
+          "ttft_seconds": 10.601706375018694,
+          "decode_seconds": 26.105101707973517,
+          "generated_tokens_sha256": "9eabb6dad5d8b2e40db3fcff1442fbec71f8ff8f207017e6a4809a2786b284ef"
+        },
+        {
+          "ttft_seconds": 9.37326579191722,
+          "decode_seconds": 30.452536458033137,
+          "generated_tokens_sha256": "9eabb6dad5d8b2e40db3fcff1442fbec71f8ff8f207017e6a4809a2786b284ef"
+        }
+      ]
+    }
+  }
+}

@@ -3866,6 +3866,8 @@ fn paged_attention_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), 
     } else {
         Some(ctx.resolve(&n.inputs[4])?)
     };
+    let original_kcache = kcache;
+    let original_vcache = vcache;
     let kquant = QuantizedCache::resolve(ctx, n, 0, true, kv_heads, head)?;
     let vquant = if latent {
         None
@@ -3955,6 +3957,8 @@ fn paged_attention_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), 
     };
     let mut cache_updated = false;
     let mut written_slots = Vec::new();
+    let mut key_patches = Vec::new();
+    let mut value_patches = Vec::new();
 
     // The cache is [max_seq, rotary_dim/2]; consume its exact values, including reduced precision.
     let rope = if do_rotary {
@@ -4040,6 +4044,7 @@ fn paged_attention_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), 
             } else {
                 knew
             };
+            key_patches.push(knew);
             let flat_slots = cshape[0] * block_size;
             let kc = ctx.reshape(kcache, &[flat_slots, kv_heads, cache_head])?;
             let kc = ctx.emit(|res, st| unsafe {
@@ -4057,6 +4062,7 @@ fn paged_attention_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), 
                 } else {
                     vnew
                 };
+                value_patches.push(vnew);
                 let vc = ctx.reshape(current_vcache, &[flat_slots, kv_heads, vcache_head])?;
                 let vc = ctx.emit(|res, st| unsafe {
                     mlx::mlx_scatter_single(res, vc, slot_idx, vnew, 0, st)
@@ -4068,9 +4074,74 @@ fn paged_attention_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), 
         prepared.push((b, nq, pastb, qh, kh_new, vh_new));
     }
 
+    let cache_patches = batch == 1
+        && kquant.is_none()
+        && vquant.is_none()
+        && !latent
+        && written_slots
+            .iter()
+            .enumerate()
+            .all(|(i, slot)| !written_slots[..i].contains(slot))
+        && !std::env::var_os("ONNXRUNTIME_EP_MLX_NO_PAGED_PATCHES")
+            .is_some_and(|v| v != "0" && !v.is_empty());
     let mut outs: Vec<mlx::mlx_array> = Vec::new();
     for (b, nq, pastb, qh, kh_new, vh_new) in prepared {
         let total = pastb + nq;
+        if (1..=8).contains(&nq)
+            && std::env::var_os("MLX_SDPA_BLOCKS").is_none()
+            && head == v_head
+            && matches!(head, 64 | 96 | 128 | 256)
+            && !latent
+            && kquant.is_none()
+            && vquant.is_none()
+            && head_sink.is_none()
+            && n.floats.get("softcap").copied().unwrap_or(0.0) == 0.0
+            && attr_int(n, "local_window_size", -1) <= 0
+            && [qh, kh_new, vh_new, kcache, vcache.unwrap()]
+                .iter()
+                .all(|&a| ctx.dtype_of(a) == mlx::mlx_dtype__MLX_FLOAT16)
+            && !std::env::var_os("ONNXRUNTIME_EP_MLX_NO_PAGED_DIRECT")
+                .is_some_and(|v| v != "0" && !v.is_empty())
+            && super::paged_attention::gpu_stream(ctx)?
+        {
+            let mut positions = vec![pastb];
+            for row in 0..nq as usize {
+                let slot = if !cache_patches {
+                    -1
+                } else if let Some(mapping) = &slot_mapping {
+                    mapping[cum[b] as usize + row] as i32
+                } else {
+                    let logical = pastb as usize + row;
+                    let physical = bt[b * max_blocks + logical / block_size as usize] as i32;
+                    physical * block_size + (logical % block_size as usize) as i32
+                };
+                positions.push(slot);
+            }
+            let position = i32_host_array(ctx, &positions);
+            let (read_k, read_v) = if cache_patches {
+                (original_kcache, original_vcache.unwrap())
+            } else {
+                (kcache, vcache.unwrap())
+            };
+            let o = super::paged_attention::vector(
+                ctx,
+                &[qh, read_k, read_v, block_table, kh_new, vh_new, position],
+                num_heads,
+                kv_heads,
+                head,
+                block_size,
+                max_blocks as i32,
+                b as i32,
+                nq,
+                total,
+                attr_int(n, "is_causal", 1) != 0,
+                scale,
+            )?;
+            let o = ctx.transpose(o, &[0, 2, 1, 3])?;
+            let o = ctx.reshape(o, &[nq, out_hidden])?;
+            outs.push(o);
+            continue;
+        }
         // Gather the cached prefix [0, past) from the physical blocks and append the new K/V.
         // Quantized PagedAttention reads the updated physical pages for *all* rows, including
         // skipped/remapped current slots. It must not attend to the unquantized new K/V.
@@ -4200,16 +4271,38 @@ fn paged_attention_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), 
         }
     };
     if cache_updated {
-        kcache =
-            ctx.write_back_input_rows(&n.inputs[3], kcache, 1, &written_slots, n.outputs.get(1))?;
-        if let Some(current_vcache) = vcache {
-            vcache = Some(ctx.write_back_input_rows(
+        if cache_patches {
+            kcache = ctx.write_back_input_patches(
+                &n.inputs[3],
+                kcache,
+                key_patches[0],
+                &written_slots,
+                n.outputs.get(1),
+            )?;
+            vcache = Some(ctx.write_back_input_patches(
                 &n.inputs[4],
-                current_vcache,
-                1,
+                vcache.unwrap(),
+                value_patches[0],
                 &written_slots,
                 n.outputs.get(2),
             )?);
+        } else {
+            kcache = ctx.write_back_input_rows(
+                &n.inputs[3],
+                kcache,
+                1,
+                &written_slots,
+                n.outputs.get(1),
+            )?;
+            if let Some(current_vcache) = vcache {
+                vcache = Some(ctx.write_back_input_rows(
+                    &n.inputs[4],
+                    current_vcache,
+                    1,
+                    &written_slots,
+                    n.outputs.get(2),
+                )?);
+            }
         }
     }
     ctx.bind(&n.outputs[0], output);

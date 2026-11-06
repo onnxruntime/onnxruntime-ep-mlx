@@ -370,8 +370,8 @@ unsafe fn compute_shape_key(
 ) -> String {
     let mut key = String::new();
     for input in inputs {
-        if let Ok((_data, shape, dtype)) =
-            crate::engine::read_ctx_input_raw(ort_api, kctx, input.ctx_index)
+        if let Ok((shape, dtype)) =
+            crate::engine::read_ctx_input_metadata(ort_api, kctx, input.ctx_index)
         {
             if !key.is_empty() {
                 key.push(';');

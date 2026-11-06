@@ -1,6 +1,6 @@
 //! Device-resident packed SSM kernels. Metadata stays on the GPU across decode calls.
 //! Contracts follow ORT CUDA's `gated_delta_net_impl.cu` and
-//! `varlen_causal_conv_with_state_impl.cu`; compact transition capture is not supported.
+//! `varlen_causal_conv_with_state_impl.cu`, including compact transition capture.
 
 use std::ffi::CString;
 
@@ -31,7 +31,9 @@ const CONV: &str = r#"
     int start = offsets[b], end = offsets[b + 1];
     if (offsets[0] != 0 || offsets[B] != N ||
         start < 0 || end < start || end > N) return;
+    // CAPTURE_INIT
     for (int t = start; t < end; ++t) {
+        // CAPTURE_STEP
         float sum = BIAS ? float(bias[c]) : 0.0f;
         for (int j = 0; j < K; ++j) {
             int local = t - start - (K - 1 - j) * D;
@@ -50,6 +52,16 @@ const CONV: &str = r#"
     }
 "#;
 
+const CONV_CAPTURE_INIT: &str = r#"
+    int captured = max(0, min(min(counts[b], CAP), end - start));
+    for (int i = 0; i < CAP; ++i) updates[(size_t(b) * CAP + i) * C + c] = T(0);
+"#;
+
+const CONV_CAPTURE_STEP: &str = r#"
+    if (t - start < captured)
+        updates[(size_t(b) * CAP + t - start) * C + c] = input[size_t(t) * C + c];
+"#;
+
 const DELTA: &str = r#"
     size_t column = thread_position_in_grid.x / 32;
     uint lane = thread_position_in_grid.x % 32;
@@ -64,6 +76,7 @@ const DELTA: &str = r#"
         uint ki = lane + 32 * j;
         state[j] = ki < K ? initial[column * K + ki] : 0.0f;
     }
+    // CAPTURE_INIT
     for (int t = start; t < end; ++t) {
         float q[(K + 31) / 32], k[(K + 31) / 32];
         float nq = 0.0f, nk = 0.0f;
@@ -99,6 +112,7 @@ const DELTA: &str = r#"
             if (SIGMOID) rate = 1.0f / (1.0f + precise::exp(-rate));
             delta *= rate;
         }
+        // CAPTURE_STEP
         float readout = 0.0f;
         for (uint j = 0; j < (K + 31) / 32; ++j) {
             uint ki = lane + 32 * j;
@@ -116,6 +130,42 @@ const DELTA: &str = r#"
         if (ki < K) final[column * K + ki] = state[j];
     }
 "#;
+
+const DELTA_CAPTURE_INIT: &str = r#"
+    int captured = (ACTIVE && active[0] == 0) ? 0
+        : max(0, min(min(counts[b], CAP), end - start));
+    size_t base = size_t(b) * CAP * (H + HQ * K + H * V);
+    for (int i = 0; i < CAP; ++i) {
+        if (vi == 0 && lane == 0) updates[base + i * H + h] = 0.0f;
+        if (vi == 0 && h == kh * (H / HQ)) {
+            for (uint j = 0; j < (K + 31) / 32; ++j) {
+                uint ki = lane + 32 * j;
+                if (ki < K) updates[base + CAP * H + (i * HQ + kh) * K + ki] = 0.0f;
+            }
+        }
+        if (lane == 0) updates[base + CAP * (H + HQ * K) + (i * H + h) * V + vi] = 0.0f;
+    }
+"#;
+
+const DELTA_CAPTURE_STEP: &str = r#"
+    int slot = t - start;
+    if (slot < captured) {
+        if (vi == 0 && lane == 0) updates[base + slot * H + h] = g;
+        if (vi == 0 && h == kh * (H / HQ)) {
+            for (uint j = 0; j < (K + 31) / 32; ++j) {
+                uint ki = lane + 32 * j;
+                if (ki < K) updates[base + CAP * H + (slot * HQ + kh) * K + ki] = k[j];
+            }
+        }
+        if (lane == 0) updates[base + CAP * (H + HQ * K) + (slot * H + h) * V + vi] = delta;
+    }
+"#;
+
+fn capture_source(source: &str, init: &str, step: &str, capacity: i32) -> String {
+    source
+        .replace("// CAPTURE_INIT", if capacity > 0 { init } else { "" })
+        .replace("// CAPTURE_STEP", if capacity > 0 { step } else { "" })
+}
 
 fn present(n: &NodeDesc, index: usize) -> bool {
     n.inputs
@@ -137,7 +187,8 @@ fn kernel(
     threads: i32,
 ) -> Result<Vec<mlx::mlx_array>, MlxError> {
     let names = super::selective_scan::VecString::new(names)?;
-    let outputs = super::selective_scan::VecString::new(&["output", "final"])?;
+    let outputs =
+        super::selective_scan::VecString::new(&["output", "final", "updates"][..shapes.len()])?;
     let name = CString::new(name).unwrap();
     let source = CString::new(source).unwrap();
     let k = unsafe {
@@ -207,12 +258,14 @@ fn kernel(
         mlx::mlx_fast_metal_kernel_config_free(config);
         mlx::mlx_fast_metal_kernel_free(k);
     }
-    if rc != 0 || results.size() != 2 {
+    if rc != 0 || results.size() != shapes.len() {
         return Err(
             "Packed SSM: Metal dispatch failed; verify input geometry and GPU availability".into(),
         );
     }
-    Ok((0..2).map(|i| ctx.keep(results.get(i))).collect())
+    Ok((0..shapes.len())
+        .map(|i| ctx.keep(results.get(i)))
+        .collect())
 }
 
 fn conv(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
@@ -252,12 +305,28 @@ fn conv(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
         .filter(|&v| v > 0)
         .ok_or("VarlenCausalConvWithState: empty or oversized dispatch")?;
     let dtype = ctx.dtype_of(x);
+    let capacity = n.ints.get("state_update_capacity").copied().unwrap_or(0) as i32;
+    let mut inputs = vec![x, w, offsets, state, bias];
+    let mut names = vec!["input", "weight", "offsets", "initial", "bias"];
+    let mut shapes = vec![xs.clone(), ss.clone()];
+    let mut dtypes = vec![dtype, dtype];
+    if capacity > 0 {
+        let counts = ctx.resolve(&n.inputs[5])?;
+        if ctx.shape_of(counts) != [ss[0]] {
+            return Err("VarlenCausalConvWithState: capture_count must have shape [batch]".into());
+        }
+        inputs.push(counts);
+        names.push("counts");
+        shapes.push(vec![ss[0], capacity, xs[1]]);
+        dtypes.push(dtype);
+    }
+    let source = capture_source(CONV, CONV_CAPTURE_INIT, CONV_CAPTURE_STEP, capacity);
     let out = kernel(
         ctx,
         "onnxrt_mlx_varlen_causal_conv",
-        CONV,
-        &["input", "weight", "offsets", "initial", "bias"],
-        &[x, w, offsets, state, bias],
+        &source,
+        &names,
+        &inputs,
         &[
             ("B", ss[0]),
             ("N", xs[0]),
@@ -266,18 +335,22 @@ fn conv(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
             ("L", length),
             ("D", dilation),
             ("BIAS", present(n, 3) as i32),
+            ("CAP", capacity),
             (
                 "SILU",
                 (activation == "silu" || activation == "swish") as i32,
             ),
         ],
         None,
-        &[xs, ss],
-        &[dtype, dtype],
+        &shapes,
+        &dtypes,
         threads,
     )?;
     ctx.bind(&n.outputs[0], out[0]);
     ctx.bind(&n.outputs[1], out[1]);
+    if capacity > 0 {
+        ctx.bind(&n.outputs[2], out[2]);
+    }
     ctx.mark_fast("mlx_varlen_causal_conv");
     Ok(())
 }
@@ -347,13 +420,40 @@ fn delta(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
         .and_then(|x| x.checked_mul(32))
         .ok_or("GatedDeltaNet: dispatch size exceeds int32")?;
     let dtype = ctx.dtype_of(qkv);
+    let capacity = n.ints.get("state_update_capacity").copied().unwrap_or(0) as i32;
+    let mut names = vec![
+        "qkv", "offsets", "initial", "decay", "beta", "a_log", "dt_bias",
+    ];
+    let mut shapes = vec![vec![qs[0], h, v], ss];
+    let mut dtypes = vec![dtype, mlx::mlx_dtype__MLX_FLOAT32];
+    if capacity > 0 {
+        let counts = ctx.resolve(&n.inputs[9])?;
+        if ctx.shape_of(counts) != [b] {
+            return Err("GatedDeltaNet: capture_count must have shape [batch]".into());
+        }
+        let active = if present(n, 10) {
+            let a = ctx.resolve(&n.inputs[10])?;
+            if ctx.shape_of(a) != [1] {
+                return Err("GatedDeltaNet: state_update_active must have shape [1]".into());
+            }
+            a
+        } else {
+            offsets
+        };
+        inputs.extend([counts, active]);
+        names.extend(["counts", "active"]);
+        let width = capacity
+            .checked_mul(h + hq * k + h * v)
+            .ok_or("GatedDeltaNet: compact capsule width exceeds int32")?;
+        shapes.push(vec![b, width]);
+        dtypes.push(mlx::mlx_dtype__MLX_FLOAT32);
+    }
+    let source = capture_source(DELTA, DELTA_CAPTURE_INIT, DELTA_CAPTURE_STEP, capacity);
     let out = kernel(
         ctx,
         "onnxrt_mlx_packed_gated_delta",
-        DELTA,
-        &[
-            "qkv", "offsets", "initial", "decay", "beta", "a_log", "dt_bias",
-        ],
+        &source,
+        &names,
         &inputs,
         &[
             ("B", b),
@@ -363,6 +463,8 @@ fn delta(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
             ("K", k),
             ("V", v),
             ("WIDTH", qs[1]),
+            ("CAP", capacity),
+            ("ACTIVE", present(n, 10) as i32),
             ("DECAY", decay as i32),
             ("BETA", beta as i32),
             ("RETRIEVE", retrieve as i32),
@@ -377,13 +479,16 @@ fn delta(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
             ),
         ],
         Some(scale),
-        &[vec![qs[0], h, v], ss],
-        &[dtype, mlx::mlx_dtype__MLX_FLOAT32],
+        &shapes,
+        &dtypes,
         threads,
     )?;
     ctx.bind(&n.outputs[0], out[0]);
     if n.outputs.len() > 1 && !n.outputs[1].name.is_empty() {
         ctx.bind(&n.outputs[1], out[1]);
+    }
+    if capacity > 0 {
+        ctx.bind(&n.outputs[2], out[2]);
     }
     ctx.mark_fast("mlx_packed_gated_delta");
     Ok(())
@@ -391,8 +496,8 @@ fn delta(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
 
 fn common_claim(n: &NodeView, offsets: usize) -> ClaimResult {
     require!(
-        n.int_attr("state_update_capacity", 0) == 0,
-        "compact transition capture is not implemented; use state_update_capacity=0"
+        (0..=8).contains(&n.int_attr("state_update_capacity", 0)),
+        "state_update_capacity must be in [0,8]"
     );
     let x = n.input_info(0).ok_or("missing input type/shape")?;
     require!(
@@ -413,11 +518,45 @@ fn common_claim(n: &NodeView, offsets: usize) -> ClaimResult {
     Ok(())
 }
 
+fn capture_claim(
+    n: &NodeView,
+    count_index: usize,
+    batch: i64,
+    shape: &[i64],
+    dtype: ort::ONNXTensorElementDataType,
+) -> ClaimResult {
+    if n.int_attr("state_update_capacity", 0) == 0 {
+        return Ok(());
+    }
+    require!(
+        n.input_info(count_index)
+            .is_some_and(|t| t.dtype == INT32 && compatible(&t.shape, &[batch])),
+        "capture_count must be int32 [batch] when state_update_capacity is positive"
+    );
+    if let Some(active) = n.input_info(count_index + 1) {
+        require!(
+            active.dtype == INT32 && active.shape == [1],
+            "state_update_active must be int32 [1]"
+        );
+    }
+    require!(
+        n.output_info(2)
+            .is_some_and(|t| t.dtype == dtype && compatible(&t.shape, shape)),
+        "compact transition output must have the declared capacity, geometry and dtype"
+    );
+    Ok(())
+}
+
 fn conv_claim(n: &NodeView) -> ClaimResult {
     common_claim(n, 2)?;
+    let capacity = n.int_attr("state_update_capacity", 0);
     require!(
-        n.num_inputs() == 5 && n.num_outputs() == 2,
-        "expects input, weight, offsets, optional bias and initial state; two outputs"
+        if capacity == 0 {
+            n.num_inputs() == 5 && n.num_outputs() == 2
+        } else {
+            n.num_inputs() == 6 && n.num_outputs() == 3
+        },
+        "expects five base inputs/two outputs; capture requires a count input and third output"
     );
     let x = n.input_info(0).unwrap();
     let w = n.input_info(1).ok_or("missing convolution weight")?;
@@ -468,14 +607,26 @@ fn conv_claim(n: &NodeView) -> ClaimResult {
         ),
         "activation must be none, silu or swish"
     );
+    capture_claim(
+        n,
+        5,
+        s.shape[0],
+        &[s.shape[0], capacity, x.shape[1]],
+        x.dtype,
+    )?;
     Ok(())
 }
 
 fn delta_claim(n: &NodeView) -> ClaimResult {
     common_claim(n, 3)?;
+    let capacity = n.int_attr("state_update_capacity", 0);
     require!(
-        (7..=9).contains(&n.num_inputs()) && (1..=2).contains(&n.num_outputs()),
-        "expects packed QKV, offsets, gates and FP32 state; compact updates are unsupported"
+        if capacity == 0 {
+            (7..=9).contains(&n.num_inputs()) && (1..=2).contains(&n.num_outputs())
+        } else {
+            (10..=11).contains(&n.num_inputs()) && n.num_outputs() == 3
+        },
+        "expects packed QKV, offsets, gates and FP32 state; capture also requires count, optional active and capsule output"
     );
     require!(
         !n.input_present(1) && !n.input_present(2),
@@ -502,6 +653,11 @@ fn delta_claim(n: &NodeView) -> ClaimResult {
             && s.shape[1] % (remaining / (2 * s.shape[3])) == 0,
         "packed QKV width must match state and inverse grouped heads"
     );
+    let capsule_width = capacity
+        .checked_mul(s.shape[1] + remaining / 2 + value_width)
+        .filter(|&v| v <= i32::MAX as i64)
+        .ok_or("compact recurrent capsule width exceeds int32")?;
+    capture_claim(n, 9, s.shape[0], &[s.shape[0], capsule_width], FLOAT)?;
     let rule = n.string_attr("update_rule", "gated_delta");
     require!(
         matches!(rule.as_str(), "linear" | "gated" | "delta" | "gated_delta"),
