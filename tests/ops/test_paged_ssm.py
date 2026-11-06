@@ -319,9 +319,160 @@ def delta_reference(feeds, hq, h, k, v, rule, fused, norm, scale=0.0, capacity=0
 
 
 @pytest.mark.parametrize("dtype", [np.float32, np.float16, ml_dtypes.bfloat16])
+@pytest.mark.parametrize("geometry", [(2, 6, 16, 32), (16, 48, 128, 128)])
+@pytest.mark.parametrize("capacity", [0, 4, 8])
+def test_chunked_delta_dynamic(dtype, geometry, capacity, monkeypatch):
+    hq, h, k, v = geometry
+    dt = storage_type(dtype)
+    inputs = [
+        m.tensor("qkv", dt, ["tokens", 2 * hq * k + h * v]),
+        ir.Value(name=""),
+        ir.Value(name=""),
+        m.tensor("offsets", ir.DataType.INT32, [3]),
+        m.tensor("decay", ir.DataType.FLOAT, ["tokens", h]),
+        m.tensor("beta", ir.DataType.FLOAT, ["tokens", h]),
+        m.tensor("state", ir.DataType.FLOAT, [2, h, v, k]),
+        m.tensor("a_log", ir.DataType.FLOAT, [h]),
+        m.tensor("dt_bias", ir.DataType.FLOAT, [h]),
+    ]
+    outputs = [
+        m.tensor("output", dt, ["tokens", h, v]),
+        m.tensor("final", ir.DataType.FLOAT, [2, h, v, k]),
+    ]
+    scale = 0.37
+    attrs = [
+        ir.Attr("qk_l2_norm", ir.AttributeType.INT, 1),
+        ir.Attr("gate_activation", ir.AttributeType.STRING, "softplus"),
+        ir.Attr("beta_activation", ir.AttributeType.STRING, "sigmoid"),
+        ir.Attr("scale", ir.AttributeType.FLOAT, scale),
+    ]
+    if capacity:
+        inputs.extend(
+            [
+                m.tensor("counts", ir.DataType.INT32, [2]),
+                m.tensor("active", ir.DataType.INT32, [1]),
+            ]
+        )
+        attrs.append(ir.Attr("state_update_capacity", ir.AttributeType.INT, capacity))
+        outputs.append(
+            m.tensor("updates", ir.DataType.FLOAT, [2, capacity * (h + hq * k + h * v)])
+        )
+    serialized = runtime_model(
+        build("GatedDeltaNet", inputs, outputs, attrs=attrs, domain="com.microsoft"),
+        dtype,
+    )
+    baseline, candidate = strict_session(serialized), strict_session(serialized)
+    rng = np.random.default_rng(814)
+    monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_GDN_PREPARE", "0")
+    for iteration, (tokens, split, mode) in enumerate(
+        [
+            (0, 0, "normal"),
+            (1, 0, "normal"),
+            (8, 3, "normal"),
+            (31, 31, "normal"),
+            (32, 1, "normal"),
+            (63, 21, "normal"),
+            (64, 0, "zero"),
+            (65, 65, "weak"),
+            (257, 0, "weak"),
+            (64, 21, "mixed"),
+            (129, 1, "collinear"),
+            (4, 1, "normal"),
+        ]
+    ):
+        feeds = {
+            "qkv": (rng.normal(size=(tokens, 2 * hq * k + h * v)) * 0.1).astype(dtype),
+            "offsets": np.array([0, split, tokens], np.int32),
+            "decay": rng.normal(size=(tokens, h)).astype(np.float32),
+            "beta": rng.normal(size=(tokens, h)).astype(np.float32),
+            "state": (rng.normal(size=(2, h, v, k)) * 0.1).astype(np.float32),
+            "a_log": np.full(
+                h, -20 if mode == "weak" else 100 if mode == "zero" else -1, np.float32
+            ),
+            "dt_bias": np.full(h, -10 if mode == "weak" else 0, np.float32),
+        }
+        if mode == "mixed":
+            feeds["a_log"].fill(0)
+            feeds["decay"][::2] = 1000
+            feeds["decay"][1::2] = -1000
+        elif mode == "collinear":
+            feeds["qkv"][:, : 2 * hq * k] = 0.1
+            feeds["a_log"].fill(-20)
+            feeds["beta"].fill(100)
+        if capacity:
+            feeds["counts"] = np.array([2, 99] if iteration % 2 else [-1, 99], np.int32)
+            feeds["active"] = np.array([iteration % 3 != 0], np.int32)
+        expected = delta_reference(
+            feeds, hq, h, k, v, "gated_delta", True, True, scale, capacity
+        )
+        monkeypatch.setenv("ONNXRUNTIME_EP_MLX_CHUNKED_PREFILL", "0")
+        control = baseline.run(None, runtime_feeds(feeds))
+        monkeypatch.setenv("ONNXRUNTIME_EP_MLX_CHUNKED_PREFILL", "1")
+        actual = candidate.run(None, runtime_feeds(feeds))
+        tolerance = 8e-3 if dtype == ml_dtypes.bfloat16 else 1e-3
+        np.testing.assert_allclose(
+            actual[0], expected[0], rtol=tolerance, atol=tolerance
+        )
+        for result, reference in zip(actual[1:], expected[1:], strict=True):
+            np.testing.assert_allclose(result, reference, rtol=2e-5, atol=2e-6)
+        if capacity and tokens == 257:
+            capsule = actual[2][1]
+            gates = capsule[: capacity * h].reshape(capacity, h)
+            keys = capsule[capacity * h : capacity * (h + hq * k)].reshape(
+                capacity, hq, k
+            )
+            deltas = capsule[capacity * (h + hq * k) :].reshape(capacity, h, v)
+            replayed = feeds["state"][1].astype(np.float64)
+            for prefix in range(capacity):
+                replayed *= gates[prefix, :, None, None]
+                replayed += (
+                    deltas[prefix, :, :, None].astype(np.float64)
+                    * np.repeat(keys[prefix], h // hq, axis=0)[:, None, :]
+                )
+                prefix_feeds = {
+                    **feeds,
+                    "qkv": feeds["qkv"][: prefix + 1],
+                    "decay": feeds["decay"][: prefix + 1],
+                    "beta": feeds["beta"][: prefix + 1],
+                    "offsets": np.array([0, 0, prefix + 1], np.int32),
+                }
+                prefix_state = delta_reference(
+                    prefix_feeds, hq, h, k, v, "gated_delta", True, True, scale, capacity
+                )[1][1]
+                np.testing.assert_allclose(
+                    replayed, prefix_state, rtol=2e-5, atol=2e-6
+                )
+        if tokens < 32:
+            for result, reference in zip(actual, control, strict=True):
+                np.testing.assert_array_equal(
+                    result.view(np.uint8), reference.view(np.uint8)
+                )
+        if tokens == 257:
+            state = feeds["state"]
+            parts = []
+            for start, end in [(0, 65), (65, tokens)]:
+                segment = {
+                    **feeds,
+                    "qkv": feeds["qkv"][start:end],
+                    "decay": feeds["decay"][start:end],
+                    "beta": feeds["beta"][start:end],
+                    "offsets": np.array([0, 0, end - start], np.int32),
+                    "state": state,
+                }
+                result = candidate.run(None, runtime_feeds(segment))
+                parts.append(result[0])
+                state = result[1]
+            np.testing.assert_allclose(
+                np.concatenate(parts), actual[0], rtol=tolerance, atol=tolerance
+            )
+            np.testing.assert_allclose(state, actual[1], rtol=2e-5, atol=2e-6)
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.float16, ml_dtypes.bfloat16])
 @pytest.mark.parametrize("geometry", [(2, 6, 33, 33), (16, 48, 128, 128)])
 @pytest.mark.parametrize("capacity", [0, 4])
 def test_prepared_delta_bitwise_dynamic(dtype, geometry, capacity, monkeypatch):
+    monkeypatch.setenv("ONNXRUNTIME_EP_MLX_CHUNKED_PREFILL", "0")
     hq, h, k, v = geometry
     dt = storage_type(dtype)
     inputs = [

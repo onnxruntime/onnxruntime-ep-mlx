@@ -219,6 +219,26 @@ restore the state after partial draft acceptance without rerunning the target.
 GDN's optional inactive control zeroes its capsule without changing recurrence;
 capacity zero retains the ordinary two-output kernels.
 
+`ONNXRUNTIME_EP_MLX_CHUNKED_PREFILL=1` opts into an experimental eight-token
+block recurrence for packed GDN prefill. It requires at least 32 packed tokens,
+key/value widths divisible by eight, L2-normalized Q/K, sigmoid beta, softplus
+decay and enabled coefficient preparation. Calls with fewer than 32 packed
+tokens, including this batch-capacity-two model's short decode and MTP
+verification calls, retain the existing recurrence. The block kernel
+keeps state and matrix arithmetic in FP32, uses direct decay products without
+clamping or dividing by a decay, and supports ragged tails, empty sequences and
+compact prefix capture. Its reassociated reductions are not bitwise identical
+to token-serial recurrence. The default remains off pending full-model
+qualification; an isolated kernel speedup is not an end-to-end TTFT claim.
+The [initial full-model qualification](reports/qwen38-paged-chunked-prefill-mtp-m1max.json)
+preserved all generated tokens and speculative statistics, but median TTFT
+regressed from 18.430 to 23.961 seconds. A scheduler-256 short pilot did not
+establish a robust improvement either. These results do not qualify the
+experimental route for default enablement or a performance release.
+Compare this option at fixed `--max-scheduled-tokens` before tuning the
+scheduler budget, and compare generated tokens and speculative statistics.
+`ONNXRUNTIME_EP_MLX_NO_GDN_PREPARE=1` also disables the block route.
+
 Packed exports can leave batch/token dimensions symbolic. `GatedRMSNorm` and
 `MRotaryEmbedding` claim these forms without CPU boundaries; concrete reshape
 and slice geometry remains shape-keyed across prefill and decode.

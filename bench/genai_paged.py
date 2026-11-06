@@ -346,6 +346,7 @@ def main():
                 "ONNXRUNTIME_EP_MLX_NO_PAGED_DIRECT",
                 "ONNXRUNTIME_EP_MLX_NO_PAGED_PATCHES",
                 "ONNXRUNTIME_EP_MLX_NO_GDN_PREPARE",
+                "ONNXRUNTIME_EP_MLX_CHUNKED_PREFILL",
             )
             if name in os.environ
         },

@@ -135,6 +135,13 @@ class CustomBuildHook(BuildHookInterface):
             )
 
         pkg_dir = project_root / "src" / "onnxruntime_ep_mlx"
+        notice = rust_dir.parent / "NOTICE"
+        if not notice.is_file():
+            raise RuntimeError(
+                f"Required third-party notice is missing: {notice}. "
+                "Restore NOTICE before building the wheel."
+            )
+        build_data.setdefault("force_include", {})[str(notice)] = "onnxruntime_ep_mlx/NOTICE"
 
         _ensure_mlx(project_root)
 

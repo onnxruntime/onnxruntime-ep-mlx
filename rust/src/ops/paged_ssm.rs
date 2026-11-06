@@ -199,6 +199,40 @@ const DELTA_CAPTURE_INIT: &str = r#"
     }
 "#;
 
+const CHUNK_CAPTURE_INIT: &str = r#"
+    int captured = (ACTIVE && active[0] == 0) ? 0
+        : max(0, min(min(counts[b], CAP), end - start));
+    size_t capsule_base = size_t(b) * CAP * (H + HQ * K + H * V);
+    for (int i = 0; i < CAP; ++i) {
+        if (vb == 0 && lane == 0) updates[capsule_base + i * H + h] = 0.0f;
+        if (vb == 0 && h == kh * (H / HQ)) {
+            for (uint ki = lane; ki < K; ki += 32)
+                updates[capsule_base + CAP * H + (i * HQ + kh) * K + ki] = 0.0f;
+        }
+        if (lane < 8)
+            updates[capsule_base + CAP * (H + HQ * K) + (i * H + h) * V + vb + lane] = 0.0f;
+    }
+"#;
+
+const CHUNK_CAPTURE_STEP: &str = r#"
+    int slot = t - start + fm;
+    if (slot < captured) {
+        if (vb == 0 && fn == 0)
+            updates[capsule_base + slot * H + h] = gates_rates[size_t(t + fm) * H + h];
+        if (vb == 0 && h == kh * (H / HQ)) {
+            for (uint ki = 0; ki < K; ki += 8) {
+                size_t src = ((size_t(N) + t + fm) * HQ + kh) * K + ki + fn;
+                size_t dst = capsule_base + CAP * H + (slot * HQ + kh) * K + ki + fn;
+                updates[dst] = normalized_qk[src];
+                updates[dst + 1] = normalized_qk[src + 1];
+            }
+        }
+        size_t dst = capsule_base + CAP * (H + HQ * K) + (slot * H + h) * V + vb + fn;
+        updates[dst] = delta.thread_elements()[0];
+        updates[dst + 1] = delta.thread_elements()[1];
+    }
+"#;
+
 const DELTA_CAPTURE_STEP: &str = r#"
     int slot = t - start;
     if (slot < captured) {
@@ -249,7 +283,7 @@ fn kernel(
             names.as_raw(),
             outputs.as_raw(),
             source.as_ptr(),
-            c"".as_ptr(),
+            c"#include <metal_simdgroup_matrix>\n".as_ptr(),
             true,
             false,
         )
@@ -549,10 +583,34 @@ fn delta(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
     };
     names.extend(["normalized_qk", "gates_rates"]);
     inputs.extend(coefficients);
-    let source = capture_source(DELTA, DELTA_CAPTURE_INIT, DELTA_CAPTURE_STEP, capacity);
+    let chunked = prepared
+        && qs[0] >= 32
+        && k % 8 == 0
+        && v % 8 == 0
+        && decay
+        && retrieve
+        && beta
+        && softplus
+        && attr("beta_activation", "none") == "sigmoid"
+        && n.ints.get("qk_l2_norm").copied().unwrap_or(0) == 1
+        && std::env::var_os("ONNXRUNTIME_EP_MLX_CHUNKED_PREFILL").is_some_and(|value| value == "1");
+    let (body, init, step) = if chunked {
+        (
+            include_str!("paged_ssm_chunked.metal"),
+            CHUNK_CAPTURE_INIT,
+            CHUNK_CAPTURE_STEP,
+        )
+    } else {
+        (DELTA, DELTA_CAPTURE_INIT, DELTA_CAPTURE_STEP)
+    };
+    let source = capture_source(body, init, step, capacity);
     let out = kernel(
         ctx,
-        "onnxrt_mlx_packed_gated_delta",
+        if chunked {
+            "onnxrt_mlx_chunked_gated_delta"
+        } else {
+            "onnxrt_mlx_packed_gated_delta"
+        },
         &source,
         &names,
         &inputs,
@@ -560,7 +618,7 @@ fn delta(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
         Some(scale),
         &shapes,
         &dtypes,
-        threads,
+        if chunked { threads / 8 } else { threads },
     )?;
     ctx.bind(&n.outputs[0], out[0]);
     if n.outputs.len() > 1 && !n.outputs[1].name.is_empty() {
@@ -569,7 +627,11 @@ fn delta(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
     if capacity > 0 {
         ctx.bind(&n.outputs[2], out[2]);
     }
-    ctx.mark_fast("mlx_packed_gated_delta");
+    ctx.mark_fast(if chunked {
+        "mlx_chunked_gated_delta"
+    } else {
+        "mlx_packed_gated_delta"
+    });
     Ok(())
 }
 
