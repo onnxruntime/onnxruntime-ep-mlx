@@ -2304,19 +2304,17 @@ fn mrotary_embedding_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<()
         }
     }
 
+    let columns: Vec<i32> = assignment.iter().map(|&stream| stream as i32).collect();
+    let columns = i32_host_array(ctx, &columns);
+    let zero = ctx.scalar_f32(0.0);
+    let one = ctx.scalar_f32(1.0);
+    let stream_zero = ctx.binary(mlx::mlx_equal, columns, zero)?;
+    let stream_one = ctx.binary(mlx::mlx_equal, columns, one)?;
     let combine = |ctx: &mut TranslationContext,
                    streams: &[mlx::mlx_array]|
      -> Result<mlx::mlx_array, MlxError> {
-        let mut out = slice(ctx, streams[assignment[0]], &[0, 0, 0], &[b, s, 1])?;
-        for col in 1..half {
-            let selected = slice(
-                ctx,
-                streams[assignment[col as usize]],
-                &[0, 0, col],
-                &[b, s, col + 1],
-            )?;
-            out = concat2(ctx, out, selected, 2)?;
-        }
+        let out = ctx.where_(stream_zero, streams[0], streams[2])?;
+        let mut out = ctx.where_(stream_one, streams[1], out)?;
         let scale = n.floats.get("scale").copied().unwrap_or(1.0);
         if scale != 1.0 {
             let dtype = ctx.dtype_of(out);

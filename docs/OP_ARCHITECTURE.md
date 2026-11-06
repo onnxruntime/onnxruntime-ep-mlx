@@ -1,5 +1,11 @@
 # ONNX→MLX Op Translation Architecture
 
+MRotaryEmbedding selects the three supplied position streams with broadcast
+selectors rather than concatenating individual rotary columns. Dynamic batch and
+sequence dimensions retain their runtime shape checks, cache precision, scaling,
+and contiguous/interleaved layout semantics. GatedRMSNorm's existing dynamic
+coverage is unchanged.
+
 **Status:** Final Rust post-pivot architecture
 **Date:** 2026-07-13
 **Repo:** `onnxruntime-mlx`

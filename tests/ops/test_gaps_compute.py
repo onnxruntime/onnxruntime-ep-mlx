@@ -532,6 +532,46 @@ def test_mrotary_embedding(
     check(model, feeds, rtol=3e-3, atol=3e-3)
 
 
+@pytest.mark.parametrize("layout", [0, 1])
+def test_mrotary_embedding_dynamic_live_bindings(layout):
+    shape = ["batch", 2, "tokens", 12]
+    model = m.make_model(
+        "MRotaryEmbedding",
+        [
+            m.tensor("input", DT.FLOAT16, shape),
+            m.tensor("position_ids", DT.INT64, [3, "batch", "tokens"]),
+            m.tensor("cos", DT.FLOAT16, [17, 6]),
+            m.tensor("sin", DT.FLOAT16, [17, 6]),
+        ],
+        [m.tensor("Y", DT.FLOAT16, shape)],
+        domain="com.microsoft",
+        attributes={"mrope_section": [2, 2, 2], "mrope_layout": layout},
+    )
+    rng = np.random.default_rng(3492)
+    caches = {
+        "cos": rng.standard_normal((17, 6)).astype(np.float16),
+        "sin": rng.standard_normal((17, 6)).astype(np.float16),
+    }
+    options = ort.SessionOptions()
+    options.log_severity_level = 3
+    session = ort.InferenceSession(model, options, providers=m.EP_PROVIDERS)
+    session.disable_fallback()
+    cpu = ort.InferenceSession(model, options, providers=["CPUExecutionProvider"])
+    for batch, tokens in [(2, 3), (1, 8), (2, 1), (1, 0), (1, 5)]:
+        feeds = {
+            **caches,
+            "input": rng.standard_normal((batch, 2, tokens, 12)).astype(np.float16),
+            "position_ids": rng.integers(0, 17, size=(3, batch, tokens), dtype=np.int64),
+        }
+        if tokens == 3:
+            assert_mlx_claims(model, feeds)
+        actual = session.run(None, feeds)[0]
+        expected = cpu.run(None, feeds)[0]
+        np.testing.assert_allclose(actual, expected, rtol=3e-3, atol=3e-3)
+    with pytest.raises(Exception, match=r"position_ids must have shape"):
+        session.run(None, {**feeds, "position_ids": feeds["position_ids"][:, :, :1]})
+
+
 def test_mrotary_embedding_packed_batching():
     rng = np.random.default_rng(9129)
     b, s, nh, hd, max_seq = 1, 7, 2, 12, 3
