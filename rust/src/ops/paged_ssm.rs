@@ -62,6 +62,49 @@ const CONV_CAPTURE_STEP: &str = r#"
         updates[(size_t(b) * CAP + t - start) * C + c] = input[size_t(t) * C + c];
 "#;
 
+const DELTA_PREPARE: &str = r#"
+    uint lane = thread_position_in_grid.x % 32;
+    uint index = thread_position_in_grid.x / 32;
+    if (index >= size_t(N) * H) return;
+    uint h = index % H, t = index / H;
+    if (h < HQ) {
+        float q[(K + 31) / 32], k[(K + 31) / 32];
+        float nq = 0.0f, nk = 0.0f;
+        for (uint j = 0; j < (K + 31) / 32; ++j) {
+            uint ki = lane + 32 * j;
+            q[j] = ki < K ? float(qkv[size_t(t) * WIDTH + h * K + ki]) : 0.0f;
+            k[j] = ki < K ? float(qkv[size_t(t) * WIDTH + HQ * K + h * K + ki]) : 0.0f;
+            nq += q[j] * q[j];
+            nk += k[j] * k[j];
+        }
+        float rq = NORM ? rsqrt(simd_sum(nq) + 1e-12f) : 1.0f;
+        float rk = NORM ? rsqrt(simd_sum(nk) + 1e-12f) : 1.0f;
+        for (uint j = 0; j < (K + 31) / 32; ++j) {
+            uint ki = lane + 32 * j;
+            if (ki < K) {
+                output[(size_t(t) * HQ + h) * K + ki] = q[j] * rq;
+                output[((size_t(N) + t) * HQ + h) * K + ki] = k[j] * rk;
+            }
+        }
+    }
+    if (lane == 0) {
+        float g = 1.0f;
+        if (DECAY) {
+            float x = decay[t * H + h];
+            if (SOFTPLUS) {
+                x += dt_bias[h];
+                x = -precise::exp(a_log[h]) *
+                    (max(x, 0.0f) + precise::log(1.0f + precise::exp(-abs(x))));
+            }
+            g = precise::exp(x);
+        }
+        final[size_t(t) * H + h] = g;
+        float rate = BETA ? beta[t * H + h] : 1.0f;
+        if (BETA && SIGMOID) rate = 1.0f / (1.0f + precise::exp(-rate));
+        final[(size_t(N) + t) * H + h] = rate;
+    }
+"#;
+
 const DELTA: &str = r#"
     size_t column = thread_position_in_grid.x / 32;
     uint lane = thread_position_in_grid.x % 32;
@@ -79,25 +122,34 @@ const DELTA: &str = r#"
     // CAPTURE_INIT
     for (int t = start; t < end; ++t) {
         float q[(K + 31) / 32], k[(K + 31) / 32];
-        float nq = 0.0f, nk = 0.0f;
-        for (uint j = 0; j < (K + 31) / 32; ++j) {
-            uint ki = lane + 32 * j;
-            q[j] = ki < K ? float(qkv[size_t(t) * WIDTH + kh * K + ki]) : 0.0f;
-            k[j] = ki < K ? float(qkv[size_t(t) * WIDTH + HQ * K + kh * K + ki]) : 0.0f;
-            nq += q[j] * q[j];
-            nk += k[j] * k[j];
-        }
-        float rq = NORM ? rsqrt(simd_sum(nq) + 1e-12f) : 1.0f;
-        float rk = NORM ? rsqrt(simd_sum(nk) + 1e-12f) : 1.0f;
-        float g = 1.0f;
-        if (DECAY) {
-            float x = decay[t * H + h];
-            if (SOFTPLUS) {
-                x += dt_bias[h];
-                x = -precise::exp(a_log[h]) *
-                    (max(x, 0.0f) + precise::log(1.0f + precise::exp(-abs(x))));
+        float rq = 1.0f, rk = 1.0f, g = 1.0f;
+        if (PREPARED) {
+            for (uint j = 0; j < (K + 31) / 32; ++j) {
+                uint ki = lane + 32 * j;
+                q[j] = ki < K ? normalized_qk[(size_t(t) * HQ + kh) * K + ki] : 0.0f;
+                k[j] = ki < K ? normalized_qk[((size_t(N) + t) * HQ + kh) * K + ki] : 0.0f;
             }
-            g = precise::exp(x);
+            g = gates_rates[size_t(t) * H + h];
+        } else {
+            float nq = 0.0f, nk = 0.0f;
+            for (uint j = 0; j < (K + 31) / 32; ++j) {
+                uint ki = lane + 32 * j;
+                q[j] = ki < K ? float(qkv[size_t(t) * WIDTH + kh * K + ki]) : 0.0f;
+                k[j] = ki < K ? float(qkv[size_t(t) * WIDTH + HQ * K + kh * K + ki]) : 0.0f;
+                nq += q[j] * q[j];
+                nk += k[j] * k[j];
+            }
+            rq = NORM ? rsqrt(simd_sum(nq) + 1e-12f) : 1.0f;
+            rk = NORM ? rsqrt(simd_sum(nk) + 1e-12f) : 1.0f;
+            if (DECAY) {
+                float x = decay[t * H + h];
+                if (SOFTPLUS) {
+                    x += dt_bias[h];
+                    x = -precise::exp(a_log[h]) *
+                        (max(x, 0.0f) + precise::log(1.0f + precise::exp(-abs(x))));
+                }
+                g = precise::exp(x);
+            }
         }
         float retrieval = 0.0f;
         for (uint j = 0; j < (K + 31) / 32; ++j) {
@@ -108,8 +160,8 @@ const DELTA: &str = r#"
         float delta = float(qkv[size_t(t) * WIDTH + 2 * HQ * K + h * V + vi]);
         if (RETRIEVE) delta -= simd_sum(retrieval);
         if (BETA) {
-            float rate = beta[t * H + h];
-            if (SIGMOID) rate = 1.0f / (1.0f + precise::exp(-rate));
+            float rate = PREPARED ? gates_rates[(size_t(N) + t) * H + h] : beta[t * H + h];
+            if (!PREPARED && SIGMOID) rate = 1.0f / (1.0f + precise::exp(-rate));
             delta *= rate;
         }
         // CAPTURE_STEP
@@ -448,6 +500,55 @@ fn delta(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
         shapes.push(vec![b, width]);
         dtypes.push(mlx::mlx_dtype__MLX_FLOAT32);
     }
+    let prepared = qs[0] > 8
+        && v >= 32
+        && !std::env::var_os("ONNXRUNTIME_EP_MLX_NO_GDN_PREPARE").is_some_and(|value| value != "0");
+    let ints = [
+        ("B", b),
+        ("N", qs[0]),
+        ("H", h),
+        ("HQ", hq),
+        ("K", k),
+        ("V", v),
+        ("WIDTH", qs[1]),
+        ("CAP", capacity),
+        ("PREPARED", prepared as i32),
+        ("ACTIVE", present(n, 10) as i32),
+        ("DECAY", decay as i32),
+        ("BETA", beta as i32),
+        ("RETRIEVE", retrieve as i32),
+        ("SOFTPLUS", softplus as i32),
+        (
+            "SIGMOID",
+            (attr("beta_activation", "none") == "sigmoid") as i32,
+        ),
+        (
+            "NORM",
+            n.ints.get("qk_l2_norm").copied().unwrap_or(0) as i32,
+        ),
+    ];
+    let coefficients = if prepared {
+        let prepare_threads = qs[0]
+            .checked_mul(h)
+            .and_then(|x| x.checked_mul(32))
+            .ok_or("GatedDeltaNet: coefficient dispatch size exceeds int32")?;
+        kernel(
+            ctx,
+            "onnxrt_mlx_gated_delta_coefficients",
+            DELTA_PREPARE,
+            &names[..7],
+            &inputs[..7],
+            &ints,
+            None,
+            &[vec![2, qs[0], hq, k], vec![2, qs[0], h]],
+            &[mlx::mlx_dtype__MLX_FLOAT32; 2],
+            prepare_threads,
+        )?
+    } else {
+        vec![state, state]
+    };
+    names.extend(["normalized_qk", "gates_rates"]);
+    inputs.extend(coefficients);
     let source = capture_source(DELTA, DELTA_CAPTURE_INIT, DELTA_CAPTURE_STEP, capacity);
     let out = kernel(
         ctx,
@@ -455,29 +556,7 @@ fn delta(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
         &source,
         &names,
         &inputs,
-        &[
-            ("B", b),
-            ("N", qs[0]),
-            ("H", h),
-            ("HQ", hq),
-            ("K", k),
-            ("V", v),
-            ("WIDTH", qs[1]),
-            ("CAP", capacity),
-            ("ACTIVE", present(n, 10) as i32),
-            ("DECAY", decay as i32),
-            ("BETA", beta as i32),
-            ("RETRIEVE", retrieve as i32),
-            ("SOFTPLUS", softplus as i32),
-            (
-                "SIGMOID",
-                (attr("beta_activation", "none") == "sigmoid") as i32,
-            ),
-            (
-                "NORM",
-                n.ints.get("qk_l2_norm").copied().unwrap_or(0) as i32,
-            ),
-        ],
+        &ints,
         Some(scale),
         &shapes,
         &dtypes,

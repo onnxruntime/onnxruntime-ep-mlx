@@ -329,6 +329,21 @@ arrays that could have other owners.
 
 For same-binary diagnostics, `ONNXRUNTIME_EP_MLX_NO_PAGED_DIRECT=1` and
 `ONNXRUNTIME_EP_MLX_NO_PAGED_PATCHES=1` independently disable these changes.
+
+Packed GDN prepares FP32 normalized Q/K and decay/beta coefficients once when
+there are more than eight packed tokens and at least 32 value rows, rather than
+recalculating them for each value row. Short-query decode and verification retain
+their original kernel. The recurrence and compact capture keep their update and
+reduction order. Set `ONNXRUNTIME_EP_MLX_NO_GDN_PREPARE=1` for the same-binary
+control; the benchmark records this setting alongside the other MLX options.
+
+The [1K-input MTP qualification](reports/qwen38-paged-gdn-prefill-mtp-m1max.json)
+observed median TTFT **28.07 -> 23.06 seconds** with identical tokens and
+speculative statistics (three warmups, five 256-token completions per mode).
+The fixed ordering and system memory pressure limit causal precision; this is
+not a WebGPU or 16K comparison. The
+[broader preparation experiment](reports/qwen38-paged-gdn-prepared-mtp-m1max.json)
+did not establish a decode gain in reversed order and is not retained.
 Collect tracing separately from final latency measurements; public GPU-to-CPU
 transfers and sparse input writebacks are included in copy accounting.
 
