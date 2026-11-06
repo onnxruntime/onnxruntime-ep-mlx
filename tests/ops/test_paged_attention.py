@@ -725,6 +725,35 @@ def test_paged_window_absolute_positions(causal, nq, window, monkeypatch):
         np.testing.assert_allclose(actual, reference, rtol=1e-4, atol=1e-4)
 
 
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("window", [3, 1025])
+def test_paged_window_prefill_absolute_rope(causal, window):
+    h, kv, d, nb, block, tokens, past = 4, 2, 64, 9, 256, 17, 1795
+    proto = onnx.load_from_string(_model(h, kv, d, nb, block, 1, 1, 1))
+    proto.graph.node[0].attribute.extend([
+        onnx.helper.make_attribute("local_window_size", window),
+        onnx.helper.make_attribute("is_causal", int(causal)),
+    ])
+    feeds, _ = _inputs(h, kv, d, nb, block, 1, 1, 1, 914)
+    rng = np.random.default_rng(42)
+    for name, width in [("query", h * d), ("key", kv * d), ("value", kv * d)]:
+        scale = 0.05 if name == "value" else 0.3
+        feeds[name] = (rng.standard_normal((tokens, width)) * scale).astype(np.float16)
+    feeds["value_cache"] *= np.float16(1 / 6)
+    feeds["cumulative_sequence_length"] = np.array([0, tokens], np.int32)
+    feeds["past_seqlens"] = np.array([past], np.int32)
+    reference = _paged_ref(
+        feeds["query"], feeds["key"], feeds["value"],
+        feeds["key_cache"], feeds["value_cache"],
+        feeds["cumulative_sequence_length"], feeds["past_seqlens"],
+        feeds["block_table"], h, kv, d,
+        cos=feeds["cos_cache"], sin=feeds["sin_cache"], interleaved=1,
+        local_window_size=window, is_causal=causal, activation_dtype=np.float16,
+    )
+    actual = m.run_mlx(proto.SerializeToString(), feeds)[0]
+    np.testing.assert_allclose(actual, reference, rtol=1e-4, atol=1e-4)
+
+
 @pytest.mark.parametrize("d", [64, 96, 128, 192, 256])
 @pytest.mark.parametrize("length,window", [(1, -1), (319, -1), (1023, 3), (1024, -1)])
 @pytest.mark.parametrize("h,kv", [(6, 2), (24, 4), (64, 1)])
