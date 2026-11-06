@@ -1,5 +1,12 @@
 # ONNX→MLX Op Translation Architecture
 
+PagedAttention's short FP16 direct vector route supports causal and bidirectional
+left windows using absolute cache positions. Its existing dtype, head geometry,
+softcap, sink and query-count guards remain in place. Longer windowed queries use
+the general implementation, gathering only intersecting physical pages and
+rebasing the attention mask without rebasing RoPE positions. The direct route can
+still be disabled with the existing `ONNXRUNTIME_EP_MLX_NO_PAGED_DIRECT` diagnostic.
+
 **Status:** Final Rust post-pivot architecture
 **Date:** 2026-07-13
 **Repo:** `onnxruntime-mlx`

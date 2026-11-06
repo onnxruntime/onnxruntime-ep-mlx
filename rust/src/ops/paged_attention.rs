@@ -43,7 +43,9 @@ const VECTOR_BODY: &str = r#"
         o[j] = 0.0f;
     }
     float maximum = -FLT_MAX, sum = 0.0f;
-    for (int i = partition; i < total; i += PARTITIONS) {
+    int first = WINDOW > 0 ? max(0, past + int(row) - WINDOW + 1) : 0;
+    for (size_t logical = size_t(first) + partition; logical < size_t(total); logical += PARTITIONS) {
+        int i = int(logical);
         size_t offset = 0;
         if (i < past) {
             int physical = table[B * MAX_BLOCKS + i / BLOCK];
@@ -238,12 +240,18 @@ pub(super) fn vector(
     queries: i32,
     length: i32,
     causal: bool,
+    window: i32,
     scale: f32,
 ) -> Result<mlx::mlx_array, MlxError> {
-    let partitions = if length < 1024 {
+    let visible = if window > 0 {
+        length.min(window.saturating_add(queries - 1))
+    } else {
+        length
+    };
+    let partitions = if visible < 1024 {
         0
     } else {
-        partitions(architecture(ctx)?, length, queries)
+        partitions(architecture(ctx)?, visible, queries)
     };
     let two_pass = partitions > 0;
     let templates = [
@@ -255,6 +263,7 @@ pub(super) fn vector(
         (c"B", batch),
         (c"NQ", queries),
         (c"CAUSAL", i32::from(causal)),
+        (c"WINDOW", window),
         (c"TWO_PASS", i32::from(two_pass)),
         (c"PARTITIONS", if two_pass { partitions } else { 32 }),
         (c"SCALE_BITS", scale.to_bits() as i32),
@@ -306,7 +315,9 @@ pub(super) fn vector(
         &templates,
         &specs,
         [
-            heads * if two_pass { 32 } else { 1024 },
+            heads
+                .checked_mul(if two_pass { 32 } else { 1024 })
+                .ok_or("PagedAttention: vector launch grid exceeds int32")?,
             queries,
             if two_pass { partitions } else { 1 },
         ],
@@ -316,6 +327,7 @@ pub(super) fn vector(
             1,
         ],
     )?;
+    ctx.mark_fast("mlx_paged_vector");
     if !two_pass {
         return Ok(results[0]);
     }
@@ -327,7 +339,13 @@ pub(super) fn vector(
         &results,
         &templates,
         &[("output", shape, mlx::mlx_dtype__MLX_FLOAT16)],
-        [heads * 1024, queries, 1],
+        [
+            heads
+                .checked_mul(1024)
+                .ok_or("PagedAttention: reduction launch grid exceeds int32")?,
+            queries,
+            1,
+        ],
         [1024, 1, 1],
     )?;
     Ok(reduced[0])

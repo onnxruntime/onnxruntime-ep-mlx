@@ -4087,6 +4087,7 @@ fn paged_attention_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), 
     let mut outs: Vec<mlx::mlx_array> = Vec::new();
     for (b, nq, pastb, qh, kh_new, vh_new) in prepared {
         let total = pastb + nq;
+        let direct_window = i32::try_from(attr_int(n, "local_window_size", -1)).ok();
         if (1..=8).contains(&nq)
             && std::env::var_os("MLX_SDPA_BLOCKS").is_none()
             && head == v_head
@@ -4096,7 +4097,7 @@ fn paged_attention_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), 
             && vquant.is_none()
             && head_sink.is_none()
             && n.floats.get("softcap").copied().unwrap_or(0.0) == 0.0
-            && attr_int(n, "local_window_size", -1) <= 0
+            && direct_window.is_some()
             && [qh, kh_new, vh_new, kcache, vcache.unwrap()]
                 .iter()
                 .all(|&a| ctx.dtype_of(a) == mlx::mlx_dtype__MLX_FLOAT16)
@@ -4135,6 +4136,7 @@ fn paged_attention_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), 
                 nq,
                 total,
                 attr_int(n, "is_causal", 1) != 0,
+                direct_window.unwrap(),
                 scale,
             )?;
             let o = ctx.transpose(o, &[0, 2, 1, 3])?;
@@ -4142,13 +4144,30 @@ fn paged_attention_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), 
             outs.push(o);
             continue;
         }
-        // Gather the cached prefix [0, past) from the physical blocks and append the new K/V.
+        // Keep absolute positions for page lookup; masks below use the bounded view's origin.
         // Quantized PagedAttention reads the updated physical pages for *all* rows, including
         // skipped/remapped current slots. It must not attend to the unquantized new K/V.
         let read_len = if kquant.is_some() { total } else { pastb };
-        let (kh, vh) = if read_len > 0 {
-            let nblk = ((read_len + block_size - 1) / block_size) as usize;
-            let idx: Vec<i32> = (0..nblk).map(|j| bt[b * max_blocks + j] as i32).collect();
+        let window = attr_int(n, "local_window_size", -1) as i32;
+        let first = if window > 0 {
+            (pastb - window + 1).max(0)
+        } else {
+            0
+        };
+        let visible_total = total - first;
+        let visible_past = pastb - first;
+        let (kh, vh) = if read_len > first {
+            let first_block = (first / block_size) as usize;
+            let nblk = ((i64::from(read_len) + i64::from(block_size) - 1) / i64::from(block_size))
+                as usize;
+            let idx: Vec<i32> = (first_block..nblk)
+                .map(|j| bt[b * max_blocks + j] as i32)
+                .collect();
+            let gathered = i32::try_from(nblk - first_block)
+                .ok()
+                .and_then(|blocks| blocks.checked_mul(block_size))
+                .ok_or("PagedAttention: gathered page extent exceeds int32")?;
+            let offset = first % block_size;
             let idx_arr = i32_host_array(ctx, &idx);
             let gk =
                 ctx.emit(|res, s| unsafe { mlx::mlx_take_axis(res, kcache, idx_arr, 0, s) })?;
@@ -4157,11 +4176,16 @@ fn paged_attention_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), 
             } else {
                 gk
             };
-            let gk = ctx.reshape(gk, &[1, (nblk as i32) * block_size, kv_hidden])?;
-            let gk = split_heads(ctx, gk, 1, (nblk as i32) * block_size, kv_heads, head)?; // [1,kv,N,head]
-            let gk = slice(ctx, gk, &[0, 0, 0, 0], &[1, kv_heads, read_len, head])?;
+            let gk = ctx.reshape(gk, &[1, gathered, kv_hidden])?;
+            let gk = split_heads(ctx, gk, 1, gathered, kv_heads, head)?;
+            let gk = slice(
+                ctx,
+                gk,
+                &[0, 0, offset, 0],
+                &[1, kv_heads, offset + read_len - first, head],
+            )?;
             let gv = if latent {
-                slice(ctx, gk, &[0, 0, 0, 0], &[1, kv_heads, pastb, v_head])?
+                slice(ctx, gk, &[0, 0, 0, 0], &[1, kv_heads, visible_past, v_head])?
             } else {
                 let gv = ctx.emit(|res, s| unsafe {
                     mlx::mlx_take_axis(res, vcache.unwrap(), idx_arr, 0, s)
@@ -4171,9 +4195,14 @@ fn paged_attention_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), 
                 } else {
                     gv
                 };
-                let gv = ctx.reshape(gv, &[1, (nblk as i32) * block_size, v_hidden])?;
-                let gv = split_heads(ctx, gv, 1, (nblk as i32) * block_size, kv_heads, v_head)?;
-                slice(ctx, gv, &[0, 0, 0, 0], &[1, kv_heads, read_len, v_head])?
+                let gv = ctx.reshape(gv, &[1, gathered, v_hidden])?;
+                let gv = split_heads(ctx, gv, 1, gathered, kv_heads, v_head)?;
+                slice(
+                    ctx,
+                    gv,
+                    &[0, 0, offset, 0],
+                    &[1, kv_heads, offset + read_len - first, v_head],
+                )?
             };
             if kquant.is_some() {
                 (gk, gv)
@@ -4185,8 +4214,8 @@ fn paged_attention_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), 
         };
 
         // GQA broadcast to full head count, then causal SDPA (query i attends keys [0, past+i]).
-        let kh = gqa_repeat_heads(ctx, kh, kv_heads, g, total, head)?; // [1,H,total,head]
-        let vh = gqa_repeat_heads(ctx, vh, kv_heads, g, total, v_head)?;
+        let kh = gqa_repeat_heads(ctx, kh, kv_heads, g, visible_total, head)?;
+        let vh = gqa_repeat_heads(ctx, vh, kv_heads, g, visible_total, v_head)?;
         let softcap = n.floats.get("softcap").copied().unwrap_or(0.0);
         let mut compute_dt = f32t;
         if nq == 1
@@ -4223,21 +4252,21 @@ fn paged_attention_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), 
         let qh = ctx.astype(qh, compute_dt)?;
         let kh = ctx.astype(kh, compute_dt)?;
         let vh = ctx.astype(vh, compute_dt)?;
-        let window = attr_int(n, "local_window_size", -1) as i32;
         let mask = if compute_dt == mlx::mlx_dtype__MLX_FLOAT16 && window <= 0 {
             None
         } else {
             let mut mask = if attr_int(n, "is_causal", 1) != 0 {
-                causal_mask_topleft(ctx, nq, total, pastb, compute_dt)?
+                causal_mask_topleft(ctx, nq, visible_total, visible_past, compute_dt)?
             } else {
-                ctx.zeros(&[nq, total], compute_dt)?
+                ctx.zeros(&[nq, visible_total], compute_dt)?
             };
             if window > 0 {
-                let key_pos = ctx.arange(0.0, total as f64, 1.0, mlx::mlx_dtype__MLX_INT32)?;
-                let key_pos = ctx.reshape(key_pos, &[1, total])?;
+                let key_pos =
+                    ctx.arange(0.0, visible_total as f64, 1.0, mlx::mlx_dtype__MLX_INT32)?;
+                let key_pos = ctx.reshape(key_pos, &[1, visible_total])?;
                 let left = ctx.arange(
-                    (pastb - window + 1) as f64,
-                    (pastb + nq - window + 1) as f64,
+                    (visible_past - window + 1) as f64,
+                    (visible_past + nq - window + 1) as f64,
                     1.0,
                     mlx::mlx_dtype__MLX_INT32,
                 )?;
@@ -4247,7 +4276,7 @@ fn paged_attention_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), 
                 mask = ctx.where_(allowed, mask, neg)?;
             }
             let mask = ctx.astype(mask, compute_dt)?;
-            let mask = ctx.reshape(mask, &[1, 1, nq, total])?;
+            let mask = ctx.reshape(mask, &[1, 1, nq, visible_total])?;
             Some(mask)
         };
         let o = paged_sdpa(ctx, qh, kh, vh, scale, mask, head_sink, softcap)?; // [1,H,nq,head]
