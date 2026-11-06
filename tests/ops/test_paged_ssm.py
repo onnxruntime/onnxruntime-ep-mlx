@@ -319,6 +319,66 @@ def delta_reference(feeds, hq, h, k, v, rule, fused, norm, scale=0.0, capacity=0
 
 
 @pytest.mark.parametrize("dtype", [np.float32, np.float16, ml_dtypes.bfloat16])
+@pytest.mark.parametrize("geometry", [(2, 6, 33, 33), (16, 48, 128, 128)])
+@pytest.mark.parametrize("capacity", [0, 4])
+def test_prepared_delta_bitwise_dynamic(dtype, geometry, capacity, monkeypatch):
+    hq, h, k, v = geometry
+    dt = storage_type(dtype)
+    inputs = [
+        m.tensor("qkv", dt, ["tokens", 2 * hq * k + h * v]),
+        ir.Value(name=""),
+        ir.Value(name=""),
+        m.tensor("offsets", ir.DataType.INT32, [3]),
+        m.tensor("decay", ir.DataType.FLOAT, ["tokens", h]),
+        m.tensor("beta", ir.DataType.FLOAT, ["tokens", h]),
+        m.tensor("state", ir.DataType.FLOAT, [2, h, v, k]),
+        m.tensor("a_log", ir.DataType.FLOAT, [h]),
+        m.tensor("dt_bias", ir.DataType.FLOAT, [h]),
+    ]
+    outputs = [
+        m.tensor("output", dt, ["tokens", h, v]),
+        m.tensor("final", ir.DataType.FLOAT, [2, h, v, k]),
+    ]
+    attrs = [
+        ir.Attr("qk_l2_norm", ir.AttributeType.INT, 1),
+        ir.Attr("gate_activation", ir.AttributeType.STRING, "softplus"),
+        ir.Attr("beta_activation", ir.AttributeType.STRING, "sigmoid"),
+    ]
+    if capacity:
+        inputs.append(m.tensor("counts", ir.DataType.INT32, [2]))
+        attrs.append(ir.Attr("state_update_capacity", ir.AttributeType.INT, capacity))
+        outputs.append(
+            m.tensor("updates", ir.DataType.FLOAT, [2, capacity * (h + hq * k + h * v)])
+        )
+    serialized = runtime_model(
+        build("GatedDeltaNet", inputs, outputs, attrs=attrs, domain="com.microsoft"),
+        dtype,
+    )
+    baseline, candidate = strict_session(serialized), strict_session(serialized)
+    rng = np.random.default_rng(433)
+    for tokens in (0, 1, 3, 4, 5, 8, 9, 64, 256, 4):
+        feeds = {
+            "qkv": (rng.normal(size=(tokens, 2 * hq * k + h * v)) * 0.1).astype(dtype),
+            "offsets": np.array([0, tokens // 3, tokens], np.int32),
+            "decay": rng.normal(size=(tokens, h)).astype(np.float32),
+            "beta": rng.normal(size=(tokens, h)).astype(np.float32),
+            "state": (rng.normal(size=(2, h, v, k)) * 0.1).astype(np.float32),
+            "a_log": rng.normal(size=h).astype(np.float32),
+            "dt_bias": rng.normal(size=h).astype(np.float32),
+        }
+        if capacity:
+            feeds["counts"] = np.array([2, 99], np.int32)
+        monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_GDN_PREPARE", "1")
+        expected = baseline.run(None, runtime_feeds(feeds))
+        monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_GDN_PREPARE", "0")
+        actual = candidate.run(None, runtime_feeds(feeds))
+        for result, reference in zip(actual, expected, strict=True):
+            np.testing.assert_array_equal(
+                result.view(np.uint8), reference.view(np.uint8)
+            )
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.float16, ml_dtypes.bfloat16])
 @pytest.mark.parametrize("rule", ["linear", "gated", "delta", "gated_delta"])
 @pytest.mark.parametrize("geometry", [(1, 1, 1, 3), (2, 6, 33, 5), (2, 6, 128, 128)])
 @pytest.mark.parametrize("fused,norm", [(False, False), (True, True)])

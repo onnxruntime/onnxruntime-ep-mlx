@@ -345,6 +345,7 @@ def main():
                 "ONNXRUNTIME_EP_MLX_DEVICE_TENSORS",
                 "ONNXRUNTIME_EP_MLX_NO_PAGED_DIRECT",
                 "ONNXRUNTIME_EP_MLX_NO_PAGED_PATCHES",
+                "ONNXRUNTIME_EP_MLX_NO_GDN_PREPARE",
             )
             if name in os.environ
         },
