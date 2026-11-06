@@ -239,7 +239,7 @@ unsafe fn create_ep_impl(
                 Ok(value) => value.unwrap_or(true),
                 Err(status) => return status,
             };
-        let status = crate::memory::configure_cache(&*f.ort_api, session_options);
+        let status = crate::memory::configure(&*f.ort_api, session_options);
         if !status.is_null() {
             return status;
         }

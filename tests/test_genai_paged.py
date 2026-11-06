@@ -84,6 +84,7 @@ def test_report_serializes_numpy_tokenizer_ids(
     prefill_chunk,
 ):
     monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_COMPILE", "0")
+    monkeypatch.setenv("ONNXRUNTIME_EP_MLX_WIRED_LIMIT_BYTES", "1048576")
     (tmp_path / "genai_config.json").write_text(
         json.dumps(
             {
@@ -195,6 +196,7 @@ def test_report_serializes_numpy_tokenizer_ids(
     assert report["versions"]["onnxruntime"] == "source"
     assert report["ort_runtime_library"] == str(tmp_path / "runtime.dylib")
     assert report["mlx_options"]["ONNXRUNTIME_EP_MLX_NO_COMPILE"] == "0"
+    assert report["mlx_options"]["ONNXRUNTIME_EP_MLX_WIRED_LIMIT_BYTES"] == "1048576"
     assert report["mode"] == ("mtp" if mtp and not disabled else "non_speculative")
     assert report["plugin_source_commit"] == "a" * 40
     assert report["plugin_library"] == str(library)

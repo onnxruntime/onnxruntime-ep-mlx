@@ -179,8 +179,11 @@ export retained 256-row GDN inputs with a 1,024-token scheduling budget until
 `--max-scheduled-tokens 512 --prefill-chunk-size 512`. These options change only
 the recorded runtime overlay, not the exported model. Larger chunks can increase
 working memory and delay other requests, and are not automatically faster.
-The runner also records the explicit `ONNXRUNTIME_EP_MLX_CACHE_LIMIT_BYTES`
-allocator setting when present; its process-wide effects are described in
+The runner also records `ONNXRUNTIME_EP_MLX_CACHE_LIMIT_BYTES` and
+`ONNXRUNTIME_EP_MLX_WIRED_LIMIT_BYTES` when present. Public GPU tensor ownership
+does not itself wire buffers into the GPU working set. Choose an explicit
+residency budget for large-model measurements without exceeding the device's
+recommended working set; the process-wide effects are described in
 [`MEMORY.md`](../docs/MEMORY.md).
 
 The plugin's minimum ABI version is not sufficient to establish operator-schema
@@ -233,8 +236,9 @@ restore the state after partial draft acceptance without rerunning the target.
 GDN's optional inactive control zeroes its capsule without changing recurrence;
 capacity zero retains the ordinary two-output kernels.
 
-`ONNXRUNTIME_EP_MLX_CHUNKED_PREFILL=1` opts into an experimental eight-token
-block recurrence for packed GDN prefill. It requires at least 32 packed tokens,
+Packed GDN prefill uses an eight-token block recurrence by default.
+`ONNXRUNTIME_EP_MLX_CHUNKED_PREFILL=0` selects the original serial recurrence
+for an A/B control; `1` explicitly enables blocks. It requires at least 32 packed tokens,
 key/value widths divisible by eight, L2-normalized Q/K, sigmoid beta, softplus
 decay and enabled coefficient preparation. Calls with fewer than 32 packed
 tokens, including this batch-capacity-two model's short decode and MTP
@@ -242,19 +246,44 @@ verification calls, retain the existing recurrence. The block kernel
 keeps state and matrix arithmetic in FP32, uses direct decay products without
 clamping or dividing by a decay, and supports ragged tails, empty sequences and
 compact prefix capture. Its reassociated reductions are not bitwise identical
-to token-serial recurrence. The default remains off; an isolated kernel speedup is not an end-to-end TTFT claim.
+to token-serial recurrence. An isolated kernel speedup is not an end-to-end TTFT claim.
 The [initial full-model qualification](reports/qwen38-paged-chunked-prefill-mtp-m1max.json)
 preserved all generated tokens and speculative statistics, but median TTFT
 regressed from 18.430 to 23.961 seconds. A scheduler-256 short pilot did not
-establish a robust improvement either. These results do not qualify the
-experimental route for default enablement.
+establish a robust improvement either. This remains a CPU-visible regression
+case: default block execution does not imply an MTP speedup, and the serial
+control remains available.
 The separate [GPU-resident target-only qualification](reports/qwen38-public-chunked-prefill-m1max.json)
 uses the public ORT chunked driver at the same 64-token chunk size. Its full
 1K-input/256-output run improved median warm TTFT from 7.836 to 7.433 seconds,
 with every token matching the independent reference. A reversed-order short
 screen showed a smaller 1.6% TTFT reduction; all samples and timing caveats are
-retained. Use `ONNXRUNTIME_EP_MLX_CHUNKED_PREFILL=1` with that resident-state
-driver to opt in. This is not an MTP or WebGPU speedup claim.
+retained. This is not an MTP or WebGPU speedup claim.
+The [16K-input/256-output check](reports/qwen38-public-chunked-prefill-16k-m1max.json)
+on M1 Max uses 1,024-token public-driver chunks, 65 cache blocks, a 512 MiB
+free-cache limit and an explicit 26,800,603,136-byte wired limit. With three
+warmups and one measured repetition per mode, serial/block TTFT was
+146.527/141.153 seconds; decode was 9.697/9.560 tok/s. All 256 tokens matched
+each other and the independent GenAI target-only and MTP runs.
+The observed 3.7% TTFT reduction is a bounded check, not a statistically robust
+speedup; decode did not improve. GPU ownership alone was insufficient for stable
+long-context latency: an earlier unwired block run did not finish its first
+warmup in 40 minutes. That failed run is retained separately, not counted as a
+performance sample or a matched wiring A/B. The wired budget is opt-in and
+device-specific; do not copy this machine's limit without checking available
+working-set capacity.
+
+The [genuine GenAI 16K MTP check](reports/qwen38-paged-mtp-16k-wired-m1max.json)
+uses the same unpruned export for target-only and MTP, CPU-owned GenAI state,
+256-token scheduling/chunks and 70 cache blocks. Three warmups and one measured
+repetition gave target/MTP TTFT of 171.190/173.191 seconds and decode of
+6.859/5.998 tok/s. MTP completed 116 speculative rounds with 248 draft tokens
+evaluated, 139 accepted and zero failures; all 256 output tokens matched.
+This is a negative MTP result, not a 50% speedup or a matched WebGPU comparison.
+The initial 66-block MTP attempt was rejected before generation because GenAI's
+speculative scheduling reserve reduced its maximum request length to 15,873;
+both final GenAI modes were rerun at 70 blocks.
+
 Compare this option at fixed `--max-scheduled-tokens` before tuning the
 scheduler budget, and compare generated tokens and speculative statistics.
 `ONNXRUNTIME_EP_MLX_NO_GDN_PREPARE=1` also disables the block route.
