@@ -1,5 +1,6 @@
 {
   "model": "Qwen/Qwen3.8-27B",
+  "interpretation_caveat": "The recorded GenAI runner selected WebGpuExecutionProvider as the GenAI provider rather than the WebGPU alias, routing WebGPU through GenAI's generic CPU device interface. Raw measurements remain valid for that configuration, but the reported lead does not establish a lead over device-resident WebGPU. Corrected main-source startup/provenance checks are in qwen38-paged-webgpu-main-m1max.json; matched qualified comparisons remain pending.",
   "model_revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
   "native_mlx_version": "0.32.4",
   "mlx_ep_crate_version": "0.31.0",

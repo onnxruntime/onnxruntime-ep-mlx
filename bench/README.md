@@ -103,6 +103,20 @@ Compare prompt and generated token arrays before comparing speed. A fresh Engine
 per repetition prevents cross-run prefix-cache reuse while model sessions stay
 warm. TTFT includes request submission; decode excludes the first generated token.
 
+The runner registers WebGPU's native `WebGpuExecutionProvider` plugin but selects
+GenAI's **`WebGPU`** provider alias. Selecting the literal plugin name instead
+routes GenAI through its generic CPU device interface, including CPU-owned cache
+buffers. Older reports produced by this runner used that generic configuration;
+their measured comparisons are not device-resident WebGPU baselines or evidence
+of a lead over the best-supported WebGPU configuration.
+
+Source-build/startup provenance is retained in
+[`qwen38-paged-webgpu-main-m1max.json`](reports/qwen38-paged-webgpu-main-m1max.json).
+The separate [multi-query MTP A/B](reports/qwen38-paged-multiquery-mtp-m1max.json)
+preserves five full 256-token samples per mode. Its aggregate throughput improved,
+but median decode latency and TTFT did not; it does not establish a robust
+short-context speedup, a WebGPU lead, or a 16K end-to-end result.
+
 The current upstream builder rejects `exclude_mtp=false` together with
 `prune_lm_head=true`. For a non-speculative baseline use `exclude_mtp=true`.
 Do not substitute an older installed builder: versions without
@@ -122,6 +136,47 @@ the runtime overlay is recorded separately from the unchanged export config hash
 The Engine's `max_draft_tokens_per_proposal` is a capacity ceiling, not the
 selected limit; inspect the overlay and proposed tokens per round together.
 Compare both providers at the same limit before tuning each independently.
+Use `--disable-mtp` instead of `--mtp` for a matched non-speculative control
+on the **same unpruned MTP export**. This changes only the recorded runtime
+overlay (`model.mtp.enabled=false`); it does not edit the export. Non-speculative
+runs reject actual draft execution. Do not compare MTP against a separately
+pruned target-only model to calculate its speculative speedup.
+
+For a WebGPU build from ONNX Runtime main, pass its library explicitly instead
+of using the installed plugin wheel:
+
+```sh
+python bench/genai_paged.py --model /path/to/mtp-export --ep webgpu \
+  --library /path/to/libonnxruntime_providers_webgpu.dylib \
+  --source-commit "$(git -C /path/to/onnxruntime rev-parse HEAD)" \
+  --mtp --max-draft-tokens 4 --prompt-file /path/to/long-prompt.txt \
+  --num-blocks 128 --max-scheduled-tokens 256 \
+  --output /tmp/long-webgpu-mtp.json
+```
+
+`--source-commit` records the supplied source revision alongside the binary
+hash; build that exact checkout before measuring. `--prompt-file` reads UTF-8
+user text, applies the normal chat template, and records the actual prompt
+tokens and text hash. Use those actual token counts, not the file size or an
+estimated "16K" label. Scheduling overrides are recorded in the runtime
+overlay and require a dynamic-batching export; its ONNX cache/input dimensions
+must also admit the requested capacity. Eight 256-token blocks cannot hold a
+16K prompt. Use identical prompt, capacity, scheduling and draft settings for
+both providers and for the `--disable-mtp` control. Measure long-context TTFT
+and decode separately, record memory pressure, and do not compare different
+Apple GPU generations as an EP speedup.
+
+The plugin's minimum ABI version is not sufficient to establish operator-schema
+compatibility. Main revision `0e21de25ea368aa3dff00daabee9bd0399ec4bed` requires a
+matching ORT 1.32.0 runtime for its `GatedDeltaNet` type constraints; the installed
+1.31.1 runtime cannot load that model/provider combination. Use an isolated
+matching runtime for both providers, and retain its library path and actual
+imported version in the report. Build the plugin version as valid SemVer
+(for example `0.5.0-dev.20261105`, not `0.5.0.dev20261105`).
+[Source-build provenance and genuine-MTP startup checks](reports/qwen38-paged-webgpu-main-m1max.json)
+retain the pinned revision and library hashes. Those short diagnostics are not
+a qualified throughput comparison or a reproduced 50% MTP speedup.
+
 Acceptance rate, verification and reconciliation forwards, and emitted tokens
 must accompany speculative throughput: a configured but inactive head is not an
 MTP measurement. Inter-token intervals include the bursts of accepted tokens
@@ -133,6 +188,12 @@ GenAI 0.19.0's shared-initializer loader calls the CPU device's unsupported
 builder config and set both `model.decoder.shared_initializers` and
 `model.mtp.shared_initializers` to empty arrays in the benchmark config before
 loading it, after verifying that both ONNX files contain all their initializers.
+Keep that compatibility config separate from the builder config. Do not remove
+working shared-weight metadata from WebGPU's device-backed configuration:
+this Qwen export shares about 3.03 GiB between the decoder and MTP head, which
+can materially affect memory pressure on a 32 GiB machine. If provider-specific
+sharing configurations are necessary, record that difference rather than
+attributing its allocation cost to arithmetic kernels.
 The inspected export is self-contained, so no weights need to change. An empty
 runtime overlay does not clear these arrays in this GenAI
 version. Reports record sharing configuration, and comparisons must disclose
