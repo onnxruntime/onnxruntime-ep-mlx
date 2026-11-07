@@ -3,11 +3,14 @@
 import gc
 import os
 from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
 
 import numpy as np
 import onnxruntime as ort
 import pytest
 from onnx import TensorProto, helper, numpy_helper
+
+from bench.mtp_replay import make_checkpoint_model, make_prefix_replay_model
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("ONNXRUNTIME_EP_MLX_DEVICE_TENSORS") != "1",
@@ -23,6 +26,160 @@ def memory_info():
     assert info.name == "MLX"
     assert info.device_vendor_id == 0x106B
     return info
+
+
+@pytest.mark.parametrize("eager", [False, True])
+@pytest.mark.parametrize("conv_dtype", [np.float16, np.float32])
+@pytest.mark.parametrize("geometry", [(2, 6, 8, 8), (16, 48, 128, 128)])
+def test_public_mtp_prefix_replay_retains_immutable_checkpoint(
+    monkeypatch, eager, conv_dtype, geometry
+):
+    monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_COMPILE", "1" if eager else "0")
+    key_heads, heads, key_width, value_width = geometry
+    capacity, batch = 4, 1
+    channels = 2 * key_heads * key_width + heads * value_width
+    inputs = [
+        SimpleNamespace(
+            name="past.0.recurrent",
+            type="tensor(float)",
+            shape=[batch, heads, value_width, key_width],
+        ),
+        SimpleNamespace(
+            name="past.0.conv",
+            type="tensor(float16)" if conv_dtype == np.float16 else "tensor(float)",
+            shape=[batch, channels, 3],
+        ),
+    ]
+    captures = [
+        SimpleNamespace(
+            name="state_update.0.recurrent_capsule",
+            type="tensor(float)",
+            shape=[
+                batch,
+                capacity * (heads + key_heads * key_width + heads * value_width),
+            ],
+        ),
+        SimpleNamespace(
+            name="state_update.0.conv_value",
+            type=inputs[1].type,
+            shape=[batch, capacity, channels],
+        ),
+    ]
+    options = ort.SessionOptions()
+    options.add_session_config_entry("session.disable_cpu_ep_fallback", "1")
+    checkpoint_session = ort.InferenceSession(
+        make_checkpoint_model(inputs).SerializeToString(),
+        options,
+        providers=["MLXExecutionProvider"],
+    )
+    replay_session = ort.InferenceSession(
+        make_prefix_replay_model(
+            inputs, captures, capacity=capacity
+        ).SerializeToString(),
+        options,
+        providers=["MLXExecutionProvider"],
+    )
+    checkpoint_session.disable_fallback()
+    replay_session.disable_fallback()
+    info = memory_info()
+
+    def device_value(shape, dtype, data=None):
+        value = ort.OrtValue.ortvalue_from_shape_and_type(
+            shape, dtype, memory_info=info
+        )
+        if data is not None:
+            value.update_inplace(data)
+        return value
+
+    rng = np.random.default_rng(4620)
+    original = {
+        value.name: rng.normal(size=value.shape).astype(
+            np.float32 if value.type == "tensor(float)" else np.float16
+        )
+        for value in inputs
+    }
+    bits_type = np.uint16 if conv_dtype == np.float16 else np.uint32
+    bits = (
+        [0x8000, 0x7C01, 0x7FFF, 0xFC02]
+        if conv_dtype == np.float16
+        else [0x80000000, 0x7F800001, 0x7FFFFFFF, 0xFF800002]
+    )
+    original["past.0.conv"].view(bits_type).flat[:4] = bits
+    states, snapshots = {}, {}
+    checkpoint_binding = checkpoint_session.io_binding()
+    replay_binding = replay_session.io_binding()
+    for value in inputs:
+        source = original[value.name]
+        states[value.name] = device_value(source.shape, source.dtype, source)
+        snapshots[value.name] = device_value(source.shape, source.dtype)
+        checkpoint_binding.bind_ortvalue_input(value.name, states[value.name])
+        checkpoint_binding.bind_ortvalue_output(
+            "checkpoint." + value.name, snapshots[value.name]
+        )
+        replay_binding.bind_ortvalue_input(value.name, snapshots[value.name])
+        replay_binding.bind_ortvalue_output(
+            "present." + value.name.removeprefix("past."), states[value.name]
+        )
+    checkpoint_session.run_with_iobinding(checkpoint_binding)
+    for value in inputs:
+        states[value.name].update_inplace(np.zeros_like(original[value.name]))
+    capture_values = {}
+    for _ in range(3):
+        host_captures = {
+            value.name: rng.normal(size=value.shape).astype(
+                np.float32 if value.type == "tensor(float)" else np.float16
+            )
+            for value in captures
+        }
+        host_captures["state_update.0.conv_value"].view(bits_type).flat[:4] = bits[::-1]
+        for name, data in host_captures.items():
+            if name not in capture_values:
+                capture_values[name] = device_value(data.shape, data.dtype, data)
+                replay_binding.bind_ortvalue_input(name, capture_values[name])
+            else:
+                capture_values[name].update_inplace(data)
+        replay_session.run_with_iobinding(replay_binding)
+        capsule = host_captures["state_update.0.recurrent_capsule"]
+        key_offset = capacity * heads
+        delta_offset = key_offset + capacity * key_heads * key_width
+        decay = capsule[:, :key_offset].reshape(batch, capacity, heads)[:, 0]
+        key = capsule[:, key_offset:delta_offset].reshape(
+            batch, capacity, key_heads, key_width
+        )[:, 0]
+        delta = capsule[:, delta_offset:].reshape(batch, capacity, heads, value_width)[
+            :, 0
+        ]
+        decayed = original["past.0.recurrent"] * decay[:, :, None, None]
+        expected = (
+            decayed.astype(np.float64)
+            + np.repeat(key, heads // key_heads, axis=1)[:, :, None, :].astype(
+                np.float64
+            )
+            * delta[:, :, :, None].astype(np.float64)
+        ).astype(np.float32)
+        np.testing.assert_array_equal(
+            states["past.0.recurrent"].numpy().view(np.uint32), expected.view(np.uint32)
+        )
+        expected_conv = np.concatenate(
+            [
+                original["past.0.conv"][:, :, 1:],
+                host_captures["state_update.0.conv_value"][:, :1].transpose(0, 2, 1),
+            ],
+            axis=2,
+        )
+        np.testing.assert_array_equal(
+            states["past.0.conv"].numpy().view(bits_type), expected_conv.view(bits_type)
+        )
+        for name, snapshot in snapshots.items():
+            np.testing.assert_array_equal(
+                snapshot.numpy().view(np.uint8), original[name].view(np.uint8)
+            )
+    del checkpoint_binding, replay_binding, checkpoint_session, replay_session
+    gc.collect()
+    for name, snapshot in snapshots.items():
+        np.testing.assert_array_equal(
+            snapshot.numpy().view(np.uint8), original[name].view(np.uint8)
+        )
 
 
 def session(*, matrix=False):
