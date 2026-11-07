@@ -1,0 +1,12 @@
+{
+  "baseline": {
+    "count": 1157,
+    "max_gap_seconds": 1.020877,
+    "observation_errors": 0
+  },
+  "candidate": {
+    "count": 1187,
+    "max_gap_seconds": 1.041482,
+    "observation_errors": 0
+  }
+}
