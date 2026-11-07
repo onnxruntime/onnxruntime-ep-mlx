@@ -328,6 +328,56 @@ regions rather than splitting at every shapeless/shape-keyed edge. Paged
 attention keeps its separate cache-alias boundary; existing eager and
 live-metadata boundaries remain eager.
 
+### Public-ORT GPU-resident K1 MTP
+
+`python -m bench.ort_mtp` is a separate fixed-length greedy outer loop, not
+GenAI Engine or a transparent EP rewrite. It uses the unchanged unpruned
+target/draft exports, public GPU OrtValues, and GPU greedy selection.
+Only sampled token IDs are read on CPU. State, captures, hidden states and
+full logits stay GPU-owned; intermediate prefill logits are released before
+decode. Bindings and state allocations are reused across requests. Recurrent and
+convolution states are reset; `past=0` logically invalidates KV without clearing
+the full cache. ORT memory patterns are disabled. Repeated 16K requests qualified
+with the explicit residency budget below; earlier larger-budget attempts hit GPU OOM.
+The draft head starts cold from the final target prompt hidden row.
+Accepted drafts are re-fed with their corresponding target hidden rows.
+
+`bench.mtp_replay` builds separate checkpoint and prefix-one replay models
+using existing ONNX operators. Recurrent replay applies the captured FP32
+decay with `Mul`, then a linear `GatedDeltaNet` update with captured keys and
+deltas. Convolution history uses bit-preserving slices and concatenation.
+Rejection restores from the pre-verification checkpoint; paged KV is retained,
+with its logical length rolled back so invalid future slots are excluded and
+overwritten on the next verification. This helper is not an implementation of
+the distinct `GatedDeltaNetStateReplay`/`ConvStateReplay` operator ABIs.
+
+Run with a flat GenAI reference containing the exact prompt and output IDs:
+
+```bash
+python -m bench.ort_mtp --model MODEL --library MLX_DYLIB \
+  --reference TARGET_REFERENCE_JSON --output RESULT_JSON \
+  --blocks 70 --block-size 256 --capacity 4 \
+  --prefill-chunk-size 512 --tokens 256 --warmup 3 --repetitions 5
+```
+
+Configure a device-appropriate explicit wired/cache budget before execution;
+GPU allocation alone does not guarantee residency. The capture capacity must
+match the export, even though the runtime proposal budget is one. Every warmup
+and measured output must match the reference before a timing report is written.
+The report distinguishes this interface and its cold-head priming from GenAI.
+One-time helper/buffer setup and per-request state resets are excluded from
+TTFT; prefill and first greedy selection are included. Same-round emitted tokens
+retain their shared timestamp rather than inventing evenly spaced inter-token timings.
+
+[The M1 Max 32 GiB residency screen](reports/qwen38-public-mtp-residency-16k-m1max.json)
+completed three warmups and one measured 256-token request at 16,384 input tokens;
+all four outputs matched the reference. With 512-token chunks, a 22 GiB wired cap
+(`23622320128` bytes) and a 512 MiB cache limit, the measured result was
+183.044 s TTFT and 9.296 tok/s. This qualifies a GPU-resident MTP baseline, not a
+new speed win or a universal memory-budget default. Earlier 24.96 GiB wired-cap
+attempts failed during repeated prefill. Native allocation counters did not
+establish a large monotonic leak; the driver-OOM root cause remains unresolved.
+
 ### Qwen3.8-27B compact MTP capture qualification
 
 [Full measurements, tokens, export/library hashes and numerical probes](reports/qwen38-paged-mtp-m1max.json)
