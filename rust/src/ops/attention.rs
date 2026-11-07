@@ -4184,10 +4184,26 @@ fn paged_attention_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), 
             (kh_new, vh_new)
         };
 
-        // GQA broadcast to full head count, then causal SDPA (query i attends keys [0, past+i]).
-        let kh = gqa_repeat_heads(ctx, kh, kv_heads, g, total, head)?; // [1,H,total,head]
-        let vh = gqa_repeat_heads(ctx, vh, kv_heads, g, total, v_head)?;
         let softcap = n.floats.get("softcap").copied().unwrap_or(0.0);
+        let native_prefill_gqa = nq > 8
+            && g > 1
+            && !latent
+            && kquant.is_none()
+            && vquant.is_none()
+            && head_sink.is_none()
+            && softcap == 0.0
+            && std::env::var_os("ONNXRUNTIME_EP_MLX_PAGED_PREFILL_GQA")
+                .is_none_or(|value| value != "0" && !value.is_empty())
+            && super::paged_attention::gpu_stream(ctx)?;
+        let (kh, vh) = if native_prefill_gqa {
+            ctx.mark_fast("paged_prefill_native_gqa");
+            (kh, vh)
+        } else {
+            (
+                gqa_repeat_heads(ctx, kh, kv_heads, g, total, head)?,
+                gqa_repeat_heads(ctx, vh, kv_heads, g, total, v_head)?,
+            )
+        };
         let mut compute_dt = f32t;
         if nq == 1
             && total < 1024
