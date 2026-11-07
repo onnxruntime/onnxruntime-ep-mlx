@@ -65,3 +65,20 @@ runtime. MLX-LM likewise
 [sets a recommended wired limit](https://github.com/ml-explore/mlx-lm/blob/736ab0d8c1d0edc79c3d798044fe6904e2fa23be/mlx_lm/utils.py#L79-L89)
 for generation; see the
 [MLX wired-limit API](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.set_wired_limit.html).
+
+## Paged-prefill workspace
+
+By default, paged prefill keeps the native KV head count in FP32
+SDPA for eligible GPU `PagedAttention` calls with more than eight queries.
+This avoids explicitly repeating grouped KV heads before attention. Decode,
+quantized or latent caches, softcap, and head-sink paths are unchanged.
+Causal/window masks and visible cache outputs retain their existing semantics.
+
+Set `ONNXRUNTIME_EP_MLX_PAGED_PREFILL_GQA=0` to restore explicit KV-head
+repetition. The native grouped path passed independent attention/cache checks
+and six exact-token Qwen 16K MTP requests (three warmups, three measured).
+The measured median TTFT was 143.913 seconds and aggregate decode was
+10.945 tokens/second on M1 Max 32 GiB with 1024-token chunks and explicit
+phase-specific residency budgets. This is not a same-binary A/B speedup claim.
+It reduces one source of temporary storage, not the model's total working set
+or the need for a device-appropriate residency budget.
