@@ -284,6 +284,38 @@ The initial 66-block MTP attempt was rejected before generation because GenAI's
 speculative scheduling reserve reduced its maximum request length to 15,873;
 both final GenAI modes were rerun at 70 blocks.
 
+The [16K proposal-budget sweep](reports/qwen38-paged-mtp-proposal-budget-16k-m1max.json)
+keeps the original capacity-four target/draft graphs and the same native binary.
+Reducing the runtime proposal budget avoids much of the rejected draft work:
+
+| GenAI MLX configuration | Warm TTFT | Decode |
+|---|---:|---:|
+| K4, 256-token chunks | 173.191 s | 5.998 tok/s |
+| K1, 256-token chunks | 174.909 s | 9.452 tok/s |
+| K2, 256-token chunks | 176.909 s | 7.699 tok/s |
+| K1, 1,024-token chunks | 156.832 s | 9.554 tok/s |
+| Separate selected-head K1, 1,024-token chunks | 145.479 s | 9.137 tok/s |
+
+All 256 MLX tokens match the target-only control. The original-export
+K1/chunk-1024 result is an observed 59.3% increase over K4 MTP, but only 39.3%
+over the non-speculative GenAI control. These are single measured repetitions
+after three warmups, not universal defaults or statistically robust speedups.
+Use explicit `--mtp --max-draft-tokens 1 --prefill-chunk-size 1024
+--max-scheduled-tokens 1024 --num-blocks 70` for this configuration.
+GenAI's reported `max_draft_tokens_per_proposal` remains the export capacity,
+four; the runtime overlay and actual proposal counts establish K1.
+The selected-head variant lowers TTFT but regresses measured decode, so no
+production model-interface rewrite is retained.
+
+WebGPU rebuilt from main at `f795db61a827f2d09710a62dc704289b18811a43`
+completed K1/chunk-256 at 525.951-second TTFT and 5.766 tok/s on this M1 Max.
+Its generated tokens diverge from MLX starting at zero-based index 39, so the
+result does **not** establish an exact-output cross-EP throughput win.
+The K4 attempts exceeded separate 40- and 75-minute orchestration bounds;
+their warmups and failure evidence remain in the report, not final throughput
+samples. WebGPU retains its working device interface and initializer sharing;
+MLX uses CPU-owned GenAI state and its explicit residency budget.
+
 Compare this option at fixed `--max-scheduled-tokens` before tuning the
 scheduler budget, and compare generated tokens and speculative statistics.
 `ONNXRUNTIME_EP_MLX_NO_GDN_PREPARE=1` also disables the block route.
