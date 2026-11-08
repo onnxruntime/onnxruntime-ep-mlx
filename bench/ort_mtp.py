@@ -1,12 +1,14 @@
 """Fixed-length greedy K=1 MTP through public ORT GPU OrtValues.
 
-The target and draft exports are unchanged. This explicit outer loop is not
+The target and draft exports are unchanged unless an explicit last-two-logit
+target is supplied. This outer loop is not
 GenAI Engine: its draft head starts cold from the last target prompt hidden row.
 Only sampled token IDs are materialized on CPU. Prefix replay and sampling use
 separate helper ONNX sessions.
 """
 
 import argparse
+import copy
 import hashlib
 import json
 import os
@@ -16,7 +18,7 @@ from itertools import pairwise
 from pathlib import Path
 
 import numpy as np
-from onnx import TensorProto, helper
+from onnx import TensorProto, helper, numpy_helper
 
 from bench.genai_paged import summarize
 from bench.mtp_replay import make_checkpoint_model, make_prefix_replay_model
@@ -28,6 +30,63 @@ _DTYPES = {
     "tensor(int64)": np.int64,
     "tensor(int32)": np.int32,
 }
+
+def make_last_two_logit_model(model):
+    """Copy a target graph, preserving every one-/two-token verification logit."""
+    result = copy.deepcopy(model)
+    outputs = {value.name: value for value in result.graph.output}
+    producers = [
+        (index, node)
+        for index, node in enumerate(result.graph.node)
+        if "logits" in node.output
+    ]
+    if (
+        not {"logits", "hidden_states"} <= outputs.keys()
+        or len(producers) != 1
+        or producers[0][1].op_type != "MatMulNBits"
+        or producers[0][1].domain != "com.microsoft"
+        or not producers[0][1].input
+        or producers[0][1].input[0] != "hidden_states"
+        or any("logits" in node.input for node in result.graph.node)
+        or any(
+            len(outputs[name].type.tensor_type.shape.dim) != 2
+            for name in ("logits", "hidden_states")
+        )
+    ):
+        raise ValueError(
+            "Last-two-logit target requires rank-two logits and hidden_states with "
+            "a direct com.microsoft::MatMulNBits vocabulary projection and no "
+            "internal logits consumers; use a compatible unpruned target export"
+        )
+    names = {
+        name for node in result.graph.node for name in (*node.input, *node.output)
+    } | {value.name for value in (*result.graph.input, *result.graph.initializer)}
+    prefix = "last_two_logits"
+    while any(name.startswith(prefix) for name in names):
+        prefix += "_"
+    keys = [f"{prefix}.{name}" for name in ("starts", "ends", "axes", "steps")]
+    for name, value in zip(
+        keys, (-2, np.iinfo(np.int64).max, 0, 1), strict=True
+    ):
+        result.graph.initializer.append(
+            numpy_helper.from_array(np.array([value], np.int64), name)
+        )
+    last_hidden = f"{prefix}.hidden"
+    index, projection = producers[0]
+    projection.input[0] = last_hidden
+    result.graph.node.insert(
+        index,
+        helper.make_node("Slice", ["hidden_states", *keys], [last_hidden]),
+    )
+    for value in (*result.graph.output, *result.graph.value_info):
+        if value.name == "logits":
+            if len(value.type.tensor_type.shape.dim) != 2:
+                raise ValueError(
+                    "Last-two-logit target found inconsistent logits value metadata; "
+                    "provide a target with rank-two logits throughout the graph"
+                )
+            value.type.tensor_type.shape.dim[0].dim_param = "logit_tokens"
+    return result
 
 
 def _shape(value, dimensions):
@@ -63,7 +122,7 @@ def _selector_model(logits, hidden):
                     "logits", dtype[logits.type], ["rows", logits.shape[-1]]
                 ),
                 helper.make_tensor_value_info(
-                    "hidden", dtype[hidden.type], ["rows", hidden.shape[-1]]
+                    "hidden", dtype[hidden.type], ["hidden_rows", hidden.shape[-1]]
                 ),
                 helper.make_tensor_value_info(
                     "indices", TensorProto.INT64, ["selected"]
@@ -96,6 +155,7 @@ def make_runner(
     prefill_chunk_size,
     capacity,
     speculative=True,
+    last_two_logits=False,
 ):
     import onnxruntime as ort
 
@@ -143,6 +203,12 @@ def make_runner(
             or value.type != other.type
         ):
             raise ValueError(f"Target and draft {name} widths/dtypes must match")
+    if last_two_logits != (target_outputs["logits"].shape[0] == "logit_tokens"):
+        raise ValueError(
+            "Last-two-logit execution requires a target with logits dimension "
+            "'logit_tokens' and last_two_logits=True; build it with "
+            "make_last_two_logit_model"
+        )
     metadata = {
         "input_ids",
         "position_ids",
@@ -196,12 +262,13 @@ def make_runner(
             value.update_inplace(np.zeros(shape, dtype))
         return value
 
-    bindings, states, buffers = {}, {}, {}
+    bindings, states, buffers, persistent_outputs = {}, {}, {}, {}
     zero_buffers, resets = {}, []
     for name, session in [("target", target), ("draft", draft)]:
         binding = session.io_binding()
         bindings[name] = binding
         states[name], buffers[name] = {}, {}
+        persistent_outputs[name] = {}
         for value in session.get_inputs():
             if not value.name.startswith(("past.", "past_key_values.")):
                 continue
@@ -214,6 +281,7 @@ def make_runner(
             states[name][value.name] = state
             binding.bind_ortvalue_input(value.name, state)
             binding.bind_ortvalue_output(state_output(value.name), state)
+            persistent_outputs[name][state_output(value.name)] = state
         binding.bind_cpu_input("block_table", np.arange(blocks, dtype=np.int32)[None])
     checkpoint_binding, replay_binding = checkpoint.io_binding(), replay.io_binding()
     snapshots = {}
@@ -235,6 +303,7 @@ def make_runner(
         capture = allocate(_shape(value, dimensions), _DTYPES[value.type])
         replay_binding.bind_ortvalue_input(value.name, capture)
         bindings["target"].bind_ortvalue_output(value.name, capture)
+        persistent_outputs["target"][value.name] = capture
     selection_binding = selector.io_binding()
     selected_hidden = allocate(
         [1, target_outputs["hidden_states"].shape[-1]],
@@ -271,7 +340,9 @@ def make_runner(
         if n not in buffers[name]:
             buffers[name][n] = {
                 value.name: allocate(
-                    _shape(value, {**dimensions, "num_tokens": n}), _DTYPES[value.type]
+                    _shape(value, {
+                        **dimensions, "num_tokens": n, "logit_tokens": min(n, 2)
+                    }), _DTYPES[value.type]
                 )
                 for value in session.get_outputs()
                 if not value.name.startswith(("present.", "state_update."))
@@ -317,8 +388,16 @@ def make_runner(
             chunk = prompt[start : start + prefill_chunk_size]
             output = execute("target", target, chunk, past, past)
             past += len(chunk)
-        anchor = int(select(output, [len(chunk) - 1], len(chunk) - 1)[0])
+        anchor = int(select(
+            output, [
+                min(len(chunk), 2) - 1 if last_two_logits else len(chunk) - 1
+            ], len(chunk) - 1
+        )[0])
         del output
+        selection_binding.clear_binding_inputs()
+        bindings["target"].clear_binding_outputs()
+        for name, state in persistent_outputs["target"].items():
+            bindings["target"].bind_ortvalue_output(name, state)
         for n in list(buffers["target"]):
             if n > 2:
                 del buffers["target"][n]
@@ -416,6 +495,10 @@ def main():
     parser.add_argument("--prefill-chunk-size", type=int, default=1024)
     parser.add_argument("--capacity", type=int, default=4)
     parser.add_argument(
+        "--target-last-two-logits", type=Path,
+        help="Explicit last-two-logit target graph; K1 verification/decode retain all rows",
+    )
+    parser.add_argument(
         "--target-only",
         action="store_true",
         help="Run a non-speculative control on the same unpruned target export",
@@ -471,7 +554,8 @@ def main():
     options.add_session_config_entry("session.disable_cpu_ep_fallback", "1")
     started = time.perf_counter()
     target = ort.InferenceSession(
-        str(args.model / "model.onnx"), options, providers=["MLXExecutionProvider"]
+        str(args.target_last_two_logits or args.model / "model.onnx"),
+        options, providers=["MLXExecutionProvider"]
     )
     draft = ort.InferenceSession(
         str(args.model / "mtp.onnx"), options, providers=["MLXExecutionProvider"]
@@ -491,6 +575,7 @@ def main():
         prefill_chunk_size=args.prefill_chunk_size,
         capacity=args.capacity,
         speculative=not args.target_only,
+        last_two_logits=args.target_last_two_logits is not None,
     )
     setup = time.perf_counter() - started
     runs = []
@@ -526,6 +611,17 @@ def main():
             if args.target_only
             else "Public ORT GPU IOBinding K=1 MTP; separate checkpoint/replay/"
             "greedy-selection helpers, not GenAI Engine"
+        ) + (
+            "; explicit last-two-logit target"
+            if args.target_last_two_logits is not None else ""
+        ),
+        "target_last_two_logits": (
+            None if args.target_last_two_logits is None else {
+                "path": str(args.target_last_two_logits.resolve()),
+                "sha256": hashlib.sha256(args.target_last_two_logits.read_bytes()).hexdigest(),
+                "scope": "Model-native last-two-logit target rewrite; one-token "
+                "decode and two-token K1 verification retain every original row",
+            }
         ),
         "draft_priming": (
             None
@@ -533,7 +629,7 @@ def main():
             else "Cold head, starting from the final target prompt hidden row; "
             "accepted drafts are re-fed with target hidden rows"
         ),
-        "cpu_materialization": "Sampled token IDs only; state, captures, hidden states and full unchanged logits remain GPU-owned",
+        "cpu_materialization": "Sampled token IDs only; state, captures, hidden states and graph-exposed logits remain GPU-owned",
         "prompt_tokens": prompt,
         "generated_tokens": args.tokens,
         "warmups": args.warmup,
