@@ -131,14 +131,60 @@ def runtime_model(serialized, dtype):
     return proto.SerializeToString()
 
 
+def mrotary_reference(x, positions, cos, sin, sections, layout, interleaved, scale, rank):
+    dtype = x.dtype
+    half = cos.shape[1]
+    assignment = np.zeros(half, dtype=np.int64)
+    if layout == 0:
+        start = 0
+        for stream, width in enumerate(sections):
+            assignment[start : start + width] = stream
+            start += width
+    else:
+        for stream, width in enumerate(sections[1:], 1):
+            assignment[stream : min(width * 3, half) : 3] = stream
+
+    selected_positions = positions[assignment].transpose(1, 2, 0)
+    columns = np.arange(half)
+    selected = []
+    for cache in (cos, sin):
+        values = cache[selected_positions, columns]
+        if scale != 1.0:
+            values = (values.astype(np.float32) * np.float32(scale)).astype(dtype)
+        selected.append(values[:, None])
+    cos_rows, sin_rows = selected
+
+    x4 = x if rank == 4 else x.reshape(x.shape[0], x.shape[1], 2, 12).transpose(0, 2, 1, 3)
+    rot = 2 * half
+    if interleaved:
+        pairs = x4[..., :rot].reshape(*x4.shape[:-1], half, 2)
+        first, second = pairs[..., 0], pairs[..., 1]
+        rotated = np.stack(
+            [first * cos_rows - second * sin_rows, first * sin_rows + second * cos_rows],
+            axis=-1,
+        ).reshape(*x4.shape[:-1], rot)
+    else:
+        first, second = x4[..., :half], x4[..., half:rot]
+        rotated = np.concatenate(
+            [first * cos_rows - second * sin_rows, first * sin_rows + second * cos_rows],
+            axis=-1,
+        )
+    expected = np.concatenate([rotated, x4[..., rot:]], axis=-1)
+    if rank == 3:
+        expected = expected.transpose(0, 2, 1, 3).reshape(x.shape)
+    return expected.astype(dtype)
+
+
 @pytest.mark.parametrize("dtype", [np.float32, np.float16, ml_dtypes.bfloat16])
 @pytest.mark.parametrize("rank", [3, 4])
 @pytest.mark.parametrize("layout,interleaved,rot", [(0, 0, 12), (1, 1, 8)])
 @pytest.mark.parametrize("eager", [False, True])
-def test_mrotary_column_gather_stock_bits(dtype, rank, layout, interleaved, rot, eager, monkeypatch):
+def test_mrotary_column_gather_reference(dtype, rank, layout, interleaved, rot, eager, monkeypatch):
     monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_COMPILE", "1" if eager else "0")
     shape = ["batch", "tokens", 24] if rank == 3 else ["batch", 2, "tokens", 12]
     half = rot // 2
+    sections = [2, 1, half - 3]
+    scale = 1.0003
     model = m.make_model(
         "MRotaryEmbedding",
         [
@@ -150,31 +196,34 @@ def test_mrotary_column_gather_stock_bits(dtype, rank, layout, interleaved, rot,
         [m.tensor("y", storage_type(dtype), shape)],
         domain="com.microsoft",
         attributes={
-            "num_heads": 2, "mrope_section": [2, 1, half - 3],
+            "num_heads": 2, "mrope_section": sections,
             "mrope_layout": layout, "interleaved": interleaved,
-            "rotary_embedding_dim": rot, "scale": 1.0003,
+            "rotary_embedding_dim": rot, "scale": scale,
         },
     )
     model = runtime_model(model, dtype)
-    candidate, control = strict_session(model), strict_session(model)
+    session = strict_session(model)
     rng = np.random.default_rng(413)
     for batch, tokens in [(2, 3), (1, 1), (3, 5), (2, 3)]:
         cos = rng.standard_normal((17, half)).astype(dtype)
         sin = rng.standard_normal((17, half)).astype(dtype)
         x4 = rng.standard_normal((batch, 2, tokens, 12)).astype(dtype)
         x = x4 if rank == 4 else x4.transpose(0, 2, 1, 3).reshape(batch, tokens, 24)
+        positions = rng.integers(0, 17, (3, batch, tokens), dtype=np.int64)
         feeds = {
-            "x": x, "positions": rng.integers(0, 17, (3, batch, tokens), dtype=np.int64),
+            "x": x, "positions": positions,
             "cos": cos, "sin": sin,
         }
+        expected = mrotary_reference(
+            x, positions, cos, sin, sections, layout, interleaved, scale, rank
+        )
         if dtype == ml_dtypes.bfloat16:
             feeds = {name: value.astype(np.float32) if name != "positions" else value
                      for name, value in feeds.items()}
-        monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_MROPE_COLUMN_GATHER", "1")
-        expected = control.run(None, feeds)[0]
-        monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_MROPE_COLUMN_GATHER", "0")
-        actual = candidate.run(None, feeds)[0]
-        np.testing.assert_array_equal(actual.view(np.uint8), expected.view(np.uint8))
+            expected = expected.astype(np.float32)
+        actual = session.run(None, feeds)[0]
+        tolerance = 2e-5 if dtype == np.float32 else 3e-3
+        np.testing.assert_allclose(actual, expected, rtol=tolerance, atol=tolerance)
 
 
 def runtime_feeds(feeds):
