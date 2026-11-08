@@ -69,7 +69,8 @@ for generation; see the
 ## Immutable quantized initializer views
 
 Large immutable initializers are interned by content, dtype, and shape. The
-packed uint32 weight and reshaped scale views used by `MatMulNBits` also reuse
+packed uint32 weight, reshaped scale views, and immutable symmetric affine biases
+used by `MatMulNBits` also reuse
 evaluated MLX leaves across plans on the same run thread. Each plan retains its
 own handle and a strong backing-storage owner; initializer names are not
 identities, and overridable inputs remain live. GPU outputs may retain this
@@ -78,6 +79,8 @@ storage after their originating session closes.
 Set `ONNXRUNTIME_EP_MLX_NO_SHARED_QUANT_VIEWS=1` to disable only quantized-view
 sharing, or `ONNXRUNTIME_EP_MLX_NO_SHARED_INITIALIZERS=1` to disable all
 initializer interning. These controls do not change quantization arithmetic.
+Derived biases preserve the existing CPU FP16/BF16/FP32 rounding and are interned
+by their resulting bytes, dtype, and shape; runtime scales are never interned.
 A Qwen 27B target/draft diagnostic reduced reported MLX active allocations by
 about 707 MiB after draft execution. Prefill peak allocations were unchanged;
 this is not a measurement of total physical memory or a decode speedup claim.
