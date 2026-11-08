@@ -1,0 +1,732 @@
+{
+  "hardware": "Apple M1 Max, 32 GPU cores, 32 GiB RAM",
+  "model": "Qwen/Qwen3.8-27B",
+  "prompt_tokens": 16384,
+  "generated_tokens": 256,
+  "target_reference_sha256": "301b2251c7b49e58f1b51bd699db9116830c0d8a60b6dee338456dafd41bc7b4",
+  "mlx_version": "0.32.4",
+  "genai_model_builder_version": "0.19.0",
+  "ep_package_version": "0.31.0",
+  "protocol": "Fresh sequential processes, greedy decoding, no prefix reuse or tracing; each warmup and measured output must match the unchanged target reference.",
+  "decision": "Default owned CPU inputs <=4096 bytes with opt-out; exact outputs retained. Same-binary aggregate gain is modest, timing variance is substantial, and llama.cpp throughput is not matched.",
+  "qualification_aggregate_gain_percent": 3.945888739174408,
+  "cases": {
+    "same_export_target_only": {
+      "driver": "Public ORT GPU IOBinding target-only control on the unchanged export",
+      "warmups": 3,
+      "repetitions": 2,
+      "warm_ttft_median_ms": 133463.25089549646,
+      "decode_median_ms_per_token": 106.3076732038776,
+      "aggregate_decode_tokens_per_second": 9.406658709218412,
+      "inter_token_p95_ms": 108.18802153225988,
+      "samples": [
+        {
+          "ttft_seconds": 133.4901540830033,
+          "decode_seconds": 27.09668541699648,
+          "speculative_stats": {
+            "completed_rounds": 0,
+            "draft_forward_passes": 0,
+            "draft_input_tokens": 0,
+            "draft_tokens_proposed": 0,
+            "draft_tokens_evaluated": 0,
+            "draft_tokens_accepted": 0,
+            "prefix_replays": 0
+          },
+          "tokens_sha256": "0559ad32a45c1b08422165a2e8091f3737335ea17f5ac5cc08fe00c2014022b8"
+        },
+        {
+          "ttft_seconds": 133.43634770798963,
+          "decode_seconds": 27.120227916981094,
+          "speculative_stats": {
+            "completed_rounds": 0,
+            "draft_forward_passes": 0,
+            "draft_input_tokens": 0,
+            "draft_tokens_proposed": 0,
+            "draft_tokens_evaluated": 0,
+            "draft_tokens_accepted": 0,
+            "prefix_replays": 0
+          },
+          "tokens_sha256": "0559ad32a45c1b08422165a2e8091f3737335ea17f5ac5cc08fe00c2014022b8"
+        }
+      ],
+      "all_requests_match_reference": true,
+      "plugin_sha256": "a0ebde399b7e416f6bc29db9c1e0740fafa8bfa8ff77cb4a21092cdf3c636ec5",
+      "model_graph_sha256": {
+        "model.onnx": "19c3f4153ee3683daa419e7092880a90345efd81cd88e928abe4965065c71a67",
+        "mtp.onnx": "fb15123f95b4bbc88358790a26f14fcb6b44aff72ec4552dd5424648715e4ca5"
+      },
+      "python_source_sha256": {
+        "bench/ort_mtp.py": "e95a843144260d5fedeec04709758ba666845d2b82657940b98c84ff6fd70223",
+        "bench/mtp_replay.py": "ae90d9415349cb20c9ac463f0de356562b71cae0a136f54386e536afe8f07bab",
+        "bench/ort_paged.py": "3a2a9cf6d717eae63825176aefd3f59cd046741a5e01908eeb6eb50b5575b52f",
+        "bench/genai_paged.py": "cb687ef7093d8a0a57c6d9af1be74b91c4a19b507bc37540c29e353d525edc3b"
+      },
+      "source_report_sha256": "78c0ce507f9107f445c9a79204cdaa3b17884ffd895df0479205a465d6bf3e2b",
+      "mlx_options": {
+        "ONNXRUNTIME_EP_MLX_CACHE_LIMIT_BYTES": "536870912",
+        "ONNXRUNTIME_EP_MLX_DEVICE_TENSORS": "1",
+        "ONNXRUNTIME_EP_MLX_NO_SHARED_QUANT_VIEWS": "0",
+        "ONNXRUNTIME_EP_MLX_WIRED_LIMIT_BYTES": "23622320128"
+      },
+      "prefill_chunk_size": 1024,
+      "phase_residency": {
+        "prefill_wired_bytes": 23622320128,
+        "decode_wired_bytes": 26800603136,
+        "scope": "Exclusive process-wide MLX configuration; no graph/state/output rewrite",
+        "synchronization": "Transitions follow completed request or prefill sampled-ID CPU readback",
+        "timing": "Low transition excluded with request reset; high transition included in decode",
+        "wrapper_sha256": "697952018575299b978fba67da9162373f70519b758b59b82c91d60ad4e9d98c",
+        "transitions": [
+          {
+            "phase": "request_reset_and_prefill",
+            "previous_bytes": 23622320128,
+            "wired_bytes": 23622320128
+          },
+          {
+            "phase": "decode",
+            "previous_bytes": 23622320128,
+            "wired_bytes": 26800603136
+          },
+          {
+            "phase": "request_reset_and_prefill",
+            "previous_bytes": 26800603136,
+            "wired_bytes": 23622320128
+          },
+          {
+            "phase": "decode",
+            "previous_bytes": 23622320128,
+            "wired_bytes": 26800603136
+          },
+          {
+            "phase": "request_reset_and_prefill",
+            "previous_bytes": 26800603136,
+            "wired_bytes": 23622320128
+          },
+          {
+            "phase": "decode",
+            "previous_bytes": 23622320128,
+            "wired_bytes": 26800603136
+          },
+          {
+            "phase": "request_reset_and_prefill",
+            "previous_bytes": 26800603136,
+            "wired_bytes": 23622320128
+          },
+          {
+            "phase": "decode",
+            "previous_bytes": 23622320128,
+            "wired_bytes": 26800603136
+          },
+          {
+            "phase": "request_reset_and_prefill",
+            "previous_bytes": 26800603136,
+            "wired_bytes": 23622320128
+          },
+          {
+            "phase": "decode",
+            "previous_bytes": 23622320128,
+            "wired_bytes": 26800603136
+          }
+        ]
+      },
+      "onnxruntime": "1.32.0",
+      "python": "3.13.5",
+      "platform": "macOS-27.0.1-arm64-arm-64bit-Mach-O"
+    },
+    "qualification_borrowed": {
+      "driver": "Public ORT GPU IOBinding K=1 MTP; separate checkpoint/replay/greedy-selection helpers, not GenAI Engine",
+      "warmups": 3,
+      "repetitions": 3,
+      "warm_ttft_median_ms": 135401.02270804346,
+      "decode_median_ms_per_token": 86.70918251360384,
+      "aggregate_decode_tokens_per_second": 11.48263348262307,
+      "inter_token_p95_ms": 200.00400848221034,
+      "samples": [
+        {
+          "ttft_seconds": 135.27430337504484,
+          "decode_seconds": 21.76915116701275,
+          "speculative_stats": {
+            "completed_rounds": 149,
+            "draft_forward_passes": 149,
+            "draft_input_tokens": 255,
+            "draft_tokens_proposed": 149,
+            "draft_tokens_evaluated": 149,
+            "draft_tokens_accepted": 106,
+            "prefix_replays": 43
+          },
+          "tokens_sha256": "0559ad32a45c1b08422165a2e8091f3737335ea17f5ac5cc08fe00c2014022b8"
+        },
+        {
+          "ttft_seconds": 136.96378479199484,
+          "decode_seconds": 22.110841540968977,
+          "speculative_stats": {
+            "completed_rounds": 149,
+            "draft_forward_passes": 149,
+            "draft_input_tokens": 255,
+            "draft_tokens_proposed": 149,
+            "draft_tokens_evaluated": 149,
+            "draft_tokens_accepted": 106,
+            "prefix_replays": 43
+          },
+          "tokens_sha256": "0559ad32a45c1b08422165a2e8091f3737335ea17f5ac5cc08fe00c2014022b8"
+        },
+        {
+          "ttft_seconds": 135.40102270804346,
+          "decode_seconds": 22.742354957968928,
+          "speculative_stats": {
+            "completed_rounds": 149,
+            "draft_forward_passes": 149,
+            "draft_input_tokens": 255,
+            "draft_tokens_proposed": 149,
+            "draft_tokens_evaluated": 149,
+            "draft_tokens_accepted": 106,
+            "prefix_replays": 43
+          },
+          "tokens_sha256": "0559ad32a45c1b08422165a2e8091f3737335ea17f5ac5cc08fe00c2014022b8"
+        }
+      ],
+      "all_requests_match_reference": true,
+      "plugin_sha256": "e265d135fb1e7ac4ee497fe27277c2834f94b2d69a2be9612174806655be8080",
+      "model_graph_sha256": {
+        "model.onnx": "19c3f4153ee3683daa419e7092880a90345efd81cd88e928abe4965065c71a67",
+        "mtp.onnx": "fb15123f95b4bbc88358790a26f14fcb6b44aff72ec4552dd5424648715e4ca5"
+      },
+      "python_source_sha256": {
+        "bench/ort_mtp.py": "e95a843144260d5fedeec04709758ba666845d2b82657940b98c84ff6fd70223",
+        "bench/mtp_replay.py": "ae90d9415349cb20c9ac463f0de356562b71cae0a136f54386e536afe8f07bab",
+        "bench/ort_paged.py": "3a2a9cf6d717eae63825176aefd3f59cd046741a5e01908eeb6eb50b5575b52f",
+        "bench/genai_paged.py": "cb687ef7093d8a0a57c6d9af1be74b91c4a19b507bc37540c29e353d525edc3b"
+      },
+      "source_report_sha256": "433c71fb0c58cacecc0f1f679e7448b80121e43d89376e10696295058c699e47",
+      "mlx_options": {
+        "ONNXRUNTIME_EP_MLX_CACHE_LIMIT_BYTES": "536870912",
+        "ONNXRUNTIME_EP_MLX_DEVICE_TENSORS": "1",
+        "ONNXRUNTIME_EP_MLX_NO_SHARED_QUANT_VIEWS": "0",
+        "ONNXRUNTIME_EP_MLX_OWN_SMALL_INPUTS": "0",
+        "ONNXRUNTIME_EP_MLX_WIRED_LIMIT_BYTES": "23622320128"
+      },
+      "prefill_chunk_size": 1024,
+      "phase_residency": {
+        "prefill_wired_bytes": 23622320128,
+        "decode_wired_bytes": 26800603136,
+        "scope": "Exclusive process-wide MLX configuration; no graph/state/output rewrite",
+        "synchronization": "Transitions follow completed request or prefill sampled-ID CPU readback",
+        "timing": "Low transition excluded with request reset; high transition included in decode",
+        "wrapper_sha256": "697952018575299b978fba67da9162373f70519b758b59b82c91d60ad4e9d98c",
+        "transitions": [
+          {
+            "phase": "request_reset_and_prefill",
+            "previous_bytes": 23622320128,
+            "wired_bytes": 23622320128
+          },
+          {
+            "phase": "decode",
+            "previous_bytes": 23622320128,
+            "wired_bytes": 26800603136
+          },
+          {
+            "phase": "request_reset_and_prefill",
+            "previous_bytes": 26800603136,
+            "wired_bytes": 23622320128
+          },
+          {
+            "phase": "decode",
+            "previous_bytes": 23622320128,
+            "wired_bytes": 26800603136
+          },
+          {
+            "phase": "request_reset_and_prefill",
+            "previous_bytes": 26800603136,
+            "wired_bytes": 23622320128
+          },
+          {
+            "phase": "decode",
+            "previous_bytes": 23622320128,
+            "wired_bytes": 26800603136
+          },
+          {
+            "phase": "request_reset_and_prefill",
+            "previous_bytes": 26800603136,
+            "wired_bytes": 23622320128
+          },
+          {
+            "phase": "decode",
+            "previous_bytes": 23622320128,
+            "wired_bytes": 26800603136
+          },
+          {
+            "phase": "request_reset_and_prefill",
+            "previous_bytes": 26800603136,
+            "wired_bytes": 23622320128
+          },
+          {
+            "phase": "decode",
+            "previous_bytes": 23622320128,
+            "wired_bytes": 26800603136
+          },
+          {
+            "phase": "request_reset_and_prefill",
+            "previous_bytes": 26800603136,
+            "wired_bytes": 23622320128
+          },
+          {
+            "phase": "decode",
+            "previous_bytes": 23622320128,
+            "wired_bytes": 26800603136
+          }
+        ]
+      },
+      "onnxruntime": "1.32.0",
+      "python": "3.13.5",
+      "platform": "macOS-27.0.1-arm64-arm-64bit-Mach-O"
+    },
+    "qualification_owned": {
+      "driver": "Public ORT GPU IOBinding K=1 MTP; separate checkpoint/replay/greedy-selection helpers, not GenAI Engine",
+      "warmups": 3,
+      "repetitions": 3,
+      "warm_ttft_median_ms": 136274.92166601587,
+      "decode_median_ms_per_token": 81.22178790953888,
+      "aggregate_decode_tokens_per_second": 11.935725424174565,
+      "inter_token_p95_ms": 195.81713299266994,
+      "samples": [
+        {
+          "ttft_seconds": 136.27492166601587,
+          "decode_seconds": 20.37358233402483,
+          "speculative_stats": {
+            "completed_rounds": 149,
+            "draft_forward_passes": 149,
+            "draft_input_tokens": 255,
+            "draft_tokens_proposed": 149,
+            "draft_tokens_evaluated": 149,
+            "draft_tokens_accepted": 106,
+            "prefix_replays": 43
+          },
+          "tokens_sha256": "0559ad32a45c1b08422165a2e8091f3737335ea17f5ac5cc08fe00c2014022b8"
+        },
+        {
+          "ttft_seconds": 138.93978679203428,
+          "decode_seconds": 20.71155591693241,
+          "speculative_stats": {
+            "completed_rounds": 149,
+            "draft_forward_passes": 149,
+            "draft_input_tokens": 255,
+            "draft_tokens_proposed": 149,
+            "draft_tokens_evaluated": 149,
+            "draft_tokens_accepted": 106,
+            "prefix_replays": 43
+          },
+          "tokens_sha256": "0559ad32a45c1b08422165a2e8091f3737335ea17f5ac5cc08fe00c2014022b8"
+        },
+        {
+          "ttft_seconds": 135.30852108297404,
+          "decode_seconds": 23.00815920799505,
+          "speculative_stats": {
+            "completed_rounds": 149,
+            "draft_forward_passes": 149,
+            "draft_input_tokens": 255,
+            "draft_tokens_proposed": 149,
+            "draft_tokens_evaluated": 149,
+            "draft_tokens_accepted": 106,
+            "prefix_replays": 43
+          },
+          "tokens_sha256": "0559ad32a45c1b08422165a2e8091f3737335ea17f5ac5cc08fe00c2014022b8"
+        }
+      ],
+      "all_requests_match_reference": true,
+      "plugin_sha256": "e265d135fb1e7ac4ee497fe27277c2834f94b2d69a2be9612174806655be8080",
+      "model_graph_sha256": {
+        "model.onnx": "19c3f4153ee3683daa419e7092880a90345efd81cd88e928abe4965065c71a67",
+        "mtp.onnx": "fb15123f95b4bbc88358790a26f14fcb6b44aff72ec4552dd5424648715e4ca5"
+      },
+      "python_source_sha256": {
+        "bench/ort_mtp.py": "e95a843144260d5fedeec04709758ba666845d2b82657940b98c84ff6fd70223",
+        "bench/mtp_replay.py": "ae90d9415349cb20c9ac463f0de356562b71cae0a136f54386e536afe8f07bab",
+        "bench/ort_paged.py": "3a2a9cf6d717eae63825176aefd3f59cd046741a5e01908eeb6eb50b5575b52f",
+        "bench/genai_paged.py": "cb687ef7093d8a0a57c6d9af1be74b91c4a19b507bc37540c29e353d525edc3b"
+      },
+      "source_report_sha256": "752a61efbb73d864291188cea645808c5c6c6767c29446480b7d582dfb7bd3df",
+      "mlx_options": {
+        "ONNXRUNTIME_EP_MLX_CACHE_LIMIT_BYTES": "536870912",
+        "ONNXRUNTIME_EP_MLX_DEVICE_TENSORS": "1",
+        "ONNXRUNTIME_EP_MLX_NO_SHARED_QUANT_VIEWS": "0",
+        "ONNXRUNTIME_EP_MLX_OWN_SMALL_INPUTS": "1",
+        "ONNXRUNTIME_EP_MLX_WIRED_LIMIT_BYTES": "23622320128"
+      },
+      "prefill_chunk_size": 1024,
+      "phase_residency": {
+        "prefill_wired_bytes": 23622320128,
+        "decode_wired_bytes": 26800603136,
+        "scope": "Exclusive process-wide MLX configuration; no graph/state/output rewrite",
+        "synchronization": "Transitions follow completed request or prefill sampled-ID CPU readback",
+        "timing": "Low transition excluded with request reset; high transition included in decode",
+        "wrapper_sha256": "697952018575299b978fba67da9162373f70519b758b59b82c91d60ad4e9d98c",
+        "transitions": [
+          {
+            "phase": "request_reset_and_prefill",
+            "previous_bytes": 23622320128,
+            "wired_bytes": 23622320128
+          },
+          {
+            "phase": "decode",
+            "previous_bytes": 23622320128,
+            "wired_bytes": 26800603136
+          },
+          {
+            "phase": "request_reset_and_prefill",
+            "previous_bytes": 26800603136,
+            "wired_bytes": 23622320128
+          },
+          {
+            "phase": "decode",
+            "previous_bytes": 23622320128,
+            "wired_bytes": 26800603136
+          },
+          {
+            "phase": "request_reset_and_prefill",
+            "previous_bytes": 26800603136,
+            "wired_bytes": 23622320128
+          },
+          {
+            "phase": "decode",
+            "previous_bytes": 23622320128,
+            "wired_bytes": 26800603136
+          },
+          {
+            "phase": "request_reset_and_prefill",
+            "previous_bytes": 26800603136,
+            "wired_bytes": 23622320128
+          },
+          {
+            "phase": "decode",
+            "previous_bytes": 23622320128,
+            "wired_bytes": 26800603136
+          },
+          {
+            "phase": "request_reset_and_prefill",
+            "previous_bytes": 26800603136,
+            "wired_bytes": 23622320128
+          },
+          {
+            "phase": "decode",
+            "previous_bytes": 23622320128,
+            "wired_bytes": 26800603136
+          },
+          {
+            "phase": "request_reset_and_prefill",
+            "previous_bytes": 26800603136,
+            "wired_bytes": 23622320128
+          },
+          {
+            "phase": "decode",
+            "previous_bytes": 23622320128,
+            "wired_bytes": 26800603136
+          }
+        ]
+      },
+      "onnxruntime": "1.32.0",
+      "python": "3.13.5",
+      "platform": "macOS-27.0.1-arm64-arm-64bit-Mach-O"
+    },
+    "shipping_default": {
+      "driver": "Public ORT GPU IOBinding K=1 MTP; separate checkpoint/replay/greedy-selection helpers, not GenAI Engine",
+      "warmups": 3,
+      "repetitions": 1,
+      "warm_ttft_median_ms": 134452.67716702074,
+      "decode_median_ms_per_token": 107.28005163106775,
+      "aggregate_decode_tokens_per_second": 9.321397452705972,
+      "inter_token_p95_ms": 203.36674192221835,
+      "samples": [
+        {
+          "ttft_seconds": 134.45267716702074,
+          "decode_seconds": 27.356413165922277,
+          "speculative_stats": {
+            "completed_rounds": 149,
+            "draft_forward_passes": 149,
+            "draft_input_tokens": 255,
+            "draft_tokens_proposed": 149,
+            "draft_tokens_evaluated": 149,
+            "draft_tokens_accepted": 106,
+            "prefix_replays": 43
+          },
+          "tokens_sha256": "0559ad32a45c1b08422165a2e8091f3737335ea17f5ac5cc08fe00c2014022b8"
+        }
+      ],
+      "all_requests_match_reference": true,
+      "plugin_sha256": "160008fbb9f004424ed8f89473cffb8ffbcb87e8720434ef17bdbb00658ed5f7",
+      "model_graph_sha256": {
+        "model.onnx": "19c3f4153ee3683daa419e7092880a90345efd81cd88e928abe4965065c71a67",
+        "mtp.onnx": "fb15123f95b4bbc88358790a26f14fcb6b44aff72ec4552dd5424648715e4ca5"
+      },
+      "python_source_sha256": {
+        "bench/ort_mtp.py": "bfe8cec7ca2aa1f274e8ec38116f61d6de3124f11300ff1d4d9649c8706c1d71",
+        "bench/mtp_replay.py": "ae90d9415349cb20c9ac463f0de356562b71cae0a136f54386e536afe8f07bab",
+        "bench/ort_paged.py": "3a2a9cf6d717eae63825176aefd3f59cd046741a5e01908eeb6eb50b5575b52f",
+        "bench/genai_paged.py": "cb687ef7093d8a0a57c6d9af1be74b91c4a19b507bc37540c29e353d525edc3b"
+      },
+      "source_report_sha256": "114ac7cfb4c9b4fa8bd9f795241c1ddea9d78e3786b6a511157ce201e8c984a7",
+      "mlx_options": {
+        "ONNXRUNTIME_EP_MLX_CACHE_LIMIT_BYTES": "536870912",
+        "ONNXRUNTIME_EP_MLX_DEVICE_TENSORS": "1",
+        "ONNXRUNTIME_EP_MLX_WIRED_LIMIT_BYTES": "23622320128"
+      },
+      "prefill_chunk_size": 1024,
+      "phase_residency": {
+        "prefill_wired_bytes": 23622320128,
+        "decode_wired_bytes": 26800603136,
+        "scope": "Exclusive process-wide MLX configuration; no graph/state/output rewrite",
+        "synchronization": "Transitions follow completed request or prefill sampled-ID CPU readback",
+        "timing": "Low transition excluded with request reset; high transition included in decode",
+        "wrapper_sha256": "697952018575299b978fba67da9162373f70519b758b59b82c91d60ad4e9d98c",
+        "transitions": [
+          {
+            "phase": "request_reset_and_prefill",
+            "previous_bytes": 23622320128,
+            "wired_bytes": 23622320128
+          },
+          {
+            "phase": "decode",
+            "previous_bytes": 23622320128,
+            "wired_bytes": 26800603136
+          },
+          {
+            "phase": "request_reset_and_prefill",
+            "previous_bytes": 26800603136,
+            "wired_bytes": 23622320128
+          },
+          {
+            "phase": "decode",
+            "previous_bytes": 23622320128,
+            "wired_bytes": 26800603136
+          },
+          {
+            "phase": "request_reset_and_prefill",
+            "previous_bytes": 26800603136,
+            "wired_bytes": 23622320128
+          },
+          {
+            "phase": "decode",
+            "previous_bytes": 23622320128,
+            "wired_bytes": 26800603136
+          },
+          {
+            "phase": "request_reset_and_prefill",
+            "previous_bytes": 26800603136,
+            "wired_bytes": 23622320128
+          },
+          {
+            "phase": "decode",
+            "previous_bytes": 23622320128,
+            "wired_bytes": 26800603136
+          }
+        ]
+      },
+      "onnxruntime": "1.32.0",
+      "python": "3.13.5",
+      "platform": "macOS-27.0.1-arm64-arm-64bit-Mach-O"
+    },
+    "shipping_opt_out": {
+      "driver": "Public ORT GPU IOBinding K=1 MTP; separate checkpoint/replay/greedy-selection helpers, not GenAI Engine",
+      "warmups": 3,
+      "repetitions": 1,
+      "warm_ttft_median_ms": 171101.1956250295,
+      "decode_median_ms_per_token": 133.30189232148376,
+      "aggregate_decode_tokens_per_second": 7.501768974054045,
+      "inter_token_p95_ms": 271.5211499482393,
+      "samples": [
+        {
+          "ttft_seconds": 171.1011956250295,
+          "decode_seconds": 33.99198254197836,
+          "speculative_stats": {
+            "completed_rounds": 149,
+            "draft_forward_passes": 149,
+            "draft_input_tokens": 255,
+            "draft_tokens_proposed": 149,
+            "draft_tokens_evaluated": 149,
+            "draft_tokens_accepted": 106,
+            "prefix_replays": 43
+          },
+          "tokens_sha256": "0559ad32a45c1b08422165a2e8091f3737335ea17f5ac5cc08fe00c2014022b8"
+        }
+      ],
+      "all_requests_match_reference": true,
+      "plugin_sha256": "160008fbb9f004424ed8f89473cffb8ffbcb87e8720434ef17bdbb00658ed5f7",
+      "model_graph_sha256": {
+        "model.onnx": "19c3f4153ee3683daa419e7092880a90345efd81cd88e928abe4965065c71a67",
+        "mtp.onnx": "fb15123f95b4bbc88358790a26f14fcb6b44aff72ec4552dd5424648715e4ca5"
+      },
+      "python_source_sha256": {
+        "bench/ort_mtp.py": "bfe8cec7ca2aa1f274e8ec38116f61d6de3124f11300ff1d4d9649c8706c1d71",
+        "bench/mtp_replay.py": "ae90d9415349cb20c9ac463f0de356562b71cae0a136f54386e536afe8f07bab",
+        "bench/ort_paged.py": "3a2a9cf6d717eae63825176aefd3f59cd046741a5e01908eeb6eb50b5575b52f",
+        "bench/genai_paged.py": "cb687ef7093d8a0a57c6d9af1be74b91c4a19b507bc37540c29e353d525edc3b"
+      },
+      "source_report_sha256": "9f84a2105fcfc4f718a01ad9fda74192cbac656d02ad2670326c0cf80166c461",
+      "mlx_options": {
+        "ONNXRUNTIME_EP_MLX_CACHE_LIMIT_BYTES": "536870912",
+        "ONNXRUNTIME_EP_MLX_DEVICE_TENSORS": "1",
+        "ONNXRUNTIME_EP_MLX_OWN_SMALL_INPUTS": "0",
+        "ONNXRUNTIME_EP_MLX_WIRED_LIMIT_BYTES": "23622320128"
+      },
+      "prefill_chunk_size": 1024,
+      "phase_residency": {
+        "prefill_wired_bytes": 23622320128,
+        "decode_wired_bytes": 26800603136,
+        "scope": "Exclusive process-wide MLX configuration; no graph/state/output rewrite",
+        "synchronization": "Transitions follow completed request or prefill sampled-ID CPU readback",
+        "timing": "Low transition excluded with request reset; high transition included in decode",
+        "wrapper_sha256": "697952018575299b978fba67da9162373f70519b758b59b82c91d60ad4e9d98c",
+        "transitions": [
+          {
+            "phase": "request_reset_and_prefill",
+            "previous_bytes": 23622320128,
+            "wired_bytes": 23622320128
+          },
+          {
+            "phase": "decode",
+            "previous_bytes": 23622320128,
+            "wired_bytes": 26800603136
+          },
+          {
+            "phase": "request_reset_and_prefill",
+            "previous_bytes": 26800603136,
+            "wired_bytes": 23622320128
+          },
+          {
+            "phase": "decode",
+            "previous_bytes": 23622320128,
+            "wired_bytes": 26800603136
+          },
+          {
+            "phase": "request_reset_and_prefill",
+            "previous_bytes": 26800603136,
+            "wired_bytes": 23622320128
+          },
+          {
+            "phase": "decode",
+            "previous_bytes": 23622320128,
+            "wired_bytes": 26800603136
+          },
+          {
+            "phase": "request_reset_and_prefill",
+            "previous_bytes": 26800603136,
+            "wired_bytes": 23622320128
+          },
+          {
+            "phase": "decode",
+            "previous_bytes": 23622320128,
+            "wired_bytes": 26800603136
+          }
+        ]
+      },
+      "onnxruntime": "1.32.0",
+      "python": "3.13.5",
+      "platform": "macOS-27.0.1-arm64-arm-64bit-Mach-O"
+    }
+  },
+  "native_llama_cpp_reference": {
+    "raw_artifact": "qwen-native-llama.cpp-16k.json",
+    "raw_artifact_sha256": "437610747f2d5769f246f1d160c4350261b732ed21272447bd4b2a54417f7d05",
+    "output_tokens_sha256": "e13919106126824f2a6ba2dde3d8310656bd636791042172c31f48defe7655be",
+    "warm_ttft_median_seconds": 128.89557720907032,
+    "ttft_range_seconds": [
+      128.69278329098597,
+      129.03803212498315
+    ],
+    "decode_time_range_seconds": [
+      15.759083666023798,
+      15.791831915965304
+    ],
+    "decode_median_ms_per_token": 61.84474967474885,
+    "aggregate_decode_tokens_per_second": 16.16607252068132,
+    "measured_runs": [
+      {
+        "ttft_seconds": 129.03803212498315,
+        "decode_seconds": 15.791831915965304,
+        "native_timings": {
+          "cache_n": 0,
+          "prompt_n": 16384,
+          "prompt_ms": 129034.291,
+          "prompt_per_token_ms": 7.875628112792969,
+          "prompt_per_second": 126.97399949289449,
+          "predicted_n": 256,
+          "predicted_ms": 15790.827,
+          "predicted_per_token_ms": 61.92481176470588,
+          "predicted_per_second": 16.148615902131027
+        }
+      },
+      {
+        "ttft_seconds": 128.89557720907032,
+        "decode_seconds": 15.759083666023798,
+        "native_timings": {
+          "cache_n": 0,
+          "prompt_n": 16384,
+          "prompt_ms": 128900.317,
+          "prompt_per_token_ms": 7.867450988769531,
+          "prompt_per_second": 127.10597135304175,
+          "predicted_n": 256,
+          "predicted_ms": 15758.318,
+          "predicted_per_token_ms": 61.79732549019607,
+          "predicted_per_second": 16.18193007654751
+        }
+      },
+      {
+        "ttft_seconds": 128.69278329098597,
+        "decode_seconds": 15.770411167060956,
+        "native_timings": {
+          "cache_n": 0,
+          "prompt_n": 16384,
+          "prompt_ms": 128689.62,
+          "prompt_per_token_ms": 7.854591064453125,
+          "prompt_per_second": 127.31407552528324,
+          "predicted_n": 256,
+          "predicted_ms": 15769.356,
+          "predicted_per_token_ms": 61.84061176470588,
+          "predicted_per_second": 16.17060328906266
+        }
+      }
+    ],
+    "model": "unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_0.gguf",
+    "revision": "4ca720788d1e01f1bff70c033e0d0028fd02e502",
+    "quantization": "GGUF Q4_0-labelled mixed quantization; not uniformly 4-bit",
+    "version": "version: 0.7.0 (build 11669, commit 620d2225c)\nbuilt with AppleClang 21.0.0.21000334 for Darwin arm64",
+    "script_sha256": "48d1932d3f3e75583304b2a2d80bc90e9f6a797c1bb1e7d05832f4f317d7c9f9",
+    "mtp": false,
+    "command": [
+      "llama-server",
+      "-m",
+      "native-llama-qwen38/Qwen3.8-27B-Q4_0.gguf",
+      "-c",
+      "17408",
+      "-ngl",
+      "99",
+      "-fa",
+      "on",
+      "-b",
+      "1024",
+      "-ub",
+      "1024",
+      "--parallel",
+      "1",
+      "--host",
+      "127.0.0.1",
+      "--port",
+      "18943"
+    ],
+    "gguf_tensor_type_counts": {
+      "F32": 456,
+      "Q4_0": 352,
+      "Q4_1": 8,
+      "Q5_K": 48,
+      "Q6_K": 1,
+      "Q8_0": 1
+    },
+    "quantization_audit": "Read GGUF v3 tensor metadata; general.architecture=qwen35, general.name=Qwen3.8-27B, general.file_type=2."
+  },
+  "limitations": [
+    "Native llama.cpp is an earlier reference, not a same-round rerun.",
+    "Native GGUF mixed quantization differs from ONNX affine INT4/group32; native and EP generated tokens diverge.",
+    "Timing varies substantially between rounds; the shipping checks use a different binary from the original ownership A/B.",
+    "MTP bonus tokens retain their shared emission timestamp; inter-token p95 is not target-forward latency.",
+    "Reported MLX allocation reductions are not measurements of total physical memory."
+  ]
+}

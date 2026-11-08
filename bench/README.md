@@ -369,6 +369,33 @@ One-time helper/buffer setup and per-request state resets are excluded from
 TTFT; prefill and first greedy selection are included. Same-round emitted tokens
 retain their shared timestamp rather than inventing evenly spaced inter-token timings.
 
+Add `--target-only` for a non-speculative control using the same unpruned target
+export, GPU state, and greedy selector. It runs one target token at a time
+without draft, checkpoint, or replay execution. Its report sets
+`max_draft_tokens` to zero and all speculative counters to zero; MTP remains
+the default. This control isolates execution differences within the ONNX
+export, not differences from native-runtime model conversions.
+
+[The small-input ownership qualification](reports/qwen38-owned-small-inputs-16k-m1max.json)
+keeps CPU runtime inputs of at most 4096 bytes in owned MLX arrays, allowing
+GPU-only boundaries to use their existing asynchronous evaluation path.
+Large borrowed CPU inputs, CPU outputs, and input writebacks remain synchronous.
+The owned path is default; `ONNXRUNTIME_EP_MLX_OWN_SMALL_INPUTS=0` restores
+borrowed wrapping for small inputs.
+
+On M1 Max 32 GiB, the same-binary 16K/256 qualification used three warmups and
+three measured requests per arm. Aggregate K1 MTP decode rose from 11.483 to
+11.936 tokens/s, while median TTFT changed from 135.401 to 136.275 seconds.
+All twelve requests matched the unchanged target reference. Subsequent
+shipping-binary default/opt-out checks also matched, but timings varied
+substantially: 9.321 versus 7.502 tokens/s and 134.453 versus 171.101 seconds
+TTFT. These checks are not a clean additional speedup measurement.
+
+The earlier native llama.cpp reference remains 128.896 seconds TTFT and
+16.166 tokens/s. Its mixed GGUF quantization differs from the ONNX affine
+INT4/group32 export, and generated tokens differ across native runtimes.
+The llama.cpp throughput target has not been reached.
+
 [The M1 Max 32 GiB residency screen](reports/qwen38-public-mtp-residency-16k-m1max.json)
 completed three warmups and one measured 256-token request at 16,384 input tokens;
 all four outputs matched the reference. With 512-token chunks, a 22 GiB wired cap

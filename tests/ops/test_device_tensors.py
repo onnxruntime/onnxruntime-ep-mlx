@@ -29,6 +29,51 @@ def memory_info():
 
 
 @pytest.mark.parametrize("eager", [False, True])
+@pytest.mark.parametrize("owned", [None, "0", "1"])
+@pytest.mark.parametrize("count", [1024, 1025])
+def test_cpu_input_ownership_threshold_and_output_lifetime(
+    monkeypatch, eager, owned, count
+):
+    monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_COMPILE", "1" if eager else "0")
+    if owned is None:
+        monkeypatch.delenv("ONNXRUNTIME_EP_MLX_OWN_SMALL_INPUTS", raising=False)
+    else:
+        monkeypatch.setenv("ONNXRUNTIME_EP_MLX_OWN_SMALL_INPUTS", owned)
+    graph = helper.make_graph(
+        [helper.make_node("Add", ["x", "one"], ["y"])],
+        "owned_cpu_input",
+        [helper.make_tensor_value_info("x", TensorProto.FLOAT, [count])],
+        [helper.make_tensor_value_info("y", TensorProto.FLOAT, [count])],
+        [numpy_helper.from_array(np.array(1, np.float32), "one")],
+    )
+    model = helper.make_model(
+        graph, ir_version=11, opset_imports=[helper.make_opsetid("", 24)]
+    )
+    options = ort.SessionOptions()
+    options.add_session_config_entry("session.disable_cpu_ep_fallback", "1")
+    session = ort.InferenceSession(
+        model.SerializeToString(), options, providers=["MLXExecutionProvider"]
+    )
+    output = ort.OrtValue.ortvalue_from_shape_and_type(
+        [count], np.float32, memory_info=memory_info()
+    )
+    binding = session.io_binding()
+    binding.bind_ortvalue_output("y", output)
+    for offset in (0, 7):
+        value = np.arange(count, dtype=np.float32) + offset
+        expected = value + 1
+        binding.bind_cpu_input("x", value)
+        session.run_with_iobinding(binding)
+        value.fill(-88)
+        binding.clear_binding_inputs()
+        del value
+        np.testing.assert_array_equal(output.numpy(), expected)
+    del binding, session
+    gc.collect()
+    np.testing.assert_array_equal(output.numpy(), expected)
+
+
+@pytest.mark.parametrize("eager", [False, True])
 @pytest.mark.parametrize("conv_dtype", [np.float16, np.float32])
 @pytest.mark.parametrize("geometry", [(2, 6, 8, 8), (16, 48, 128, 128)])
 def test_public_mtp_prefix_replay_retains_immutable_checkpoint(

@@ -1051,6 +1051,27 @@ impl<'a> TranslationContext<'a> {
         raw
     }
 
+    fn runtime_input_array(&mut self, data: *const c_void, shape: &[i32], dtype: u32) -> Array {
+        let count = shape.iter().try_fold(1usize, |count, &dim| {
+            count.checked_mul(usize::try_from(dim).ok()?)
+        });
+        let small = count
+            .and_then(|count| {
+                onnx_runtime_ir::DataType::from_onnx(dtype as i32)
+                    .and_then(|dtype| dtype.checked_storage_bytes(count))
+            })
+            .is_some_and(|bytes| bytes <= 4096);
+        if small
+            && std::env::var_os("ONNXRUNTIME_EP_MLX_OWN_SMALL_INPUTS")
+                .is_none_or(|value| value != "0" && !value.is_empty())
+        {
+            Array::from_data(data, shape, mlx_dtype_from_onnx(dtype))
+        } else {
+            self.borrowed_runtime_inputs = true;
+            Array::from_data_managed(data, shape, mlx_dtype_from_onnx(dtype))
+        }
+    }
+
     pub(crate) fn initializer_view(
         &mut self,
         input: &TensorRef,
@@ -1400,13 +1421,9 @@ impl<'a> TranslationContext<'a> {
                     self.plan.cache.insert(r.name.clone(), arr);
                     Ok(raw)
                 } else {
-                    // Zero-copy wrap of the live ORT input buffer (ORT owns it for the whole Compute
-                    // call; MLX borrows via a no-op deallocator and the wrapper drops before we
-                    // return, after the synchronous boundary eval). Dominant win in shared-buffer
-                    // mode where the per-token past K/V is a full [B,kv,cap,hd] buffer that
-                    // `from_data` used to memcpy every token.
-                    let arr = Array::from_data_managed(data, &ishape, mlx_dtype_from_onnx(dtype));
-                    self.borrowed_runtime_inputs = true;
+                    // Owned small inputs can outlive Compute; borrowed large inputs still require
+                    // synchronous evaluation before ORT may reuse their zero-copy buffers.
+                    let arr = self.runtime_input_array(data, &ishape, dtype);
                     let raw = self.keep_input(arr);
                     self.env.insert(r.name.clone(), raw);
                     Ok(raw)
@@ -1532,12 +1549,12 @@ impl<'a> TranslationContext<'a> {
             self.plan.cache.insert(cache_key, array);
             raw
         } else {
-            self.borrowed_runtime_inputs = true;
-            self.keep_input(Array::from_data_managed(
+            let array = self.runtime_input_array(
                 host.data,
                 &storage_shape,
-                mlxsys::mlx_dtype__MLX_UINT8,
-            ))
+                ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8,
+            );
+            self.keep_input(array)
         };
         Ok(Some(Packed4 {
             data,
