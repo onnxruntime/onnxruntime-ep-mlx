@@ -376,6 +376,37 @@ without draft, checkpoint, or replay execution. Its report sets
 the default. This control isolates execution differences within the ONNX
 export, not differences from native-runtime model conversions.
 
+For an explicit model-native prefill optimization, build a separate target
+graph that projects only the last two hidden rows:
+
+```python
+from pathlib import Path
+import onnx
+from bench.ort_mtp import make_last_two_logit_model
+
+model = Path("MODEL")
+target = onnx.load(model / "model.onnx", load_external_data=False)
+onnx.save(make_last_two_logit_model(target), model / "model.last-two-logits.onnx")
+```
+
+Keep it beside the original graph so relative external-weight references remain
+valid; weights are not loaded or rewritten. Add
+`--target-last-two-logits MODEL/model.last-two-logits.onnx` to the benchmark.
+
+The [16K M1 Max qualification](reports/qwen38-last-two-logits-m1max.json)
+measured 128.559 s median TTFT versus 134.969 s for the original target, with
+unchanged reference tokens and effectively unchanged decode throughput.
+This is a model-native vocabulary-projection reduction, not an EP kernel gain.
+Only the vocabulary projection input is sliced. All hidden, cache and recurrent
+outputs are preserved, and one-token decode/two-token K1 verification retain
+every original logit row. This uses one target session, not a second prefill
+session. It is an explicit graph rewrite, not an unchanged-export EP comparison
+or permission for ordinary public sessions to omit output rows.
+
+The original target remains the default comparison. Before treating the clipped
+graph as a performance improvement, qualify exact reference tokens and measure
+prefill and decode independently; different QMM/QMV paths can change rounding.
+
 [The small-input ownership qualification](reports/qwen38-owned-small-inputs-16k-m1max.json)
 keeps CPU runtime inputs of at most 4096 bytes in owned MLX arrays, allowing
 GPU-only boundaries to use their existing asynchronous evaluation path.

@@ -6,11 +6,12 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
-from onnx import TensorProto, load_from_string
+from onnx import TensorProto, checker, helper, load_from_string, numpy_helper
 from onnx.reference import ReferenceEvaluator
+from onnx.reference.op_run import OpRun
 from test_mtp_replay import GatedDeltaNet
 
-from bench.ort_mtp import main, make_runner, run_once
+from bench.ort_mtp import main, make_last_two_logit_model, make_runner, run_once
 
 
 def descriptor(name, shape, typ="tensor(float)"):
@@ -49,10 +50,22 @@ def install_runtime(monkeypatch, mode):
         def bind_cpu_input(self, name, value):
             self.cpu[name] = value.copy()
 
+        def clear_binding_inputs(self):
+            self.inputs.clear()
+            self.cpu.clear()
+
+        def clear_binding_outputs(self):
+            self.outputs.clear()
+
     class Session:
+        instances = []
+
         def __init__(self, model=None, *_args, kind=None, **_kwargs):
+            self.instances.append(self)
             self.kind = kind
             self.head_past = 0
+            self.last_binding = None
+            self.last_two_logits = False
             if model is not None:
                 self.model = load_from_string(model)
                 self.reference = ReferenceEvaluator(self.model, new_ops=[GatedDeltaNet])
@@ -112,9 +125,11 @@ def install_runtime(monkeypatch, mode):
             if self.kind is None:
                 return self.proto_descriptors(self.model.graph.output)
             outputs = [
-                descriptor("logits", ["num_tokens", 5]),
+                descriptor("logits", [
+                    "logit_tokens" if self.last_two_logits else "num_tokens", 5
+                ]),
                 descriptor(
-                    "hidden_states" if self.kind == "target" else "hidden_states_out",
+                    "hidden_states" if self.kind != "draft" else "hidden_states_out",
                     ["num_tokens", 2],
                 ),
                 descriptor("present.0.key", ["num_blocks", "block_size", 1, 1]),
@@ -130,6 +145,7 @@ def install_runtime(monkeypatch, mode):
             return outputs
 
         def run_with_iobinding(self, binding):
+            self.last_binding = binding
             feeds = {**binding.cpu, **{k: v.data for k, v in binding.inputs.items()}}
             if self.kind is None:
                 arrays = self.reference.run(None, feeds)
@@ -192,11 +208,14 @@ def install_runtime(monkeypatch, mode):
                 result["present.0." + kind] = cache
             logits = np.full([len(ids), 5], -10, np.float32)
             logits[np.arange(len(ids)), prediction] = 10
-            result["logits"] = logits
+            result["logits"] = (
+                logits[-2:] if self.last_two_logits else logits
+            )
             result[
-                "hidden_states" if self.kind == "target" else "hidden_states_out"
+                "hidden_states" if self.kind != "draft" else "hidden_states_out"
             ] = np.stack([ids, positions], axis=1).astype(np.float32)
             for name, data in result.items():
+                assert binding.outputs[name].data.shape == data.shape
                 binding.outputs[name].data = data
 
     monkeypatch.setitem(
@@ -211,6 +230,133 @@ def install_runtime(monkeypatch, mode):
         ),
     )
     return Session(kind="target"), Session(kind="draft"), calls, values
+
+
+class MatMulNBits(OpRun):
+    op_domain = "com.microsoft"
+
+    def _run(self, x, packed, scales, **_attributes):
+        assert np.all(packed == 0x99)
+        return (x.sum(axis=1, keepdims=True) * scales.reshape(1, -1),)
+
+
+def companion_source_model():
+    return helper.make_model(
+        helper.make_graph(
+            [
+                helper.make_node("Identity", ["x"], ["hidden_states"]),
+                helper.make_node("Identity", ["state"], ["present"]),
+                helper.make_node(
+                    "MatMulNBits", ["hidden_states", "weight", "scales"], ["logits"],
+                    domain="com.microsoft", K=32, N=3, bits=4, block_size=32,
+                ),
+            ],
+            "prefill_companion",
+            [
+                helper.make_tensor_value_info("x", TensorProto.FLOAT, ["tokens", 32]),
+                helper.make_tensor_value_info("state", TensorProto.FLOAT, [2]),
+            ],
+            [
+                helper.make_tensor_value_info("logits", TensorProto.FLOAT, ["tokens", 3]),
+                helper.make_tensor_value_info(
+                    "hidden_states", TensorProto.FLOAT, ["tokens", 32]
+                ),
+                helper.make_tensor_value_info("present", TensorProto.FLOAT, [2]),
+            ],
+            [
+                numpy_helper.from_array(np.full((3, 1, 16), 0x99, np.uint8), "weight"),
+                numpy_helper.from_array(np.array([[.25], [.5], [.75]], np.float32), "scales"),
+            ],
+        ),
+        opset_imports=[helper.make_opsetid("", 21), helper.make_opsetid("com.microsoft", 1)],
+        ir_version=10,
+    )
+
+
+@pytest.mark.parametrize("tokens", [1, 2, 8, 32])
+def test_last_two_logit_target_preserves_hidden_state_and_last_logits(tokens):
+    original = companion_source_model()
+    serialized = original.SerializeToString()
+    companion = make_last_two_logit_model(original)
+    checker.check_model(companion)
+    assert original.SerializeToString() == serialized
+    feeds = {
+        "x": np.arange(tokens * 32, dtype=np.float32).reshape(tokens, 32),
+        "state": np.array([7, 19], np.float32),
+    }
+    expected = ReferenceEvaluator(original, new_ops=[MatMulNBits]).run(None, feeds)
+    actual = ReferenceEvaluator(companion, new_ops=[MatMulNBits]).run(None, feeds)
+    np.testing.assert_array_equal(actual[0], expected[0][-2:])
+    for result, reference in zip(actual[1:], expected[1:], strict=True):
+        np.testing.assert_array_equal(result, reference)
+    dimension = companion.graph.output[0].type.tensor_type.shape.dim[0]
+    assert dimension.dim_param == "logit_tokens"
+
+
+def test_last_two_logit_target_preserves_external_weight_metadata():
+    from onnx.external_data_helper import set_external_data
+
+    original = companion_source_model()
+    set_external_data(original.graph.initializer[0], "weights.data", offset=128)
+    original.graph.initializer[0].data_location = TensorProto.EXTERNAL
+    companion = make_last_two_logit_model(original)
+    assert companion.graph.initializer[0] == original.graph.initializer[0]
+
+
+@pytest.mark.parametrize("fault", ["producer", "consumer", "rank"])
+def test_last_two_logit_target_rejects_incompatible_graph(fault):
+    original = companion_source_model()
+    if fault == "producer":
+        original.graph.node[-1].op_type = "MatMul"
+    elif fault == "consumer":
+        original.graph.node.append(helper.make_node("Identity", ["logits"], ["extra"]))
+    else:
+        original.graph.output[1].type.tensor_type.ClearField("shape")
+    with pytest.raises(ValueError, match="compatible unpruned target export"):
+        make_last_two_logit_model(original)
+
+
+@pytest.mark.parametrize("mode", ["accept", "reject", "mixed"])
+@pytest.mark.parametrize("chunk", [1, 2, 5, 8])
+@pytest.mark.parametrize("speculative", [False, True])
+def test_single_last_two_logit_target_preserves_prefill_and_mtp(
+    monkeypatch, mode, chunk, speculative
+):
+    target, draft, calls, values = install_runtime(monkeypatch, mode)
+    target.last_two_logits = True
+    runner = make_runner(
+        target, draft, [0, 1, 2, 3, 4], 12, info=object(), blocks=8,
+        block_size=8, prefill_chunk_size=chunk, capacity=4,
+        speculative=speculative, last_two_logits=True,
+    )
+    for prompt in ([0, 1, 2, 3, 4], [2, 3, 4], [3, 4]):
+        assert runner(prompt, 12)["tokens"] == [i % 5 for i in range(12)]
+    assert all(value.readbacks == 0 for value in values if value.device)
+    assert any(call[0] == "target" for call in calls)
+
+@pytest.mark.parametrize("declared,enabled", [(True, False), (False, True)])
+def test_last_two_logit_target_requires_matching_contract(monkeypatch, declared, enabled):
+    target, draft, _, _ = install_runtime(monkeypatch, "accept")
+    target.last_two_logits = declared
+    with pytest.raises(ValueError, match="last_two_logits=True"):
+        make_runner(
+            target, draft, [1], 2, info=object(), blocks=8, block_size=8,
+            prefill_chunk_size=2, capacity=4, last_two_logits=enabled,
+        )
+
+def test_prefill_releases_bound_bulk_outputs_and_selector_inputs(monkeypatch):
+    target, draft, _, _ = install_runtime(monkeypatch, "accept")
+    run_once(
+        target, draft, [0, 1, 2, 3, 4], 1, info=object(), blocks=8,
+        block_size=8, prefill_chunk_size=5, capacity=4,
+    )
+    assert not {"logits", "hidden_states"} & target.last_binding.outputs.keys()
+    for name, state in target.last_binding.inputs.items():
+        if name.startswith(("past.", "past_key_values.")):
+            from bench.ort_paged import state_output
+
+            assert target.last_binding.outputs[state_output(name)] is state
+    assert type(target).instances[-1].last_binding.inputs == {}
 
 
 @pytest.mark.parametrize("mode", ["accept", "reject", "mixed"])
