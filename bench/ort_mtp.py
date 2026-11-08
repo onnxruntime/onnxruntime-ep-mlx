@@ -95,6 +95,7 @@ def make_runner(
     block_size,
     prefill_chunk_size,
     capacity,
+    speculative=True,
 ):
     import onnxruntime as ort
 
@@ -326,6 +327,13 @@ def make_runner(
         pending_hidden, head_tokens, head_past = selected_hidden, [anchor], 0
         rounds = accepted = rejections = draft_input_tokens = 0
         while len(tokens) < generated:
+            if not speculative:
+                output = execute("target", target, [anchor], past, past)
+                anchor = int(select(output, [0], 0)[0])
+                past += 1
+                tokens.append(anchor)
+                times.append(time.perf_counter())
+                continue
             # Re-feed accepted drafts with target hidden rows, then the bonus
             # anchor. K=1 never writes speculative drafts into the head KV.
             draft_output = execute(
@@ -407,6 +415,11 @@ def main():
     parser.add_argument("--block-size", type=int, default=256)
     parser.add_argument("--prefill-chunk-size", type=int, default=1024)
     parser.add_argument("--capacity", type=int, default=4)
+    parser.add_argument(
+        "--target-only",
+        action="store_true",
+        help="Run a non-speculative control on the same unpruned target export",
+    )
     args = parser.parse_args()
     if args.tokens < 2 or args.warmup < 3 or args.repetitions < 1:
         parser.error("require tokens >= 2, warmup >= 3 and repetitions >= 1")
@@ -477,6 +490,7 @@ def main():
         block_size=args.block_size,
         prefill_chunk_size=args.prefill_chunk_size,
         capacity=args.capacity,
+        speculative=not args.target_only,
     )
     setup = time.perf_counter() - started
     runs = []
@@ -507,8 +521,18 @@ def main():
         if i >= args.warmup:
             runs.append(result)
     report = {
-        "driver": "Public ORT GPU IOBinding K=1 MTP; separate checkpoint/replay/greedy-selection helpers, not GenAI Engine",
-        "draft_priming": "Cold head, starting from the final target prompt hidden row; accepted drafts are re-fed with target hidden rows",
+        "driver": (
+            "Public ORT GPU IOBinding target-only control on the unchanged export"
+            if args.target_only
+            else "Public ORT GPU IOBinding K=1 MTP; separate checkpoint/replay/"
+            "greedy-selection helpers, not GenAI Engine"
+        ),
+        "draft_priming": (
+            None
+            if args.target_only
+            else "Cold head, starting from the final target prompt hidden row; "
+            "accepted drafts are re-fed with target hidden rows"
+        ),
         "cpu_materialization": "Sampled token IDs only; state, captures, hidden states and full unchanged logits remain GPU-owned",
         "prompt_tokens": prompt,
         "generated_tokens": args.tokens,
@@ -518,7 +542,7 @@ def main():
         "block_size": args.block_size,
         "prefill_chunk_size": args.prefill_chunk_size,
         "capture_capacity": args.capacity,
-        "max_draft_tokens": 1,
+        "max_draft_tokens": 0 if args.target_only else 1,
         "model_directory": str(args.model.resolve()),
         "model_graph_sha256": {
             name: hashlib.sha256((args.model / name).read_bytes()).hexdigest()

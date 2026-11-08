@@ -82,6 +82,19 @@ A Qwen 27B target/draft diagnostic reduced reported MLX active allocations by
 about 707 MiB after draft execution. Prefill peak allocations were unchanged;
 this is not a measurement of total physical memory or a decode speedup claim.
 
+## Runtime input ownership
+
+CPU runtime inputs of at most 4096 bytes are copied into owned MLX arrays by
+default. This removes their borrowed-buffer synchronization requirement when
+all boundary outputs are GPU-owned. Public GPU inputs retain their zero-copy
+wrapping. Larger CPU inputs still use borrowed wrapping and synchronous
+evaluation; CPU outputs and side-effecting input writebacks also retain their
+synchronous boundary.
+
+Set `ONNXRUNTIME_EP_MLX_OWN_SMALL_INPUTS=0` to restore borrowed wrapping for
+small CPU inputs. The byte limit applies to actual tensor storage, including
+packed-input storage, rather than just the element count.
+
 ## Paged-prefill workspace
 
 By default, paged prefill keeps the native KV head count in FP32

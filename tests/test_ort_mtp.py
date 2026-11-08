@@ -250,6 +250,23 @@ def test_public_mtp_alignment_rollback_and_tail(monkeypatch, mode, generated, ch
     assert all(v.readbacks == 0 for v in values if v.device)
 
 
+def test_public_target_only_control_skips_speculation(monkeypatch):
+    target, draft, calls, values = install_runtime(monkeypatch, "reject")
+    result = run_once(
+        target, draft, [0, 1, 2, 3, 4], 12, info=object(), blocks=8,
+        block_size=8, prefill_chunk_size=2, capacity=4, speculative=False,
+    )
+    assert result["tokens"] == [i % 5 for i in range(12)]
+    assert all(value == 0 for value in result["speculative_stats"].values())
+    assert not any(call[0] == "draft" for call in calls)
+    assert not any(
+        call[0] == "helper" and ("GatedDeltaNet" in call[1] or set(call[1]) == {"Identity"})
+        for call in calls
+    )
+    assert len([call for call in calls if call[0] == "target"]) == 14
+    assert all(v.readbacks == 0 for v in values if v.device)
+
+
 @pytest.mark.parametrize(
     "field,value",
     [
