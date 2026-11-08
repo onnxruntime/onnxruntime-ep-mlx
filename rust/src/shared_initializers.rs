@@ -77,6 +77,27 @@ pub(crate) fn get(
     init: &InitData,
     shape: &[i32],
 ) -> Result<Option<Arc<SharedInitializer>>, MlxError> {
+    get_typed(init, shape, mlx_dtype_from_onnx(init.dtype))
+}
+
+pub(crate) fn get_view(
+    init: &InitData,
+    shape: &[i32],
+    dtype: mlx::mlx_dtype,
+) -> Result<Option<Arc<SharedInitializer>>, MlxError> {
+    if std::env::var_os("ONNXRUNTIME_EP_MLX_NO_SHARED_QUANT_VIEWS")
+        .is_some_and(|value| value != "0")
+    {
+        return Ok(None);
+    }
+    get_typed(init, shape, dtype)
+}
+
+fn get_typed(
+    init: &InitData,
+    shape: &[i32],
+    dtype: mlx::mlx_dtype,
+) -> Result<Option<Arc<SharedInitializer>>, MlxError> {
     if !enabled() {
         return Ok(None);
     }
@@ -90,7 +111,7 @@ pub(crate) fn get(
     // its entire indexed lifetime, including MLX's copy fallback and foreign-thread teardown.
     let key = ArrayKey {
         data: storage.as_ptr() as usize,
-        dtype: init.dtype,
+        dtype,
         shape: shape.to_vec(),
     };
     ARRAYS.with(|index| {
@@ -99,7 +120,7 @@ pub(crate) fn get(
         }
         // Own the payload: a borrowed ORT buffer could disappear when the originating session
         // closes while another plan still uses the shared array. Publish only evaluated leaves.
-        let array = Array::from_owned_data(storage.clone(), shape, mlx_dtype_from_onnx(init.dtype));
+        let array = Array::from_owned_data(storage.clone(), shape, dtype);
         if unsafe { mlx::mlx_array_eval(array.as_raw()) } != 0 {
             return Err("MLX: could not evaluate shared initializer".into());
         }
@@ -178,5 +199,35 @@ mod tests {
             .map(|worker| worker.join().unwrap())
             .collect::<Vec<_>>();
         assert!(Arc::ptr_eq(&owners[0], &owners[1]));
+    }
+
+    #[test]
+    fn typed_views_share_only_matching_dtype_and_shape() {
+        let dtype = crate::sys::ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8;
+        let storage = own(&vec![19; 8192], dtype, &[8192]).unwrap();
+        let init = InitData {
+            data: storage.as_ptr().cast(),
+            shape: vec![8192],
+            dtype,
+            count: 8192,
+            owned: Some(storage),
+        };
+        let first = get_view(&init, &[2048], mlx::mlx_dtype__MLX_UINT32)
+            .unwrap()
+            .unwrap();
+        let same = get_view(&init, &[2048], mlx::mlx_dtype__MLX_UINT32)
+            .unwrap()
+            .unwrap();
+        assert!(Arc::ptr_eq(&first, &same));
+        let other_dtype = get_view(&init, &[2048], mlx::mlx_dtype__MLX_FLOAT32)
+            .unwrap()
+            .unwrap();
+        let other_shape = get_view(&init, &[1024, 2], mlx::mlx_dtype__MLX_UINT32)
+            .unwrap()
+            .unwrap();
+        assert!(!Arc::ptr_eq(&first, &other_dtype));
+        assert!(!Arc::ptr_eq(&first, &other_shape));
+        drop(init);
+        assert!(Arc::ptr_eq(&first, &same));
     }
 }

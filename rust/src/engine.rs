@@ -1051,6 +1051,24 @@ impl<'a> TranslationContext<'a> {
         raw
     }
 
+    pub(crate) fn initializer_view(
+        &mut self,
+        input: &TensorRef,
+        data: *const c_void,
+        shape: &[i32],
+        dtype: mlxsys::mlx_dtype,
+    ) -> Result<Array, MlxError> {
+        if input.source == Src::Initializer
+            && let Some(init) = &input.init
+            && let Some(shared) = crate::shared_initializers::get_view(init, shape, dtype)?
+        {
+            let handle = shared.array.retained()?;
+            self.plan.shared_initializers.push(shared);
+            return Ok(handle);
+        }
+        Ok(initializer_array(input, data, shape, dtype))
+    }
+
     /// Borrow an arena-owned intermediate from this graph translation.
     pub fn temporary_get(&self, key: &str) -> Option<mlxsys::mlx_array> {
         self.temporary_arrays.get(key).copied()
