@@ -2292,9 +2292,7 @@ fn mrotary_embedding_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<()
         }
     }
 
-    let linear_gather = ctx.shape_of(cos_cache)[0].checked_mul(half).is_some()
-        && !std::env::var_os("ONNXRUNTIME_EP_MLX_NO_MROPE_COLUMN_GATHER")
-            .is_some_and(|v| v != "0" && !v.is_empty());
+    let linear_gather = ctx.shape_of(cos_cache)[0].checked_mul(half).is_some();
     let (cos_rows, sin_rows) = if linear_gather {
         let key = format!("{}#mrope_columns", n.outputs[0].name);
         let columns = match ctx.cache_get(&key) {

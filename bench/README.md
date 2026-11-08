@@ -552,14 +552,14 @@ selected cosine/sine cache values, rather than gathering all three full streams
 and assembling them with per-column Slice/Concat chains. Position validation,
 stream assignment, dtype, and scale arithmetic are unchanged. The column and
 stream maps are cached; caches too large for safe int32 linear addressing retain
-the original path. `ONNXRUNTIME_EP_MLX_NO_MROPE_COLUMN_GATHER=1` restores that path
-for same-binary comparisons. No chip-specific kernel is selected.
-Set the flag before creating sessions. The
+the original path. All other valid inputs use the column gather without model,
+hardware, or process-flag gating; no chip-specific kernel is selected. The
 [M1 Max qualification](reports/qwen38-mrope-column-gather-m1max.json) measured
 about 27% faster aggregate short-context decode and 30% faster 16K decode with
 unchanged tokens and FP32 state. 16K TTFT was effectively unchanged. The report
-retains all samples, including the slower candidate request; newer Macs were
-not measured.
+retains all samples, including the slower candidate request, and records the
+temporary diagnostic opt-out used for its historical control arm. Newer Macs
+were not measured.
 
 The [follow-up decode experiments](reports/qwen38-decode-followups-m1max.json)
 retain the completed non-speculative 16K control and all short-context samples.
