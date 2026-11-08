@@ -547,6 +547,20 @@ arrays that could have other owners.
 For same-binary diagnostics, `ONNXRUNTIME_EP_MLX_NO_PAGED_DIRECT=1` and
 `ONNXRUNTIME_EP_MLX_NO_PAGED_PATCHES=1` independently disable these changes.
 
+MRotaryEmbedding shares per-column position indices and gathers only the
+selected cosine/sine cache values, rather than gathering all three full streams
+and assembling them with per-column Slice/Concat chains. Position validation,
+stream assignment, dtype, and scale arithmetic are unchanged. The column and
+stream maps are cached; caches too large for safe int32 linear addressing retain
+the original path. `ONNXRUNTIME_EP_MLX_NO_MROPE_COLUMN_GATHER=1` restores that path
+for same-binary comparisons. No chip-specific kernel is selected.
+Set the flag before creating sessions. The
+[M1 Max qualification](reports/qwen38-mrope-column-gather-m1max.json) measured
+about 27% faster aggregate short-context decode and 30% faster 16K decode with
+unchanged tokens and FP32 state. 16K TTFT was effectively unchanged. The report
+retains all samples, including the slower candidate request; newer Macs were
+not measured.
+
 Packed GDN prepares FP32 normalized Q/K and decay/beta coefficients once when
 there are more than eight packed tokens and at least 32 value rows, rather than
 recalculating them for each value row. Short-query decode and verification retain
