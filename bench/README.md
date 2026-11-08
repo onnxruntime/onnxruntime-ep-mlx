@@ -561,6 +561,14 @@ unchanged tokens and FP32 state. 16K TTFT was effectively unchanged. The report
 retains all samples, including the slower candidate request; newer Macs were
 not measured.
 
+The [follow-up decode experiments](reports/qwen38-decode-followups-m1max.json)
+retain the completed non-speculative 16K control and all short-context samples.
+Fixed K2, confidence-gated K2, draft last-logit pruning and forcing native
+matrix kernels did not establish a gain over the qualified K1 defaults, so
+none is enabled. More accepted drafts or fewer projected rows alone are not
+an end-to-end speedup. Native aggregate parity and newer-Mac gains remain
+unproven.
+
 Packed GDN prepares FP32 normalized Q/K and decay/beta coefficients once when
 there are more than eight packed tokens and at least 32 value rows, rather than
 recalculating them for each value row. Short-query decode and verification retain
