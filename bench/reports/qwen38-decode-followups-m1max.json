@@ -1,0 +1,79 @@
+{
+  "scope": "Qwen3.8-27B ONNX affine INT4/group32 on M1 Max 32 GiB; public GPU IOBinding experiments, not GenAI Engine",
+  "decision": "Retain default rotary column gathers and K1. None of these followups established an end-to-end improvement. All experimental production changes were removed.",
+  "qualified_plugin_sha256": "e38e60175d3a4b46df27901a60ec9f91d5c54d5593c86e16c07a178cebe48645",
+  "protocol": {
+    "short_prompt_tokens": 256,
+    "generated_tokens": 256,
+    "cache_blocks": 70,
+    "block_size": 256,
+    "prefill_chunk_size": 1024,
+    "capture_capacity": 4,
+    "prefill_wired_bytes": 23622320128,
+    "decode_wired_bytes": 26800603136,
+    "correctness": "Every GPU request matched all 256 reference tokens. State, hidden arrays and dense logits remained GPU-owned.",
+    "limitations": "Short-context followups are not 16K results. Screens have no warmups and are not qualification measurements. No newer Mac or CUDA execution was measured."
+  },
+  "fixed_k2": {
+    "implementation": "KV-only self-conditioned second proposal; three-row target verification; exact one-/two-update FP32 state replay; speculative head KV is discarded and accepted drafts are re-fed with target hidden rows",
+    "warmups_per_arm": 3,
+    "measured_requests_per_arm": 3,
+    "arm_order": ["k1_control_first", "k2_candidate_first", "k2_candidate_last", "k1_control_last"],
+    "measured_decode_seconds": {
+      "k1_control_first": [18.87576608301606, 19.108925833948888, 18.76216579193715],
+      "k2_candidate_first": [19.578174832975492, 19.44678962510079, 19.49095662496984],
+      "k2_candidate_last": [19.701617417042144, 19.934968582936563, 19.77390374999959],
+      "k1_control_last": [19.519543042057194, 20.6870675830869, 18.940826250007376]
+    },
+    "pooled_k1_tokens_per_second": 13.201685255440692,
+    "pooled_k2_tokens_per_second": 12.974192881748715,
+    "change_percent": -1.7232070700838875,
+    "k1_stats_per_request": {"rounds": 155, "draft_forwards": 155, "accepted": 100, "prefix_replays": 55},
+    "k2_stats_per_request": {"rounds": 124, "draft_forwards": 247, "accepted": 131, "prefix_replays": 70},
+    "conclusion": "Fewer target rounds and more accepted drafts did not offset the additional draft-head work."
+  },
+  "confidence_gated_k2_screens": {
+    "warmups": 0,
+    "measured_requests_per_threshold": 1,
+    "thresholds": [0.5, 0.8, 0.95],
+    "decode_seconds": [19.232502250000834, 19.425418750033714, 19.599990291986614],
+    "tokens_per_second": [13.258805156255159, 13.1271301422811, 13.010210525678465],
+    "cpu_materialization": "Sampled token IDs plus one confidence decision bit; no dense logits, hidden states or recurrent state",
+    "conclusion": "No compelling gain over bracketed K1; not promoted to default or claimed as a speedup."
+  },
+  "last_logit_draft": {
+    "implementation": "Explicit draft graph companion slicing only the vocabulary projection input; all hidden-state and cache outputs unchanged",
+    "warmups_per_mode": 3,
+    "measured_requests_per_mode": 3,
+    "arm_order": ["candidate", "control"],
+    "candidate_decode_seconds": [20.036756374989636, 20.816376541974023, 20.847373249940574],
+    "control_decode_seconds": [20.392761458992027, 19.894514958024956, 20.263803125009872],
+    "candidate_tokens_per_second": 12.39860168943543,
+    "control_tokens_per_second": 12.633961372547196,
+    "conclusion": "Identical target tokens and speculative statistics, but no measured improvement."
+  },
+  "native_padded_qmm_screen": {
+    "implementation": "Pad one-/two-row FP16 MatMulNBits activations to sixteen rows, use MLX native quantized matrix/split-K dispatch, and slice back; shapeless traces retain stock dispatch",
+    "warmups": 0,
+    "requests": 1,
+    "plugin_sha256": "673b57b7a30cf583593efe1d49ba64d9fcfc332c2b2a39645789ca6ac5c8c032",
+    "decode_seconds": 49.22292650002055,
+    "tokens_per_second": 5.180512784015261,
+    "conclusion": "Gross screening regression; rejected without full qualification."
+  },
+  "native_mlx_source": {
+    "url": "https://github.com/ml-explore/mlx/blob/v0.32.4/mlx/backend/metal/quantized.cpp",
+    "lesson": "Stock MLX already chooses architecture-dependent vector/matrix thresholds and affine wide GEMV on supported newer GPU families. Do not force a losing M1 dispatch onto other Macs."
+  },
+  "retained_16k_results": {
+    "optimized_mtp_ttft_median_seconds": 128.340602,
+    "optimized_mtp_aggregate_tokens_per_second": 14.502294,
+    "stock_mtp_aggregate_tokens_per_second": 11.136700,
+    "optimized_target_only_ttft_median_seconds": 125.71641208406072,
+    "optimized_target_only_aggregate_tokens_per_second": 9.541883731464763,
+    "optimized_target_only_decode_seconds": [26.75854116701521, 26.657702500000596, 26.75660495797638],
+    "optimized_mtp_median_request_tokens_per_second": 16.170708,
+    "earlier_llama_cpp_aggregate_tokens_per_second": 16.166073,
+    "native_comparison_limitations": "Native Q4_0 quantization, weights and generated tokens differ. MTP median matches the earlier native sample center; aggregate remains about 10% below it. All slow samples are retained in the original rotary qualification report."
+  }
+}
