@@ -131,6 +131,52 @@ def runtime_model(serialized, dtype):
     return proto.SerializeToString()
 
 
+@pytest.mark.parametrize("dtype", [np.float32, np.float16, ml_dtypes.bfloat16])
+@pytest.mark.parametrize("rank", [3, 4])
+@pytest.mark.parametrize("layout,interleaved,rot", [(0, 0, 12), (1, 1, 8)])
+@pytest.mark.parametrize("eager", [False, True])
+def test_mrotary_column_gather_stock_bits(dtype, rank, layout, interleaved, rot, eager, monkeypatch):
+    monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_COMPILE", "1" if eager else "0")
+    shape = ["batch", "tokens", 24] if rank == 3 else ["batch", 2, "tokens", 12]
+    half = rot // 2
+    model = m.make_model(
+        "MRotaryEmbedding",
+        [
+            m.tensor("x", storage_type(dtype), shape),
+            m.tensor("positions", ir.DataType.INT64, [3, "batch", "tokens"]),
+            m.tensor("cos", storage_type(dtype), [17, half]),
+            m.tensor("sin", storage_type(dtype), [17, half]),
+        ],
+        [m.tensor("y", storage_type(dtype), shape)],
+        domain="com.microsoft",
+        attributes={
+            "num_heads": 2, "mrope_section": [2, 1, half - 3],
+            "mrope_layout": layout, "interleaved": interleaved,
+            "rotary_embedding_dim": rot, "scale": 1.0003,
+        },
+    )
+    model = runtime_model(model, dtype)
+    candidate, control = strict_session(model), strict_session(model)
+    rng = np.random.default_rng(413)
+    for batch, tokens in [(2, 3), (1, 1), (3, 5), (2, 3)]:
+        cos = rng.standard_normal((17, half)).astype(dtype)
+        sin = rng.standard_normal((17, half)).astype(dtype)
+        x4 = rng.standard_normal((batch, 2, tokens, 12)).astype(dtype)
+        x = x4 if rank == 4 else x4.transpose(0, 2, 1, 3).reshape(batch, tokens, 24)
+        feeds = {
+            "x": x, "positions": rng.integers(0, 17, (3, batch, tokens), dtype=np.int64),
+            "cos": cos, "sin": sin,
+        }
+        if dtype == ml_dtypes.bfloat16:
+            feeds = {name: value.astype(np.float32) if name != "positions" else value
+                     for name, value in feeds.items()}
+        monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_MROPE_COLUMN_GATHER", "1")
+        expected = control.run(None, feeds)[0]
+        monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_MROPE_COLUMN_GATHER", "0")
+        actual = candidate.run(None, feeds)[0]
+        np.testing.assert_array_equal(actual.view(np.uint8), expected.view(np.uint8))
+
+
 def runtime_feeds(feeds):
     return {
         name: array.astype(np.float32) if array.dtype == ml_dtypes.bfloat16 else array

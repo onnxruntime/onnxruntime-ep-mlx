@@ -2272,18 +2272,6 @@ fn mrotary_embedding_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<()
         .ok_or("MRotaryEmbedding: mrope_section is required")?;
     let layout = attr_int(n, "mrope_layout", 0);
 
-    let mut cos_streams = Vec::with_capacity(3);
-    let mut sin_streams = Vec::with_capacity(3);
-    for stream in 0..3 {
-        let ids = slice(ctx, pos, &[stream, 0, 0], &[stream + 1, b, s])?;
-        let ids = ctx.squeeze(ids, 0)?;
-        let ids = ctx.astype(ids, mlx::mlx_dtype__MLX_INT32)?;
-        cos_streams
-            .push(ctx.emit(|res, st| unsafe { mlx::mlx_take_axis(res, cos_cache, ids, 0, st) })?);
-        sin_streams
-            .push(ctx.emit(|res, st| unsafe { mlx::mlx_take_axis(res, sin_cache, ids, 0, st) })?);
-    }
-
     let mut assignment = vec![0usize; half as usize];
     if layout == 0 {
         let mut col = 0usize;
@@ -2304,19 +2292,80 @@ fn mrotary_embedding_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<()
         }
     }
 
-    let combine = |ctx: &mut TranslationContext,
-                   streams: &[mlx::mlx_array]|
-     -> Result<mlx::mlx_array, MlxError> {
-        let mut out = slice(ctx, streams[assignment[0]], &[0, 0, 0], &[b, s, 1])?;
-        for col in 1..half {
-            let selected = slice(
-                ctx,
-                streams[assignment[col as usize]],
-                &[0, 0, col],
-                &[b, s, col + 1],
-            )?;
-            out = concat2(ctx, out, selected, 2)?;
+    let linear_gather = ctx.shape_of(cos_cache)[0].checked_mul(half).is_some()
+        && !std::env::var_os("ONNXRUNTIME_EP_MLX_NO_MROPE_COLUMN_GATHER")
+            .is_some_and(|v| v != "0" && !v.is_empty());
+    let (cos_rows, sin_rows) = if linear_gather {
+        let key = format!("{}#mrope_columns", n.outputs[0].name);
+        let columns = match ctx.cache_get(&key) {
+            Some(array) => array,
+            None => {
+                let values: Vec<i32> = (0..half).collect();
+                ctx.cache_put(
+                    key,
+                    Array::from_data(values.as_ptr().cast(), &[half], mlx::mlx_dtype__MLX_INT32),
+                )
+            }
+        };
+        let key = format!("{}#mrope_streams", n.outputs[0].name);
+        let streams = match ctx.cache_get(&key) {
+            Some(array) => array,
+            None => {
+                let values: Vec<i32> = assignment.iter().map(|&stream| stream as i32).collect();
+                ctx.cache_put(
+                    key,
+                    Array::from_data(values.as_ptr().cast(), &[half], mlx::mlx_dtype__MLX_INT32),
+                )
+            }
+        };
+        let pos = ctx.astype(pos, mlx::mlx_dtype__MLX_INT32)?;
+        let selected =
+            ctx.emit(|res, st| unsafe { mlx::mlx_take_axis(res, pos, streams, 0, st) })?;
+        let selected = ctx.transpose(selected, &[1, 2, 0])?;
+        let width = ctx.scalar_i32(half);
+        // Each column reads its assigned position stream, not a complete cache row.
+        let indices = ctx.mul(selected, width)?;
+        let indices = ctx.add(indices, columns)?;
+        let cos_flat = ctx.reshape(cos_cache, &[-1])?;
+        let sin_flat = ctx.reshape(sin_cache, &[-1])?;
+        let cos =
+            ctx.emit(|res, st| unsafe { mlx::mlx_take_axis(res, cos_flat, indices, 0, st) })?;
+        let sin =
+            ctx.emit(|res, st| unsafe { mlx::mlx_take_axis(res, sin_flat, indices, 0, st) })?;
+        ctx.mark_fast("mrope_column_gather");
+        (cos, sin)
+    } else {
+        let mut cos_streams = Vec::with_capacity(3);
+        let mut sin_streams = Vec::with_capacity(3);
+        for stream in 0..3 {
+            let ids = slice(ctx, pos, &[stream, 0, 0], &[stream + 1, b, s])?;
+            let ids = ctx.squeeze(ids, 0)?;
+            let ids = ctx.astype(ids, mlx::mlx_dtype__MLX_INT32)?;
+            cos_streams.push(
+                ctx.emit(|res, st| unsafe { mlx::mlx_take_axis(res, cos_cache, ids, 0, st) })?,
+            );
+            sin_streams.push(
+                ctx.emit(|res, st| unsafe { mlx::mlx_take_axis(res, sin_cache, ids, 0, st) })?,
+            );
         }
+        let combine = |ctx: &mut TranslationContext,
+                       streams: &[mlx::mlx_array]|
+         -> Result<mlx::mlx_array, MlxError> {
+            let mut out = slice(ctx, streams[assignment[0]], &[0, 0, 0], &[b, s, 1])?;
+            for col in 1..half {
+                let selected = slice(
+                    ctx,
+                    streams[assignment[col as usize]],
+                    &[0, 0, col],
+                    &[b, s, col + 1],
+                )?;
+                out = concat2(ctx, out, selected, 2)?;
+            }
+            Ok(out)
+        };
+        (combine(ctx, &cos_streams)?, combine(ctx, &sin_streams)?)
+    };
+    let scaled = |ctx: &mut TranslationContext, mut out: mlx::mlx_array| {
         let scale = n.floats.get("scale").copied().unwrap_or(1.0);
         if scale != 1.0 {
             let dtype = ctx.dtype_of(out);
@@ -2327,8 +2376,8 @@ fn mrotary_embedding_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<()
         }
         ctx.reshape(out, &[b, 1, s, half])
     };
-    let cos4 = combine(ctx, &cos_streams)?;
-    let sin4 = combine(ctx, &sin_streams)?;
+    let cos4 = scaled(ctx, cos_rows)?;
+    let sin4 = scaled(ctx, sin_rows)?;
     let interleaved = attr_int(n, "interleaved", 0) != 0;
     let out4 = rope_apply(ctx, x4, cos4, sin4, half, interleaved)?;
     if rank == 4 {
