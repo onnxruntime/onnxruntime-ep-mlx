@@ -2788,7 +2788,15 @@ impl<'a> TranslationContext<'a> {
                 device_outputs &= publish_device_output(self.ort_api, self.kctx, output, &array)?;
             }
         }
+        let tr = crate::trace::tracer();
+        // A captured boundary must finish before its guard stops Metal capture.
+        let capture = tr.begin_gpu_capture();
         if device_outputs {
+            if capture.is_some() {
+                let _eval = tr.eval_region();
+                mlx::eval(&outs)?;
+                return Ok(());
+            }
             let result = unsafe { mlxsys::mlx_async_eval(outs.as_raw()) };
             if result != 0 {
                 return Err(
@@ -2802,7 +2810,6 @@ impl<'a> TranslationContext<'a> {
         // in the `mlx.eval` (cat "gpu") span, whose CPU wall time is the GPU-inclusive
         // time of the whole fused subgraph (MLX blocks here until the GPU work lands).
         // Sample GPU-memory counters just before and after so the curve shows the eval.
-        let tr = crate::trace::tracer();
         tr.sample_gpu_counters();
         let eval_t0 = if tr.active() {
             Some(std::time::Instant::now())
@@ -2810,9 +2817,6 @@ impl<'a> TranslationContext<'a> {
             None
         };
         {
-            // Wrap the FIRST eval in a Metal GPU capture when requested (one-shot; the
-            // guard stops the capture on drop). `None`/near-zero cost otherwise.
-            let _cap = tr.begin_gpu_capture();
             let _eval = tr.eval_region();
             mlx::eval(&outs)?;
         }
