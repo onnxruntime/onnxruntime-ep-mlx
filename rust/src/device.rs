@@ -14,6 +14,32 @@ use crate::factory::ORT_API_VERSION;
 use crate::mlx::{Array, VectorArray};
 use crate::sys::{mlx, ort};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DefaultStreamKind {
+    Cpu,
+    Gpu,
+}
+
+fn default_stream_kind(dtype: u32, stored_dtype: mlx::mlx_dtype) -> DefaultStreamKind {
+    if crate::registry::is_float64(dtype) || stored_dtype == mlx::mlx_dtype__MLX_FLOAT64 {
+        DefaultStreamKind::Cpu
+    } else {
+        DefaultStreamKind::Gpu
+    }
+}
+
+fn default_stream(kind: DefaultStreamKind) -> crate::mlx::Stream {
+    match kind {
+        DefaultStreamKind::Cpu => crate::mlx::Stream::new_default_cpu(),
+        DefaultStreamKind::Gpu => crate::mlx::Stream::new_default_gpu(),
+    }
+}
+
+struct Loaded {
+    array: Array,
+    stream_kind: DefaultStreamKind,
+}
+
 struct Stored {
     handle: usize,
     host_views: HashMap<(u32, Vec<i64>), usize>,
@@ -142,9 +168,9 @@ fn metadata(
     Ok((data, shape, dtype, bytes))
 }
 
-fn load(data: *const c_void, bytes: usize, dtype: u32, shape: &[i64]) -> Result<Array, MlxError> {
+fn load(data: *const c_void, bytes: usize, dtype: u32, shape: &[i64]) -> Result<Loaded, MlxError> {
     if bytes == 0 {
-        let (shape, dtype) = if crate::registry::is_movable(dtype) {
+        let (shape, mlx_dtype) = if crate::registry::is_movable(dtype) {
             (
                 shape
                     .iter()
@@ -160,14 +186,17 @@ fn load(data: *const c_void, bytes: usize, dtype: u32, shape: &[i64]) -> Result<
                     .into(),
             );
         };
-        return Ok(Array::from_data(ptr::null(), &shape, dtype));
+        return Ok(Loaded {
+            array: Array::from_data(ptr::null(), &shape, mlx_dtype),
+            stream_kind: default_stream_kind(dtype, mlx_dtype),
+        });
     }
     let address = data as usize;
     let index = allocations()
         .lock()
         .map_err(|_| "MLX device allocation index is poisoned")?;
     let (&base, allocation) = index.range(..=address).next_back().ok_or(
-        "MLX device tensor is not allocator-owned; allocate it using the EP's memory_info",
+        "MLX cannot import an Apple GPU tensor that is not backed by its public device allocator; copy it to CPU with the owning execution provider before passing it to MLX",
     )?;
     let offset = address - base;
     if offset
@@ -188,19 +217,24 @@ fn load(data: *const c_void, bytes: usize, dtype: u32, shape: &[i64]) -> Result<
         ctx: entry.handle as *mut c_void,
     }));
     let mut array = borrowed.retained()?;
+    let stream_kind = default_stream_kind(dtype, array.dtype());
     if crate::registry::is_movable(dtype) && array.dtype() != mlx_dtype_from_onnx(dtype) {
+        let actual_dtype = array.dtype();
+        let declared_dtype = mlx_dtype_from_onnx(dtype);
         let mut viewed = Array::new();
-        let stream = crate::mlx::Stream::new_default_gpu();
+        let stream = default_stream(stream_kind);
         if unsafe {
             mlx::mlx_view(
                 viewed.as_mut_ptr(),
                 array.as_raw(),
-                mlx_dtype_from_onnx(dtype),
+                declared_dtype,
                 stream.as_raw(),
             )
         } != 0
         {
-            return Err("MLX device byte transfer cannot preserve the declared dtype".into());
+            return Err(format!(
+                "MLX device byte transfer cannot reinterpret stored dtype {actual_dtype:?} as declared dtype {declared_dtype:?}; keep device bindings on the dtype used to create the OrtValue"
+            ));
         }
         array = viewed;
     }
@@ -210,7 +244,7 @@ fn load(data: *const c_void, bytes: usize, dtype: u32, shape: &[i64]) -> Result<
             .map(|&v| dim_i32(v))
             .collect::<Result<_, _>>()?;
         let mut reshaped = Array::new();
-        let stream = crate::mlx::Stream::new_default_gpu();
+        let stream = default_stream(stream_kind);
         if unsafe {
             mlx::mlx_reshape(
                 reshaped.as_mut_ptr(),
@@ -223,9 +257,12 @@ fn load(data: *const c_void, bytes: usize, dtype: u32, shape: &[i64]) -> Result<
         {
             return Err("MLX device tensor view cannot preserve its declared shape".into());
         }
-        return Ok(reshaped);
+        return Ok(Loaded {
+            array: reshaped,
+            stream_kind,
+        });
     }
-    Ok(array)
+    Ok(Loaded { array, stream_kind })
 }
 
 fn store(data: *const c_void, bytes: usize, _dtype: u32, array: &Array) -> Result<(), MlxError> {
@@ -266,10 +303,10 @@ fn store(data: *const c_void, bytes: usize, _dtype: u32, array: &Array) -> Resul
     Ok(())
 }
 
-pub(crate) fn array(
+fn loaded_array(
     api: &ort::OrtApi,
     value: *const ort::OrtValue,
-) -> Result<Option<Array>, MlxError> {
+) -> Result<Option<Loaded>, MlxError> {
     if !enabled() {
         return Ok(None);
     }
@@ -280,13 +317,21 @@ pub(crate) fn array(
     Ok(Some(load(data, bytes, dtype, &shape)?))
 }
 
+pub(crate) fn array(
+    api: &ort::OrtApi,
+    value: *const ort::OrtValue,
+) -> Result<Option<Array>, MlxError> {
+    Ok(loaded_array(api, value)?.map(|loaded| loaded.array))
+}
+
 pub(crate) fn host_data(
     api: &ort::OrtApi,
     value: *const ort::OrtValue,
 ) -> Result<Option<*const c_void>, MlxError> {
-    let Some(array) = array(api, value)? else {
+    let Some(loaded) = loaded_array(api, value)? else {
         return Ok(None);
     };
+    let array = loaded.array;
     let (data, shape, dtype, bytes) = metadata(api, value)?;
     if bytes == 0 {
         return Ok(Some(ptr::null()));
@@ -308,7 +353,7 @@ pub(crate) fn host_data(
         }
     }
     let mut contiguous = Array::new();
-    let stream = crate::mlx::Stream::new_default_gpu();
+    let stream = default_stream(loaded.stream_kind);
     if unsafe {
         mlx::mlx_contiguous(
             contiguous.as_mut_ptr(),
@@ -451,10 +496,15 @@ struct Transfer {
     base: ort::OrtDataTransferImpl,
     api: *const ort::OrtApi,
     ep_api: *const ort::OrtEpApi,
+    memory_info: *mut ort::OrtMemoryInfo,
+    memory_device: *const ort::OrtMemoryDevice,
 }
 
 unsafe extern "C" fn release_transfer(transfer: *mut ort::OrtDataTransferImpl) {
-    drop(unsafe { Box::from_raw(transfer.cast::<Transfer>()) });
+    let transfer = unsafe { Box::from_raw(transfer.cast::<Transfer>()) };
+    if !transfer.memory_info.is_null() {
+        unsafe { ((*transfer.api).ReleaseMemoryInfo.unwrap())(transfer.memory_info) };
+    }
 }
 
 unsafe extern "C" fn can_copy(
@@ -462,23 +512,19 @@ unsafe extern "C" fn can_copy(
     source: *const ort::OrtMemoryDevice,
     destination: *const ort::OrtMemoryDevice,
 ) -> bool {
-    let ep = unsafe { &*(*(transfer.cast::<Transfer>())).ep_api };
-    let supported = |device| unsafe {
+    let transfer = unsafe { &*(transfer.cast::<Transfer>()) };
+    let ep = unsafe { &*transfer.ep_api };
+    let is_cpu = |device| unsafe {
         (ep.MemoryDevice_GetDeviceType.unwrap())(device)
             == ort::OrtMemoryInfoDeviceType_OrtMemoryInfoDeviceType_CPU
-            || ((ep.MemoryDevice_GetDeviceType.unwrap())(device)
-                == ort::OrtMemoryInfoDeviceType_OrtMemoryInfoDeviceType_GPU
-                && (ep.MemoryDevice_GetVendorId.unwrap())(device) == 0x106B
-                && (ep.MemoryDevice_GetDeviceId.unwrap())(device) == 0)
     };
-    supported(source)
-        && supported(destination)
-        && unsafe {
-            (ep.MemoryDevice_GetDeviceType.unwrap())(source)
-                != ort::OrtMemoryInfoDeviceType_OrtMemoryInfoDeviceType_CPU
-                || (ep.MemoryDevice_GetDeviceType.unwrap())(destination)
-                    != ort::OrtMemoryInfoDeviceType_OrtMemoryInfoDeviceType_CPU
-        }
+    let is_mlx =
+        |device| unsafe { (ep.MemoryDevice_AreEqual.unwrap())(device, transfer.memory_device) };
+    let source_cpu = is_cpu(source);
+    let destination_cpu = is_cpu(destination);
+    let source_mlx = is_mlx(source);
+    let destination_mlx = is_mlx(destination);
+    (source_mlx && (destination_cpu || destination_mlx)) || (destination_mlx && source_cpu)
 }
 
 unsafe extern "C" fn copy_tensors(
@@ -556,14 +602,162 @@ unsafe extern "C" fn copy_tensors(
     }
 }
 
-pub(crate) fn create_transfer(
+fn create_transfer_with_enabled(
     api: *const ort::OrtApi,
     ep_api: *const ort::OrtEpApi,
-) -> *mut ort::OrtDataTransferImpl {
+    enabled: bool,
+) -> Result<*mut ort::OrtDataTransferImpl, MlxError> {
+    if !enabled {
+        return Ok(ptr::null_mut());
+    }
+    let memory_info = unsafe { memory_info(&*api)? };
+    let memory_device = unsafe { ((*ep_api).MemoryInfo_GetMemoryDevice.unwrap())(memory_info) };
+    if memory_device.is_null() {
+        unsafe { ((*api).ReleaseMemoryInfo.unwrap())(memory_info) };
+        return Err(
+            "MLX device transfer could not obtain its registered memory-device identity; use ONNX Runtime 1.31 or newer"
+                .into(),
+        );
+    }
     let mut base: ort::OrtDataTransferImpl = unsafe { std::mem::zeroed() };
     base.ort_version_supported = ORT_API_VERSION;
     base.Release = Some(release_transfer);
     base.CanCopy = Some(can_copy);
     base.CopyTensors = Some(copy_tensors);
-    Box::into_raw(Box::new(Transfer { base, api, ep_api })).cast()
+    Ok(Box::into_raw(Box::new(Transfer {
+        base,
+        api,
+        ep_api,
+        memory_info,
+        memory_device,
+    }))
+    .cast())
+}
+
+pub(crate) fn create_transfer(
+    api: *const ort::OrtApi,
+    ep_api: *const ort::OrtEpApi,
+) -> Result<*mut ort::OrtDataTransferImpl, MlxError> {
+    create_transfer_with_enabled(api, ep_api, enabled())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    static CPU_TOKEN: u8 = 1;
+    static MLX_TOKEN: u8 = 2;
+    static FOREIGN_TOKEN: u8 = 3;
+    static EQUIVALENT_TOKEN: u8 = 4;
+
+    fn device(token: &'static u8) -> *const ort::OrtMemoryDevice {
+        std::ptr::from_ref(token).cast()
+    }
+
+    fn cpu() -> *const ort::OrtMemoryDevice {
+        device(&CPU_TOKEN)
+    }
+
+    fn mlx() -> *const ort::OrtMemoryDevice {
+        device(&MLX_TOKEN)
+    }
+
+    fn foreign() -> *const ort::OrtMemoryDevice {
+        device(&FOREIGN_TOKEN)
+    }
+
+    fn equivalent() -> *const ort::OrtMemoryDevice {
+        device(&EQUIVALENT_TOKEN)
+    }
+
+    unsafe extern "C" fn mock_device_type(
+        device: *const ort::OrtMemoryDevice,
+    ) -> ort::OrtMemoryInfoDeviceType {
+        if device == cpu() {
+            ort::OrtMemoryInfoDeviceType_OrtMemoryInfoDeviceType_CPU
+        } else {
+            ort::OrtMemoryInfoDeviceType_OrtMemoryInfoDeviceType_GPU
+        }
+    }
+
+    unsafe extern "C" fn mock_device_equal(
+        left: *const ort::OrtMemoryDevice,
+        right: *const ort::OrtMemoryDevice,
+    ) -> bool {
+        left == right
+            || (left == equivalent() && right == mlx())
+            || (left == mlx() && right == equivalent())
+    }
+
+    #[test]
+    fn disabled_device_tensors_do_not_create_a_data_transfer() {
+        let transfer = create_transfer_with_enabled(ptr::null(), ptr::null(), false).unwrap();
+        assert!(transfer.is_null());
+    }
+
+    #[test]
+    fn can_copy_uses_ort_memory_device_identity() {
+        let mut ep_api: ort::OrtEpApi = unsafe { std::mem::zeroed() };
+        ep_api.MemoryDevice_GetDeviceType = Some(mock_device_type);
+        ep_api.MemoryDevice_AreEqual = Some(mock_device_equal);
+        let transfer = Transfer {
+            base: unsafe { std::mem::zeroed() },
+            api: ptr::null(),
+            ep_api: &ep_api,
+            memory_info: ptr::null_mut(),
+            memory_device: mlx(),
+        };
+        let transfer = (&transfer as *const Transfer).cast::<ort::OrtDataTransferImpl>();
+
+        assert!(unsafe { can_copy(transfer, cpu(), mlx()) });
+        assert!(unsafe { can_copy(transfer, mlx(), cpu()) });
+        assert!(unsafe { can_copy(transfer, mlx(), mlx()) });
+        assert!(!unsafe { can_copy(transfer, cpu(), cpu()) });
+        assert!(!unsafe { can_copy(transfer, cpu(), foreign()) });
+        assert!(!unsafe { can_copy(transfer, foreign(), cpu()) });
+
+        // OrtMemoryDevice identity has no allocator name or owner. An equivalent descriptor can
+        // pass CanCopy, so CopyTensors must still validate MLX allocation ownership.
+        assert!(unsafe { can_copy(transfer, equivalent(), cpu()) });
+    }
+
+    #[test]
+    fn foreign_gpu_pointer_is_rejected_before_mlx_host_import() {
+        let result = load(
+            std::ptr::dangling::<u8>().cast(),
+            std::mem::size_of::<f32>(),
+            ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
+            &[1],
+        );
+        let Err(error) = result else {
+            panic!("foreign GPU pointer unexpectedly imported");
+        };
+        assert!(error.contains("not backed by its public device allocator"));
+        assert!(error.contains("copy it to CPU with the owning execution provider"));
+    }
+
+    #[test]
+    fn float64_device_materialization_uses_cpu_streams() {
+        assert_eq!(
+            default_stream_kind(
+                ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_DOUBLE,
+                mlx::mlx_dtype__MLX_FLOAT64,
+            ),
+            DefaultStreamKind::Cpu
+        );
+        assert_eq!(
+            default_stream_kind(
+                ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8,
+                mlx::mlx_dtype__MLX_FLOAT64,
+            ),
+            DefaultStreamKind::Cpu
+        );
+        assert_eq!(
+            default_stream_kind(
+                ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8,
+                mlx::mlx_dtype__MLX_FLOAT32,
+            ),
+            DefaultStreamKind::Gpu
+        );
+    }
 }

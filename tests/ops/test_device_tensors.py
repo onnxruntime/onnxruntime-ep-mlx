@@ -295,6 +295,45 @@ def test_device_output_outlives_session():
     np.testing.assert_array_equal(state.numpy(), x * 2)
 
 
+def test_float64_upload_reshape_download_and_session_lifetime():
+    shape = np.array([3, 2], dtype=np.int64)
+    graph = helper.make_graph(
+        [helper.make_node("Reshape", ["x", "shape"], ["y"])],
+        "float64-device-tensors",
+        [helper.make_tensor_value_info("x", TensorProto.DOUBLE, [2, 3])],
+        [helper.make_tensor_value_info("y", TensorProto.DOUBLE, [3, 2])],
+        [numpy_helper.from_array(shape, "shape")],
+    )
+    model = helper.make_model(
+        graph, opset_imports=[helper.make_opsetid("", 24)], ir_version=11
+    )
+    options = ort.SessionOptions()
+    options.add_session_config_entry("session.disable_cpu_ep_fallback", "1")
+    session = ort.InferenceSession(
+        model.SerializeToString(), options, providers=["MLXExecutionProvider"]
+    )
+    session.disable_fallback()
+    source = np.arange(6, dtype=np.float64).reshape(2, 3)
+    device_input = ort.OrtValue.ortvalue_from_shape_and_type(
+        source.shape, source.dtype, memory_info=memory_info()
+    )
+    device_input.update_inplace(source)
+    np.testing.assert_array_equal(device_input.numpy(), source)
+    device_output = ort.OrtValue.ortvalue_from_shape_and_type(
+        (3, 2), source.dtype, memory_info=memory_info()
+    )
+    assert device_input.data_type() == "tensor(double)"
+    assert device_output.data_type() == "tensor(double)"
+    binding = session.io_binding()
+    binding.bind_ortvalue_input("x", device_input)
+    binding.bind_ortvalue_output("y", device_output)
+    session.run_with_iobinding(binding)
+    assert device_output.data_type() == "tensor(double)"
+    del binding, device_input, session
+    gc.collect()
+    np.testing.assert_array_equal(device_output.numpy(), source.reshape(3, 2))
+
+
 @pytest.mark.parametrize("compiled", [False, True])
 def test_quantized_device_output_outlives_initializer_storage(monkeypatch, compiled):
     monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_COMPILE", "0" if compiled else "1")
