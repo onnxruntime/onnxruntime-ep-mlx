@@ -487,6 +487,13 @@ thread. MLX device addresses are opaque allocator identifiers, not host buffers
 or an interop contract with another GPU provider. Use the registered memory
 information, not a hand-constructed memory descriptor:
 
+When this mode is enabled, a co-registered GPU provider with an equivalent ORT
+memory-device descriptor can match MLX's transfer callback. Foreign allocations
+are rejected safely, but ORT cannot retry a later provider's transfer. Use
+separate processes for such providers, or copy through the owning EP to CPU
+before passing data to MLX. Float64 device views and downloads use the MLX CPU
+stream; they do not enable float64 Metal computation.
+
 ```python
 device = next(d for d in ort.get_ep_devices() if d.ep_name == "MLXExecutionProvider")
 info = device.memory_info(ort.OrtDeviceMemoryType.DEFAULT)
