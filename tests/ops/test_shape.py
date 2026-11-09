@@ -776,7 +776,7 @@ def test_constant_of_shape_value_guard_replay(tmp_path):
         [
             sys.executable, "-m", "pytest", Path(__file__).name,
             "-k", "test_constant_of_shape_live_values and compiled-enabled",
-            "-q", "-p", "no:cacheprovider",
+            "-q", "-p", "no:cacheprovider", "-p", "no:randomly",
         ],
         cwd=Path(__file__).parent,
         env={
