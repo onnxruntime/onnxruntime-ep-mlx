@@ -4737,3 +4737,159 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod schema_contract_tests {
+    use super::*;
+    use crate::ops::test_helpers::*;
+
+    #[test]
+    fn version29_gather_and_scatter_mean_live_indices() {
+        for cpu in [false, true] {
+            let stream = if cpu {
+                Stream::new_default_cpu()
+            } else {
+                Stream::new_default_gpu()
+            };
+            let mut plan = Plan::new(vec![]);
+            let mut ctx = TranslationContext::new(
+                &mut plan,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                stream.as_raw(),
+            );
+            for int32 in [false, true] {
+                bind_float(&mut ctx, "x", &[2, 2], &[1., 2., 3., 4.]);
+                bind_indices(&mut ctx, &[2, 1], &[0, -1], int32);
+                let gather = node("GatherND", &["x", "indices"], 29);
+                crate::registry::translate(&mut ctx, &gather).unwrap();
+                assert_output(&mut ctx, "y", &[2, 2], &[1., 2., 3., 4.]);
+                bind_indices(&mut ctx, &[2, 1], &[0, 2], int32);
+                assert!(
+                    crate::registry::translate(&mut ctx, &gather)
+                        .unwrap_err()
+                        .contains("outside")
+                );
+
+                bind_indices(&mut ctx, &[2, 1], &[0, 0], int32);
+                bind_float(&mut ctx, "updates", &[2, 2], &[3., 4., 5., 6.]);
+                let mut scatter = node("ScatterND", &["x", "indices", "updates"], 29);
+                scatter.strings.insert("reduction".into(), "mean".into());
+                crate::registry::translate(&mut ctx, &scatter).unwrap();
+                assert_output(&mut ctx, "y", &[2, 2], &[3., 4., 3., 4.]);
+                bind_indices(&mut ctx, &[2, 0], &[], int32);
+                bind_float(
+                    &mut ctx,
+                    "updates",
+                    &[2, 2, 2],
+                    &[3., 4., 5., 6., 5., 6., 7., 8.],
+                );
+                crate::registry::translate(&mut ctx, &scatter).unwrap();
+                assert_output(&mut ctx, "y", &[2, 2], &[3., 4., 5., 6.]);
+
+                bind_float(&mut ctx, "x", &[2, 3], &[1., 2., 3., 4., 5., 6.]);
+                bind_indices(&mut ctx, &[1, 4], &[0, -1, 0, 1], int32);
+                bind_float(&mut ctx, "updates", &[1, 4], &[3., 7., 5., 6.]);
+                let mut elements = node("ScatterElements", &["x", "indices", "updates"], 29);
+                elements.ints.insert("axis".into(), -1);
+                elements.strings.insert("reduction".into(), "mean".into());
+                crate::registry::translate(&mut ctx, &elements).unwrap();
+                assert_output(&mut ctx, "y", &[2, 3], &[3., 4., 5., 4., 5., 6.]);
+                bind_indices(&mut ctx, &[1, 4], &[0, 3, 0, 1], int32);
+                assert!(
+                    crate::registry::translate(&mut ctx, &elements)
+                        .unwrap_err()
+                        .contains("outside")
+                );
+            }
+            bind_float(&mut ctx, "x", &[1], &[f32::MAX]);
+            bind_float(&mut ctx, "updates", &[2], &[f32::MAX, f32::MAX]);
+            bind_indices(&mut ctx, &[2], &[0, 0], true);
+            let mut scatter = node("ScatterElements", &["x", "indices", "updates"], 29);
+            scatter.strings.insert("reduction".into(), "mean".into());
+            crate::registry::translate(&mut ctx, &scatter).unwrap();
+            assert_output(&mut ctx, "y", &[1], &[f32::MAX]);
+        }
+    }
+
+    #[test]
+    fn version29_integer_scatter_mean_is_exact_and_floors_negative_results() {
+        let stream = Stream::new_default_gpu();
+        let mut plan = Plan::new(vec![]);
+        let mut ctx = TranslationContext::new(
+            &mut plan,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            stream.as_raw(),
+        );
+        for signed in [false, true] {
+            let (dtype, values, updates, expected) = if signed {
+                (
+                    mlx::mlx_dtype__MLX_INT64,
+                    [i64::MAX as u64, (-2i64) as u64],
+                    [i64::MAX as u64, (-3i64) as u64],
+                    [i64::MAX as u64, (-3i64) as u64],
+                )
+            } else {
+                (
+                    mlx::mlx_dtype__MLX_UINT64,
+                    [u64::MAX, 2],
+                    [u64::MAX, 3],
+                    [u64::MAX, 2],
+                )
+            };
+            for (name, values) in [("x", values), ("updates", updates)] {
+                let value = ctx.keep(Array::from_data(values.as_ptr().cast(), &[2], dtype));
+                ctx.bind(&output(name), value);
+            }
+            bind_indices(&mut ctx, &[2], &[0, 1], true);
+            let mut scatter = node("ScatterElements", &["x", "indices", "updates"], 29);
+            scatter.strings.insert("reduction".into(), "mean".into());
+            crate::registry::translate(&mut ctx, &scatter).unwrap();
+            let y = ctx.resolve(&reference("y")).unwrap();
+            assert_eq!(ctx.dtype_of(y), dtype);
+            let y = ctx.contiguous_eval(y).unwrap();
+            let actual = unsafe { std::slice::from_raw_parts(ctx.host_ptr(y).cast::<u64>(), 2) };
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn version29_double_mean_and_whole_tensor_scatter() {
+        let stream = Stream::new_default_cpu();
+        let mut plan = Plan::new(vec![]);
+        let mut ctx = TranslationContext::new(
+            &mut plan,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            stream.as_raw(),
+        );
+        let large = 2f64.powi(40);
+        for (name, values) in [("x", [large, -1.]), ("updates", [large + 0.125, -2.])] {
+            let value = ctx.keep(Array::from_data(
+                values.as_ptr().cast(),
+                &[2],
+                mlx::mlx_dtype__MLX_FLOAT64,
+            ));
+            ctx.bind(&output(name), value);
+        }
+        bind_indices(&mut ctx, &[2], &[0, 1], true);
+        let mut scatter = node("ScatterElements", &["x", "indices", "updates"], 29);
+        scatter.strings.insert("reduction".into(), "mean".into());
+        crate::registry::translate(&mut ctx, &scatter).unwrap();
+        let y = ctx.resolve(&reference("y")).unwrap();
+        let y = ctx.contiguous_eval(y).unwrap();
+        let actual = unsafe { std::slice::from_raw_parts(mlx::mlx_array_data_float64(y), 2) };
+        assert_eq!(actual, [large + 0.0625, -1.5]);
+
+        bind_float(&mut ctx, "x", &[2], &[1., 2.]);
+        bind_float(&mut ctx, "updates", &[1, 2], &[3., 4.]);
+        bind_indices(&mut ctx, &[1, 0], &[], true);
+        let mut scatter = node("ScatterND", &["x", "indices", "updates"], 29);
+        crate::registry::translate(&mut ctx, &scatter).unwrap();
+        assert_output(&mut ctx, "y", &[2], &[3., 4.]);
+        scatter.strings.insert("reduction".into(), "add".into());
+        crate::registry::translate(&mut ctx, &scatter).unwrap();
+        assert_output(&mut ctx, "y", &[2], &[4., 6.]);
+    }
+}

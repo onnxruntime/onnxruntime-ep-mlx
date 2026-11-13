@@ -355,7 +355,6 @@ fn register_builtin_ops(registry: &mut OpRegistry) {
     crate::ops::nonzero::register(registry);
     crate::ops::unique::register(registry);
     crate::ops::math::register(registry);
-    crate::ops::opset29::register(registry);
     crate::ops::reduction::register(registry);
     crate::ops::shape::register(registry);
     crate::ops::matmul::register(registry);
@@ -378,6 +377,7 @@ fn register_builtin_ops(registry: &mut OpRegistry) {
     crate::ops::conv::register_conv(registry);
     crate::ops::vision::register_vision(registry);
     crate::ops::quant::register(registry); // quant
+    crate::ops::packed::register(registry);
     crate::ops::stragglers::register(registry); // stragglers
 }
 

@@ -55,8 +55,9 @@ python -m pytest tests/ops -q
 Running `pytest` without `ONNXRUNTIME_MLX_EP_LIB` set **skips** the suite (rather than failing), so
 it is safe to include in any pytest invocation.
 
-`test_opset29.py` and `test_packed_ops.py` use ONNX-main reference schemas for
-unreleased opset-29 contracts. With released ONNX packages, unavailable references
+New-schema tests live with their math, reduction, matrix-product, indexing,
+normalization, SSM, and packed-operator families. They use ONNX-main reference
+schemas for unreleased opset-29 contracts. With released ONNX packages, unavailable references
 are explicitly skipped. ORT 1.31 cannot load the new schemas, even with its
 development-opset override; those end-to-end cases are separately skipped, not
 counted as EP execution. An isolated ORT-main build with pinned ONNX-main sources

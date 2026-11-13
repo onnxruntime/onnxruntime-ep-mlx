@@ -2106,3 +2106,37 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod schema_contract_tests {
+    use super::*;
+    use crate::ops::test_helpers::*;
+
+    #[test]
+    fn causal_conv29_dilated_carry() {
+        for cpu in [false, true] {
+            let stream = if cpu {
+                Stream::new_default_cpu()
+            } else {
+                Stream::new_default_gpu()
+            };
+            let mut plan = Plan::new(vec![]);
+            let mut ctx = TranslationContext::new(
+                &mut plan,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                stream.as_raw(),
+            );
+            bind_float(&mut ctx, "x", &[1, 1, 3], &[1., 2., 3.]);
+            bind_float(&mut ctx, "w", &[1, 1, 2], &[1., 10.]);
+            bind_float(&mut ctx, "past", &[1, 1, 2], &[4., 5.]);
+            let mut causal = node("CausalConvWithState", &["x", "w", "", "past"], 29);
+            causal.inputs[2] = TensorRef::absent();
+            causal.ints.insert("dilation".into(), 2);
+            causal.outputs.push(output("state"));
+            crate::registry::translate(&mut ctx, &causal).unwrap();
+            assert_output(&mut ctx, "y", &[1, 1, 3], &[14., 25., 31.]);
+            assert_output(&mut ctx, "state", &[1, 1, 2], &[2., 3.]);
+        }
+    }
+}

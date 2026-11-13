@@ -1,13 +1,13 @@
 """SSM schema contracts, independent recurrences, and live-input replay."""
 
-import numpy as np
+import _models as m
+import _schema_runtime as schema_runtime
 import ml_dtypes
+import numpy as np
 import onnx_ir as ir
 import onnxruntime as ort
 import pytest
-
-import _models as m
-from test_ssm_quant import build, initz, _linear_attention_model
+from test_ssm_quant import _linear_attention_model, build, initz
 
 DT = ir.DataType
 
@@ -628,3 +628,28 @@ def test_gated_delta_zero_weak_decay_recurrence(monkeypatch, eager, time, normal
         if decay == 0:
             for actual, reference in zip(outputs, delta, strict=True):
                 np.testing.assert_allclose(actual, reference, rtol=2e-3, atol=2e-5)
+
+
+def _causal_dilation_cases():
+    yield "CausalConvWithState", {
+        "x": np.array([[[1, 2, 3]]], np.float32),
+        "w": np.array([[[1, 10]]], np.float32),
+        "bias": np.zeros(1, np.float32),
+        "past": np.array([[[4, 5]]], np.float32),
+    }, {"dilation": 2}, (
+        np.array([[[14, 25, 31]]], np.float32), np.array([[[2, 3]]], np.float32),
+    )
+
+
+CAUSAL_DILATION_CASES = list(_causal_dilation_cases())
+
+
+@pytest.mark.parametrize("op,feeds,attrs,expected", CAUSAL_DILATION_CASES, ids=[case[0] for case in CAUSAL_DILATION_CASES])
+def test_causal_dilation_goldens_match_onnx_reference(op, feeds, attrs, expected):
+    schema_runtime.check_reference(op, feeds, attrs, expected, opset=29)
+
+
+@pytest.mark.parametrize("eager", [False, True])
+@pytest.mark.parametrize("op,feeds,attrs,expected", CAUSAL_DILATION_CASES, ids=[case[0] for case in CAUSAL_DILATION_CASES])
+def test_causal_dilation_mlx_against_reference(op, feeds, attrs, expected, eager, monkeypatch, tmp_path):
+    schema_runtime.check_mlx(op, feeds, attrs, expected, eager, monkeypatch, tmp_path, opset=29)

@@ -15,6 +15,9 @@ use crate::registry::{
 use crate::sys::{mlx, ort};
 use crate::{deny, require};
 
+mod integer_gemm;
+use integer_gemm::{integer_gemm_dtype, integer_gemm_op, integer_gemm_scale};
+
 fn present(n: &NodeDesc, i: usize) -> bool {
     i < n.inputs.len() && n.inputs[i].source != Src::Absent
 }
@@ -649,212 +652,6 @@ fn gemm_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
     Ok(())
 }
 
-fn integer_gemm_dtype(dtype: ort::ONNXTensorElementDataType) -> bool {
-    matches!(
-        dtype,
-        ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32
-            | ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT32
-            | ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64
-            | ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT64
-    )
-}
-
-fn integer_gemm_scale(value: f32, name: &str) -> Result<i128, MlxError> {
-    let limit = 2f32.powi(127);
-    if !value.is_finite() || value.fract() != 0.0 || value < -limit || value >= limit {
-        return Err(format!(
-            "Gemm integer {name}={value} is unsupported; use a finite integral coefficient in [-2^127,2^127), or cast the operands to floating point for fractional scaling"
-        ));
-    }
-    Ok(value as i128)
-}
-
-fn integer_gemm_input(
-    ctx: &mut TranslationContext,
-    n: &NodeDesc,
-    index: usize,
-) -> Result<(Vec<i64>, mlx::mlx_dtype, Vec<i128>), MlxError> {
-    let input = read_live(ctx, &n.inputs[index], "integer Gemm")?;
-    let width = match input.dtype {
-        mlx::mlx_dtype__MLX_INT32 | mlx::mlx_dtype__MLX_UINT32 => 4,
-        mlx::mlx_dtype__MLX_INT64 | mlx::mlx_dtype__MLX_UINT64 => 8,
-        _ => {
-            return Err(format!(
-                "Gemm input {index} must be int32/uint32/int64/uint64; supply matching integer tensors"
-            ));
-        }
-    };
-    let values = input
-        .data
-        .chunks_exact(width)
-        .map(|value| match input.dtype {
-            mlx::mlx_dtype__MLX_INT32 => i128::from(i32::from_ne_bytes(value.try_into().unwrap())),
-            mlx::mlx_dtype__MLX_UINT32 => i128::from(u32::from_ne_bytes(value.try_into().unwrap())),
-            mlx::mlx_dtype__MLX_INT64 => i128::from(i64::from_ne_bytes(value.try_into().unwrap())),
-            _ => i128::from(u64::from_ne_bytes(value.try_into().unwrap())),
-        })
-        .collect();
-    Ok((input.shape, input.dtype, values))
-}
-
-fn integer_gemm_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
-    if n.since_version < 29 {
-        return Err("Integer Gemm requires the version-29 handler; use floating-point Gemm for older schemas".into());
-    }
-    let alpha = integer_gemm_scale(n.floats.get("alpha").copied().unwrap_or(1.0), "alpha")?;
-    let beta = integer_gemm_scale(n.floats.get("beta").copied().unwrap_or(1.0), "beta")?;
-    let (a_shape, dtype, a) = integer_gemm_input(ctx, n, 0)?;
-    let (b_shape, b_dtype, b) = integer_gemm_input(ctx, n, 1)?;
-    if a_shape.is_empty() || b_shape.len() != 2 || b_dtype != dtype {
-        return Err("Gemm integer inputs require rank >=1 A and rank-2 B with the same dtype; reshape or cast the operands".into());
-    }
-    let mut shape = a_shape.clone();
-    let mut strides = vec![1usize; shape.len()];
-    for dim in (0..shape.len().saturating_sub(1)).rev() {
-        strides[dim] = if a_shape.contains(&0) {
-            0
-        } else {
-            strides[dim + 1]
-                .checked_mul(shape[dim + 1] as usize)
-                .ok_or(
-                    "Gemm integer strides exceed addressable memory; reduce the input dimensions",
-                )?
-        };
-    }
-    if n.ints.get("transA").copied().unwrap_or(0) != 0 && shape.len() >= 2 {
-        let rank = shape.len();
-        shape.swap(rank - 2, rank - 1);
-        strides.swap(rank - 2, rank - 1);
-    }
-    let trans_b = n.ints.get("transB").copied().unwrap_or(0) != 0;
-    let (k, width) = if trans_b {
-        (b_shape[1], b_shape[0])
-    } else {
-        (b_shape[0], b_shape[1])
-    };
-    if shape.last() != Some(&k) {
-        return Err(format!(
-            "Gemm integer contraction dimensions differ: A {:?}, B {b_shape:?}; correct transA/transB or reshape the operands",
-            a_shape
-        ));
-    }
-    let reduction_stride = *strides.last().expect("checked non-scalar A");
-    shape.pop();
-    strides.pop();
-    shape.push(width);
-    let (byte_count, _) = super::host_scan::layout(&shape, dtype, "integer Gemm")?;
-    let c_shape = if present(n, 2) {
-        Some(ctx.tensor_shape(&n.inputs[2])?)
-    } else {
-        None
-    };
-    if let Some(c_shape) = &c_shape
-        && (c_shape.len() > shape.len()
-            || !c_shape
-                .iter()
-                .rev()
-                .zip(shape.iter().rev())
-                .all(|(&c, &y)| c == 1 || c == y))
-    {
-        return Err(format!(
-            "Gemm integer C shape {c_shape:?} cannot broadcast to {shape:?}; reshape C to a suffix compatible with Y"
-        ));
-    }
-    if shape.contains(&0) {
-        let shape = shape
-            .into_iter()
-            .map(dim_i32)
-            .collect::<Result<Vec<_>, _>>()?;
-        let y = ctx.zeros(&shape, dtype)?;
-        ctx.bind(&n.outputs[0], y);
-        return Ok(());
-    }
-    let rows = shape[..shape.len() - 1]
-        .iter()
-        .try_fold(1usize, |total, &dim| total.checked_mul(dim as usize))
-        .ok_or("Gemm integer output size overflow; reduce the input dimensions")?;
-    let c = if present(n, 2) && beta != 0 {
-        let (_, c_dtype, values) = integer_gemm_input(ctx, n, 2)?;
-        if c_dtype != dtype {
-            return Err(
-                "Gemm integer C dtype differs from A/B; cast all operands to the same integer type"
-                    .into(),
-            );
-        }
-        Some(values)
-    } else {
-        None
-    };
-    let overflow = || {
-        "Gemm integer arithmetic exceeds the checked i128 accumulator or output dtype; reduce operand magnitudes/scales or use a wider floating-point representation".to_string()
-    };
-    let mut result = Vec::with_capacity(byte_count);
-    for row in 0..rows {
-        let mut coordinate = row;
-        let mut a_offset = 0usize;
-        for dim in (0..shape.len() - 1).rev() {
-            a_offset += coordinate % shape[dim] as usize * strides[dim];
-            coordinate /= shape[dim] as usize;
-        }
-        for column in 0..width as usize {
-            let mut sum = 0i128;
-            if alpha != 0 {
-                for j in 0..k as usize {
-                    let b_offset = if trans_b {
-                        column * k as usize + j
-                    } else {
-                        j * width as usize + column
-                    };
-                    sum = a[a_offset + j * reduction_stride]
-                        .checked_mul(b[b_offset])
-                        .and_then(|value| sum.checked_add(value))
-                        .ok_or_else(overflow)?;
-                }
-                sum = sum.checked_mul(alpha).ok_or_else(overflow)?;
-            }
-            if let Some(c) = &c {
-                let c_shape = c_shape.as_ref().expect("present C shape");
-                let mut index = row * width as usize + column;
-                let mut c_offset = 0usize;
-                let mut c_stride = 1usize;
-                for dim in (0..shape.len()).rev() {
-                    let coordinate = index % shape[dim] as usize;
-                    index /= shape[dim] as usize;
-                    if dim >= shape.len() - c_shape.len() {
-                        let size = c_shape[dim - (shape.len() - c_shape.len())];
-                        if size != 1 {
-                            c_offset += coordinate * c_stride;
-                        }
-                        c_stride *= size as usize;
-                    }
-                }
-                sum = c[c_offset]
-                    .checked_mul(beta)
-                    .and_then(|value| sum.checked_add(value))
-                    .ok_or_else(overflow)?;
-            }
-            match dtype {
-                mlx::mlx_dtype__MLX_INT32 => result
-                    .extend_from_slice(&i32::try_from(sum).map_err(|_| overflow())?.to_ne_bytes()),
-                mlx::mlx_dtype__MLX_UINT32 => result
-                    .extend_from_slice(&u32::try_from(sum).map_err(|_| overflow())?.to_ne_bytes()),
-                mlx::mlx_dtype__MLX_INT64 => result
-                    .extend_from_slice(&i64::try_from(sum).map_err(|_| overflow())?.to_ne_bytes()),
-                _ => result
-                    .extend_from_slice(&u64::try_from(sum).map_err(|_| overflow())?.to_ne_bytes()),
-            }
-        }
-    }
-    let shape = shape
-        .into_iter()
-        .map(dim_i32)
-        .collect::<Result<Vec<_>, _>>()?;
-    let y = ctx.from_host(result.as_ptr().cast(), &shape, dtype);
-    ctx.mark_composed("checked exact host integer Gemm (MLX has no integer GEMM primitive)");
-    ctx.bind(&n.outputs[0], y);
-    Ok(())
-}
-
 // ---- claim predicates --------------------------------------------------------------------------
 
 fn matmul_claim(node: &NodeView) -> ClaimResult {
@@ -1436,5 +1233,228 @@ mod tests {
         assert_eq!(fused_matmul_axes(3, true, true), [1, 2, 0]);
         assert_eq!(fused_matmul_axes(5, false, true), [1, 2, 3, 0, 4]);
         assert_eq!(fused_matmul_axes(5, true, true), [1, 2, 3, 4, 0]);
+    }
+}
+
+#[cfg(test)]
+mod schema_contract_tests {
+    use super::*;
+    use crate::ops::test_helpers::*;
+
+    #[test]
+    fn integer_gemm29_exact_values_transposes_broadcast_and_empty_geometry() {
+        use crate::ops::host_scan::read_live;
+        use crate::sys::ort;
+        for (dtype, otype) in [
+            (
+                mlx::mlx_dtype__MLX_INT32,
+                ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32,
+            ),
+            (
+                mlx::mlx_dtype__MLX_UINT32,
+                ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT32,
+            ),
+            (
+                mlx::mlx_dtype__MLX_INT64,
+                ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64,
+            ),
+            (
+                mlx::mlx_dtype__MLX_UINT64,
+                ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT64,
+            ),
+        ] {
+            let stream = Stream::new_default_gpu();
+            let mut plan = Plan::new(vec![]);
+            let mut ctx = TranslationContext::new(
+                &mut plan,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                stream.as_raw(),
+            );
+            let encode = |values: &[i128]| -> Vec<u8> {
+                values
+                    .iter()
+                    .flat_map(|&value| match dtype {
+                        mlx::mlx_dtype__MLX_INT32 => (value as i32).to_ne_bytes().to_vec(),
+                        mlx::mlx_dtype__MLX_UINT32 => (value as u32).to_ne_bytes().to_vec(),
+                        mlx::mlx_dtype__MLX_INT64 => (value as i64).to_ne_bytes().to_vec(),
+                        _ => (value as u64).to_ne_bytes().to_vec(),
+                    })
+                    .collect()
+            };
+            let mut n = NodeDesc::new(
+                "Gemm".into(),
+                "".into(),
+                29,
+                CompileShapeSafety::EagerOnly {
+                    reason: "checked integer arithmetic",
+                },
+            );
+            n.inputs = vec![reference("a"), reference("b"), reference("c")];
+            n.outputs = vec![output("y")];
+            n.outputs[0].otype = otype;
+            let result_ref = reference("y");
+            n.ints.insert("transA".into(), 1);
+            n.floats.insert("alpha".into(), 2.0);
+            n.floats.insert("beta".into(), -1.0);
+            for trans_b in [0, 1] {
+                n.ints.insert("transB".into(), trans_b);
+                for (name, shape, values) in [
+                    ("a", vec![2, 2, 3], (1..=12).collect::<Vec<i128>>()),
+                    (
+                        "b",
+                        vec![2, 2],
+                        if trans_b == 0 {
+                            vec![1, 2, 3, 4]
+                        } else {
+                            vec![1, 3, 2, 4]
+                        },
+                    ),
+                    ("c", vec![2], vec![1, 2]),
+                ] {
+                    let bytes = encode(&values);
+                    let array = ctx.from_host(bytes.as_ptr().cast(), &shape, dtype);
+                    ctx.bind(&output(name), array);
+                }
+                crate::registry::translate(&mut ctx, &n).unwrap();
+                let result = read_live(&mut ctx, &result_ref, "test").unwrap();
+                assert_eq!(result.shape, [2, 3, 2]);
+                assert_eq!(
+                    result.data,
+                    encode(&[25, 34, 33, 46, 41, 58, 73, 106, 81, 118, 89, 130])
+                );
+            }
+            n.ints.insert("transB".into(), 0);
+            n.floats.insert("alpha".into(), 1.0);
+            n.floats.insert("beta".into(), 0.0);
+            let large = if matches!(
+                dtype,
+                mlx::mlx_dtype__MLX_INT64 | mlx::mlx_dtype__MLX_UINT64
+            ) {
+                (1i128 << 53) + 1
+            } else {
+                (1i128 << 25) + 1
+            };
+            for (name, shape, values) in [
+                ("a", vec![2], vec![large, 2]),
+                ("b", vec![2, 1], vec![1, 1]),
+                ("c", vec![1], vec![1]),
+            ] {
+                let bytes = encode(&values);
+                let array = ctx.from_host(bytes.as_ptr().cast(), &shape, dtype);
+                ctx.bind(&output(name), array);
+            }
+            crate::registry::translate(&mut ctx, &n).unwrap();
+            let result = read_live(&mut ctx, &result_ref, "test").unwrap();
+            assert_eq!(result.shape, [1]);
+            assert_eq!(result.data, encode(&[large + 2]));
+            n.floats.insert("alpha".into(), 0.5);
+            assert!(
+                crate::registry::translate(&mut ctx, &n)
+                    .unwrap_err()
+                    .contains("finite integral")
+            );
+            n.floats.insert("alpha".into(), 2f32.powi(100));
+            assert!(
+                crate::registry::translate(&mut ctx, &n)
+                    .unwrap_err()
+                    .contains("exceeds")
+            );
+            n.ints.insert("transA".into(), 0);
+            n.floats.insert("alpha".into(), 1.0);
+            n.inputs.truncate(2);
+            for (a_shape, b_shape, expected_shape) in [
+                (vec![0, 2], vec![2, 3], vec![0, 3]),
+                (vec![2, 0], vec![0, 3], vec![2, 3]),
+                (vec![4, 2], vec![2, 0], vec![4, 0]),
+            ] {
+                for (name, shape) in [("a", a_shape), ("b", b_shape)] {
+                    let array = ctx.zeros(&shape, dtype).unwrap();
+                    ctx.bind(&output(name), array);
+                }
+                crate::registry::translate(&mut ctx, &n).unwrap();
+                let result = read_live(&mut ctx, &result_ref, "test").unwrap();
+                assert_eq!(result.shape, expected_shape);
+                assert!(result.data.iter().all(|&value| value == 0));
+            }
+        }
+    }
+
+    #[test]
+    fn gemm29_rank_transpose_and_beta_zero() {
+        for cpu in [false, true] {
+            let stream = if cpu {
+                Stream::new_default_cpu()
+            } else {
+                Stream::new_default_gpu()
+            };
+            let mut plan = Plan::new(vec![]);
+            let mut ctx = TranslationContext::new(
+                &mut plan,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                stream.as_raw(),
+            );
+            bind_float(
+                &mut ctx,
+                "x",
+                &[2, 2, 3],
+                &[1., 2., 3., 4., 5., 6., 7., 8., 9., 10., 11., 12.],
+            );
+            bind_float(&mut ctx, "w", &[2, 2], &[1., 2., 3., 4.]);
+            bind_float(&mut ctx, "bias", &[2], &[0.5, -0.5]);
+            let mut gemm = node("Gemm", &["x", "w", "bias"], 29);
+            gemm.ints.insert("transA".into(), 1);
+            crate::registry::translate(&mut ctx, &gemm).unwrap();
+            assert_output(
+                &mut ctx,
+                "y",
+                &[2, 3, 2],
+                &[
+                    13.5, 17.5, 17.5, 23.5, 21.5, 29.5, 37.5, 53.5, 41.5, 59.5, 45.5, 65.5,
+                ],
+            );
+            bind_float(&mut ctx, "x", &[2], &[1., 2.]);
+            bind_float(&mut ctx, "bias", &[2], &[f32::NAN, f32::INFINITY]);
+            gemm.floats.insert("beta".into(), 0.0);
+            crate::registry::translate(&mut ctx, &gemm).unwrap();
+            assert_output(&mut ctx, "y", &[2], &[7., 10.]);
+        }
+    }
+
+    #[test]
+    fn grouped_matmul29_transposed_weights() {
+        for cpu in [false, true] {
+            let stream = if cpu {
+                Stream::new_default_cpu()
+            } else {
+                Stream::new_default_gpu()
+            };
+            let mut plan = Plan::new(vec![]);
+            let mut ctx = TranslationContext::new(
+                &mut plan,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                stream.as_raw(),
+            );
+            bind_float(&mut ctx, "x", &[2, 3], &[1., 2., 3., 4., 5., 6.]);
+            bind_float(
+                &mut ctx,
+                "w",
+                &[2, 2, 3],
+                &[1., 2., 3., 4., 5., 6., 7., 8., 9., 10., 11., 12.],
+            );
+            bind_float(&mut ctx, "bias", &[2, 2], &[0.5, -0.5, 1., -1.]);
+            bind_indices(&mut ctx, &[2, 2], &[1, 0, 0, 1], true);
+            let mut grouped = node("GroupedMatMul", &["x", "w", "indices", "bias"], 29);
+            grouped.ints.insert("transB".into(), -1);
+            crate::registry::translate(&mut ctx, &grouped).unwrap();
+            assert_output(
+                &mut ctx,
+                "y",
+                &[2, 2, 2],
+                &[51., 67., 14.5, 31.5, 32.5, 76.5, 123., 166.],
+            );
+        }
     }
 }

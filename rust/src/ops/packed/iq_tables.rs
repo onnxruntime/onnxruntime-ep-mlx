@@ -3,7 +3,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0 AND MIT
 
-//! Generated from ONNX commit 3c41120b9c69657a1dd13407b080bd451ed06c9c
+//! Normative codebooks generated from ONNX commit 3c41120b9c69657a1dd13407b080bd451ed06c9c
 //! `onnx/reference/ops/_gguf_codebooks.py`; do not edit.
 //! The normative data originates from GGML commit
 //! da8e2a54b919557b816b1c2beb432ccb766f7ce0, `src/ggml-common.h`.

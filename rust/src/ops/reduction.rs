@@ -354,19 +354,64 @@ fn read_scalar_int(
 
 fn cumsum_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
     let x = ctx.resolve(&n.inputs[0])?;
-    let rank = ctx.ndim(x) as i64;
-    let mut axis = read_scalar_int(ctx, &n.inputs[1])?;
-    if axis < 0 {
-        axis += rank;
-    }
-    if axis < 0 || axis >= rank {
-        return Err("MLX CumSum axis is out of range".to_string());
-    }
+    let axis = scan_axis(read_scalar_int(ctx, &n.inputs[1])?, ctx.ndim(x), "CumSum")?;
     let reverse = n.ints.get("reverse").copied().unwrap_or(0) != 0;
     let inclusive = n.ints.get("exclusive").copied().unwrap_or(0) == 0;
-    let axis = axis as i32;
     let out = ctx.cumsum(x, axis, reverse, inclusive)?;
     ctx.bind(&n.outputs[0], out);
+    Ok(())
+}
+
+fn scan_axis(raw: i64, rank: usize, op: &str) -> Result<i32, MlxError> {
+    let rank = rank as i64;
+    if rank == 0 || raw < -rank || raw >= rank {
+        return Err(format!(
+            "{op}: axis {raw} is invalid for rank {rank}; use a rank >= 1 tensor and an axis in [-rank, rank-1]"
+        ));
+    }
+    Ok(if raw < 0 { raw + rank } else { raw } as i32)
+}
+
+fn logcumsumexp_claim(node: &NodeView) -> ClaimResult {
+    require!(
+        node.num_inputs() == 1 && node.num_outputs() == 1,
+        "LogCumSumExp requires one input and one output"
+    );
+    let (Some(x), Some(y)) = (node.input_info(0), node.output_info(0)) else {
+        deny!("LogCumSumExp requires input/output tensor type information");
+    };
+    require!(
+        is_mlx_cpu_float(x.dtype) && y.dtype == x.dtype,
+        "LogCumSumExp requires matching float16/bfloat16/float32/float64 input and output"
+    );
+    if node.input_rank_known(0) == Some(true) {
+        scan_axis(node.int_attr("axis", 0), x.shape.len(), "LogCumSumExp")?;
+    }
+    Ok(())
+}
+
+fn logcumsumexp_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
+    let x = ctx.resolve(&n.inputs[0])?;
+    let axis = scan_axis(
+        n.ints.get("axis").copied().unwrap_or(0),
+        ctx.ndim(x),
+        "LogCumSumExp",
+    )?;
+    let dtype = ctx.dtype_of(x);
+    if ctx.size_of(x) == 0 {
+        let y = ctx.zeros(&ctx.shape_of(x), dtype)?;
+        ctx.bind(&n.outputs[0], y);
+        return Ok(());
+    }
+    let work = if dtype == mlx::mlx_dtype__MLX_FLOAT64 {
+        x
+    } else {
+        ctx.astype(x, mlx::mlx_dtype__MLX_FLOAT32)?
+    };
+    let y =
+        ctx.emit(|res, s| unsafe { mlx::mlx_logcumsumexp_axis(res, work, axis, false, true, s) })?;
+    let y = ctx.astype(y, dtype)?;
+    ctx.bind(&n.outputs[0], y);
     Ok(())
 }
 
@@ -388,17 +433,9 @@ fn shape_metadata_compatible(expected: &[i64], actual: &[i64]) -> bool {
 
 fn cumprod_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
     let x = ctx.resolve(&n.inputs[0])?;
-    let rank = ctx.ndim(x) as i64;
-    let mut axis = read_scalar_int(ctx, &n.inputs[1])?;
-    if axis < 0 {
-        axis += rank;
-    }
-    if axis < 0 || axis >= rank {
-        return Err("MLX CumProd axis is out of range".to_string());
-    }
+    let axis = scan_axis(read_scalar_int(ctx, &n.inputs[1])?, ctx.ndim(x), "CumProd")?;
     let reverse = n.ints.get("reverse").copied().unwrap_or(0) != 0;
     let inclusive = n.ints.get("exclusive").copied().unwrap_or(0) == 0;
-    let axis = axis as i32;
     let out = ctx.cumprod(x, axis, reverse, inclusive)?;
     ctx.bind(&n.outputs[0], out);
     Ok(())
@@ -1073,6 +1110,14 @@ pub fn register(registry: &mut OpRegistry) {
     );
     shape_keyed(
         registry,
+        "LogCumSumExp",
+        29,
+        logcumsumexp_op,
+        logcumsumexp_claim,
+        crate::registry::MLX_SCAN_SHAPE_REASON,
+    );
+    shape_keyed(
+        registry,
         "CumProd",
         26,
         cumprod_op,
@@ -1113,5 +1158,144 @@ mod cumulative_shape_tests {
         assert!(shape_metadata_compatible(&[2, 3], &[-1, 3]));
         assert!(!shape_metadata_compatible(&[2, 3], &[2, 4]));
         assert!(!shape_metadata_compatible(&[2, 3], &[6]));
+    }
+}
+
+#[cfg(test)]
+mod schema_contract_tests {
+    use super::*;
+    use crate::ops::test_helpers::*;
+
+    #[test]
+    fn logcumsumexp_stable_prefixes_and_nonfinite_order() {
+        for cpu in [false, true] {
+            let stream = if cpu {
+                Stream::new_default_cpu()
+            } else {
+                Stream::new_default_gpu()
+            };
+            let mut plan = Plan::new(vec![]);
+            let mut ctx = TranslationContext::new(
+                &mut plan,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                stream.as_raw(),
+            );
+            let mut n = NodeDesc::new(
+                "LogCumSumExp".into(),
+                "".into(),
+                29,
+                CompileShapeSafety::ShapeKeyedOnly {
+                    reason: MLX_SCAN_SHAPE_REASON,
+                },
+            );
+            n.ints.insert("axis".into(), -1);
+            n.inputs = vec![reference("x")];
+            n.outputs = vec![output("y")];
+            for values in [
+                vec![-1000.0f32, -1001.0, 1000.0, 1001.0],
+                vec![
+                    f32::NEG_INFINITY,
+                    f32::NEG_INFINITY,
+                    2.0,
+                    f32::INFINITY,
+                    3.0,
+                    f32::NAN,
+                ],
+                vec![f32::NAN, f32::INFINITY, 0.0],
+            ] {
+                let x = ctx.keep(Array::from_data(
+                    values.as_ptr().cast(),
+                    &[1, values.len() as i32],
+                    mlx::mlx_dtype__MLX_FLOAT32,
+                ));
+                ctx.bind(&output("x"), x);
+                logcumsumexp_op(&mut ctx, &n).unwrap();
+                let y = ctx.resolve(&reference("y")).unwrap();
+                let y = ctx.contiguous_eval(y).unwrap();
+                let actual = unsafe {
+                    std::slice::from_raw_parts(mlx::mlx_array_data_float32(y), values.len())
+                };
+                let mut sum = f64::NEG_INFINITY;
+                for (&value, &a) in values.iter().zip(actual) {
+                    let value = f64::from(value);
+                    sum = if sum.is_nan() || value.is_nan() {
+                        f64::NAN
+                    } else if sum == f64::NEG_INFINITY {
+                        value
+                    } else if value == f64::NEG_INFINITY {
+                        sum
+                    } else if sum == f64::INFINITY || value == f64::INFINITY {
+                        f64::INFINITY
+                    } else {
+                        sum.max(value) + (-(sum - value).abs()).exp().ln_1p()
+                    };
+                    if sum.is_nan() {
+                        assert!(a.is_nan());
+                    } else if sum.is_infinite() {
+                        assert_eq!(f64::from(a), sum);
+                    } else {
+                        assert!((f64::from(a) - sum).abs() < 2e-4, "{a} != {sum}");
+                    }
+                }
+            }
+            for shape in [vec![0, 2], vec![2, 0]] {
+                let x = ctx.zeros(&shape, mlx::mlx_dtype__MLX_FLOAT32).unwrap();
+                ctx.bind(&output("x"), x);
+                logcumsumexp_op(&mut ctx, &n).unwrap();
+                let y = ctx.resolve(&reference("y")).unwrap();
+                assert_eq!(ctx.shape_of(y), shape);
+            }
+        }
+        assert!(scan_axis(0, 0, "LogCumSumExp").is_err());
+        assert!(scan_axis(i64::MIN, 2, "LogCumSumExp").is_err());
+        assert!(scan_axis(2, 2, "LogCumSumExp").is_err());
+    }
+
+    #[test]
+    fn logcumsumexp_low_precision_accumulates_wide_and_double_keeps_low_bits() {
+        for (cpu, dtype) in [
+            (false, mlx::mlx_dtype__MLX_FLOAT16),
+            (false, mlx::mlx_dtype__MLX_BFLOAT16),
+            (true, mlx::mlx_dtype__MLX_FLOAT64),
+        ] {
+            let stream = if cpu {
+                Stream::new_default_cpu()
+            } else {
+                Stream::new_default_gpu()
+            };
+            let mut plan = Plan::new(vec![]);
+            let mut ctx = TranslationContext::new(
+                &mut plan,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                stream.as_raw(),
+            );
+            let mut scan = node("LogCumSumExp", &["x"], 29);
+            scan.ints.insert("axis".into(), 0);
+            if dtype == mlx::mlx_dtype__MLX_FLOAT64 {
+                let values = [2f64.powi(40), 2f64.powi(40)];
+                let x = ctx.keep(Array::from_data(values.as_ptr().cast(), &[2], dtype));
+                ctx.bind(&output("x"), x);
+                logcumsumexp_op(&mut ctx, &scan).unwrap();
+                let y = ctx.resolve(&reference("y")).unwrap();
+                let y = ctx.contiguous_eval(y).unwrap();
+                let actual =
+                    unsafe { std::slice::from_raw_parts(mlx::mlx_array_data_float64(y), 2) };
+                assert_eq!(actual, [values[0], values[0] + std::f64::consts::LN_2]);
+            } else {
+                let x = ctx.zeros(&[2048], dtype).unwrap();
+                ctx.bind(&output("x"), x);
+                logcumsumexp_op(&mut ctx, &scan).unwrap();
+                let y = ctx.resolve(&reference("y")).unwrap();
+                assert_eq!(ctx.dtype_of(y), dtype);
+                let y = ctx.astype(y, mlx::mlx_dtype__MLX_FLOAT32).unwrap();
+                let y = ctx.contiguous_eval(y).unwrap();
+                let actual =
+                    unsafe { std::slice::from_raw_parts(mlx::mlx_array_data_float32(y), 2048) };
+                let expected = 2048f32.ln();
+                assert!((actual[2047] - expected).abs() < 0.02);
+            }
+        }
     }
 }

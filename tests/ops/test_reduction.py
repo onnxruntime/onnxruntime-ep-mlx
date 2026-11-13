@@ -4,20 +4,19 @@ from __future__ import annotations
 
 import json
 import os
-from pathlib import Path
 import subprocess
 import sys
+from pathlib import Path
 
-import numpy as np
+import _models as m
+import _schema_runtime as schema_runtime
 import ml_dtypes
+import numpy as np
 import onnx
 import onnx_ir as ir
 import onnxruntime as ort
 import pytest
 from onnx_ir import DataType as DT
-
-import _models as m
-
 
 _REDUCE_OPS = [
     "ReduceSum", "ReduceMean", "ReduceMax", "ReduceMin", "ReduceProd",
@@ -1239,3 +1238,23 @@ def test_topk_compile_routes(tmp_path):
         + ["MISS", "HIT", "RETRACE", "HIT"]
         + ["MISS"] + ["RETRACE"] * 15 + ["n/a", "HIT"]
     )
+
+
+def _logcumsumexp_cases():
+    yield "LogCumSumExp", {"x": np.array([-1000, -1001, 1000, 1001], np.float32)}, {"axis": -1}, (
+        np.logaddexp.accumulate(np.array([-1000, -1001, 1000, 1001], np.float64)).astype(np.float32),
+    )
+
+
+LOGCUMSUMEXP_CASES = list(_logcumsumexp_cases())
+
+
+@pytest.mark.parametrize("op,feeds,attrs,expected", LOGCUMSUMEXP_CASES, ids=[case[0] for case in LOGCUMSUMEXP_CASES])
+def test_logcumsumexp_goldens_match_onnx_reference(op, feeds, attrs, expected):
+    schema_runtime.check_reference(op, feeds, attrs, expected, opset=29)
+
+
+@pytest.mark.parametrize("eager", [False, True])
+@pytest.mark.parametrize("op,feeds,attrs,expected", LOGCUMSUMEXP_CASES, ids=[case[0] for case in LOGCUMSUMEXP_CASES])
+def test_logcumsumexp_mlx_against_reference(op, feeds, attrs, expected, eager, monkeypatch, tmp_path):
+    schema_runtime.check_mlx(op, feeds, attrs, expected, eager, monkeypatch, tmp_path, opset=29)

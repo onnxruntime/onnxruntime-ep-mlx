@@ -9,16 +9,16 @@ from __future__ import annotations
 
 import json
 import os
-from pathlib import Path
 import subprocess
 import sys
+from pathlib import Path
 
+import _models as m
+import _schema_runtime as schema_runtime
 import numpy as np
 import onnxruntime as ort
 import pytest
 from onnx_ir import DataType as DT
-
-import _models as m
 
 
 def _indices(ishape, dshape):
@@ -39,7 +39,8 @@ def _assert_mlx_claims(model, feeds):
     sess.run(None, feeds)
     path = sess.end_profiling()
     try:
-        events = json.load(open(path))
+        with open(path) as profile:
+            events = json.load(profile)
     finally:
         os.remove(path)
     providers = {e.get("args", {}).get("provider") for e in events
@@ -199,3 +200,24 @@ def test_gathernd_shape_keyed_replay(tmp_path):
     paths = [e for e in json.loads(trace.read_text()) if e.get("cat") == "ep.path"]
     assert [e["args"]["path"] for e in paths] == ["general", "general", "eager", "general"]
     assert [e["args"]["cache"] for e in paths] == ["MISS", "RETRACE", "n/a", "HIT"]
+
+
+def _gather_bounds_cases():
+    yield "GatherND", {
+        "x": np.array([[1, 2], [3, 4]], np.float32),
+        "indices": np.array([[0], [-1]], np.int32),
+    }, {}, (np.array([[1, 2], [3, 4]], np.float32),)
+
+
+GATHER_BOUNDS_CASES = list(_gather_bounds_cases())
+
+
+@pytest.mark.parametrize("op,feeds,attrs,expected", GATHER_BOUNDS_CASES, ids=[case[0] for case in GATHER_BOUNDS_CASES])
+def test_gather_bounds_goldens_match_onnx_reference(op, feeds, attrs, expected):
+    schema_runtime.check_reference(op, feeds, attrs, expected, opset=29)
+
+
+@pytest.mark.parametrize("eager", [False, True])
+@pytest.mark.parametrize("op,feeds,attrs,expected", GATHER_BOUNDS_CASES, ids=[case[0] for case in GATHER_BOUNDS_CASES])
+def test_gather_bounds_mlx_against_reference(op, feeds, attrs, expected, eager, monkeypatch, tmp_path):
+    schema_runtime.check_mlx(op, feeds, attrs, expected, eager, monkeypatch, tmp_path, opset=29)

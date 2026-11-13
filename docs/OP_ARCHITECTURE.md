@@ -178,7 +178,10 @@ python -m venv --system-site-packages .venv-opset29
 ALLOW_RELEASED_ONNX_OPSET_ONLY=0 \
 ONNXRUNTIME_MLX_EP_LIB="$PWD/rust/target/release/libonnxruntime_mlx_ep.dylib" \
   .venv-opset29/bin/python -m pytest -q \
-    tests/ops/test_opset29.py tests/ops/test_packed_ops.py
+    tests/ops/test_math.py tests/ops/test_reduction.py \
+    tests/ops/test_gemm.py tests/ops/test_grouped_matmul.py \
+    tests/ops/test_mean_variance_normalization_forms.py tests/ops/test_ssm_contracts.py \
+    tests/ops/test_gathernd.py tests/ops/test_scatter_symbolic.py tests/ops/test_packed_ops.py
 ```
 
 Changing the model's opset stamp, merely registering schemas, or allowing CPU
