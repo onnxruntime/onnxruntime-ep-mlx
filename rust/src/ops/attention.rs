@@ -4202,7 +4202,10 @@ fn paged_attention_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), 
             && kquant.is_none()
             && vquant.is_none()
             && out_dt == mlx::mlx_dtype__MLX_FLOAT16
+            && !std::env::var_os("ONNXRUNTIME_EP_MLX_NO_PAGED_WINDOW_GATHER")
+                .is_some_and(|value| value != "0" && !value.is_empty())
         {
+            ctx.mark_fast("paged_prefill_window_gather");
             (pastb - window + 1).max(0)
         } else {
             0

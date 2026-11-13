@@ -105,6 +105,10 @@ SDPA for eligible GPU `PagedAttention` calls with more than eight queries.
 This avoids explicitly repeating grouped KV heads before attention. Decode,
 quantized or latent caches, softcap, and head-sink paths are unchanged.
 Causal/window masks and visible cache outputs retain their existing semantics.
+Eligible FP16 windowed prefill also gathers only physical pages intersecting
+the attention window instead of materializing the full cached prefix.
+Set `ONNXRUNTIME_EP_MLX_NO_PAGED_WINDOW_GATHER=1` to restore the full-prefix
+gather for diagnostics.
 
 Set `ONNXRUNTIME_EP_MLX_PAGED_PREFILL_GQA=0` to restore explicit KV-head
 repetition. The native grouped path passed independent attention/cache checks

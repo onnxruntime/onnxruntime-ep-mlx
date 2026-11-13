@@ -783,18 +783,20 @@ def test_paged_window_absolute_positions(causal, nq, window, monkeypatch):
         feeds["block_table"], h, kv, d,
         local_window_size=window, is_causal=causal,
     )
-    for direct in ("0", "1"):
-        monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_PAGED_DIRECT", direct)
-        actual = m.run_mlx(
-            proto.SerializeToString(),
-            {name: value.copy() for name, value in feeds.items()},
-        )[0]
-        np.testing.assert_allclose(actual, reference, rtol=1e-4, atol=1e-4)
+    actual = m.run_mlx(
+        proto.SerializeToString(),
+        {name: value.copy() for name, value in feeds.items()},
+    )[0]
+    np.testing.assert_allclose(actual, reference, rtol=1e-4, atol=1e-4)
 
 
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("window", [3, 1025])
-def test_paged_window_prefill_absolute_rope(causal, window):
+@pytest.mark.parametrize("native_gqa", [False, True])
+@pytest.mark.parametrize("bounded_gather", [False, True])
+def test_paged_window_prefill_absolute_rope(
+    causal, window, native_gqa, bounded_gather, monkeypatch
+):
     h, kv, d, nb, block, tokens, past = 4, 2, 64, 9, 256, 17, 1795
     proto = onnx.load_from_string(_model(h, kv, d, nb, block, 1, 1, 1))
     proto.graph.node[0].attribute.extend([
@@ -809,6 +811,10 @@ def test_paged_window_prefill_absolute_rope(causal, window):
     feeds["value_cache"] *= np.float16(1 / 6)
     feeds["cumulative_sequence_length"] = np.array([0, tokens], np.int32)
     feeds["past_seqlens"] = np.array([past], np.int32)
+    monkeypatch.setenv("ONNXRUNTIME_EP_MLX_PAGED_PREFILL_GQA", str(int(native_gqa)))
+    monkeypatch.setenv(
+        "ONNXRUNTIME_EP_MLX_NO_PAGED_WINDOW_GATHER", str(int(not bounded_gather))
+    )
     reference = _paged_ref(
         feeds["query"], feeds["key"], feeds["value"],
         feeds["key_cache"], feeds["value_cache"],

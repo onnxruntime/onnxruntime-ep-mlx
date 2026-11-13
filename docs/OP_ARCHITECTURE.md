@@ -1,13 +1,5 @@
 # ONNX→MLX Op Translation Architecture
 
-PagedAttention's long (>8 query) unquantized non-latent FP16 windowed prefill
-gathers only intersecting physical pages and rebases attention masks without
-rebasing RoPE positions. Short queries retain the upstream full-view FP32
-reduction contract: neither a new windowed vector kernel nor a bounded short
-view replaces that exact route. Other dtypes and cache layouts retain their
-existing fallbacks. Launch/index arithmetic uses checked host dimensions and
-wide Metal loop counters.
-
 **Status:** Final Rust post-pivot architecture
 **Date:** 2026-07-13
 **Repo:** `onnxruntime-mlx`
@@ -766,6 +758,12 @@ query rows, including writes that overwrite cached-prefix slots. Duplicate
 writes and multiple sequences retain functional updated-cache reads. Other
 geometries and an explicit `MLX_SDPA_BLOCKS` override retain dense attention
 lowering; all existing masks and cache writeback semantics are preserved.
+
+Long unquantized, non-latent FP16 windowed prefill gathers only physical pages
+intersecting the earliest query's attention window. Attention-mask coordinates
+are relative to that bounded view while RoPE keeps absolute sequence positions.
+This composes with native grouped-KV prefill; short queries and other cache or
+dtype forms retain their existing full-view routes.
 
 Standard causal `Attention` with one query and one current key can attend every
 past/current key. It omits the redundant causal array rather than capturing a
