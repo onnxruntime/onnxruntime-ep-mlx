@@ -244,15 +244,24 @@ fn mean_variance_normalization_op(
     };
     let x = ctx.astype(x, working_dtype)?;
     let mean = mean_axes(ctx, x, &axes)?;
-    let squared = ctx.mul(x, x)?;
-    let mean_sq = mean_axes(ctx, squared, &axes)?;
-    let mean_squared = ctx.mul(mean, mean)?;
-    let variance = ctx.sub(mean_sq, mean_squared)?;
+    let centered = ctx.sub(x, mean)?;
+    let variance = if n.since_version >= 29 {
+        let squared = ctx.mul(centered, centered)?;
+        mean_axes(ctx, squared, &axes)?
+    } else {
+        let squared = ctx.mul(x, x)?;
+        let mean_sq = mean_axes(ctx, squared, &axes)?;
+        let mean_squared = ctx.mul(mean, mean)?;
+        ctx.sub(mean_sq, mean_squared)?
+    };
     let std = ctx.emit(|res, s| unsafe { mlx::mlx_sqrt(res, variance, s) })?;
-    let scalar = ctx.scalar_f32(1e-9);
+    let scalar = ctx.scalar_f32(if n.since_version >= 29 {
+        n.floats.get("epsilon").copied().unwrap_or(1e-9)
+    } else {
+        1e-9
+    });
     let epsilon = ctx.astype(scalar, working_dtype)?;
     let denom = ctx.add(std, epsilon)?;
-    let centered = ctx.sub(x, mean)?;
     let out = ctx.binary(mlx::mlx_divide, centered, denom)?;
     let out = ctx.astype(out, dtype)?;
     ctx.bind(&n.outputs[0], out);

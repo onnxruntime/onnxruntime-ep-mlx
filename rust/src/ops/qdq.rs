@@ -66,7 +66,8 @@ pub(crate) fn partition_product_candidate(node: &NodeView) -> bool {
     let Some(grouped) = product_kind(&node.domain(), &node.op_type(), node.since_version()) else {
         return false;
     };
-    node.num_outputs() == 1
+    (!grouped || node.int_attr("transB", 0) == 0)
+        && node.num_outputs() == 1
         && node.output_info(0).is_some_and(|out| out.dtype == FLOAT)
         && node
             .input_info(0)
@@ -108,6 +109,8 @@ pub(crate) fn recognize(nodes: &mut [NodeDesc]) {
     let mut producers: HashMap<String, NodeDesc> = HashMap::new();
     for node in nodes {
         if product_kind(&node.domain, &node.op_type, node.since_version).is_some()
+            && (node.op_type != "GroupedMatMul"
+                || node.ints.get("transB").copied().unwrap_or(0) == 0)
             && node.inputs.len() >= 2
             && node.outputs.len() == 1
             && node.outputs[0].otype == FLOAT

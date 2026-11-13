@@ -355,6 +355,7 @@ fn register_builtin_ops(registry: &mut OpRegistry) {
     crate::ops::nonzero::register(registry);
     crate::ops::unique::register(registry);
     crate::ops::math::register(registry);
+    crate::ops::opset29::register(registry);
     crate::ops::reduction::register(registry);
     crate::ops::shape::register(registry);
     crate::ops::matmul::register(registry);

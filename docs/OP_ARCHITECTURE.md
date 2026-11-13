@@ -78,7 +78,7 @@ The following table is the current support contract. Do not broaden claims witho
 | **NonZero** | `ai.onnx` | schema 9/13; bool, all 8/16/32/64-bit signed/unsigned integers, fp16/fp32/fp64 and (schema 13) bf16 | provider-owned exact eager host scan + int64 MLX output | Live payload determines row-major coordinates and `[rank, count]` shape on every call. Scalar output is `[0, count]` per ONNX, unlike ORT 1.31 CPU's `[1, count]`. |
 | **Unique** | `ai.onnx` | schema 11; bool, all 8/16/32/64-bit signed/unsigned integers, fp16/fp32/fp64; flat or axis slices, scalar/unknown rank/empty shapes, all optional outputs | provider-owned exact eager host sort/group + byte-preserving MLX outputs | [Contracts and authority limits](UNIQUE.md). Live cardinality and exact metadata; recursive eager parent boundaries. Legal NaNs use deterministic NaN-last sorting; NumPy half-axis ordering disagreement is explicit. Future28 dispatch is preserved; bf16 Unique28 remains unclaimed/unvalidated. Native validation pending. |
 | **MatMul** | `ai.onnx` | rank >=1 floating operands, including vector-vector, vector-matrix and batched vector forms | `mlx_matmul` | ONNX vector promotion/squeezing and batch broadcasting are native MLX semantics. Empty contraction dimensions, empty batches and symbolic extents are supported. Float64 uses the isolated MLX CPU stream; integer MatMul stays on ORT CPU. |
-| **GroupedMatMul** | `ai.onnx`, schema 29 (unreleased) | X[M,K], W[G,K,N], indices[M,S] int32/int64, optional bias[G,N]; matching fp16/bf16/fp32/fp64 data | GPU `mlx_gather_mm`; typed CPU gather + matmul | Output [M,S,N]. Eager live index validation rejects negative/out-of-range/full-width-overflow routes before dispatch. Empty M/S/K/N and unused/repeated experts retain ONNX semantics. Source implementation and direct handler tests; ORT 1.31 cannot load this schema. |
+| **GroupedMatMul** | `ai.onnx`, schema 29 (unreleased) | X[M,K], W[G,K,N] or transB W[G,N,K], indices[M,S] int32/int64, optional bias[G,N]; matching fp16/bf16/fp32/fp64 data | GPU `mlx_gather_mm`; typed CPU gather + matmul | Output [M,S,N]. Eager live index validation rejects negative/out-of-range/full-width-overflow routes before dispatch. Empty M/S/K/N and unused/repeated experts retain ONNX semantics. Direct QDQ fusion currently applies only to transB=0. Native handler tests; ORT 1.31 cannot load this schema. |
 | **CDist** | `com.microsoft` | v1; homogeneous `fp32`/`fp64` rank-two A[M,N], B[K,N]; default/explicit `sqeuclidean` or `euclidean`; C[M,K] | provider-owned eager typed host distances | [Contracts, resource bounds and remaining metrics](CDIST.md). Direct differences; no [M,K,N] workspace. No ORT CPU fallback or GPU-acceleration claim; recursive eager boundary, unchanged DOUBLE-body restrictions. |
 | **Inverse** | `com.microsoft` | v1; homogeneous `fp32`/`fp64` rank >=2, square final axes, same-shape output, no attributes | eager `mlx_linalg_inv` on the run thread's reused default MLX CPU stream | [Contracts and limits](INVERSE.md). Typed LAPACK, explicit nonfinite-input errors, checked empty short-circuit and synchronous native errors; zero-trip Scan shape templates, recursive eager parent boundary, unchanged context stream and DOUBLE-body rejection. FLOAT16 promotion remains OPEN. |
 | **FusedMatMul** | `com.microsoft`, schema 1 | matching fp16/fp32/fp64/bf16 A/B/Y, alpha and all four transpose flags | transpose + `mlx_matmul` + scale | Batch transpose rotates axis 0 behind all batch axes, before last-two transpose; either batch flag requires equal ranks >=3, matching ORT's compute helper. Vector last-two transpose is a no-op. Narrow scaling uses a dtype-rounded alpha and FP32 product/scaling before the final output cast, avoiding an intermediate fp16/bf16 result. Empty-result materialization uses shape-keyed compilation. Float64 retains the existing isolated MLX CPU stream. Source implementation and fixtures only; runtime/compiled evidence pending. |
@@ -100,10 +100,47 @@ The following table is the current support contract. Do not broaden claims witho
 | **Dropout** | `ai.onnx` | Versioned floating data, optional ratio/training controls and mask; legacy `is_test` | identity/ones for inference, uniform sampling and scaled masking for training | Opsets 1/6 honor `is_test`; 7/10 retain inference behavior because they provide no per-node training selector. Mask dtype follows the schema (data dtype before opset 10, bool thereafter). Modern controls are live scalar tensors, including intermediate producers; inference ignores the ratio value. BF16 data requires opset 13 and BF16 ratio requires opset 22. Training is an eager partition boundary, preserving compiled neighbors and fresh default keys; explicit INT64 seed bits are preserved. Float64 data uses the MLX CPU stream. |
 | **RandomNormal / RandomNormalLike / RandomUniform / RandomUniformLike / Bernoulli / Multinomial** | `ai.onnx` | Existing versioned dtype/attribute restrictions; Like reads tensor geometry only; Normal supports bfloat16 output since schema 22; Bernoulli accepts float32/float16/float64 probabilities since schema 15 and bfloat16 since schema 22, with default or explicit native numeric/Boolean outputs | MLX random primitives | Unseeded forms are eager partition boundaries: each call consumes the live default key, including empty draws. Explicit float-seed forms retain the finite/non-negative/<2^64 claim guard and literal integer truncation; they remain fixed-key and shape-keyed when eligible. Normal's bfloat16 path keeps one existing F32 standard-normal draw/key on the context stream, then uses the current thread's existing default MLX CPU stream for F32 multiplication by the original FLOAT scale, F32 addition of the original FLOAT mean, and the final bfloat16 cast. This is provider-owned CPU affine execution, not an all-GPU path or ORT CPU fallback. It completes evaluation and checks CPU synchronization before exposing the result to consumers, also checking synchronization after construction/evaluation errors. This default stream can share other same-thread work; no exclusive ownership, new per-plan stream/worker/pool, or exhaustive native-error isolation is claimed. BF16 Normal/NormalLike and their recursive parents are eager even when seeded; old float32/float16 compilation behavior is unchanged. Parameters and intermediate samples are not pre-rounded to bfloat16; no new sampler, F64 Normal route or exact-real/higher-precision guarantee is introduced. Ordinary F32 arithmetic and final bfloat16 rounding can overflow or underflow; finite attributes do not guarantee finite outputs, and actual subnormal, signed-zero and cross-stream fidelity require runtime qualification. NormalLike defaults to the input dtype, including bfloat16 since schema 22; RandomNormal still defaults to float32. Bernoulli preserves its native bool draw and casts 0/1 exactly to the requested output type, including uint64 and DOUBLE. DOUBLE input or output selects the existing provider-owned MLX CPU-stream eager path, not ORT CPU fallback. Original DOUBLE probabilities are not downcast: native uint32 bits are compared in F64 against the F64 product of p and the native F32 upper constant (2^32+512). This preserves the native finite 32-bit draw/threshold policy, not a new sampler, 53-bit uniform resolution, exact-real probability guarantee, or cross-provider seeded sequence contract. The default output dtype remains the input dtype. Like's metadata claim accepts every legal input type in schema 1/22, including string/complex/double with explicit float32/float16 output dtype (also bfloat16 for NormalLike since schema 22), without converting its payload; non-MLX input types remain eager even with a seed. [ORT 1.31 initializer sizing](https://github.com/microsoft/onnxruntime/blob/v1.31.0/onnxruntime/core/framework/tensorprotoutils.cc#L1402-L1437) rejects complex initializers, as seen in [hosted run 39913638545](https://github.com/onnxruntime/onnxruntime-ep-mlx/actions/runs/39913638545/job/120282096717): these cases assert the exact session-initialization error against an independent CPU Shape control, not RNG execution. Scalar, empty and unknown-rank Like geometry is checked without narrowing wide dimensions. Recursive eager boundaries preserve neighboring deterministic compilation; control-flow bodies performing DOUBLE payload computation remain declined. Uniform bfloat16 output, Normal/Uniform DOUBLE outputs, full-precision DOUBLE uniform sampling and extreme uniform endpoints remain separate coverage gaps. |
 
+### Opset 29 (ONNX main, unreleased)
+
+The schema inventory is pinned to ONNX main
+[`3c41120`](https://github.com/onnx/onnx/blob/3c41120b9c69657a1dd13407b080bd451ed06c9c/onnx/defs/operator_sets.h):
+seven new operators and six schema updates. Source support does not upgrade the
+host runtime's schema registry. ORT 1.31 rejects opset 29 by default; even with
+`ALLOW_RELEASED_ONNX_OPSET_ONLY=0`, it lacks the new operator schemas. Use an ORT
+build containing these schemas for end-to-end execution. Native Rust tests execute
+the handlers directly against pinned MLX; Python tests cross-check their goldens
+against ONNX-main ReferenceEvaluator and explicitly skip unavailable ORT loading.
+
+| Operator | Change and implementation |
+|---|---|
+| Expm1, Log1p (new) | Native MLX stable unary primitives, preserving tiny representable results and signed zero. fp16/bf16/fp32 on Metal; fp64 on MLX CPU. |
+| LogCumSumExp (new) | Native inclusive forward MLX log-add-exp scan, arbitrary axis, fp32 accumulation for narrow inputs and fp64 for double. NaN and signed infinities propagate prefix-wise; empty tensors retain shape. Shape-keyed compilation. |
+| GroupedMatMul (new) | Existing gather-MM path now honors transB by swapping only the final weight axes. |
+| Pack, Unpack (new) | UINT8 logical codes, UINT8/UINT32 words, arbitrary axis, bits 1-8 or grouped radix with the signed-INT64 power bound. See packed-format limits below. |
+| DequantizePacked (new) | Exact little-endian GGUF block decoding in fp32, one final output conversion; 20 of the 27 normative formats implemented. |
+| Gemm (updated) | Rank >=1 A, rank-2 B, last-two-axis transA (no-op for vectors), unidirectional C broadcasting, beta=0 ignores C. Floating dtypes retain native matmul; integer Gemm remains unclaimed. Version 29 is shape-keyed for empty-result replay. |
+| MeanVarianceNormalization (updated) | Version 29 uses centered variance and configurable epsilon after sqrt; earlier schemas retain their second-moment expression and fixed epsilon. |
+| CausalConvWithState (updated) | Standard-domain dilation from version 29 uses native depthwise MLX conv1d and raw chronological carry of `(K-1)*dilation`. |
+| GatherND (updated) | Existing int32/int64 path plus full-width live bounds validation for version 29, before any unchecked gather. Version 29 is eager. |
+| ScatterElements, ScatterND (updated) | Version-29 mean includes original data once and all duplicate updates. Floating means use MLX scatter sums/counts, fp32 narrow accumulation, and a scaled retry for finite-sum overflow; double uses MLX CPU. Integer means use exact eager i128 host sums and floor division, avoiding 64-bit Metal scatter limitations. ScatterND accepts int32 indices and version-29 zero-width tuples. Other previously unclaimed reductions remain unclaimed. |
+
+DequantizePacked supports `gguf:q1_0`, `q2_0`, `q4_0`, `q4_1`, `q5_0`,
+`q5_1`, `q8_0`, `q8_1`, `q2_k`, `q3_k`, `q4_k`, `q5_k`, `q6_k`,
+`q8_k`, `iq4_nl`, `iq4_xs`, `tq1_0`, `tq2_0`, `mxfp4`, and `nvfp4`
+(each identifier has the `gguf:` prefix).
+Seven codebook formats remain unclaimed: `iq2_xxs`, `iq2_xs`, `iq2_s`,
+`iq3_xxs`, `iq3_s`, `iq1_s`, and `iq1_m`. Supporting them requires the
+normative IQ lookup tables and their format-specific bit/sign/scale decoding,
+with independent reference fixtures; a similar bit width is not a substitute.
+Pack/Unpack's bits spelling and Q4_0/Q4_1/Q8_0 dequantization have vectorized
+MLX fast paths. Grouped radix and the other 17 supported quantization formats
+use exact eager host fallbacks; they are not GPU-speed claims.
+String/complex forms unsupported by the array boundary remain unclaimed.
+
 ### GroupedMatMul and direct QDQ products
 
-The GroupedMatMul contract is the merged ONNX
-[`0834d5e`](https://github.com/onnx/onnx/blob/0834d5e3a5c41e6e3c36a6853e7540e81c704d07/onnx/defs/math/defs.cc),
+The GroupedMatMul contract is ONNX main
+[`3c41120`](https://github.com/onnx/onnx/blob/3c41120b9c69657a1dd13407b080bd451ed06c9c/onnx/defs/math/defs.cc),
 including its standard-operator function decomposition and float64 support. The pinned
 MLX GatherMM CPU kernel accepts only float32; the typed CPU fallback uses ordinary
 Matmul (double GEMM for float64), not a narrowing cast. GPU routing does not construct
@@ -400,7 +437,7 @@ place. Those unused arrays are not additional evaluation roots, but compiled
 and performance evidence must include that per-cached-trace ownership cost;
 results for the earlier typed wide scan do not validate this implementation.
 
-`MeanVarianceNormalization` follows the schema-9/13 second-moment expression:
+Before schema 29, `MeanVarianceNormalization` follows the schema-9/13 second-moment expression:
 the epsilon is added after the square root, not inside it. Default axes are
 exactly `[0, 2, 3]`; explicit empty axes reduce all dimensions, including scalar
 inputs. Axes are checked at full integer width before native reduction. Narrow

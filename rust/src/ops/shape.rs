@@ -179,6 +179,20 @@ fn gathernd_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxErro
             "GatherND: indices last dim {m} out of range for data rank {r} and batch_dims {batch_dims}"
         ));
     }
+    if n.since_version >= 29 {
+        let values = ctx.read_ints_eval(&n.inputs[1])?;
+        for tuple in values.chunks_exact(m) {
+            for (dim, &value) in tuple.iter().enumerate() {
+                let extent = i64::from(dshape[batch_dims + dim]);
+                if value < -extent || value >= extent {
+                    return Err(format!(
+                        "GatherND: index {value} is outside [-{extent}, {}] at tuple axis {dim}; supply an in-bounds index",
+                        extent - 1
+                    ));
+                }
+            }
+        }
+    }
     let mut oshape = ishape[..q - 1].to_vec();
     oshape.extend_from_slice(&dshape[batch_dims + m..]);
     if oshape.contains(&0) {
@@ -318,6 +332,43 @@ fn scatter_elements_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(),
         ctx.bind(&n.outputs[0], result);
         return Ok(());
     }
+    if n.strings.get("reduction").map(String::as_str) == Some("mean") {
+        let values = ctx.read_ints_eval(&n.inputs[1])?;
+        let bound = i64::from(shape[axis as usize]);
+        if values.iter().any(|&value| value < -bound || value >= bound) {
+            return Err(format!(
+                "ScatterElements mean: index outside [-{bound}, {}]; supply indices within the selected data axis",
+                bound - 1
+            ));
+        }
+        let count = gathernd_extent_product(&index_shape)?;
+        let rows = gathernd_extent_product(&shape)?;
+        let position = ctx.arange(0.0, f64::from(count), 1.0, mlx::mlx_dtype__MLX_INT64)?;
+        let mut flat = ctx.reshape(indices, &[count])?;
+        flat = normalize_indices(ctx, flat, shape[axis as usize])?;
+        flat = ctx.astype(flat, mlx::mlx_dtype__MLX_INT64)?;
+        let axis_stride = ctx.scalar_i64(i64::from(gathernd_extent_product(
+            &shape[axis as usize + 1..],
+        )?));
+        flat = ctx.binary(mlx::mlx_multiply, flat, axis_stride)?;
+        let mut data_stride = 1i64;
+        let mut index_stride = 1i64;
+        for dim in (0..shape.len()).rev() {
+            if dim != axis as usize {
+                let stride = ctx.scalar_i64(data_stride);
+                let source_stride = ctx.scalar_i64(index_stride);
+                let coordinate = ctx.binary(mlx::mlx_floor_divide, position, source_stride)?;
+                let extent = ctx.scalar_i64(i64::from(index_shape[dim]));
+                let coordinate = ctx.binary(mlx::mlx_remainder, coordinate, extent)?;
+                let offset = ctx.binary(mlx::mlx_multiply, coordinate, stride)?;
+                flat = ctx.binary(mlx::mlx_add, flat, offset)?;
+            }
+            data_stride *= i64::from(shape[dim]);
+            index_stride *= i64::from(index_shape[dim]);
+        }
+        let flat = ctx.astype(flat, mlx::mlx_dtype__MLX_INT32)?;
+        return scatter_mean_rows(ctx, n, data, updates, flat, rows, 1, count, &shape);
+    }
     let start = vec![0; shape.len()];
     let partial = extent != shape;
     let source = if partial {
@@ -335,6 +386,158 @@ fn scatter_elements_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(),
         result
     };
     let result = ctx.contiguous(result)?;
+    ctx.bind(&n.outputs[0], result);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scatter_mean_rows(
+    ctx: &mut TranslationContext,
+    n: &NodeDesc,
+    data: mlx::mlx_array,
+    updates: mlx::mlx_array,
+    indices: mlx::mlx_array,
+    rows: i32,
+    tail: i32,
+    count: i32,
+    shape: &[i32],
+) -> Result<(), MlxError> {
+    let dtype = ctx.dtype_of(data);
+    if matches!(
+        dtype,
+        mlx::mlx_dtype__MLX_INT8
+            | mlx::mlx_dtype__MLX_UINT8
+            | mlx::mlx_dtype__MLX_INT16
+            | mlx::mlx_dtype__MLX_UINT16
+            | mlx::mlx_dtype__MLX_INT32
+            | mlx::mlx_dtype__MLX_UINT32
+            | mlx::mlx_dtype__MLX_INT64
+            | mlx::mlx_dtype__MLX_UINT64
+    ) {
+        return scatter_integer_mean(ctx, n, indices, rows, tail, count, shape);
+    }
+    let work_dtype = if dtype == mlx::mlx_dtype__MLX_FLOAT64 {
+        dtype
+    } else {
+        mlx::mlx_dtype__MLX_FLOAT32
+    };
+    let data = ctx.astype(data, work_dtype)?;
+    let updates = ctx.astype(updates, work_dtype)?;
+    let base = ctx.reshape(data, &[rows, tail])?;
+    let updates = ctx.reshape(updates, &[count, 1, tail])?;
+    let sum = ctx
+        .emit(|res, s| unsafe { mlx::mlx_scatter_add_single(res, base, indices, updates, 0, s) })?;
+    let ones = ctx.scalar_f32(1.0);
+    let ones = ctx.astype(ones, work_dtype)?;
+    let initial_counts =
+        ctx.emit(|res, s| unsafe { mlx::mlx_broadcast_to(res, ones, [rows, 1].as_ptr(), 2, s) })?;
+    let increments = ctx
+        .emit(|res, s| unsafe { mlx::mlx_broadcast_to(res, ones, [count, 1, 1].as_ptr(), 3, s) })?;
+    let counts = ctx.emit(|res, s| unsafe {
+        mlx::mlx_scatter_add_single(res, initial_counts, indices, increments, 0, s)
+    })?;
+    let mean = ctx.binary(mlx::mlx_divide, sum, counts)?;
+    // Retry overflowing finite sums with contributions scaled before addition.
+    // NaNs and either sign of infinity retain the same IEEE propagation.
+    let scaled_base = ctx.binary(mlx::mlx_divide, base, counts)?;
+    let selected_counts =
+        ctx.emit(|res, s| unsafe { mlx::mlx_take_axis(res, counts, indices, 0, s) })?;
+    let selected_counts = ctx.reshape(selected_counts, &[count, 1, 1])?;
+    let scaled_updates = ctx.binary(mlx::mlx_divide, updates, selected_counts)?;
+    let scaled = ctx.emit(|res, s| unsafe {
+        mlx::mlx_scatter_add_single(res, scaled_base, indices, scaled_updates, 0, s)
+    })?;
+    let finite = ctx.unary(mlx::mlx_isfinite, mean)?;
+    let mean = ctx.where_(finite, mean, scaled)?;
+    let mean = ctx.astype(mean, dtype)?;
+    let mean = ctx.reshape(mean, shape)?;
+    let mean = ctx.contiguous(mean)?;
+    ctx.bind(&n.outputs[0], mean);
+    Ok(())
+}
+
+fn scatter_integer_mean(
+    ctx: &mut TranslationContext,
+    n: &NodeDesc,
+    indices: mlx::mlx_array,
+    rows: i32,
+    tail: i32,
+    count: i32,
+    shape: &[i32],
+) -> Result<(), MlxError> {
+    // Metal scatter cannot accumulate 64-bit integers; i128 also prevents overflow
+    // when averaging UINT64_MAX values or a large number of narrow integers.
+    let data = super::host_scan::read_live(ctx, &n.inputs[0], &n.op_type)?;
+    let dtype = data.dtype;
+    let bytes = data.data.to_vec();
+    let updates = super::host_scan::read_live(ctx, &n.inputs[2], &n.op_type)?;
+    let update_bytes = updates.data.to_vec();
+    let (width, signed) = match dtype {
+        mlx::mlx_dtype__MLX_INT8 => (1, true),
+        mlx::mlx_dtype__MLX_UINT8 => (1, false),
+        mlx::mlx_dtype__MLX_INT16 => (2, true),
+        mlx::mlx_dtype__MLX_UINT16 => (2, false),
+        mlx::mlx_dtype__MLX_INT32 => (4, true),
+        mlx::mlx_dtype__MLX_UINT32 => (4, false),
+        mlx::mlx_dtype__MLX_INT64 => (8, true),
+        mlx::mlx_dtype__MLX_UINT64 => (8, false),
+        _ => {
+            return Err(format!(
+                "{} mean: expected integer data and updates",
+                n.op_type
+            ));
+        }
+    };
+    let decode = |bytes: &[u8]| {
+        bytes
+            .chunks_exact(width)
+            .map(|value| {
+                let mut raw = [0u8; 8];
+                raw[..width].copy_from_slice(value);
+                let value = u64::from_ne_bytes(raw);
+                if signed {
+                    let shift = 64 - width * 8;
+                    i128::from(((value << shift) as i64) >> shift)
+                } else {
+                    i128::from(value)
+                }
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut sums = decode(&bytes);
+    let updates = decode(&update_bytes);
+    if sums.len() != rows as usize * tail as usize
+        || updates.len() != count as usize * tail as usize
+    {
+        return Err(format!(
+            "{} mean: live integer payload does not match its shape; supply matching data and updates",
+            n.op_type
+        ));
+    }
+    let indices = ctx.contiguous_eval(indices)?;
+    let indices =
+        unsafe { std::slice::from_raw_parts(mlx::mlx_array_data_int32(indices), count as usize) };
+    let mut counts = vec![1i128; rows as usize];
+    for (update, &row) in indices.iter().enumerate() {
+        if row < 0 || row >= rows {
+            return Err(format!(
+                "{} mean: flattened index {row} is outside [0,{rows}); supply in-bounds indices",
+                n.op_type
+            ));
+        }
+        counts[row as usize] += 1;
+        for column in 0..tail as usize {
+            sums[row as usize * tail as usize + column] += updates[update * tail as usize + column];
+        }
+    }
+    let mut result = Vec::with_capacity(bytes.len());
+    for (row, sum) in sums.chunks(tail as usize).enumerate() {
+        for &value in sum {
+            let value = value.div_euclid(counts[row]);
+            result.extend_from_slice(&(value as u64).to_ne_bytes()[..width]);
+        }
+    }
+    let result = ctx.from_host(result.as_ptr().cast(), shape, dtype);
     ctx.bind(&n.outputs[0], result);
     Ok(())
 }
@@ -515,11 +718,16 @@ fn scatter_nd_geometry(
     data: &[i32],
     indices: &[i32],
     updates: &[i32],
+    allow_empty_tuple: bool,
 ) -> Result<(usize, i32, i32, i32), MlxError> {
     let width = *indices
         .last()
         .ok_or("ScatterND: indices rank must be positive")?;
-    if data.is_empty() || width <= 0 || width as usize > data.len() {
+    if data.is_empty()
+        || width < 0
+        || width == 0 && !allow_empty_tuple
+        || width as usize > data.len()
+    {
         return Err("ScatterND: index tuple width is outside the data rank".to_string());
     }
     let width = width as usize;
@@ -549,7 +757,8 @@ fn scatter_nd_add_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), M
     let shape = ctx.shape_of(data);
     let index_shape = ctx.shape_of(indices);
     let update_shape = ctx.shape_of(updates);
-    let (width, rows, tail, count) = scatter_nd_geometry(&shape, &index_shape, &update_shape)?;
+    let (width, rows, tail, count) =
+        scatter_nd_geometry(&shape, &index_shape, &update_shape, n.since_version >= 29)?;
     if count == 0 {
         let out = ctx.contiguous(data)?;
         ctx.bind(&n.outputs[0], out);
@@ -561,8 +770,12 @@ fn scatter_nd_add_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), M
     if raw.len() != count as usize * width {
         return Err("ScatterND: index value count does not match its shape".to_string());
     }
-    let mut flat = Vec::with_capacity(count as usize);
-    for tuple in raw.chunks_exact(width) {
+    let mut flat = if width == 0 {
+        vec![0; count as usize]
+    } else {
+        Vec::with_capacity(count as usize)
+    };
+    for tuple in raw.chunks_exact(width.max(1)) {
         let mut index = 0i64;
         for (&value, &extent) in tuple.iter().zip(&shape[..width]) {
             let extent = i64::from(extent);
@@ -583,6 +796,9 @@ fn scatter_nd_add_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), M
         &[count],
         mlx::mlx_dtype__MLX_INT32,
     ));
+    if n.strings.get("reduction").map(String::as_str) == Some("mean") {
+        return scatter_mean_rows(ctx, n, data, updates, indices, rows, tail, count, &shape);
+    }
     let base = ctx.reshape(data, &[rows, tail])?;
     let updates = ctx.reshape(updates, &[count, 1, tail])?;
     let out = ctx.emit(|res, stream| unsafe {
@@ -595,7 +811,10 @@ fn scatter_nd_add_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), M
 }
 
 fn scatter_nd_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
-    if n.strings.get("reduction").map(String::as_str) == Some("add") {
+    if matches!(
+        n.strings.get("reduction").map(String::as_str),
+        Some("add" | "mean")
+    ) {
         return scatter_nd_add_op(ctx, n);
     }
     let data = ctx.resolve(&n.inputs[0])?;
@@ -604,7 +823,7 @@ fn scatter_nd_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxEr
     let dshape = ctx.shape_of(data);
     let ishape = ctx.shape_of(indices);
     let ushape = ctx.shape_of(updates);
-    let (m, rows, tail, p) = scatter_nd_geometry(&dshape, &ishape, &ushape)?;
+    let (m, rows, tail, p) = scatter_nd_geometry(&dshape, &ishape, &ushape, n.since_version >= 29)?;
     if p == 0 || tail == 0 {
         let out = ctx.contiguous(data)?;
         ctx.bind(&n.outputs[0], out);
@@ -2089,9 +2308,10 @@ fn scatter_elements_claim(node: &NodeView) -> ClaimResult {
         node.num_inputs(),
         node.num_outputs()
     );
+    let reduction = node.string_attr("reduction", "none");
     require!(
-        node.string_attr("reduction", "none") == "none",
-        "ScatterElements: only reduction=none is claimed (add/mul/min/max reductions stay on CPU)"
+        reduction == "none" || reduction == "mean" && node.since_version() >= 29,
+        "ScatterElements supports reduction=none and opset-29 mean; use a supported reduction or another execution provider"
     );
     let (data, indices, updates, out) = match (
         node.input_info(0),
@@ -2102,10 +2322,11 @@ fn scatter_elements_claim(node: &NodeView) -> ClaimResult {
         (Some(a), Some(b), Some(c), Some(d)) => (a, b, c, d),
         _ => deny!("missing tensor type/shape info on an input or the output"),
     };
-    // mlx_put_along_axis's GPU kernel aborts on int64 payloads → keep to MLX float dtypes.
     require!(
-        is_mlx_float(data.dtype),
-        "data dtype {} unsupported: mlx_put_along_axis's GPU kernel needs an MLX float (fp32/fp16/bf16)",
+        is_mlx_float(data.dtype)
+            || reduction == "mean"
+                && (is_mlx_numeric(data.dtype) || crate::registry::is_float64(data.dtype)),
+        "ScatterElements data dtype {} unsupported: replacement supports fp32/fp16/bf16; mean supports real numeric types",
         crate::registry::ort_dtype_name(data.dtype)
     );
     require!(
@@ -2408,9 +2629,9 @@ fn reverse_sequence_claim(node: &NodeView) -> ClaimResult {
 }
 
 fn scatter_nd_compile_policy(reduction: &str) -> crate::registry::CompileShapeSafety {
-    if reduction == "add" {
+    if reduction == "add" || reduction == "mean" {
         crate::registry::CompileShapeSafety::EagerOnly {
-            reason: "validates live ScatterND add indices before unchecked MLX scatter writes",
+            reason: "validates live scatter reduction indices before unchecked MLX scatter writes",
         }
     } else {
         crate::registry::CompileShapeSafety::ShapeKeyedOnly {
@@ -2426,8 +2647,10 @@ fn scatter_nd_claim(node: &NodeView) -> ClaimResult {
     );
     let reduction = node.string_attr("reduction", "none");
     require!(
-        reduction == "none" || reduction == "add",
-        "ScatterND: supports reduction none/add"
+        reduction == "none"
+            || reduction == "add"
+            || reduction == "mean" && node.since_version() >= 29,
+        "ScatterND supports none/add and opset-29 mean; use a supported reduction or another execution provider"
     );
     require!(
         reduction != "add" || node.since_version() >= 16,
@@ -2445,8 +2668,10 @@ fn scatter_nd_claim(node: &NodeView) -> ClaimResult {
         _ => deny!("ScatterND: missing tensor type/shape info"),
     };
     require!(
-        is_mlx_float(data.dtype),
-        "ScatterND: data must be fp32/fp16/bf16 because MLX scatter payload kernels require float"
+        is_mlx_float(data.dtype)
+            || reduction == "mean"
+                && (is_mlx_numeric(data.dtype) || crate::registry::is_float64(data.dtype)),
+        "ScatterND data must be fp32/fp16/bf16 for none/add, or a real numeric type for mean"
     );
     let compatible = |left: &[i64], right: &[i64]| {
         left.len() == right.len()
@@ -2467,7 +2692,8 @@ fn scatter_nd_claim(node: &NodeView) -> ClaimResult {
     );
     let width = *indices.shape.last().unwrap();
     require!(
-        width > 0 && width as usize <= data.shape.len(),
+        (width > 0 || width == 0 && node.since_version() >= 29)
+            && width as usize <= data.shape.len(),
         "ScatterND: index tuple width must be static and within data rank"
     );
     let mut expected = indices.shape[..indices.shape.len() - 1].to_vec();
@@ -3902,12 +4128,27 @@ fn shape_keyed(
 
 pub fn register(registry: &mut OpRegistry) {
     shapeless(registry, "Gather", gather_op, gather_like_claim);
-    shape_keyed(
-        registry,
-        "GatherND",
-        gathernd_op,
-        gathernd_claim,
+    registry.register_shape_keyed(
+        OpRegistration {
+            domain: "",
+            op_type: "GatherND",
+            min_opset: K_ANY_OPSET,
+            max_opset: 28,
+            handler: gathernd_op,
+            claim: gathernd_claim,
+        },
         "conservatively shape-keyed: GatherND flattening strides and batch offsets depend on concrete input extents",
+    );
+    registry.register_eager(
+        OpRegistration {
+            domain: "",
+            op_type: "GatherND",
+            min_opset: 29,
+            max_opset: K_ANY_OPSET,
+            handler: gathernd_op,
+            claim: gathernd_claim,
+        },
+        "validates live GatherND indices before unchecked MLX gather reads",
     );
     shapeless(
         registry,
@@ -3915,12 +4156,27 @@ pub fn register(registry: &mut OpRegistry) {
         gather_elements_op,
         gather_like_claim,
     );
-    shape_keyed(
-        registry,
-        "ScatterElements",
-        scatter_elements_op,
-        scatter_elements_claim,
+    registry.register_shape_keyed(
+        OpRegistration {
+            domain: "",
+            op_type: "ScatterElements",
+            min_opset: K_ANY_OPSET,
+            max_opset: 28,
+            handler: scatter_elements_op,
+            claim: scatter_elements_claim,
+        },
         crate::registry::MLX_SCATTER_SHAPE_REASON,
+    );
+    registry.register_shape_classified(
+        OpRegistration {
+            domain: "",
+            op_type: "ScatterElements",
+            min_opset: 29,
+            max_opset: K_ANY_OPSET,
+            handler: scatter_elements_op,
+            claim: scatter_elements_claim,
+        },
+        |node| scatter_nd_compile_policy(&node.string_attr("reduction", "none")),
     );
     shape_keyed(
         registry,
@@ -4098,17 +4354,21 @@ mod tests {
             crate::registry::CompileShapeSafety::EagerOnly { .. }
         ));
         assert_eq!(
-            super::scatter_nd_geometry(&[2, 3, 4], &[0, 2], &[0, 4]).unwrap(),
+            super::scatter_nd_geometry(&[2, 3, 4], &[0, 2], &[0, 4], false).unwrap(),
             (2, 6, 4, 0)
         );
         assert_eq!(
-            super::scatter_nd_geometry(&[2, 3], &[2], &[]).unwrap(),
+            super::scatter_nd_geometry(&[2, 3], &[2], &[], false).unwrap(),
             (2, 6, 1, 1)
         );
-        assert!(super::scatter_nd_geometry(&[2], &[1, 2], &[1]).is_err());
-        assert!(super::scatter_nd_geometry(&[2], &[1, 0], &[1, 2]).is_err());
-        assert!(super::scatter_nd_geometry(&[2, 3], &[2, 1], &[2, 2]).is_err());
-        assert!(super::scatter_nd_geometry(&[i32::MAX, 2], &[1, 2], &[1]).is_err());
+        assert!(super::scatter_nd_geometry(&[2], &[1, 2], &[1], false).is_err());
+        assert!(super::scatter_nd_geometry(&[2], &[1, 0], &[1, 2], false).is_err());
+        assert_eq!(
+            super::scatter_nd_geometry(&[2], &[1, 0], &[1, 2], true).unwrap(),
+            (0, 1, 2, 1)
+        );
+        assert!(super::scatter_nd_geometry(&[2, 3], &[2, 1], &[2, 2], false).is_err());
+        assert!(super::scatter_nd_geometry(&[i32::MAX, 2], &[1, 2], &[1], false).is_err());
     }
 
     use super::{

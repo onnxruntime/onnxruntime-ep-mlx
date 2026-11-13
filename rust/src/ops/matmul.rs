@@ -400,9 +400,13 @@ fn grouped_claim(node: &NodeView) -> ClaimResult {
     } else {
         None
     };
+    let mut weight_shape = w.shape.clone();
+    if node.int_attr("transB", 0) != 0 && weight_shape.len() == 3 {
+        weight_shape.swap(1, 2);
+    }
     grouped_geometry(
         &x.shape,
-        &w.shape,
+        &weight_shape,
         &indices.shape,
         bias.as_ref().map(|b| b.shape.as_slice()),
         Some(&y.shape),
@@ -414,12 +418,16 @@ pub(super) fn grouped_matmul_op(
     ctx: &mut TranslationContext,
     n: &NodeDesc,
 ) -> Result<(), MlxError> {
-    if super::qdq::execute(ctx, n)? {
+    let trans_b = n.ints.get("transB").copied().unwrap_or(0) != 0;
+    if !trans_b && super::qdq::execute(ctx, n)? {
         return Ok(());
     }
     let x = ctx.resolve(&n.inputs[0])?;
     let xs = ctx.shape_of(x);
-    let w = ctx.resolve(&n.inputs[1])?;
+    let mut w = ctx.resolve(&n.inputs[1])?;
+    if trans_b {
+        w = ctx.transpose(w, &[0, 2, 1])?;
+    }
     let ws = ctx.shape_of(w);
     let indices = ctx.resolve(&n.inputs[2])?;
     let ish = ctx.shape_of(indices);
@@ -590,8 +598,8 @@ fn gemm_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
 
     let trans_a = n.ints.get("transA").copied().unwrap_or(0) != 0;
     let trans_b = n.ints.get("transB").copied().unwrap_or(0) != 0;
-    if trans_a {
-        a = ctx.transpose(a, &[1, 0])?;
+    if trans_a && ctx.ndim(a) >= 2 {
+        a = ctx.transpose(a, &fused_matmul_axes(ctx.ndim(a), true, false))?;
     }
     if trans_b {
         b = ctx.transpose(b, &[1, 0])?;
@@ -607,13 +615,31 @@ fn gemm_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
     } else {
         mm
     };
-    if present(n, 2) {
+    if present(n, 2) && (n.since_version < 29 || beta != 0.0) {
         let mut c = ctx.resolve(&n.inputs[2])?;
+        if n.since_version >= 29 {
+            let shape = ctx.shape_of(y);
+            let cshape = ctx.shape_of(c);
+            if cshape.len() > shape.len()
+                || !cshape
+                    .iter()
+                    .rev()
+                    .zip(shape.iter().rev())
+                    .all(|(&c, &y)| c == 1 || c == y)
+            {
+                return Err(format!(
+                    "Gemm-29: C shape {cshape:?} cannot broadcast to output {shape:?}; reshape C to a suffix compatible with Y"
+                ));
+            }
+        }
         if beta != 1.0 {
             let s = scalar_like(ctx, beta, dt)?;
             c = ctx.binary(mlx::mlx_multiply, c, s)?;
         }
         y = ctx.binary(mlx::mlx_add, y, c)?;
+    }
+    if n.since_version >= 29 && ctx.size_of(y) == 0 {
+        y = ctx.zeros(&ctx.shape_of(y), dt)?;
     }
     ctx.mark_fast("mlx_matmul");
     ctx.bind(&n.outputs[0], y);
@@ -669,16 +695,44 @@ fn gemm_claim(node: &NodeView) -> ClaimResult {
         crate::registry::ort_dtype_name(out.dtype)
     );
     require!(
-        a.shape.len() == 2 && b.shape.len() == 2,
-        "A and B must both have rank 2 (got ranks {} and {})",
+        (a.shape.len() == 2 || node.since_version() >= 29 && !a.shape.is_empty())
+            && b.shape.len() == 2,
+        "Gemm requires rank-2 B and rank-2 A before opset 29, rank >= 1 A from opset 29 (got {} and {})",
         a.shape.len(),
         b.shape.len()
     );
+    let mut product_shape = a.shape.clone();
+    if node.int_attr("transA", 0) != 0 && product_shape.len() >= 2 {
+        let rank = product_shape.len();
+        product_shape.swap(rank - 2, rank - 1);
+    }
+    let (k, width) = if node.int_attr("transB", 0) == 0 {
+        (b.shape[0], b.shape[1])
+    } else {
+        (b.shape[1], b.shape[0])
+    };
+    let reduction = product_shape.last_mut().expect("checked non-scalar A");
+    require!(
+        *reduction < 0 || k < 0 || *reduction == k,
+        "Gemm contraction dimensions must match after transposition"
+    );
+    *reduction = width;
     if nin == 3 && node.input_present(2) {
         match node.input_info(2) {
-            Some(c) if c.dtype == a.dtype && c.shape.len() <= 2 => {}
+            Some(c) if c.dtype == a.dtype && c.shape.len() <= product_shape.len() => {
+                require!(
+                    c.shape
+                        .iter()
+                        .rev()
+                        .zip(product_shape.iter().rev())
+                        .all(|(&c, &y)| c < 0 || y < 0 || c == 1 || c == y),
+                    "Gemm C shape {:?} must be unidirectionally broadcastable to {:?}",
+                    c.shape,
+                    product_shape
+                );
+            }
             Some(c) => deny!(
-                "C must match dtype {} and have rank <= 2 (got dtype {}, rank {})",
+                "C must match dtype {} and be unidirectionally broadcastable to Y (got dtype {}, rank {})",
                 crate::registry::ort_dtype_name(a.dtype),
                 crate::registry::ort_dtype_name(c.dtype),
                 c.shape.len()
@@ -761,14 +815,23 @@ pub fn register(registry: &mut OpRegistry) {
         handler: matmul_op,
         claim: matmul_claim,
     });
-    registry.register_shapeless(OpRegistration {
-        domain: "",
-        op_type: "Gemm",
-        min_opset: K_ANY_OPSET,
-        max_opset: K_ANY_OPSET,
-        handler: gemm_op,
-        claim: gemm_claim,
-    });
+    registry.register_shape_classified(
+        OpRegistration {
+            domain: "",
+            op_type: "Gemm",
+            min_opset: K_ANY_OPSET,
+            max_opset: K_ANY_OPSET,
+            handler: gemm_op,
+            claim: gemm_claim,
+        },
+        |node| if node.since_version() >= 29 {
+            crate::registry::CompileShapeSafety::ShapeKeyedOnly {
+                reason: "Gemm-29 specializes empty-result materialization on live output extents",
+            }
+        } else {
+            crate::registry::CompileShapeSafety::Shapeless
+        },
+    );
 }
 
 #[cfg(test)]

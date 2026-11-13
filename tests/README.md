@@ -55,6 +55,14 @@ python -m pytest tests/ops -q
 Running `pytest` without `ONNXRUNTIME_MLX_EP_LIB` set **skips** the suite (rather than failing), so
 it is safe to include in any pytest invocation.
 
+`test_opset29.py` and `test_packed_ops.py` use ONNX-main reference schemas for
+unreleased opset-29 contracts. With released ONNX packages, unavailable references
+are explicitly skipped. ORT 1.31 cannot load the new schemas, even with its
+development-opset override; those end-to-end cases are separately skipped, not
+counted as EP execution. The corresponding Rust tests run native CPU/Metal handlers
+directly, including all 20 supported packed formats, without an ORT model loader.
+See the [opset-29 support and remaining gaps](../docs/OP_ARCHITECTURE.md#opset-29-onnx-main-unreleased).
+
 `test_attention_semantics.py` uses small, locally built models and an independent float64 SDPA
 oracle rather than version-specific ONNX backend fixture names. It covers fully masked rows
 (including the combined causal/explicit mask), broadcast mask ranks, FP16/FP32, GQA and cached

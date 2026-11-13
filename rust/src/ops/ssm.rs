@@ -414,8 +414,11 @@ fn causal_conv_claim(node: &NodeView) -> ClaimResult {
         "dilation must be a positive int32"
     );
     require!(
-        !standard || (channels_last == 0 && dilation == 1 && state_window == 0),
-        "standard CausalConvWithState does not define contrib layout/dilation/window attributes"
+        !standard
+            || (channels_last == 0
+                && (node.since_version() >= 29 || dilation == 1)
+                && state_window == 0),
+        "standard CausalConvWithState requires channels-first/no state window; dilation requires opset 29"
     );
     let (input, weight) = match (node.input_info(0), node.input_info(1)) {
         (Some(a), Some(b)) => (a, b),
