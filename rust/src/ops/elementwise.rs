@@ -134,7 +134,7 @@ fn fold_variadic(
     ) -> i32,
 ) -> Result<mlx::mlx_array, MlxError> {
     let mut acc = ctx.resolve(&n.inputs[0])?;
-    for input in n.inputs.iter().skip(1) {
+    for input in &n.inputs[1..] {
         let next = ctx.resolve(input)?;
         acc = ctx.binary(op, acc, next)?;
     }

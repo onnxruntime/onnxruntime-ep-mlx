@@ -269,7 +269,7 @@ fn scan_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
         .clone();
 
     let mut state: Vec<mlx::mlx_array> = Vec::with_capacity(num_state);
-    for input in n.inputs.iter().take(num_state) {
+    for input in &n.inputs[..num_state] {
         state.push(ctx.resolve(input)?);
     }
     let mut scans: Vec<mlx::mlx_array> = Vec::with_capacity(num_scan);
