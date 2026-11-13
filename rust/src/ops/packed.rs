@@ -1289,8 +1289,10 @@ fn unpack_op(ctx: &mut TranslationContext, node: &NodeDesc) -> Result<(), MlxErr
         mlx::mlx_dtype__MLX_UINT32 => (
             32,
             host.data
-                .chunks_exact(4)
-                .map(|bytes| u32::from_ne_bytes(bytes.try_into().unwrap()) as u64)
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|&bytes| u32::from_ne_bytes(bytes) as u64)
                 .collect(),
         ),
         _ => return Err("MLX Unpack: input must be UINT8 or UINT32".into()),

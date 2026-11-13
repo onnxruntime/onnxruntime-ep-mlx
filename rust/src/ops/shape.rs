@@ -1396,10 +1396,10 @@ fn split_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> 
     if parts.size() != n.outputs.len() {
         return Err("MLX Split: backend returned an unexpected output count".to_string());
     }
-    for i in 0..n.outputs.len() {
+    for (i, output) in n.outputs.iter().enumerate() {
         let part = ctx.keep(parts.get(i));
         // Split parts are zero-copy strided views; contiguous is deferred to the output boundary.
-        ctx.bind(&n.outputs[i], part);
+        ctx.bind(output, part);
     }
     Ok(())
 }
