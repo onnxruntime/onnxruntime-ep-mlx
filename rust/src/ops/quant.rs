@@ -765,7 +765,7 @@ fn matmulnbits_repack(
         // runtime constant inputs still need an owned copy.
         let shape = [big_n as i32, words as i32];
         let arr = if wref.source == Src::Initializer {
-            crate::engine::initializer_array(wref, host.data, &shape, mlx::mlx_dtype__MLX_UINT32)
+            ctx.initializer_view(wref, host.data, &shape, mlx::mlx_dtype__MLX_UINT32)?
         } else {
             Array::from_data(host.data, &shape, mlx::mlx_dtype__MLX_UINT32)
         };
@@ -894,12 +894,12 @@ fn matmulnbits_scales(
         }
         let shape = [big_n, nblocks];
         let scales = if scales_ref.source == Src::Initializer {
-            crate::engine::initializer_array(
+            ctx.initializer_view(
                 scales_ref,
                 host.data,
                 &shape,
                 crate::engine::mlx_dtype_from_onnx(host.dtype),
-            )
+            )?
         } else {
             Array::from_data(
                 host.data,
@@ -947,11 +947,13 @@ fn matmulnbits_symmetric_biases(
                             .to_bits()
                     })
                     .collect();
-                Array::from_data(
-                    biases.as_ptr() as *const c_void,
-                    &shape,
-                    mlx::mlx_dtype__MLX_FLOAT16,
-                )
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(
+                        biases.as_ptr().cast(),
+                        std::mem::size_of_val(biases.as_slice()),
+                    )
+                };
+                ctx.derived_initializer_array(scales_ref, bytes, &shape, host.dtype)?
             }
             ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16 => {
                 let values = unsafe { std::slice::from_raw_parts(host.data as *const u16, count) };
@@ -962,20 +964,24 @@ fn matmulnbits_symmetric_biases(
                             .to_bits()
                     })
                     .collect();
-                Array::from_data(
-                    biases.as_ptr() as *const c_void,
-                    &shape,
-                    mlx::mlx_dtype__MLX_BFLOAT16,
-                )
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(
+                        biases.as_ptr().cast(),
+                        std::mem::size_of_val(biases.as_slice()),
+                    )
+                };
+                ctx.derived_initializer_array(scales_ref, bytes, &shape, host.dtype)?
             }
             ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT => {
                 let values = unsafe { std::slice::from_raw_parts(host.data as *const f32, count) };
                 let biases: Vec<f32> = values.iter().map(|&value| value * multiplier).collect();
-                Array::from_data(
-                    biases.as_ptr() as *const c_void,
-                    &shape,
-                    mlx::mlx_dtype__MLX_FLOAT32,
-                )
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(
+                        biases.as_ptr().cast(),
+                        std::mem::size_of_val(biases.as_slice()),
+                    )
+                };
+                ctx.derived_initializer_array(scales_ref, bytes, &shape, host.dtype)?
             }
             _ => {
                 return Err("MatMulNBits: scales must be fp16, bf16, or fp32".to_string());

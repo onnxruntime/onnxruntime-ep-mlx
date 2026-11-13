@@ -341,7 +341,7 @@ def test_standard_norm_compile_and_cpu_routes(tmp_path):
         [
             sys.executable, "-m", "pytest", Path(__file__).name,
             "-k", "test_standard_norm_dynamic_affine_dispatch or (test_standard_norm_stash and DOUBLE)",
-            "-q", "-p", "no:cacheprovider",
+            "-q", "-p", "no:cacheprovider", "-p", "no:randomly",
         ],
         cwd=Path(__file__).parent,
         env={
@@ -826,7 +826,7 @@ def test_skip_statistics_compile_routes(tmp_path):
     trace = tmp_path / "skip_statistics.json"
     subprocess.run(
         [sys.executable, "-m", "pytest", Path(__file__).name, "-k", "test_skip_statistics_trace_cases",
-         "-q", "-p", "no:cacheprovider"], cwd=Path(__file__).parent,
+         "-q", "-p", "no:cacheprovider", "-p", "no:randomly"], cwd=Path(__file__).parent,
         env={**os.environ, "ONNXRUNTIME_EP_MLX_TRACE": str(trace),
              "ONNXRUNTIME_EP_MLX_NO_COMPILE": "0", "ONNXRUNTIME_EP_MLX_NO_GENERAL_COMPILE": "0"},
         check=True, timeout=120,

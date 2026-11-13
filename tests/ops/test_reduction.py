@@ -77,7 +77,7 @@ def test_reduction_axes_compile_routing(tmp_path):
         [
             sys.executable, "-m", "pytest", Path(__file__).name,
             "-k", "(test_reduction_live_axes and compiled-enabled and ReduceSum and not ReduceSumSquare) or test_reduction_initializer_cache",
-            "-q", "-p", "no:cacheprovider",
+            "-q", "-p", "no:cacheprovider", "-p", "no:randomly",
         ],
         cwd=Path(__file__).parent,
         env={
@@ -1225,7 +1225,7 @@ def test_topk_compile_routes(tmp_path):
     trace = tmp_path / "topk.json"
     subprocess.run(
         [sys.executable, "-m", "pytest", Path(__file__).name, "-k", "test_topk_cache_replays",
-         "-q", "-p", "no:cacheprovider"],
+         "-q", "-p", "no:cacheprovider", "-p", "no:randomly"],
         cwd=Path(__file__).parent,
         env={**os.environ, "ONNXRUNTIME_EP_MLX_TRACE": str(trace),
              "ONNXRUNTIME_EP_MLX_NO_COMPILE": "0", "ONNXRUNTIME_EP_MLX_NO_GENERAL_COMPILE": "0"},

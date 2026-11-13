@@ -593,7 +593,7 @@ fn delta(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
         && softplus
         && attr("beta_activation", "none") == "sigmoid"
         && n.ints.get("qk_l2_norm").copied().unwrap_or(0) == 1
-        && std::env::var_os("ONNXRUNTIME_EP_MLX_CHUNKED_PREFILL").is_some_and(|value| value == "1");
+        && std::env::var_os("ONNXRUNTIME_EP_MLX_CHUNKED_PREFILL").is_none_or(|value| value == "1");
     let (body, init, step) = if chunked {
         (
             include_str!("paged_ssm_chunked.metal"),

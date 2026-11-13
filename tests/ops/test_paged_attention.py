@@ -376,6 +376,73 @@ def test_paged_vector_multiquery_cache_overlay(causal, mapping, monkeypatch):
         np.testing.assert_array_equal(updated, reference[index])
 
 
+@pytest.mark.parametrize("batch", [1, 3])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("window", [-1, 3])
+def test_paged_prefill_native_gqa(batch, causal, window, monkeypatch):
+    _check_native_prefill_gqa(
+        monkeypatch, 4, 2, 16, 4 * batch, 16, batch, 13, causal, window
+    )
+
+
+def test_paged_prefill_native_gqa_qwen_geometry(monkeypatch):
+    _check_native_prefill_gqa(monkeypatch, 24, 4, 256, 17, 256, 1, 4095, True, -1)
+
+
+def _check_native_prefill_gqa(
+    monkeypatch, heads, kv_heads, width, blocks, block, batch, past, causal, window
+):
+    geometry = (heads, kv_heads, width, blocks, block, batch)
+    proto = onnx.load_from_string(_model(*geometry, 0, 0))
+    node = proto.graph.node[0]
+    node.attribute.extend([
+        onnx.helper.make_attribute("is_causal", int(causal)),
+        onnx.helper.make_attribute("local_window_size", window),
+    ])
+    node.output.extend(["present.key", "present.value"])
+    for name in ("present.key", "present.value"):
+        proto.graph.output.append(onnx.helper.make_tensor_value_info(
+            name, onnx.TensorProto.FLOAT16, [blocks, block, kv_heads, width]
+        ))
+    feeds, _ = _inputs(*geometry, 0, 0, 881)
+    lengths = np.array([17] if batch == 1 else [17, 9, 0], dtype=np.int32)
+    feeds["cumulative_sequence_length"] = np.r_[0, np.cumsum(lengths)].astype(np.int32)
+    feeds["past_seqlens"] = np.full(batch, past, dtype=np.int32)
+    rng = np.random.default_rng(882)
+    for name, count in [("query", heads), ("key", kv_heads), ("value", kv_heads)]:
+        feeds[name] = (
+            rng.standard_normal((int(lengths.sum()), count * width)) * 0.3
+        ).astype(np.float16)
+    reference = _paged_ref(
+        *(feeds[name] for name in [
+            "query", "key", "value", "key_cache", "value_cache",
+            "cumulative_sequence_length", "past_seqlens", "block_table",
+        ]),
+        heads, kv_heads, width,
+        is_causal=causal,
+        local_window_size=window,
+        return_cache=True,
+    )
+    results = []
+    for enabled in ("0", "1", None):
+        if enabled is None:
+            monkeypatch.delenv("ONNXRUNTIME_EP_MLX_PAGED_PREFILL_GQA", raising=False)
+        else:
+            monkeypatch.setenv("ONNXRUNTIME_EP_MLX_PAGED_PREFILL_GQA", enabled)
+        options = ort.SessionOptions()
+        options.add_session_config_entry("session.disable_cpu_ep_fallback", "1")
+        session = ort.InferenceSession(
+            proto.SerializeToString(), options, providers=["MLXExecutionProvider"]
+        )
+        actual = session.run(None, {name: value.copy() for name, value in feeds.items()})
+        np.testing.assert_allclose(actual[0], reference[0], rtol=3e-3, atol=2e-4)
+        for value, expected in zip(actual[1:], reference[1:], strict=True):
+            np.testing.assert_array_equal(value, expected)
+        results.append(actual[0])
+    np.testing.assert_allclose(results[0], results[1], rtol=3e-3, atol=2e-4)
+    np.testing.assert_array_equal(results[1], results[2])
+
+
 @pytest.mark.parametrize("source", ["runtime", "initializer", "intermediate"])
 @pytest.mark.parametrize("eager", [False, True])
 def test_paged_attention_metadata_sources(source, eager, monkeypatch):

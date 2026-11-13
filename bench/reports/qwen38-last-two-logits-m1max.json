@@ -1,0 +1,59 @@
+{
+  "model": "Qwen/Qwen3.8-27B",
+  "device": "Apple M1 Max, 32 GPU cores, 32 GiB",
+  "platform": "macOS 27.0.1",
+  "runtime": "ONNX Runtime 1.32.0; MLX 0.32.4",
+  "scope": "Sequential, reverse-order, same-binary public GPU IOBinding K1 MTP qualification. No tracing or Metal capture.",
+  "quantization": "Original ONNX INT4/group32 weights and FP16 scales, unchanged",
+  "prompt_tokens": 16384,
+  "generated_tokens": 256,
+  "warmups_per_arm": 3,
+  "measured_requests_per_arm": 3,
+  "order": ["last_two_logits", "original"],
+  "plugin_sha256": "078f95daac85cd7284b6c380b061d23d3ea4c2d8d905f03f1e6517deae33c49f",
+  "original_target_sha256": "19c3f4153ee3683daa419e7092880a90345efd81cd88e928abe4965065c71a67",
+  "last_two_target_sha256": "203146b62f210b56f4d7a687ee2a428d9b435a9cad33ff0c30293a3516ee926a",
+  "draft_sha256": "fb15123f95b4bbc88358790a26f14fcb6b44aff72ec4552dd5424648715e4ca5",
+  "driver_sha256": "39a7563c7a951ee825ccf5b1f8d248944fe482e2a9b5efa9e05895d2f36d8299",
+  "residency_wrapper_sha256": "697952018575299b978fba67da9162373f70519b758b59b82c91d60ad4e9d98c",
+  "configuration": {
+    "blocks": 70,
+    "block_size": 256,
+    "prefill_chunk_size": 1024,
+    "capture_capacity": 4,
+    "cache_limit_bytes": 536870912,
+    "prefill_wired_bytes": 23622320128,
+    "decode_wired_bytes": 26800603136,
+    "residency_scope": "Exclusive process-wide experiment, not EP defaults"
+  },
+  "last_two_logits": {
+    "ttft_seconds": [128.55890750000253, 127.18303733295761, 130.60275204200298],
+    "decode_seconds": [28.964659332996234, 28.9409159590723, 28.940640458022244],
+    "median_ttft_seconds": 128.55890750000253,
+    "aggregate_decode_tokens_per_second": 8.808673969184436
+  },
+  "original": {
+    "ttft_seconds": [135.73192545794882, 134.96884966699872, 134.64640804100782],
+    "decode_seconds": [28.901456749998033, 28.890729999984615, 28.89741308405064],
+    "median_ttft_seconds": 134.96884966699872,
+    "aggregate_decode_tokens_per_second": 8.824587972
+  },
+  "median_ttft_reduction_percent": 4.7492011548,
+  "correctness": {
+    "all_warmup_and_measured_requests_match_original_reference_tokens": true,
+    "completed_mtp_rounds_per_request": 149,
+    "accepted_drafts_per_request": 106,
+    "prefix_replays_per_request": 43,
+    "draft_input_tokens_per_request": 255,
+    "recurrent_state": "FP32, unchanged",
+    "hidden_state_cache_and_capture_outputs": "Full original shapes and ownership, unchanged"
+  },
+  "graph_change": "Slice only the final hidden-state input to the vocabulary MatMulNBits to its last two rows. All one-token decode and two-token K1 verification logits are retained. Bulk-prefill logits are explicitly reduced.",
+  "public_contract": "Original target remains default. A transformed target requires an explicit last-two-logit runner option.",
+  "interpretation": "Qualified prefill improvement, no meaningful decode improvement in this pair. Absolute decode timings varied across earlier rounds; compare paired arms, not isolated historical numbers.",
+  "native_context": "Earlier llama.cpp Q4_0 measured 128.895577 s median TTFT and 16.166073 tok/s. Native quantization and outputs differ, and those runs were not paired with this qualification. Native decode parity remains unmet.",
+  "raw_local_artifacts": [
+    "qwen-last-two-final-last2-16k.json",
+    "qwen-last-two-final-full-16k.json"
+  ]
+}

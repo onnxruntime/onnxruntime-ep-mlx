@@ -179,8 +179,11 @@ export retained 256-row GDN inputs with a 1,024-token scheduling budget until
 `--max-scheduled-tokens 512 --prefill-chunk-size 512`. These options change only
 the recorded runtime overlay, not the exported model. Larger chunks can increase
 working memory and delay other requests, and are not automatically faster.
-The runner also records the explicit `ONNXRUNTIME_EP_MLX_CACHE_LIMIT_BYTES`
-allocator setting when present; its process-wide effects are described in
+The runner also records `ONNXRUNTIME_EP_MLX_CACHE_LIMIT_BYTES` and
+`ONNXRUNTIME_EP_MLX_WIRED_LIMIT_BYTES` when present. Public GPU tensor ownership
+does not itself wire buffers into the GPU working set. Choose an explicit
+residency budget for large-model measurements without exceeding the device's
+recommended working set; the process-wide effects are described in
 [`MEMORY.md`](../docs/MEMORY.md).
 
 The plugin's minimum ABI version is not sufficient to establish operator-schema
@@ -233,8 +236,9 @@ restore the state after partial draft acceptance without rerunning the target.
 GDN's optional inactive control zeroes its capsule without changing recurrence;
 capacity zero retains the ordinary two-output kernels.
 
-`ONNXRUNTIME_EP_MLX_CHUNKED_PREFILL=1` opts into an experimental eight-token
-block recurrence for packed GDN prefill. It requires at least 32 packed tokens,
+Packed GDN prefill uses an eight-token block recurrence by default.
+`ONNXRUNTIME_EP_MLX_CHUNKED_PREFILL=0` selects the original serial recurrence
+for an A/B control; `1` explicitly enables blocks. It requires at least 32 packed tokens,
 key/value widths divisible by eight, L2-normalized Q/K, sigmoid beta, softplus
 decay and enabled coefficient preparation. Calls with fewer than 32 packed
 tokens, including this batch-capacity-two model's short decode and MTP
@@ -242,19 +246,76 @@ verification calls, retain the existing recurrence. The block kernel
 keeps state and matrix arithmetic in FP32, uses direct decay products without
 clamping or dividing by a decay, and supports ragged tails, empty sequences and
 compact prefix capture. Its reassociated reductions are not bitwise identical
-to token-serial recurrence. The default remains off; an isolated kernel speedup is not an end-to-end TTFT claim.
+to token-serial recurrence. An isolated kernel speedup is not an end-to-end TTFT claim.
 The [initial full-model qualification](reports/qwen38-paged-chunked-prefill-mtp-m1max.json)
 preserved all generated tokens and speculative statistics, but median TTFT
 regressed from 18.430 to 23.961 seconds. A scheduler-256 short pilot did not
-establish a robust improvement either. These results do not qualify the
-experimental route for default enablement.
+establish a robust improvement either. This remains a CPU-visible regression
+case: default block execution does not imply an MTP speedup, and the serial
+control remains available.
 The separate [GPU-resident target-only qualification](reports/qwen38-public-chunked-prefill-m1max.json)
 uses the public ORT chunked driver at the same 64-token chunk size. Its full
 1K-input/256-output run improved median warm TTFT from 7.836 to 7.433 seconds,
 with every token matching the independent reference. A reversed-order short
 screen showed a smaller 1.6% TTFT reduction; all samples and timing caveats are
-retained. Use `ONNXRUNTIME_EP_MLX_CHUNKED_PREFILL=1` with that resident-state
-driver to opt in. This is not an MTP or WebGPU speedup claim.
+retained. This is not an MTP or WebGPU speedup claim.
+The [16K-input/256-output check](reports/qwen38-public-chunked-prefill-16k-m1max.json)
+on M1 Max uses 1,024-token public-driver chunks, 65 cache blocks, a 512 MiB
+free-cache limit and an explicit 26,800,603,136-byte wired limit. With three
+warmups and one measured repetition per mode, serial/block TTFT was
+146.527/141.153 seconds; decode was 9.697/9.560 tok/s. All 256 tokens matched
+each other and the independent GenAI target-only and MTP runs.
+The observed 3.7% TTFT reduction is a bounded check, not a statistically robust
+speedup; decode did not improve. GPU ownership alone was insufficient for stable
+long-context latency: an earlier unwired block run did not finish its first
+warmup in 40 minutes. That failed run is retained separately, not counted as a
+performance sample or a matched wiring A/B. The wired budget is opt-in and
+device-specific; do not copy this machine's limit without checking available
+working-set capacity.
+
+The [genuine GenAI 16K MTP check](reports/qwen38-paged-mtp-16k-wired-m1max.json)
+uses the same unpruned export for target-only and MTP, CPU-owned GenAI state,
+256-token scheduling/chunks and 70 cache blocks. Three warmups and one measured
+repetition gave target/MTP TTFT of 171.190/173.191 seconds and decode of
+6.859/5.998 tok/s. MTP completed 116 speculative rounds with 248 draft tokens
+evaluated, 139 accepted and zero failures; all 256 output tokens matched.
+This is a negative MTP result, not a 50% speedup or a matched WebGPU comparison.
+The initial 66-block MTP attempt was rejected before generation because GenAI's
+speculative scheduling reserve reduced its maximum request length to 15,873;
+both final GenAI modes were rerun at 70 blocks.
+
+The [16K proposal-budget sweep](reports/qwen38-paged-mtp-proposal-budget-16k-m1max.json)
+keeps the original capacity-four target/draft graphs and the same native binary.
+Reducing the runtime proposal budget avoids much of the rejected draft work:
+
+| GenAI MLX configuration | Warm TTFT | Decode |
+|---|---:|---:|
+| K4, 256-token chunks | 173.191 s | 5.998 tok/s |
+| K1, 256-token chunks | 174.909 s | 9.452 tok/s |
+| K2, 256-token chunks | 176.909 s | 7.699 tok/s |
+| K1, 1,024-token chunks | 156.832 s | 9.554 tok/s |
+| Separate selected-head K1, 1,024-token chunks | 145.479 s | 9.137 tok/s |
+
+All 256 MLX tokens match the target-only control. The original-export
+K1/chunk-1024 result is an observed 59.3% increase over K4 MTP, but only 39.3%
+over the non-speculative GenAI control. These are single measured repetitions
+after three warmups, not universal defaults or statistically robust speedups.
+Use explicit `--mtp --max-draft-tokens 1 --prefill-chunk-size 1024
+--max-scheduled-tokens 1024 --num-blocks 70` for this configuration.
+GenAI's reported `max_draft_tokens_per_proposal` remains the export capacity,
+four; the runtime overlay and actual proposal counts establish K1.
+The selected-head variant lowers TTFT but regresses measured decode, so no
+production model-interface rewrite is retained.
+
+WebGPU rebuilt from main at `f795db61a827f2d09710a62dc704289b18811a43`
+completed K1/chunk-256 at 525.951-second TTFT and 5.766 tok/s on this M1 Max.
+Its generated tokens diverge from MLX starting at zero-based index 39, so the
+result does **not** establish an exact-output cross-EP throughput win.
+The K4 attempts exceeded separate 40- and 75-minute orchestration bounds;
+their warmups and failure evidence remain in the report, not final throughput
+samples. WebGPU retains its working device interface and initializer sharing;
+MLX uses CPU-owned GenAI state and its explicit residency budget.
+
 Compare this option at fixed `--max-scheduled-tokens` before tuning the
 scheduler budget, and compare generated tokens and speculative statistics.
 `ONNXRUNTIME_EP_MLX_NO_GDN_PREPARE=1` also disables the block route.
@@ -266,6 +327,114 @@ Packed SSM decoders coalesce capture-compatible neighbours into shape-keyed
 regions rather than splitting at every shapeless/shape-keyed edge. Paged
 attention keeps its separate cache-alias boundary; existing eager and
 live-metadata boundaries remain eager.
+
+### Public-ORT GPU-resident K1 MTP
+
+`python -m bench.ort_mtp` is a separate fixed-length greedy outer loop, not
+GenAI Engine or a transparent EP rewrite. It uses the unchanged unpruned
+target/draft exports, public GPU OrtValues, and GPU greedy selection.
+Only sampled token IDs are read on CPU. State, captures, hidden states and
+full logits stay GPU-owned; intermediate prefill logits are released before
+decode. Bindings and state allocations are reused across requests. Recurrent and
+convolution states are reset; `past=0` logically invalidates KV without clearing
+the full cache. ORT memory patterns are disabled. Repeated 16K requests qualified
+with the explicit residency budget below; earlier larger-budget attempts hit GPU OOM.
+The draft head starts cold from the final target prompt hidden row.
+Accepted drafts are re-fed with their corresponding target hidden rows.
+
+`bench.mtp_replay` builds separate checkpoint and prefix-one replay models
+using existing ONNX operators. Recurrent replay applies the captured FP32
+decay with `Mul`, then a linear `GatedDeltaNet` update with captured keys and
+deltas. Convolution history uses bit-preserving slices and concatenation.
+Rejection restores from the pre-verification checkpoint; paged KV is retained,
+with its logical length rolled back so invalid future slots are excluded and
+overwritten on the next verification. This helper is not an implementation of
+the distinct `GatedDeltaNetStateReplay`/`ConvStateReplay` operator ABIs.
+
+Run with a flat GenAI reference containing the exact prompt and output IDs:
+
+```bash
+python -m bench.ort_mtp --model MODEL --library MLX_DYLIB \
+  --reference TARGET_REFERENCE_JSON --output RESULT_JSON \
+  --blocks 70 --block-size 256 --capacity 4 \
+  --prefill-chunk-size 512 --tokens 256 --warmup 3 --repetitions 5
+```
+
+Configure a device-appropriate explicit wired/cache budget before execution;
+GPU allocation alone does not guarantee residency. The capture capacity must
+match the export, even though the runtime proposal budget is one. Every warmup
+and measured output must match the reference before a timing report is written.
+The report distinguishes this interface and its cold-head priming from GenAI.
+One-time helper/buffer setup and per-request state resets are excluded from
+TTFT; prefill and first greedy selection are included. Same-round emitted tokens
+retain their shared timestamp rather than inventing evenly spaced inter-token timings.
+
+Add `--target-only` for a non-speculative control using the same unpruned target
+export, GPU state, and greedy selector. It runs one target token at a time
+without draft, checkpoint, or replay execution. Its report sets
+`max_draft_tokens` to zero and all speculative counters to zero; MTP remains
+the default. This control isolates execution differences within the ONNX
+export, not differences from native-runtime model conversions.
+
+For an explicit model-native prefill optimization, build a separate target
+graph that projects only the last two hidden rows:
+
+```python
+from pathlib import Path
+import onnx
+from bench.ort_mtp import make_last_two_logit_model
+
+model = Path("MODEL")
+target = onnx.load(model / "model.onnx", load_external_data=False)
+onnx.save(make_last_two_logit_model(target), model / "model.last-two-logits.onnx")
+```
+
+Keep it beside the original graph so relative external-weight references remain
+valid; weights are not loaded or rewritten. Add
+`--target-last-two-logits MODEL/model.last-two-logits.onnx` to the benchmark.
+
+The [16K M1 Max qualification](reports/qwen38-last-two-logits-m1max.json)
+measured 128.559 s median TTFT versus 134.969 s for the original target, with
+unchanged reference tokens and effectively unchanged decode throughput.
+This is a model-native vocabulary-projection reduction, not an EP kernel gain.
+Only the vocabulary projection input is sliced. All hidden, cache and recurrent
+outputs are preserved, and one-token decode/two-token K1 verification retain
+every original logit row. This uses one target session, not a second prefill
+session. It is an explicit graph rewrite, not an unchanged-export EP comparison
+or permission for ordinary public sessions to omit output rows.
+
+The original target remains the default comparison. Before treating the clipped
+graph as a performance improvement, qualify exact reference tokens and measure
+prefill and decode independently; different QMM/QMV paths can change rounding.
+
+[The small-input ownership qualification](reports/qwen38-owned-small-inputs-16k-m1max.json)
+keeps CPU runtime inputs of at most 4096 bytes in owned MLX arrays, allowing
+GPU-only boundaries to use their existing asynchronous evaluation path.
+Large borrowed CPU inputs, CPU outputs, and input writebacks remain synchronous.
+The owned path is default; `ONNXRUNTIME_EP_MLX_OWN_SMALL_INPUTS=0` restores
+borrowed wrapping for small inputs.
+
+On M1 Max 32 GiB, the same-binary 16K/256 qualification used three warmups and
+three measured requests per arm. Aggregate K1 MTP decode rose from 11.483 to
+11.936 tokens/s, while median TTFT changed from 135.401 to 136.275 seconds.
+All twelve requests matched the unchanged target reference. Subsequent
+shipping-binary default/opt-out checks also matched, but timings varied
+substantially: 9.321 versus 7.502 tokens/s and 134.453 versus 171.101 seconds
+TTFT. These checks are not a clean additional speedup measurement.
+
+The earlier native llama.cpp reference remains 128.896 seconds TTFT and
+16.166 tokens/s. Its mixed GGUF quantization differs from the ONNX affine
+INT4/group32 export, and generated tokens differ across native runtimes.
+The llama.cpp throughput target has not been reached.
+
+[The M1 Max 32 GiB residency screen](reports/qwen38-public-mtp-residency-16k-m1max.json)
+completed three warmups and one measured 256-token request at 16,384 input tokens;
+all four outputs matched the reference. With 512-token chunks, a 22 GiB wired cap
+(`23622320128` bytes) and a 512 MiB cache limit, the measured result was
+183.044 s TTFT and 9.296 tok/s. This qualifies a GPU-resident MTP baseline, not a
+new speed win or a universal memory-budget default. Earlier 24.96 GiB wired-cap
+attempts failed during repeated prefill. Native allocation counters did not
+establish a large monotonic leak; the driver-OOM root cause remains unresolved.
 
 ### Qwen3.8-27B compact MTP capture qualification
 
@@ -317,6 +486,13 @@ Device tensors and their transfers must stay on their producer's inference
 thread. MLX device addresses are opaque allocator identifiers, not host buffers
 or an interop contract with another GPU provider. Use the registered memory
 information, not a hand-constructed memory descriptor:
+
+When this mode is enabled, a co-registered GPU provider with an equivalent ORT
+memory-device descriptor can match MLX's transfer callback. Foreign allocations
+are rejected safely, but ORT cannot retry a later provider's transfer. Use
+separate processes for such providers, or copy through the owning EP to CPU
+before passing data to MLX. Float64 device views and downloads use the MLX CPU
+stream; they do not enable float64 Metal computation.
 
 ```python
 device = next(d for d in ort.get_ep_devices() if d.ep_name == "MLXExecutionProvider")
@@ -377,6 +553,28 @@ arrays that could have other owners.
 
 For same-binary diagnostics, `ONNXRUNTIME_EP_MLX_NO_PAGED_DIRECT=1` and
 `ONNXRUNTIME_EP_MLX_NO_PAGED_PATCHES=1` independently disable these changes.
+
+MRotaryEmbedding shares per-column position indices and gathers only the
+selected cosine/sine cache values, rather than gathering all three full streams
+and assembling them with per-column Slice/Concat chains. Position validation,
+stream assignment, dtype, and scale arithmetic are unchanged. The column and
+stream maps are cached; caches too large for safe int32 linear addressing retain
+the original path. All other valid inputs use the column gather without model,
+hardware, or process-flag gating; no chip-specific kernel is selected. The
+[M1 Max qualification](reports/qwen38-mrope-column-gather-m1max.json) measured
+about 27% faster aggregate short-context decode and 30% faster 16K decode with
+unchanged tokens and FP32 state. 16K TTFT was effectively unchanged. The report
+retains all samples, including the slower candidate request, and records the
+temporary diagnostic opt-out used for its historical control arm. Newer Macs
+were not measured.
+
+The [follow-up decode experiments](reports/qwen38-decode-followups-m1max.json)
+retain the completed non-speculative 16K control and all short-context samples.
+Fixed K2, confidence-gated K2, draft last-logit pruning and forcing native
+matrix kernels did not establish a gain over the qualified K1 defaults, so
+none is enabled. More accepted drafts or fewer projected rows alone are not
+an end-to-end speedup. Native aggregate parity and newer-Mac gains remain
+unproven.
 
 Packed GDN prepares FP32 normalized Q/K and decay/beta coefficients once when
 there are more than eight packed tokens and at least 32 value rows, rather than

@@ -158,7 +158,7 @@ impl Array {
         }
         let data = storage.as_ptr().cast_mut().cast();
         let payload = std::sync::Arc::into_raw(storage).cast_mut().cast();
-        Self::from_raw(unsafe {
+        let array = Self::from_raw(unsafe {
             mlx::mlx_array_new_data_managed_payload(
                 data,
                 shape.as_ptr(),
@@ -167,7 +167,15 @@ impl Array {
                 payload,
                 Some(release_storage),
             )
-        })
+        });
+        let tr = crate::trace::tracer();
+        if tr.active() {
+            tr.record_managed_wrap(
+                (array.size() * array.itemsize()) as u64,
+                (data as usize).is_multiple_of(16384),
+            );
+        }
+        array
     }
 
     /// A distinct C handle referencing the same array storage.
