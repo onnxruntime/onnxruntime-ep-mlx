@@ -32,6 +32,40 @@ python bench/compare.py --base base.json --pr pr.json --threshold 10 > comment.m
 Emits a Markdown table (regressions 🔴, improvements 🟢, new CPU fallbacks ⛔).
 Timing flags are threshold-based observations, not proof of a performance change.
 
+## Softmax numerical audit
+
+`softmax_numerics.py` reproduces the forward collapse described in
+[A Fix for Softmax and Cross-Entropy](https://arxiv.org/html/2610.31642v1).
+It compares Softmax, LogSoftmax, SoftmaxCrossEntropyLoss (including its optional
+log-probability output), NLL, and fused/composed attention with an independent
+FP64 reference. Cases include high margins, tied maxima, a single class,
+non-max targets, and large common offsets. FP16/BF16 inputs are quantized before
+constructing the reference; unavoidable output underflow is distinguished from
+lost log-probabilities.
+
+With the built plugin and Python `mlx`, `onnxruntime`, `onnx_ir`, and `numpy`
+available:
+
+```sh
+ONNXRUNTIME_MLX_EP_LIB=rust/target/release/libonnxruntime_mlx_ep.dylib \
+  python bench/softmax_numerics.py --output /tmp/softmax-numerics.json
+```
+
+Use `--mode accuracy` or `--mode benchmark` to run only one part. The ONNX
+baseline and paper-style candidate run through the EP with CPU fallback and ORT
+graph optimizations disabled. Separate compiled-MLX timings compare an
+inference-only `log1p` formulation and distinguish loss of fused SDPA from
+normalization overhead. Each latency sample synchronizes output evaluation;
+warmup/compilation is excluded. JSON includes raw samples and device/version
+metadata. Repeat in separate processes on an idle machine before interpreting
+small differences.
+
+The candidates are benchmark graphs, not production replacements. The existing
+`x - logsumexp(x)` loss/log-softmax path can lose representable values, including
+BF16 uniform logits with a large common offset. Rewriting the normalizer
+improves those outputs but can add significant dispatch/memory overhead; the
+paper's training-gradient benefits do not establish an inference speedup.
+
 ## CI
 
 `.github/workflows/bench.yml` is **manual-only**. In Actions, select the **Bench**
