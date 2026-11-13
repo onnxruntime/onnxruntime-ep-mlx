@@ -995,7 +995,9 @@ pub fn try_compiled(
             device_outputs &= publish_device_output(api, kctx, output, &outs.get(i))?;
         }
     }
-    let eval_result = if device_outputs {
+    // A captured boundary must finish before its guard stops Metal capture.
+    let capture = tr.begin_gpu_capture();
+    let eval_result = if device_outputs && capture.is_none() {
         let result = unsafe { mlxsys::mlx_async_eval(outs.as_raw()) };
         if result == 0 {
             Ok(())
@@ -1003,7 +1005,6 @@ pub fn try_compiled(
             Err("MLX compiled device evaluation failed; inspect GPU availability".into())
         }
     } else {
-        let _capture = tr.begin_gpu_capture();
         let _eval_region = tr.eval_region();
         mlx::eval(&outs)
     };

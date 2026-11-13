@@ -24,6 +24,7 @@ NAMES = ["y", "indices", "inverse", "counts"]
 BROKEN_UNSORTED_REFERENCE = onnx.__version__.split("+")[0] in {
     "1.22.0", "1.23.0", "1.23.1", "1.23.2",
 }
+ORT_131 = ort.__version__.split("+", 1)[0].split(".")[:2] == ["1", "31"]
 
 
 def _model(dtype=np.float32, shape=None, *, axis=None, sorted=None, outputs=(0, 1, 2, 3),
@@ -248,9 +249,10 @@ def test_unique_scalar_and_zero_sized_slices(shape, axis, sorted, tmp_path):
         capture_output=True, text=True, timeout=30)
     (tmp_path / "ort_cpu_unique.stdout").write_text(child.stdout)
     (tmp_path / "ort_cpu_unique.stderr").write_text(child.stderr)
-    if child.returncode == -signal.SIGABRT and ort.__version__ == "1.31.0":
+    if child.returncode == -signal.SIGABRT and ORT_131:
         warnings.warn(
-            f"ORT 1.31 CPU Unique aborted for shape={shape}, axis={axis}, sorted={sorted}; "
+            f"ORT {ort.__version__} CPU Unique aborted for shape={shape}, axis={axis}, "
+            f"sorted={sorted}; "
             f"CPU authority unavailable (diagnostic: {tmp_path}). "
             "Strict MLX and independent typed/Reference checks passed.",
             RuntimeWarning, stacklevel=1)

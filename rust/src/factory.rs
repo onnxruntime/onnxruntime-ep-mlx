@@ -239,7 +239,7 @@ unsafe fn create_ep_impl(
                 Ok(value) => value.unwrap_or(true),
                 Err(status) => return status,
             };
-        let status = crate::memory::configure_cache(&*f.ort_api, session_options);
+        let status = crate::memory::configure(&*f.ort_api, session_options);
         if !status.is_null() {
             return status;
         }
@@ -295,8 +295,16 @@ unsafe extern "C" fn create_data_transfer(
     data_transfer: *mut *mut ort::OrtDataTransferImpl,
 ) -> *mut ort::OrtStatus {
     let factory = unsafe { &*this(p) };
-    unsafe { *data_transfer = crate::device::create_transfer(factory.ort_api, factory.ep_api) };
-    ptr::null_mut()
+    match crate::device::create_transfer(factory.ort_api, factory.ep_api) {
+        Ok(transfer) => {
+            unsafe { *data_transfer = transfer };
+            ptr::null_mut()
+        }
+        Err(error) => {
+            unsafe { *data_transfer = ptr::null_mut() };
+            crate::device::status(unsafe { &*factory.ort_api }, error)
+        }
+    }
 }
 unsafe extern "C" fn create_sync_stream_for_device(
     _p: *mut ort::OrtEpFactory,

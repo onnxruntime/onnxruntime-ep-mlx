@@ -131,6 +131,101 @@ def runtime_model(serialized, dtype):
     return proto.SerializeToString()
 
 
+def mrotary_reference(x, positions, cos, sin, sections, layout, interleaved, scale, rank):
+    dtype = x.dtype
+    half = cos.shape[1]
+    assignment = np.zeros(half, dtype=np.int64)
+    if layout == 0:
+        start = 0
+        for stream, width in enumerate(sections):
+            assignment[start : start + width] = stream
+            start += width
+    else:
+        for stream, width in enumerate(sections[1:], 1):
+            assignment[stream : min(width * 3, half) : 3] = stream
+
+    selected_positions = positions[assignment].transpose(1, 2, 0)
+    columns = np.arange(half)
+    selected = []
+    for cache in (cos, sin):
+        values = cache[selected_positions, columns]
+        if scale != 1.0:
+            values = (values.astype(np.float32) * np.float32(scale)).astype(dtype)
+        selected.append(values[:, None])
+    cos_rows, sin_rows = selected
+
+    x4 = x if rank == 4 else x.reshape(x.shape[0], x.shape[1], 2, 12).transpose(0, 2, 1, 3)
+    rot = 2 * half
+    if interleaved:
+        pairs = x4[..., :rot].reshape(*x4.shape[:-1], half, 2)
+        first, second = pairs[..., 0], pairs[..., 1]
+        rotated = np.stack(
+            [first * cos_rows - second * sin_rows, first * sin_rows + second * cos_rows],
+            axis=-1,
+        ).reshape(*x4.shape[:-1], rot)
+    else:
+        first, second = x4[..., :half], x4[..., half:rot]
+        rotated = np.concatenate(
+            [first * cos_rows - second * sin_rows, first * sin_rows + second * cos_rows],
+            axis=-1,
+        )
+    expected = np.concatenate([rotated, x4[..., rot:]], axis=-1)
+    if rank == 3:
+        expected = expected.transpose(0, 2, 1, 3).reshape(x.shape)
+    return expected.astype(dtype)
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.float16, ml_dtypes.bfloat16])
+@pytest.mark.parametrize("rank", [3, 4])
+@pytest.mark.parametrize("layout,interleaved,rot", [(0, 0, 12), (1, 1, 8)])
+@pytest.mark.parametrize("eager", [False, True])
+def test_mrotary_column_gather_reference(dtype, rank, layout, interleaved, rot, eager, monkeypatch):
+    monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_COMPILE", "1" if eager else "0")
+    shape = ["batch", "tokens", 24] if rank == 3 else ["batch", 2, "tokens", 12]
+    half = rot // 2
+    sections = [2, 1, half - 3]
+    scale = 1.0003
+    model = m.make_model(
+        "MRotaryEmbedding",
+        [
+            m.tensor("x", storage_type(dtype), shape),
+            m.tensor("positions", ir.DataType.INT64, [3, "batch", "tokens"]),
+            m.tensor("cos", storage_type(dtype), [17, half]),
+            m.tensor("sin", storage_type(dtype), [17, half]),
+        ],
+        [m.tensor("y", storage_type(dtype), shape)],
+        domain="com.microsoft",
+        attributes={
+            "num_heads": 2, "mrope_section": sections,
+            "mrope_layout": layout, "interleaved": interleaved,
+            "rotary_embedding_dim": rot, "scale": scale,
+        },
+    )
+    model = runtime_model(model, dtype)
+    session = strict_session(model)
+    rng = np.random.default_rng(413)
+    for batch, tokens in [(2, 3), (1, 1), (1, 0), (3, 5), (2, 3)]:
+        cos = rng.standard_normal((17, half)).astype(dtype)
+        sin = rng.standard_normal((17, half)).astype(dtype)
+        x4 = rng.standard_normal((batch, 2, tokens, 12)).astype(dtype)
+        x = x4 if rank == 4 else x4.transpose(0, 2, 1, 3).reshape(batch, tokens, 24)
+        positions = rng.integers(0, 17, (3, batch, tokens), dtype=np.int64)
+        feeds = {
+            "x": x, "positions": positions,
+            "cos": cos, "sin": sin,
+        }
+        expected = mrotary_reference(
+            x, positions, cos, sin, sections, layout, interleaved, scale, rank
+        )
+        if dtype == ml_dtypes.bfloat16:
+            feeds = {name: value.astype(np.float32) if name != "positions" else value
+                     for name, value in feeds.items()}
+            expected = expected.astype(np.float32)
+        actual = session.run(None, feeds)[0]
+        tolerance = 2e-5 if dtype == np.float32 else 3e-3
+        np.testing.assert_allclose(actual, expected, rtol=tolerance, atol=tolerance)
+
+
 def runtime_feeds(feeds):
     return {
         name: array.astype(np.float32) if array.dtype == ml_dtypes.bfloat16 else array
@@ -319,7 +414,10 @@ def delta_reference(feeds, hq, h, k, v, rule, fused, norm, scale=0.0, capacity=0
 
 
 @pytest.mark.parametrize("dtype", [np.float32, np.float16, ml_dtypes.bfloat16])
-@pytest.mark.parametrize("geometry", [(2, 6, 16, 32), (16, 48, 128, 128)])
+@pytest.mark.parametrize(
+    "geometry",
+    [(2, 6, 8, 8), (2, 6, 16, 32), (16, 48, 128, 128), (2, 6, 256, 64)],
+)
 @pytest.mark.parametrize("capacity", [0, 4, 8])
 def test_chunked_delta_dynamic(dtype, geometry, capacity, monkeypatch):
     hq, h, k, v = geometry
@@ -409,6 +507,16 @@ def test_chunked_delta_dynamic(dtype, geometry, capacity, monkeypatch):
         control = baseline.run(None, runtime_feeds(feeds))
         monkeypatch.setenv("ONNXRUNTIME_EP_MLX_CHUNKED_PREFILL", "1")
         actual = candidate.run(None, runtime_feeds(feeds))
+        if tokens == 65:
+            with monkeypatch.context() as default_environment:
+                default_environment.delenv(
+                    "ONNXRUNTIME_EP_MLX_CHUNKED_PREFILL", raising=False
+                )
+                default = strict_session(serialized).run(None, runtime_feeds(feeds))
+            for result, enabled in zip(default, actual, strict=True):
+                np.testing.assert_array_equal(
+                    result.view(np.uint8), enabled.view(np.uint8)
+                )
         tolerance = 8e-3 if dtype == ml_dtypes.bfloat16 else 1e-3
         np.testing.assert_allclose(
             actual[0], expected[0], rtol=tolerance, atol=tolerance
@@ -437,11 +545,18 @@ def test_chunked_delta_dynamic(dtype, geometry, capacity, monkeypatch):
                     "offsets": np.array([0, 0, prefix + 1], np.int32),
                 }
                 prefix_state = delta_reference(
-                    prefix_feeds, hq, h, k, v, "gated_delta", True, True, scale, capacity
+                    prefix_feeds,
+                    hq,
+                    h,
+                    k,
+                    v,
+                    "gated_delta",
+                    True,
+                    True,
+                    scale,
+                    capacity,
                 )[1][1]
-                np.testing.assert_allclose(
-                    replayed, prefix_state, rtol=2e-5, atol=2e-6
-                )
+                np.testing.assert_allclose(replayed, prefix_state, rtol=2e-5, atol=2e-6)
         if tokens < 32:
             for result, reference in zip(actual, control, strict=True):
                 np.testing.assert_array_equal(

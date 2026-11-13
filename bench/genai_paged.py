@@ -364,6 +364,7 @@ def main():
                 "ONNXRUNTIME_EP_MLX_NO_GDN_PREPARE",
                 "ONNXRUNTIME_EP_MLX_CHUNKED_PREFILL",
                 "ONNXRUNTIME_EP_MLX_CACHE_LIMIT_BYTES",
+                "ONNXRUNTIME_EP_MLX_WIRED_LIMIT_BYTES",
             )
             if name in os.environ
         },

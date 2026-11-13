@@ -1051,6 +1051,66 @@ impl<'a> TranslationContext<'a> {
         raw
     }
 
+    fn runtime_input_array(&mut self, data: *const c_void, shape: &[i32], dtype: u32) -> Array {
+        let count = shape.iter().try_fold(1usize, |count, &dim| {
+            count.checked_mul(usize::try_from(dim).ok()?)
+        });
+        let small = count
+            .and_then(|count| {
+                onnx_runtime_ir::DataType::from_onnx(dtype as i32)
+                    .and_then(|dtype| dtype.checked_storage_bytes(count))
+            })
+            .is_some_and(|bytes| bytes <= 4096);
+        if small
+            && std::env::var_os("ONNXRUNTIME_EP_MLX_OWN_SMALL_INPUTS")
+                .is_none_or(|value| value != "0" && !value.is_empty())
+        {
+            Array::from_data(data, shape, mlx_dtype_from_onnx(dtype))
+        } else {
+            self.borrowed_runtime_inputs = true;
+            Array::from_data_managed(data, shape, mlx_dtype_from_onnx(dtype))
+        }
+    }
+
+    pub(crate) fn initializer_view(
+        &mut self,
+        input: &TensorRef,
+        data: *const c_void,
+        shape: &[i32],
+        dtype: mlxsys::mlx_dtype,
+    ) -> Result<Array, MlxError> {
+        if input.source == Src::Initializer
+            && let Some(init) = &input.init
+            && let Some(shared) = crate::shared_initializers::get_view(init, shape, dtype)?
+        {
+            let handle = shared.array.retained()?;
+            self.plan.shared_initializers.push(shared);
+            return Ok(handle);
+        }
+        Ok(initializer_array(input, data, shape, dtype))
+    }
+
+    pub(crate) fn derived_initializer_array(
+        &mut self,
+        input: &TensorRef,
+        data: &[u8],
+        shape: &[i32],
+        dtype: u32,
+    ) -> Result<Array, MlxError> {
+        if input.source == Src::Initializer
+            && let Some(shared) = crate::shared_initializers::get_derived(data, shape, dtype)?
+        {
+            let handle = shared.array.retained()?;
+            self.plan.shared_initializers.push(shared);
+            return Ok(handle);
+        }
+        Ok(Array::from_data(
+            data.as_ptr().cast(),
+            shape,
+            mlx_dtype_from_onnx(dtype),
+        ))
+    }
+
     /// Borrow an arena-owned intermediate from this graph translation.
     pub fn temporary_get(&self, key: &str) -> Option<mlxsys::mlx_array> {
         self.temporary_arrays.get(key).copied()
@@ -1382,13 +1442,9 @@ impl<'a> TranslationContext<'a> {
                     self.plan.cache.insert(r.name.clone(), arr);
                     Ok(raw)
                 } else {
-                    // Zero-copy wrap of the live ORT input buffer (ORT owns it for the whole Compute
-                    // call; MLX borrows via a no-op deallocator and the wrapper drops before we
-                    // return, after the synchronous boundary eval). Dominant win in shared-buffer
-                    // mode where the per-token past K/V is a full [B,kv,cap,hd] buffer that
-                    // `from_data` used to memcpy every token.
-                    let arr = Array::from_data_managed(data, &ishape, mlx_dtype_from_onnx(dtype));
-                    self.borrowed_runtime_inputs = true;
+                    // Owned small inputs can outlive Compute; borrowed large inputs still require
+                    // synchronous evaluation before ORT may reuse their zero-copy buffers.
+                    let arr = self.runtime_input_array(data, &ishape, dtype);
                     let raw = self.keep_input(arr);
                     self.env.insert(r.name.clone(), raw);
                     Ok(raw)
@@ -1514,12 +1570,12 @@ impl<'a> TranslationContext<'a> {
             self.plan.cache.insert(cache_key, array);
             raw
         } else {
-            self.borrowed_runtime_inputs = true;
-            self.keep_input(Array::from_data_managed(
+            let array = self.runtime_input_array(
                 host.data,
                 &storage_shape,
-                mlxsys::mlx_dtype__MLX_UINT8,
-            ))
+                ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8,
+            );
+            self.keep_input(array)
         };
         Ok(Some(Packed4 {
             data,
@@ -2732,7 +2788,15 @@ impl<'a> TranslationContext<'a> {
                 device_outputs &= publish_device_output(self.ort_api, self.kctx, output, &array)?;
             }
         }
+        let tr = crate::trace::tracer();
+        // A captured boundary must finish before its guard stops Metal capture.
+        let capture = tr.begin_gpu_capture();
         if device_outputs {
+            if capture.is_some() {
+                let _eval = tr.eval_region();
+                mlx::eval(&outs)?;
+                return Ok(());
+            }
             let result = unsafe { mlxsys::mlx_async_eval(outs.as_raw()) };
             if result != 0 {
                 return Err(
@@ -2746,7 +2810,6 @@ impl<'a> TranslationContext<'a> {
         // in the `mlx.eval` (cat "gpu") span, whose CPU wall time is the GPU-inclusive
         // time of the whole fused subgraph (MLX blocks here until the GPU work lands).
         // Sample GPU-memory counters just before and after so the curve shows the eval.
-        let tr = crate::trace::tracer();
         tr.sample_gpu_counters();
         let eval_t0 = if tr.active() {
             Some(std::time::Instant::now())
@@ -2754,9 +2817,6 @@ impl<'a> TranslationContext<'a> {
             None
         };
         {
-            // Wrap the FIRST eval in a Metal GPU capture when requested (one-shot; the
-            // guard stops the capture on drop). `None`/near-zero cost otherwise.
-            let _cap = tr.begin_gpu_capture();
             let _eval = tr.eval_region();
             mlx::eval(&outs)?;
         }

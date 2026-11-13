@@ -1,0 +1,68 @@
+{
+  "device": "M1 Max, 32 GPU cores, 32 GiB",
+  "onnxruntime": "1.32.0",
+  "mlx": "0.32.4",
+  "change": "Default-on MRotaryEmbedding column-index cache gathers using standard MLX primitives",
+  "model_geometry": {
+    "mrotary_nodes": 32,
+    "cache_shape": [262144, 32],
+    "mrope_section": [11, 11, 10],
+    "mrope_layout": 1,
+    "rotary_embedding_dim": 64
+  },
+  "control_flag": "ONNXRUNTIME_EP_MLX_NO_MROPE_COLUMN_GATHER=1",
+  "candidate_flag": "ONNXRUNTIME_EP_MLX_NO_MROPE_COLUMN_GATHER=0",
+  "protocol": {
+    "driver": "Public ORT GPU IOBinding K1 MTP; not GenAI Engine",
+    "target": "Explicit last-two-logit graph; same graph in both arms",
+    "target_sha256": "203146b62f210b56f4d7a687ee2a428d9b435a9cad33ff0c30293a3516ee926a",
+    "warmups_per_arm": 3,
+    "measured_requests_per_arm": 3,
+    "generated_tokens": 256,
+    "tracing": false,
+    "state_dtype": "FP32",
+    "cache_limit_bytes": 536870912,
+    "prefill_wired_bytes": 23622320128,
+    "decode_wired_bytes": 26800603136,
+    "scope": "One-time setup and request resets excluded; TTFT includes prefill and first selection, decode counts the remaining 255 emitted tokens"
+  },
+  "short_context": {
+    "prompt_tokens": 256,
+    "plugin_sha256": "f87a231093c26b333fa6450f4760c3d6d79e297e35f58de0863df84c9be5b827",
+    "other_change": "Identity-write experiment disabled in these arms",
+    "order": ["control-first", "candidate", "rejected-combined-variant", "control-last"],
+    "token_validation": "Every warmup and measured request matches the complete first stock-control sequence",
+    "control_first_decode_seconds": [30.26842537499033, 25.73649120796472, 25.937714209081605],
+    "candidate_decode_seconds": [19.307298208004795, 20.129386375076137, 19.241294541978277],
+    "control_last_decode_seconds": [25.28116895898711, 24.86640229204204, 24.544036332983524],
+    "control_first_ttft_seconds": [1.7755748749477789, 1.7744382920209318, 1.7319727910216898],
+    "candidate_ttft_seconds": [1.7330744999926537, 1.8724006250267848, 1.7181227910332382],
+    "control_last_ttft_seconds": [1.7182545830728486, 1.7867689999984577, 1.7476092500146478],
+    "candidate_aggregate_tokens_per_second": 13.037258804867337,
+    "control_last_aggregate_tokens_per_second": 10.242114539301253
+  },
+  "long_context": {
+    "prompt_tokens": 16384,
+    "plugin_sha256": "e38e60175d3a4b46df27901a60ec9f91d5c54d5593c86e16c07a178cebe48645",
+    "order": ["candidate", "control"],
+    "other_change": "Rejected identity-write dispatch removed",
+    "token_validation": "All warmups and measured requests equal the unchanged target reference",
+    "candidate_ttft_seconds": [126.70292116701603, 134.42867483303417, 128.34060225007124],
+    "control_ttft_seconds": [128.10853829199914, 127.58292324992362, 127.30371283402201],
+    "candidate_decode_seconds": [15.697043416905217, 15.769254291895777, 21.283976707956754],
+    "control_decode_seconds": [23.447716291993856, 22.25533275003545, 22.988751790951937],
+    "candidate_aggregate_tokens_per_second": 14.502294224216854,
+    "control_aggregate_tokens_per_second": 11.136700315370065,
+    "candidate_median_request_tokens_per_second": 16.170707585776647,
+    "control_median_request_tokens_per_second": 11.092381279281312,
+    "candidate_ttft_median_seconds": 128.34060225007124,
+    "control_ttft_median_seconds": 127.58292324992362
+  },
+  "interpretation": "About 27% aggregate short-context and 30% aggregate 16K decode gain. Every measured 16K candidate request is faster than every control request. TTFT is effectively unchanged. Preserve the slow candidate sample; median and aggregate are not interchangeable.",
+  "native_context": {
+    "earlier_llama_cpp_aggregate_tokens_per_second": 16.16607252068132,
+    "earlier_llama_cpp_ttft_median_seconds": 128.89557720907032,
+    "scope": "Different Q4_0 quantization and non-speculative runtime; this is context, not a paired native comparison or an aggregate-parity claim"
+  },
+  "newer_macs": "Not measured. This removes architecture-neutral data movement and Rust graph assembly; it does not introduce an M1-tuned kernel."
+}
