@@ -592,6 +592,9 @@ fn fused_matmul_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), Mlx
 }
 
 fn gemm_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
+    if integer_gemm_dtype(n.outputs[0].otype) {
+        return integer_gemm_op(ctx, n);
+    }
     let mut a = ctx.resolve(&n.inputs[0])?;
     let mut b = ctx.resolve(&n.inputs[1])?;
     let dt = ctx.dtype_of(a);
@@ -646,6 +649,212 @@ fn gemm_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
     Ok(())
 }
 
+fn integer_gemm_dtype(dtype: ort::ONNXTensorElementDataType) -> bool {
+    matches!(
+        dtype,
+        ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32
+            | ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT32
+            | ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64
+            | ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT64
+    )
+}
+
+fn integer_gemm_scale(value: f32, name: &str) -> Result<i128, MlxError> {
+    let limit = 2f32.powi(127);
+    if !value.is_finite() || value.fract() != 0.0 || value < -limit || value >= limit {
+        return Err(format!(
+            "Gemm integer {name}={value} is unsupported; use a finite integral coefficient in [-2^127,2^127), or cast the operands to floating point for fractional scaling"
+        ));
+    }
+    Ok(value as i128)
+}
+
+fn integer_gemm_input(
+    ctx: &mut TranslationContext,
+    n: &NodeDesc,
+    index: usize,
+) -> Result<(Vec<i64>, mlx::mlx_dtype, Vec<i128>), MlxError> {
+    let input = read_live(ctx, &n.inputs[index], "integer Gemm")?;
+    let width = match input.dtype {
+        mlx::mlx_dtype__MLX_INT32 | mlx::mlx_dtype__MLX_UINT32 => 4,
+        mlx::mlx_dtype__MLX_INT64 | mlx::mlx_dtype__MLX_UINT64 => 8,
+        _ => {
+            return Err(format!(
+                "Gemm input {index} must be int32/uint32/int64/uint64; supply matching integer tensors"
+            ));
+        }
+    };
+    let values = input
+        .data
+        .chunks_exact(width)
+        .map(|value| match input.dtype {
+            mlx::mlx_dtype__MLX_INT32 => i128::from(i32::from_ne_bytes(value.try_into().unwrap())),
+            mlx::mlx_dtype__MLX_UINT32 => i128::from(u32::from_ne_bytes(value.try_into().unwrap())),
+            mlx::mlx_dtype__MLX_INT64 => i128::from(i64::from_ne_bytes(value.try_into().unwrap())),
+            _ => i128::from(u64::from_ne_bytes(value.try_into().unwrap())),
+        })
+        .collect();
+    Ok((input.shape, input.dtype, values))
+}
+
+fn integer_gemm_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
+    if n.since_version < 29 {
+        return Err("Integer Gemm requires the version-29 handler; use floating-point Gemm for older schemas".into());
+    }
+    let alpha = integer_gemm_scale(n.floats.get("alpha").copied().unwrap_or(1.0), "alpha")?;
+    let beta = integer_gemm_scale(n.floats.get("beta").copied().unwrap_or(1.0), "beta")?;
+    let (a_shape, dtype, a) = integer_gemm_input(ctx, n, 0)?;
+    let (b_shape, b_dtype, b) = integer_gemm_input(ctx, n, 1)?;
+    if a_shape.is_empty() || b_shape.len() != 2 || b_dtype != dtype {
+        return Err("Gemm integer inputs require rank >=1 A and rank-2 B with the same dtype; reshape or cast the operands".into());
+    }
+    let mut shape = a_shape.clone();
+    let mut strides = vec![1usize; shape.len()];
+    for dim in (0..shape.len().saturating_sub(1)).rev() {
+        strides[dim] = if a_shape.contains(&0) {
+            0
+        } else {
+            strides[dim + 1]
+                .checked_mul(shape[dim + 1] as usize)
+                .ok_or(
+                    "Gemm integer strides exceed addressable memory; reduce the input dimensions",
+                )?
+        };
+    }
+    if n.ints.get("transA").copied().unwrap_or(0) != 0 && shape.len() >= 2 {
+        let rank = shape.len();
+        shape.swap(rank - 2, rank - 1);
+        strides.swap(rank - 2, rank - 1);
+    }
+    let trans_b = n.ints.get("transB").copied().unwrap_or(0) != 0;
+    let (k, width) = if trans_b {
+        (b_shape[1], b_shape[0])
+    } else {
+        (b_shape[0], b_shape[1])
+    };
+    if shape.last() != Some(&k) {
+        return Err(format!(
+            "Gemm integer contraction dimensions differ: A {:?}, B {b_shape:?}; correct transA/transB or reshape the operands",
+            a_shape
+        ));
+    }
+    let reduction_stride = *strides.last().expect("checked non-scalar A");
+    shape.pop();
+    strides.pop();
+    shape.push(width);
+    let (byte_count, _) = super::host_scan::layout(&shape, dtype, "integer Gemm")?;
+    let c_shape = if present(n, 2) {
+        Some(ctx.tensor_shape(&n.inputs[2])?)
+    } else {
+        None
+    };
+    if let Some(c_shape) = &c_shape
+        && (c_shape.len() > shape.len()
+            || !c_shape
+                .iter()
+                .rev()
+                .zip(shape.iter().rev())
+                .all(|(&c, &y)| c == 1 || c == y))
+    {
+        return Err(format!(
+            "Gemm integer C shape {c_shape:?} cannot broadcast to {shape:?}; reshape C to a suffix compatible with Y"
+        ));
+    }
+    if shape.contains(&0) {
+        let shape = shape
+            .into_iter()
+            .map(dim_i32)
+            .collect::<Result<Vec<_>, _>>()?;
+        let y = ctx.zeros(&shape, dtype)?;
+        ctx.bind(&n.outputs[0], y);
+        return Ok(());
+    }
+    let rows = shape[..shape.len() - 1]
+        .iter()
+        .try_fold(1usize, |total, &dim| total.checked_mul(dim as usize))
+        .ok_or("Gemm integer output size overflow; reduce the input dimensions")?;
+    let c = if present(n, 2) && beta != 0 {
+        let (_, c_dtype, values) = integer_gemm_input(ctx, n, 2)?;
+        if c_dtype != dtype {
+            return Err(
+                "Gemm integer C dtype differs from A/B; cast all operands to the same integer type"
+                    .into(),
+            );
+        }
+        Some(values)
+    } else {
+        None
+    };
+    let overflow = || {
+        "Gemm integer arithmetic exceeds the checked i128 accumulator or output dtype; reduce operand magnitudes/scales or use a wider floating-point representation".to_string()
+    };
+    let mut result = Vec::with_capacity(byte_count);
+    for row in 0..rows {
+        let mut coordinate = row;
+        let mut a_offset = 0usize;
+        for dim in (0..shape.len() - 1).rev() {
+            a_offset += coordinate % shape[dim] as usize * strides[dim];
+            coordinate /= shape[dim] as usize;
+        }
+        for column in 0..width as usize {
+            let mut sum = 0i128;
+            if alpha != 0 {
+                for j in 0..k as usize {
+                    let b_offset = if trans_b {
+                        column * k as usize + j
+                    } else {
+                        j * width as usize + column
+                    };
+                    sum = a[a_offset + j * reduction_stride]
+                        .checked_mul(b[b_offset])
+                        .and_then(|value| sum.checked_add(value))
+                        .ok_or_else(overflow)?;
+                }
+                sum = sum.checked_mul(alpha).ok_or_else(overflow)?;
+            }
+            if let Some(c) = &c {
+                let c_shape = c_shape.as_ref().expect("present C shape");
+                let mut index = row * width as usize + column;
+                let mut c_offset = 0usize;
+                let mut c_stride = 1usize;
+                for dim in (0..shape.len()).rev() {
+                    let coordinate = index % shape[dim] as usize;
+                    index /= shape[dim] as usize;
+                    if dim >= shape.len() - c_shape.len() {
+                        let size = c_shape[dim - (shape.len() - c_shape.len())];
+                        if size != 1 {
+                            c_offset += coordinate * c_stride;
+                        }
+                        c_stride *= size as usize;
+                    }
+                }
+                sum = c[c_offset]
+                    .checked_mul(beta)
+                    .and_then(|value| sum.checked_add(value))
+                    .ok_or_else(overflow)?;
+            }
+            match dtype {
+                mlx::mlx_dtype__MLX_INT32 => result
+                    .extend_from_slice(&i32::try_from(sum).map_err(|_| overflow())?.to_ne_bytes()),
+                mlx::mlx_dtype__MLX_UINT32 => result
+                    .extend_from_slice(&u32::try_from(sum).map_err(|_| overflow())?.to_ne_bytes()),
+                mlx::mlx_dtype__MLX_INT64 => result
+                    .extend_from_slice(&i64::try_from(sum).map_err(|_| overflow())?.to_ne_bytes()),
+                _ => result
+                    .extend_from_slice(&u64::try_from(sum).map_err(|_| overflow())?.to_ne_bytes()),
+            }
+        }
+    }
+    let shape = shape
+        .into_iter()
+        .map(dim_i32)
+        .collect::<Result<Vec<_>, _>>()?;
+    let y = ctx.from_host(result.as_ptr().cast(), &shape, dtype);
+    ctx.mark_composed("checked exact host integer Gemm (MLX has no integer GEMM primitive)");
+    ctx.bind(&n.outputs[0], y);
+    Ok(())
+}
+
 // ---- claim predicates --------------------------------------------------------------------------
 
 fn matmul_claim(node: &NodeView) -> ClaimResult {
@@ -688,12 +897,18 @@ fn gemm_claim(node: &NodeView) -> ClaimResult {
         _ => deny!("missing tensor type/shape info on an input or the output"),
     };
     require!(
-        is_mlx_cpu_float(a.dtype) && b.dtype == a.dtype && out.dtype == a.dtype,
-        "A/B/output must share one float dtype (fp32/fp16/bf16/fp64), got {}, {} -> {}",
+        (is_mlx_cpu_float(a.dtype) || node.since_version() >= 29 && integer_gemm_dtype(a.dtype))
+            && b.dtype == a.dtype
+            && out.dtype == a.dtype,
+        "A/B/output must share one floating dtype, or opset-29 int32/uint32/int64/uint64; got {}, {} -> {}",
         crate::registry::ort_dtype_name(a.dtype),
         crate::registry::ort_dtype_name(b.dtype),
         crate::registry::ort_dtype_name(out.dtype)
     );
+    if integer_gemm_dtype(a.dtype) {
+        integer_gemm_scale(node.float_attr("alpha", 1.0), "alpha")?;
+        integer_gemm_scale(node.float_attr("beta", 1.0), "beta")?;
+    }
     require!(
         (a.shape.len() == 2 || node.since_version() >= 29 && !a.shape.is_empty())
             && b.shape.len() == 2,
@@ -824,7 +1039,11 @@ pub fn register(registry: &mut OpRegistry) {
             handler: gemm_op,
             claim: gemm_claim,
         },
-        |node| if node.since_version() >= 29 {
+        |node|         if node.input_info(0).is_some_and(|input| integer_gemm_dtype(input.dtype)) {
+            crate::registry::CompileShapeSafety::EagerOnly {
+                reason: "integer Gemm uses checked live host accumulation without narrowing integer operands",
+            }
+        } else if node.since_version() >= 29 {
             crate::registry::CompileShapeSafety::ShapeKeyedOnly {
                 reason: "Gemm-29 specializes empty-result materialization on live output extents",
             }

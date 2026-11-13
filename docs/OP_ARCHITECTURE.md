@@ -106,10 +106,15 @@ The schema inventory is pinned to ONNX main
 [`3c41120`](https://github.com/onnx/onnx/blob/3c41120b9c69657a1dd13407b080bd451ed06c9c/onnx/defs/operator_sets.h):
 seven new operators and six schema updates. Source support does not upgrade the
 host runtime's schema registry. ORT 1.31 rejects opset 29 by default; even with
-`ALLOW_RELEASED_ONNX_OPSET_ONLY=0`, it lacks the new operator schemas. Use an ORT
-build containing these schemas for end-to-end execution. Native Rust tests execute
-the handlers directly against pinned MLX; Python tests cross-check their goldens
-against ONNX-main ReferenceEvaluator and explicitly skip unavailable ORT loading.
+`ALLOW_RELEASED_ONNX_OPSET_ONLY=0`, it lacks the new operator schemas. ORT main
+[`6080d7c`](https://github.com/microsoft/onnxruntime/tree/6080d7c7cc598db70335be28c7946c429dfb2671)
+also pins released ONNX 1.23.2 by default. An isolated build of that ORT main with
+the pinned ONNX-main source substituted successfully executes the version-29
+models through MLX, with CPU fallback and ahead-of-time function inlining
+disabled and MLX provider execution verified in profiles. This is a custom
+development runtime, not official ORT 1.31 support. Native handler tests and
+ONNX-main reference fixtures remain separate evidence; unavailable released
+runtime loading is explicitly skipped.
 
 | Operator | Change and implementation |
 |---|---|
@@ -117,8 +122,8 @@ against ONNX-main ReferenceEvaluator and explicitly skip unavailable ORT loading
 | LogCumSumExp (new) | Native inclusive forward MLX log-add-exp scan, arbitrary axis, fp32 accumulation for narrow inputs and fp64 for double. NaN and signed infinities propagate prefix-wise; empty tensors retain shape. Shape-keyed compilation. |
 | GroupedMatMul (new) | Existing gather-MM path now honors transB by swapping only the final weight axes. |
 | Pack, Unpack (new) | UINT8 logical codes, UINT8/UINT32 words, arbitrary axis, bits 1-8 or grouped radix with the signed-INT64 power bound. See packed-format limits below. |
-| DequantizePacked (new) | Exact little-endian GGUF block decoding in fp32, one final output conversion; 20 of the 27 normative formats implemented. |
-| Gemm (updated) | Rank >=1 A, rank-2 B, last-two-axis transA (no-op for vectors), unidirectional C broadcasting, beta=0 ignores C. Floating dtypes retain native matmul; integer Gemm remains unclaimed. Version 29 is shape-keyed for empty-result replay. |
+| DequantizePacked (new) | Exact little-endian GGUF block decoding in fp32, one final output conversion; all 27 normative formats implemented, including the seven IQ codebook formats below. |
+| Gemm (updated) | Rank >=1 A, rank-2 B, last-two-axis transA (no-op for vectors), unidirectional C broadcasting, beta=0 ignores C. Floating dtypes retain native matmul and shape-keyed empty-result replay. Version 29 adds an exact eager host path for int32/uint32/int64/uint64 with checked i128 accumulation and integral scaling. |
 | MeanVarianceNormalization (updated) | Version 29 uses centered variance and configurable epsilon after sqrt; earlier schemas retain their second-moment expression and fixed epsilon. |
 | CausalConvWithState (updated) | Standard-domain dilation from version 29 uses native depthwise MLX conv1d and raw chronological carry of `(K-1)*dilation`. |
 | GatherND (updated) | Existing int32/int64 path plus full-width live bounds validation for version 29, before any unchecked gather. Version 29 is eager. |
@@ -126,16 +131,63 @@ against ONNX-main ReferenceEvaluator and explicitly skip unavailable ORT loading
 
 DequantizePacked supports `gguf:q1_0`, `q2_0`, `q4_0`, `q4_1`, `q5_0`,
 `q5_1`, `q8_0`, `q8_1`, `q2_k`, `q3_k`, `q4_k`, `q5_k`, `q6_k`,
-`q8_k`, `iq4_nl`, `iq4_xs`, `tq1_0`, `tq2_0`, `mxfp4`, and `nvfp4`
+`q8_k`, `iq4_nl`, `iq4_xs`, `tq1_0`, `tq2_0`, `mxfp4`, `nvfp4`,
+`iq2_xxs`, `iq2_xs`, `iq2_s`, `iq3_xxs`, `iq3_s`, `iq1_s`, and `iq1_m`
 (each identifier has the `gguf:` prefix).
-Seven codebook formats remain unclaimed: `iq2_xxs`, `iq2_xs`, `iq2_s`,
-`iq3_xxs`, `iq3_s`, `iq1_s`, and `iq1_m`. Supporting them requires the
-normative IQ lookup tables and their format-specific bit/sign/scale decoding,
-with independent reference fixtures; a similar bit width is not a substitute.
+IQ decoding uses the pinned normative codebooks and format-specific
+bit/sign/scale layouts, with independently generated ONNX-reference fixtures
+covering randomized nonzero single/multiblock data and scale/sign edge cases.
 Pack/Unpack's bits spelling and Q4_0/Q4_1/Q8_0 dequantization have vectorized
-MLX fast paths. Grouped radix and the other 17 supported quantization formats
+MLX fast paths. Grouped radix and the other 24 supported quantization formats
 use exact eager host fallbacks; they are not GPU-speed claims.
 String/complex forms unsupported by the array boundary remain unclaimed.
+
+Gemm-13 and Gemm-29 have the same integer dtype set: version 29 adds generalized
+geometry, not new integer dtypes. The new integer path preserves full-width
+values without floating-point narrowing, including values above 2^53.
+Fractional/nonfinite or out-of-i128-range coefficients remain unclaimed; checked
+accumulator overflow and results outside the output dtype produce actionable
+errors rather than assuming unspecified wraparound or silently rounding.
+MLX has no native integer GEMM primitive, so this is a correctness fallback, not
+an accelerated integer matrix product. Older-version integer Gemm remains
+unclaimed. Full-width fixtures use Python arbitrary-precision arithmetic because
+ONNX's NumPy reference applies floating scalar multiplication and can itself
+round large integers; smaller integral cases also match ReferenceEvaluator.
+
+#### Reproducing schema-enabled runtime validation
+
+Use fresh, ignored directories inside this worktree, not another checkout.
+With the normal test dependencies installed and the pinned MLX plugin built,
+download ORT `6080d7c` to `.deps/ort-opset29` and ONNX `3c41120` to
+`.deps/onnx-opset29`. The validated Apple-arm64 build route is:
+
+```bash
+python -m venv --system-site-packages .venv-opset29
+.venv-opset29/bin/python .deps/ort-opset29/tools/ci_build/build.py \
+  --config Release --build_dir "$PWD/.deps/ort-opset29-build" \
+  --parallel 6 --skip_tests --skip_submodule_sync --cmake_generator Ninja \
+  --build_shared_lib --build_wheel --compile_no_warning_as_error --update --build \
+  --cmake_extra_defines \
+    "FETCHCONTENT_SOURCE_DIR_ONNX=$PWD/.deps/onnx-opset29" \
+    FETCHCONTENT_TRY_FIND_PACKAGE_MODE=NEVER CMAKE_OSX_ARCHITECTURES=arm64 \
+    onnxruntime_ENABLE_TELEMETRY=OFF onnxruntime_BUILD_UNIT_TESTS=OFF
+.venv-opset29/bin/python -m pip install \
+  .deps/ort-opset29-build/Release/dist/onnxruntime-*.whl \
+  "onnx @ git+https://github.com/onnx/onnx.git@3c41120b9c69657a1dd13407b080bd451ed06c9c" \
+  "protobuf>=7.36.2"
+ALLOW_RELEASED_ONNX_OPSET_ONLY=0 \
+ONNXRUNTIME_MLX_EP_LIB="$PWD/rust/target/release/libonnxruntime_mlx_ep.dylib" \
+  .venv-opset29/bin/python -m pytest -q \
+    tests/ops/test_opset29.py tests/ops/test_packed_ops.py
+```
+
+Changing the model's opset stamp, merely registering schemas, or allowing CPU
+fallback does not validate these handlers. These tests run version-29 models,
+disable function inlining, and require MLX provider profiles.
+Validation passed 156 focused opset-29 tests without skips, 219 native Rust
+tests, and 2,299 selected Python operator/regression tests. The only regression
+skip was an unrelated negative loader contract specific to ORT 1.31, not missing
+opset-29 execution.
 
 ### GroupedMatMul and direct QDQ products
 

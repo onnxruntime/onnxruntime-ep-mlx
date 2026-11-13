@@ -59,8 +59,15 @@ it is safe to include in any pytest invocation.
 unreleased opset-29 contracts. With released ONNX packages, unavailable references
 are explicitly skipped. ORT 1.31 cannot load the new schemas, even with its
 development-opset override; those end-to-end cases are separately skipped, not
-counted as EP execution. The corresponding Rust tests run native CPU/Metal handlers
-directly, including all 20 supported packed formats, without an ORT model loader.
+counted as EP execution. An isolated ORT-main build with pinned ONNX-main sources
+also runs genuine version-29 MLX-only models, with CPU fallback and ahead-of-time
+function inlining disabled and provider profiles checked. The corresponding Rust
+tests run native CPU/Metal handlers directly, including all 27 packed formats,
+without an ORT model loader. Randomized IQ fixtures cover 21 blocks with scale,
+sign, parity, and distributed-scale edge bits. Integer Gemm compares ordinary
+values to ONNX ReferenceEvaluator and full-width values to an independent Python
+arbitrary-precision oracle; fractional scaling and arithmetic overflow retain
+explicit guards.
 See the [opset-29 support and remaining gaps](../docs/OP_ARCHITECTURE.md#opset-29-onnx-main-unreleased).
 
 `test_attention_semantics.py` uses small, locally built models and an independent float64 SDPA

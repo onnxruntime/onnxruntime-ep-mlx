@@ -219,6 +219,145 @@ mod tests {
     }
 
     #[test]
+    fn integer_gemm29_exact_values_transposes_broadcast_and_empty_geometry() {
+        use crate::ops::host_scan::read_live;
+        use crate::sys::ort;
+        for (dtype, otype) in [
+            (
+                mlx::mlx_dtype__MLX_INT32,
+                ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32,
+            ),
+            (
+                mlx::mlx_dtype__MLX_UINT32,
+                ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT32,
+            ),
+            (
+                mlx::mlx_dtype__MLX_INT64,
+                ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64,
+            ),
+            (
+                mlx::mlx_dtype__MLX_UINT64,
+                ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT64,
+            ),
+        ] {
+            let stream = Stream::new_default_gpu();
+            let mut plan = Plan::new(vec![]);
+            let mut ctx = TranslationContext::new(
+                &mut plan,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                stream.as_raw(),
+            );
+            let encode = |values: &[i128]| -> Vec<u8> {
+                values
+                    .iter()
+                    .flat_map(|&value| match dtype {
+                        mlx::mlx_dtype__MLX_INT32 => (value as i32).to_ne_bytes().to_vec(),
+                        mlx::mlx_dtype__MLX_UINT32 => (value as u32).to_ne_bytes().to_vec(),
+                        mlx::mlx_dtype__MLX_INT64 => (value as i64).to_ne_bytes().to_vec(),
+                        _ => (value as u64).to_ne_bytes().to_vec(),
+                    })
+                    .collect()
+            };
+            let mut n = NodeDesc::new(
+                "Gemm".into(),
+                "".into(),
+                29,
+                CompileShapeSafety::EagerOnly {
+                    reason: "checked integer arithmetic",
+                },
+            );
+            n.inputs = vec![reference("a"), reference("b"), reference("c")];
+            n.outputs = vec![output("y")];
+            n.outputs[0].otype = otype;
+            let result_ref = reference("y");
+            n.ints.insert("transA".into(), 1);
+            n.floats.insert("alpha".into(), 2.0);
+            n.floats.insert("beta".into(), -1.0);
+            for trans_b in [0, 1] {
+                n.ints.insert("transB".into(), trans_b);
+                for (name, shape, values) in [
+                    ("a", vec![2, 2, 3], (1..=12).collect::<Vec<i128>>()),
+                    (
+                        "b",
+                        vec![2, 2],
+                        if trans_b == 0 {
+                            vec![1, 2, 3, 4]
+                        } else {
+                            vec![1, 3, 2, 4]
+                        },
+                    ),
+                    ("c", vec![2], vec![1, 2]),
+                ] {
+                    let bytes = encode(&values);
+                    let array = ctx.from_host(bytes.as_ptr().cast(), &shape, dtype);
+                    ctx.bind(&output(name), array);
+                }
+                crate::registry::translate(&mut ctx, &n).unwrap();
+                let result = read_live(&mut ctx, &result_ref, "test").unwrap();
+                assert_eq!(result.shape, [2, 3, 2]);
+                assert_eq!(
+                    result.data,
+                    encode(&[25, 34, 33, 46, 41, 58, 73, 106, 81, 118, 89, 130])
+                );
+            }
+            n.ints.insert("transB".into(), 0);
+            n.floats.insert("alpha".into(), 1.0);
+            n.floats.insert("beta".into(), 0.0);
+            let large = if matches!(
+                dtype,
+                mlx::mlx_dtype__MLX_INT64 | mlx::mlx_dtype__MLX_UINT64
+            ) {
+                (1i128 << 53) + 1
+            } else {
+                (1i128 << 25) + 1
+            };
+            for (name, shape, values) in [
+                ("a", vec![2], vec![large, 2]),
+                ("b", vec![2, 1], vec![1, 1]),
+                ("c", vec![1], vec![1]),
+            ] {
+                let bytes = encode(&values);
+                let array = ctx.from_host(bytes.as_ptr().cast(), &shape, dtype);
+                ctx.bind(&output(name), array);
+            }
+            crate::registry::translate(&mut ctx, &n).unwrap();
+            let result = read_live(&mut ctx, &result_ref, "test").unwrap();
+            assert_eq!(result.shape, [1]);
+            assert_eq!(result.data, encode(&[large + 2]));
+            n.floats.insert("alpha".into(), 0.5);
+            assert!(
+                crate::registry::translate(&mut ctx, &n)
+                    .unwrap_err()
+                    .contains("finite integral")
+            );
+            n.floats.insert("alpha".into(), 2f32.powi(100));
+            assert!(
+                crate::registry::translate(&mut ctx, &n)
+                    .unwrap_err()
+                    .contains("exceeds")
+            );
+            n.ints.insert("transA".into(), 0);
+            n.floats.insert("alpha".into(), 1.0);
+            n.inputs.truncate(2);
+            for (a_shape, b_shape, expected_shape) in [
+                (vec![0, 2], vec![2, 3], vec![0, 3]),
+                (vec![2, 0], vec![0, 3], vec![2, 3]),
+                (vec![4, 2], vec![2, 0], vec![4, 0]),
+            ] {
+                for (name, shape) in [("a", a_shape), ("b", b_shape)] {
+                    let array = ctx.zeros(&shape, dtype).unwrap();
+                    ctx.bind(&output(name), array);
+                }
+                crate::registry::translate(&mut ctx, &n).unwrap();
+                let result = read_live(&mut ctx, &result_ref, "test").unwrap();
+                assert_eq!(result.shape, expected_shape);
+                assert!(result.data.iter().all(|&value| value == 0));
+            }
+        }
+    }
+
+    #[test]
     fn logcumsumexp_stable_prefixes_and_nonfinite_order() {
         for cpu in [false, true] {
             let stream = if cpu {

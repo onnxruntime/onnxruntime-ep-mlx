@@ -2,9 +2,8 @@
 //!
 //! These byte-exact operators run eagerly on the host. This preserves the full signed-INT64
 //! grouped-radix contract and the normative little-endian GGUF layouts instead of narrowing
-//! intermediates to Metal's 32-bit integer arithmetic. The seven codebook-backed formats
-//! IQ2_XXS, IQ2_XS, IQ3_XXS, IQ1_S, IQ3_S, IQ2_S, and IQ1_M are explicitly declined until their
-//! complete normative ONNX tables are embedded; the other 20 opset-29 GGUF profiles are supported.
+//! intermediates to Metal's 32-bit integer arithmetic. All 27 fixed opset-29 GGUF profiles,
+//! including the pinned normative IQ codebooks, are supported.
 
 use std::ffi::c_void;
 
@@ -15,6 +14,9 @@ use crate::engine::{MlxError, NodeDesc, TranslationContext, dim_i32, mlx_dtype_f
 use crate::registry::{ClaimResult, CompileShapeSafety, NodeView, OpRegistration, OpRegistry};
 use crate::sys::{mlx, ort};
 use crate::{deny, require};
+
+#[path = "packed_iq_tables.rs"]
+mod iq_tables;
 
 const UINT8: ort::ONNXTensorElementDataType =
     ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8;
@@ -332,8 +334,15 @@ enum PackedFormat {
     Q5K,
     Q6K,
     Q8K,
+    Iq2Xxs,
+    Iq2Xs,
+    Iq3Xxs,
+    Iq1S,
     Iq4Nl,
+    Iq3S,
+    Iq2S,
     Iq4Xs,
+    Iq1M,
     Tq1_0,
     Tq2_0,
     Mxfp4,
@@ -357,18 +366,21 @@ impl PackedFormat {
             "gguf:q5_k" => Ok(Self::Q5K),
             "gguf:q6_k" => Ok(Self::Q6K),
             "gguf:q8_k" => Ok(Self::Q8K),
+            "gguf:iq2_xxs" => Ok(Self::Iq2Xxs),
+            "gguf:iq2_xs" => Ok(Self::Iq2Xs),
+            "gguf:iq3_xxs" => Ok(Self::Iq3Xxs),
+            "gguf:iq1_s" => Ok(Self::Iq1S),
             "gguf:iq4_nl" => Ok(Self::Iq4Nl),
+            "gguf:iq3_s" => Ok(Self::Iq3S),
+            "gguf:iq2_s" => Ok(Self::Iq2S),
             "gguf:iq4_xs" => Ok(Self::Iq4Xs),
+            "gguf:iq1_m" => Ok(Self::Iq1M),
             "gguf:tq1_0" => Ok(Self::Tq1_0),
             "gguf:tq2_0" => Ok(Self::Tq2_0),
             "gguf:mxfp4" => Ok(Self::Mxfp4),
             "gguf:nvfp4" => Ok(Self::Nvfp4),
             "gguf:q1_0" => Ok(Self::Q1_0),
             "gguf:q2_0" => Ok(Self::Q2_0),
-            "gguf:iq2_xxs" | "gguf:iq2_xs" | "gguf:iq3_xxs" | "gguf:iq1_s" | "gguf:iq3_s"
-            | "gguf:iq2_s" | "gguf:iq1_m" => Err(format!(
-                "MLX DequantizePacked: format {name} requires an ONNX IQ codebook that is not yet embedded"
-            )),
             _ => Err(format!(
                 "MLX DequantizePacked: unsupported format identifier {name:?}"
             )),
@@ -389,7 +401,14 @@ impl PackedFormat {
             Self::Q5K => (256, 176),
             Self::Q6K => (256, 210),
             Self::Q8K => (256, 292),
+            Self::Iq2Xxs => (256, 66),
+            Self::Iq2Xs => (256, 74),
+            Self::Iq3Xxs => (256, 98),
+            Self::Iq1S => (256, 50),
+            Self::Iq3S => (256, 110),
+            Self::Iq2S => (256, 82),
             Self::Iq4Xs => (256, 136),
+            Self::Iq1M => (256, 56),
             Self::Tq1_0 => (256, 54),
             Self::Tq2_0 => (256, 66),
             Self::Mxfp4 => (32, 17),
@@ -438,8 +457,139 @@ fn unpack_planes(data: &[u8], bits: usize, group: usize) -> Vec<i32> {
     output
 }
 
+fn iq_signs(mut index: u32, parity: bool) -> [f32; 8] {
+    if parity {
+        index |= (index.count_ones() & 1) << 7;
+    }
+    std::array::from_fn(|bit| 1.0 - 2.0 * ((index >> bit) & 1) as f32)
+}
+
+fn decode_iq(format: PackedFormat, block: &[u8]) -> Vec<f32> {
+    let mut d = half(block, 0);
+    let mut scales = [0u16; 4];
+    if format == PackedFormat::Iq1M {
+        for (index, scale) in scales.iter_mut().enumerate() {
+            *scale = uint(block, 48 + 2 * index, 2) as u16;
+        }
+        let scale_bits = scales
+            .iter()
+            .enumerate()
+            .fold(0u16, |bits, (index, &scale)| {
+                bits | ((scale >> 12) << (4 * index))
+            });
+        d = f16::from_bits(scale_bits).to_f32();
+    }
+    let mut output = vec![0.0f32; 256];
+    for group in 0..8 {
+        let aux = match format {
+            PackedFormat::Iq2Xxs => uint(block, 6 + 8 * group, 4) as u32,
+            PackedFormat::Iq3Xxs => uint(block, 66 + 4 * group, 4) as u32,
+            _ => 0,
+        };
+        for lane in 0..4 {
+            let i = 4 * group + lane;
+            match format {
+                PackedFormat::Iq2Xxs | PackedFormat::Iq2Xs | PackedFormat::Iq2S => {
+                    let (index, signs, scale, codebook) = match format {
+                        PackedFormat::Iq2Xxs => (
+                            block[2 + 8 * group + lane] as usize,
+                            iq_signs((aux >> (7 * lane)) & 127, true),
+                            (d * (0.5 + (aux >> 28) as f32)) * 0.25,
+                            iq_tables::IQ2_XXS,
+                        ),
+                        PackedFormat::Iq2Xs => {
+                            let word = uint(block, 2 + 2 * i, 2) as u16;
+                            (
+                                (word & 511) as usize,
+                                iq_signs((word >> 9) as u32, true),
+                                (d * (0.5 + ((block[66 + group] >> (4 * (lane / 2))) & 15) as f32))
+                                    * 0.25,
+                                iq_tables::IQ2_XS,
+                            )
+                        }
+                        PackedFormat::Iq2S => (
+                            (block[2 + i] as usize)
+                                | ((((block[66 + group] >> (2 * lane)) & 3) as usize) << 8),
+                            iq_signs(block[34 + i] as u32, false),
+                            (d * (0.5 + ((block[74 + group] >> (4 * (lane / 2))) & 15) as f32))
+                                * 0.25,
+                            iq_tables::IQ2_S,
+                        ),
+                        _ => unreachable!(),
+                    };
+                    let values = codebook.row(index);
+                    for j in 0..8 {
+                        output[8 * i + j] = (scale * values[j]) * signs[j];
+                    }
+                }
+                PackedFormat::Iq3Xxs | PackedFormat::Iq3S => {
+                    let (indices, signs, scale, codebook) = if format == PackedFormat::Iq3Xxs {
+                        (
+                            [block[2 + 2 * i] as usize, block[3 + 2 * i] as usize],
+                            iq_signs((aux >> (7 * lane)) & 127, true),
+                            (d * (0.5 + (aux >> 28) as f32)) * 0.5,
+                            iq_tables::IQ3_XXS,
+                        )
+                    } else {
+                        (
+                            [
+                                (block[2 + 2 * i] as usize)
+                                    | ((((block[66 + group] >> (2 * lane)) & 1) as usize) << 8),
+                                (block[3 + 2 * i] as usize)
+                                    | ((((block[66 + group] >> (2 * lane + 1)) & 1) as usize) << 8),
+                            ],
+                            iq_signs(block[74 + i] as u32, false),
+                            d * (1 + 2 * ((block[106 + group / 2] >> (4 * (group % 2))) & 15))
+                                as f32,
+                            iq_tables::IQ3_S,
+                        )
+                    };
+                    let first = codebook.row(indices[0]);
+                    let second = codebook.row(indices[1]);
+                    for j in 0..4 {
+                        output[8 * i + j] = (scale * first[j]) * signs[j];
+                        output[8 * i + 4 + j] = (scale * second[j]) * signs[4 + j];
+                    }
+                }
+                PackedFormat::Iq1S | PackedFormat::Iq1M => {
+                    let (index, scale, delta) = if format == PackedFormat::Iq1S {
+                        let high = uint(block, 34 + 2 * group, 2) as u16;
+                        (
+                            (block[2 + i] as usize) | ((((high >> (3 * lane)) & 7) as usize) << 8),
+                            d * (2 * ((high >> 12) & 7) + 1) as f32,
+                            if high & 0x8000 != 0 { -0.125 } else { 0.125 },
+                        )
+                    } else {
+                        let high = block[32 + i / 2] >> (4 * (i % 2));
+                        (
+                            (block[i] as usize) | (((high & 7) as usize) << 8),
+                            d * (2
+                                * ((scales[group / 2] >> (6 * (group % 2) + 3 * (lane / 2))) & 7)
+                                + 1) as f32,
+                            if high & 8 != 0 { -0.125 } else { 0.125 },
+                        )
+                    };
+                    let values = iq_tables::IQ1_S.row(index);
+                    for j in 0..8 {
+                        output[8 * i + j] = scale * (values[j] + delta);
+                    }
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+    output
+}
+
 fn decode_block(format: PackedFormat, block: &[u8]) -> Vec<f32> {
     match format {
+        PackedFormat::Iq2Xxs
+        | PackedFormat::Iq2Xs
+        | PackedFormat::Iq3Xxs
+        | PackedFormat::Iq1S
+        | PackedFormat::Iq3S
+        | PackedFormat::Iq2S
+        | PackedFormat::Iq1M => decode_iq(format, block),
         PackedFormat::Q4_0
         | PackedFormat::Q4_1
         | PackedFormat::Q5_0
@@ -1458,9 +1608,9 @@ mod tests {
             .map(|index| (index as u8).wrapping_mul(37).wrapping_add(11))
             .collect();
         match name {
-            "gguf:q4_0" | "gguf:q5_0" | "gguf:q8_0" | "gguf:iq4_nl" | "gguf:q1_0" | "gguf:q2_0" => {
-                write_reference_half(&mut bytes, 0, 0.75)
-            }
+            "gguf:q4_0" | "gguf:q5_0" | "gguf:q8_0" | "gguf:iq2_xxs" | "gguf:iq2_xs"
+            | "gguf:iq3_xxs" | "gguf:iq1_s" | "gguf:iq4_nl" | "gguf:iq3_s" | "gguf:iq2_s"
+            | "gguf:q1_0" | "gguf:q2_0" => write_reference_half(&mut bytes, 0, 0.75),
             "gguf:q4_1" | "gguf:q5_1" | "gguf:q8_1" => {
                 write_reference_half(&mut bytes, 0, 0.75);
                 write_reference_half(&mut bytes, 2, -0.5);
@@ -1477,11 +1627,80 @@ mod tests {
             "gguf:q6_k" => write_reference_half(&mut bytes, 208, 0.75),
             "gguf:q8_k" => bytes[..4].copy_from_slice(&0.75f32.to_le_bytes()),
             "gguf:iq4_xs" => write_reference_half(&mut bytes, 0, 0.75),
+            "gguf:iq1_m" => {
+                let bits = f16::from_f32(0.75).to_bits();
+                for index in 0..4 {
+                    let offset = 48 + 2 * index;
+                    let low = u16::from_le_bytes([bytes[offset], bytes[offset + 1]]) & 0x0fff;
+                    let word = low | (((bits >> (4 * index)) & 15) << 12);
+                    bytes[offset..offset + 2].copy_from_slice(&word.to_le_bytes());
+                }
+            }
             "gguf:tq1_0" => write_reference_half(&mut bytes, 52, 0.75),
             "gguf:tq2_0" => write_reference_half(&mut bytes, 64, 0.75),
             "gguf:mxfp4" => bytes[0] = 126,
             "gguf:nvfp4" => bytes[..4].copy_from_slice(&[0x38, 0x21, 0x01, 0x7f]),
             _ => panic!("missing reference payload for {name}"),
+        }
+        bytes
+    }
+
+    fn iq_edge_payload(name: &str, block_size: usize) -> Vec<u8> {
+        let mut state = 0x6d2b_79f5u32;
+        let mut bytes: Vec<_> = (0..3 * block_size)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                (state % 255 + 1) as u8
+            })
+            .collect();
+        for (block, scale) in [0.5, -1.0, 65504.0].into_iter().enumerate() {
+            let base = block * block_size;
+            if name == "gguf:iq1_m" {
+                let bits = f16::from_f32(scale).to_bits();
+                for (index, low) in [0x000, 0x249, 0xdb6, 0xfff].into_iter().enumerate() {
+                    let offset = base + 48 + 2 * index;
+                    let word = low | (((bits >> (4 * index)) & 15) << 12);
+                    bytes[offset..offset + 2].copy_from_slice(&word.to_le_bytes());
+                }
+                for (index, byte) in bytes[base + 32..base + 48].iter_mut().enumerate() {
+                    *byte = if index % 2 == 0 { 0x08 } else { 0xf7 };
+                }
+            } else {
+                write_reference_half(&mut bytes, base, scale);
+            }
+            match name {
+                "gguf:iq2_xxs" => {
+                    bytes[base + 6..base + 10].fill(0xff);
+                    bytes[base + 14..base + 18].fill(0);
+                }
+                "gguf:iq2_xs" => {
+                    bytes[base + 2..base + 4].copy_from_slice(&0xfe00u16.to_le_bytes());
+                    bytes[base + 4..base + 6].fill(0);
+                    bytes[base + 66..base + 68].copy_from_slice(&[0xf0, 0x0f]);
+                }
+                "gguf:iq2_s" => {
+                    bytes[base + 34..base + 36].copy_from_slice(&[0, 0xff]);
+                    bytes[base + 66] = 0xff;
+                    bytes[base + 74..base + 76].copy_from_slice(&[0xf0, 0x0f]);
+                }
+                "gguf:iq3_xxs" => {
+                    bytes[base + 66..base + 70].fill(0xff);
+                    bytes[base + 70..base + 74].fill(0);
+                }
+                "gguf:iq3_s" => {
+                    bytes[base + 66] = 0xff;
+                    bytes[base + 74..base + 76].copy_from_slice(&[0, 0xff]);
+                    bytes[base + 106..base + 108].copy_from_slice(&[0xf0, 0x0f]);
+                }
+                "gguf:iq1_s" => {
+                    bytes[base + 34..base + 36].copy_from_slice(&0x8000u16.to_le_bytes());
+                    bytes[base + 36..base + 38].copy_from_slice(&0x7fffu16.to_le_bytes());
+                }
+                "gguf:iq1_m" => {}
+                _ => panic!("missing IQ edge payload for {name}"),
+            }
         }
         bytes
     }
@@ -1608,7 +1827,7 @@ mod tests {
     }
 
     #[test]
-    fn every_table_free_format_decodes_zero_block() {
+    fn every_format_decodes_zero_block() {
         let formats = [
             "gguf:q4_0",
             "gguf:q4_1",
@@ -1622,8 +1841,15 @@ mod tests {
             "gguf:q5_k",
             "gguf:q6_k",
             "gguf:q8_k",
+            "gguf:iq2_xxs",
+            "gguf:iq2_xs",
+            "gguf:iq3_xxs",
+            "gguf:iq1_s",
             "gguf:iq4_nl",
+            "gguf:iq3_s",
+            "gguf:iq2_s",
             "gguf:iq4_xs",
+            "gguf:iq1_m",
             "gguf:tq1_0",
             "gguf:tq2_0",
             "gguf:mxfp4",
@@ -1631,7 +1857,7 @@ mod tests {
             "gguf:q1_0",
             "gguf:q2_0",
         ];
-        assert_eq!(formats.len(), 20);
+        assert_eq!(formats.len(), 27);
         for name in formats {
             let format = PackedFormat::parse(name).unwrap();
             let (elements, bytes) = format.geometry();
@@ -1693,12 +1919,40 @@ mod tests {
                 "8dfa3856e7e2d6a013d7972667db95a0ef582090fd06aa181d0b6bf17cc6b816",
             ),
             (
+                "gguf:iq2_xxs",
+                "2d847c629a20c0680fd803ff4a3e6b9e52c1c0370827c1f2e298460232a9d4ac",
+            ),
+            (
+                "gguf:iq2_xs",
+                "3794aef862517c04fe35779d80807c6e11a0ac68192c5642f665214c0441f114",
+            ),
+            (
+                "gguf:iq3_xxs",
+                "0837edfdefd1d16019a57cd13b9c1e3da84b2b4111f0ac533bdfad8e5562eae1",
+            ),
+            (
+                "gguf:iq1_s",
+                "d684261b0f868b731aa93073192579ffe72cb620d8687c698fdbeed1b3485189",
+            ),
+            (
                 "gguf:iq4_nl",
                 "f6a109ad08842a7434e5ede115bb231181fb91f3d074ab73fe7d0b80b543f34c",
             ),
             (
+                "gguf:iq3_s",
+                "a1eb566ccfbfc5cb89a10a48c2d91d897508160a4f23ee7b85f4b639fb9e40a4",
+            ),
+            (
+                "gguf:iq2_s",
+                "6fab6c67ea45a243db184a07bb39fea51fcb2085cc89a512bd88e5751496e802",
+            ),
+            (
                 "gguf:iq4_xs",
                 "71290fdeb45737ab8df10e7c517805451e222c5321efc5f4274b6208d8ce382b",
+            ),
+            (
+                "gguf:iq1_m",
+                "78a282a22eb9b4f25a773fcaaf6d2d11555620e31031e04fb8b7c6a9f377f228",
             ),
             (
                 "gguf:tq1_0",
@@ -1743,6 +1997,60 @@ mod tests {
     }
 
     #[test]
+    fn iq_multiblock_edges_match_onnx_reference_golden_hashes() {
+        let expected = [
+            (
+                "gguf:iq2_xxs",
+                "9dae46c6ae7941e2eda7453fb20b8982176eea4f39ee83f11ad5d8eb3efeb2da",
+            ),
+            (
+                "gguf:iq2_xs",
+                "0e88985fd051c2ceb6e0445c29bb7310f62995166b3add6e4323b128d319ae6a",
+            ),
+            (
+                "gguf:iq2_s",
+                "bbe22508be22eb4de5426c94a7a23e319db5444871772ff4ec0db41c334aa537",
+            ),
+            (
+                "gguf:iq3_xxs",
+                "60ca09a43f9f8a511ec6574ad2fa91b494f19af494a857548c45d5f57032d3d0",
+            ),
+            (
+                "gguf:iq3_s",
+                "25529fa9c30b113bd83e14155b4a2e5b25377f28e8f92e08c43b060e6f502e4f",
+            ),
+            (
+                "gguf:iq1_s",
+                "aa41c544e32edfa8c6e6ba342d8680504107498a183efba6246d8b64bc5a4e64",
+            ),
+            (
+                "gguf:iq1_m",
+                "868b328bfa9e3547645fde1deae4f97a91fc4f4d655181d795bba6351c023699",
+            ),
+        ];
+        for (name, expected_hash) in expected {
+            let format = PackedFormat::parse(name).unwrap();
+            let (elements, bytes) = format.geometry();
+            let output = decode_packed(
+                &iq_edge_payload(name, bytes),
+                format,
+                &[3 * elements as i64],
+            )
+            .unwrap();
+            assert!(output.iter().all(|value| value.is_finite()), "{name}");
+            let encoded: Vec<_> = output
+                .into_iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect();
+            assert_eq!(
+                format!("{:x}", Sha256::digest(encoded)),
+                expected_hash,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
     fn conventional_decoders_follow_lane_order_and_affine_rules() {
         let one = f16::from_f32(1.0).to_bits().to_le_bytes();
         let mut q4 = vec![0u8; 18];
@@ -1760,22 +2068,6 @@ mod tests {
         let output = decode_block(PackedFormat::Q4_1, &q4_1);
         assert_eq!(output[0], 3.0);
         assert_eq!(output[16], 5.0);
-    }
-
-    #[test]
-    fn iq_codebook_formats_are_explicitly_restricted() {
-        for format in [
-            "gguf:iq2_xxs",
-            "gguf:iq2_xs",
-            "gguf:iq3_xxs",
-            "gguf:iq1_s",
-            "gguf:iq3_s",
-            "gguf:iq2_s",
-            "gguf:iq1_m",
-        ] {
-            let error = PackedFormat::parse(format).unwrap_err();
-            assert!(error.contains("codebook"), "{error}");
-        }
     }
 
     #[test]
