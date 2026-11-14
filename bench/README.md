@@ -120,6 +120,19 @@ before drawing conclusions. Correctness tests remain automatic and separate.
 
 ## Static-weight decode consumers
 
+`fp8_block_products.py` compares `MatMulBlockQuantizedFp8Weight`, equivalent
+blocked DQ → Cast → Gemm / Transpose + MatMul + bias patterns, and their unfused
+versions using the same library and inputs on ORT 1.31. Both FP16 and BF16
+preserve weight/product/bias rounding; `--activation-scale` adds scalar FP8
+activation Q/DQ. Host outputs synchronize each timed call; session setup and
+warmup are excluded, and variant order rotates across samples.
+
+```sh
+python bench/fp8_block_products.py --library rust/target/release/libonnxruntime_mlx_ep.dylib \
+  --dtype fp16 --rows 1 32 --inner 4096 --outer 4096 --iterations 200 --output fp8.json
+# Repeat serially with --dtype bf16 and/or --activation-scale.
+```
+
 `static_weight_decode.py` measures real MLX-only ORT MatMul, Gemm and
 GroupedMatMul calls with float, byte-QDQ or common GGUF weights. Opset-29
 models need a runtime containing the new schemas; see the

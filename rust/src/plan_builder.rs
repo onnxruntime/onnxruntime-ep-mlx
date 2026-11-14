@@ -454,7 +454,18 @@ fn build_graph(
         nodes.push(node);
     }
     mark_shape_constants(&mut nodes, &inits.keys().cloned().collect());
-    crate::ops::qdq::recognize(&mut nodes);
+    let dtypes = snapshot
+        .values
+        .values()
+        .filter_map(|value| {
+            value
+                .tensor
+                .as_ref()?
+                .dtype
+                .map(|dtype| (value.name.clone(), dtype.to_onnx() as u32))
+        })
+        .collect();
+    crate::ops::qdq::recognize(&mut nodes, &dtypes);
     let graph_outputs = snapshot
         .graph_output_slots
         .iter()

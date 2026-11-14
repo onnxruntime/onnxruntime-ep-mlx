@@ -26,7 +26,7 @@ if (active) {
             size_t p = pk + size_t((CHUNK_SCALE ? n0 : n0 + j) / WD2) * WS2;
             float d = dv[j];
             if (W_ZERO) { d -= mlx_fp8(uint(wzero[p])); }
-            float wv = precise::fma(d, float(wscale[p]), -0.0f);
+            float wv = mlx_weight_round(precise::fma(d, float(wscale[p]), -0.0f));
             for (uint m = 0; m < TILE_M; ++m) { acc[m][j] = precise::fma(xv[m], wv, acc[m][j]); }
         }
     }

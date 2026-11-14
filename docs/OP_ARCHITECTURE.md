@@ -322,7 +322,7 @@ Released-runtime schema skips and native direct-handler tests are distinct evide
 has no float8 dtype, so `engine::resolve_float8` transports initializer and
 boundary payloads as uint8 bits (copying unaligned initializer bytes); generic
 dtype mapping and Cast remain unchanged. Standalone DQ decodes bits through an
-exact 256-entry table, applies `(d - zero) * scale` in fp32 (zero point must
+exact inline GPU decoder (a 256-entry table on CPU), applies `(d - zero) * scale` in fp32 (zero point must
 share the data format and scale shape), then rounds once to the output dtype.
 FP8 DQ is eager-only, like packed transport.
 
@@ -336,14 +336,30 @@ before an fp32 dot:
 | --- | --- |
 | M≤8, K-contiguous weight (Gemm transB=1, transB GroupedMatMul), K%8==0 | `mlx_fp8_gemv_k`: SIMD-group per 4 output rows, M tiled by 4 |
 | M≤8, N-contiguous weight (MatMul, Gemm transB=0), N%4==0 | `mlx_fp8_gemv_n`: K split across threadgroups, then sum |
-| M>8, not grouped | `mlx_fp8_dequant_matmul`: one GPU decode to fp32, then MLX GEMM |
+| M>8, not grouped | `mlx_fp8_dequant_matmul`: one GPU decode to the weight's consumer dtype, then MLX GEMM |
 | other (odd N/K, transA, grouped M>16) | `mlx_fp8_matvec` / `mlx_fp8_tiled_matmul` reader |
 
-MatMul with rank≥3 X is flattened when the weight is FP8. Shared DQ outputs keep
-their ordinary DQ value. FP8 activations, fp16/bf16-output DQ, device-tensor
-FP8 inputs and other unsupported forms use ordinary DQ plus the unfused product.
-`ONNXRUNTIME_EP_MLX_NO_QDQ_FUSION=1` disables fusion. The contrib
-`MatMulBlockQuantizedFp8Weight` op still decodes on host.
+MatMul with rank≥3 X is flattened when the weight is FP8. The recognizer follows
+an optional FP16/BF16 Cast and rank-two Transpose after FP32 weight DQ. Decode
+rounds each scaled weight through that Cast before FP32 accumulation; prefill
+decodes directly into the consumer dtype. Product output rounding precedes the
+ordinary Gemm epilogue or Add bias. Shared DQ/Cast outputs retain their ordinary
+values. Cast fusion is FP8-only: INT8/UINT8 DQ followed by FP16/BF16 Cast retains
+ordinary compiled matrix products, while direct FP32 integer DQ through a rank-two
+Transpose still fuses. Packed INT4/UINT4 transport remains eager independently
+of fusion. Partition discovery checks these same dtype and view constraints.
+FP8 activation DQ stays in the graph and supplies floating activations
+to the weight-only kernels; its byte codes never enter integer QDQ readers.
+Scalar FP32, saturated E4M3FN QuantizeLinear uses device round-to-nearest-even
+encoding (including subnormals and signed zero), enabling activation Q/DQ patterns.
+Other FP8 quantization forms, FP16/BF16-output weight DQ, and device-tensor FP8
+inputs remain outside fusion.
+
+`MatMulBlockQuantizedFp8Weight` uses the same GPU decode/prefill kernels with
+FP16/BF16 weight/output rounding, partial final K blocks, optional bias and
+activation Q/DQ. Its CPU path retains host decoding. FP8 transport and product
+geometry are eager-only. `ONNXRUNTIME_EP_MLX_NO_QDQ_FUSION=1` disables standard
+pattern fusion, not the contrib operator's native implementation.
 
 `test_fp8_fusion.py` checks all 256 codes of each format through every kernel
 above, including transA, odd-N/K and grouped routes, and asserts the kernel

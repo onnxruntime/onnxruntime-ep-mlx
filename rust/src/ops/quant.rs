@@ -191,7 +191,7 @@ fn align_quant_param(
     }
 }
 
-fn mlx_float_dtype(t: ort::ONNXTensorElementDataType) -> Option<mlx::mlx_dtype> {
+pub(super) fn mlx_float_dtype(t: ort::ONNXTensorElementDataType) -> Option<mlx::mlx_dtype> {
     use ort::*;
     #[allow(non_upper_case_globals)]
     match t {
@@ -479,6 +479,11 @@ fn fp8_quantize_dequantize_activation(
     let inv = div(ctx, one, scale)?;
     let inv = ctx.emit(|res, s| unsafe { mlx::mlx_where(res, nonzero, inv, zero, s) })?;
     let q = mul(ctx, a, inv)?;
+    if crate::mlx::metal::is_gpu(ctx)? {
+        let bits = super::float8::quantize_e4m3(ctx, q)?;
+        let q = super::float8::decode(ctx, bits, super::float8::Format::E4M3Fn)?;
+        return mul(ctx, q, scale);
+    }
     let abs = ctx.unary(mlx::mlx_abs, q)?;
     let min_normal = f32(ctx, 2.0f32.powi(-6));
     let subnormal = ctx.binary(mlx::mlx_less, abs, min_normal)?;
@@ -508,6 +513,14 @@ fn matmul_block_quantized_fp8_op(
 ) -> Result<(), MlxError> {
     let mut a = ctx.resolve(&n.inputs[0])?;
     let act_dtype = ctx.dtype_of(a);
+    if present(n, 3) {
+        let scale = ctx.resolve(&n.inputs[3])?;
+        a = fp8_quantize_dequantize_activation(ctx, a, scale)?;
+        a = ctx.astype(a, act_dtype)?;
+    }
+    if super::qdq::block_fp8(ctx, n, a)? {
+        return Ok(());
+    }
     let b_host = ctx.raw_host(&n.inputs[1])?;
     let nrows = i32::try_from(b_host.shape[0]).map_err(|_| "FP8 weight N exceeds i32")?;
     let k = i32::try_from(b_host.shape[1]).map_err(|_| "FP8 weight K exceeds i32")?;
@@ -519,11 +532,6 @@ fn matmul_block_quantized_fp8_op(
     let scales = broadcast_blocks(ctx, scales, nrows, nblocks, block)?;
     let scales = trim_block_values(ctx, scales, nrows, k)?;
     let weight = mul(ctx, base, scales)?;
-    if present(n, 3) {
-        let scale = ctx.resolve(&n.inputs[3])?;
-        a = fp8_quantize_dequantize_activation(ctx, a, scale)?;
-        a = ctx.astype(a, act_dtype)?;
-    }
     let act_dtype = ctx.dtype_of(a);
     let weight = ctx.astype(weight, act_dtype)?;
     let weight_t = ctx.transpose(weight, &[1, 0])?;
@@ -1367,6 +1375,11 @@ fn quantize_linear_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), 
         n.ints.get("block_size").copied().unwrap_or(0),
     )?;
     let d = div(ctx, x, scale)?;
+    if super::float8::Format::from_onnx(n.outputs[0].otype).is_some() {
+        let bits = super::float8::quantize_e4m3(ctx, d)?;
+        ctx.bind(&n.outputs[0], bits);
+        return Ok(());
+    }
     let q = round_e(ctx, d)?;
     let mut q = ctx.astype(q, mlx::mlx_dtype__MLX_FLOAT32)?;
     if present(n, 2) {
@@ -1929,7 +1942,14 @@ fn output_dtype_matches(node: &NodeView, actual: ort::ONNXTensorElementDataType)
 const QUANT_BLOCKED_SHAPE_REASON: &str = "blocked quantization expands scale blocks with static geometry that lacks Primitive::output_shapes";
 
 fn quantize_linear_compile_shape_safety(node: &NodeView) -> crate::registry::CompileShapeSafety {
-    if node.int_attr("block_size", 0) != 0 {
+    if node
+        .output_info(0)
+        .is_some_and(|out| super::float8::Format::from_onnx(out.dtype).is_some())
+    {
+        CompileShapeSafety::EagerOnly {
+            reason: "FP8 quantization produces byte payloads with device-specialized geometry",
+        }
+    } else if node.int_attr("block_size", 0) != 0 {
         crate::registry::CompileShapeSafety::ShapeKeyedOnly {
             reason: QUANT_BLOCKED_SHAPE_REASON,
         }
@@ -2012,12 +2032,10 @@ fn block_quantized_fp4_compile_shape_safety(node: &NodeView) -> CompileShapeSafe
     block_quantized_compile_shape_safety(k, node.int_attr("block_size", 16))
 }
 
-fn block_quantized_fp8_compile_shape_safety(node: &NodeView) -> CompileShapeSafety {
-    let k = node
-        .input_info(0)
-        .and_then(|input| input.shape.last().copied())
-        .unwrap_or(0);
-    block_quantized_compile_shape_safety(k, node.int_attr("block_size", 128))
+fn block_quantized_fp8_compile_shape_safety(_node: &NodeView) -> CompileShapeSafety {
+    CompileShapeSafety::EagerOnly {
+        reason: "FP8 block products import byte payloads and specialize GPU geometry",
+    }
 }
 
 fn matmulnbits_compile_shape_safety_for(
@@ -2280,9 +2298,21 @@ fn quantize_linear_claim(node: &NodeView) -> ClaimResult {
             crate::registry::ort_dtype_name(s.dtype)
         );
     }
-    if !is_quant_output(o.dtype) {
+    let fp8 = o.dtype == ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E4M3FN;
+    if fp8 {
+        require!(
+            node.since_version() >= 19
+                && is_float(x.dtype)
+                && s.dtype == ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT
+                && s.shape.iter().product::<i64>() == 1
+                && node.int_attr("block_size", 0) == 0
+                && node.int_attr("saturate", 1) == 1
+                && matches!(node.int_attr("precision", 0), 0 | 1),
+            "FP8 QuantizeLinear requires opset >=19, scalar FP32 scale/precision, E4M3FN and saturate=1"
+        );
+    } else if !is_quant_output(o.dtype) {
         deny!(
-            "output dtype {} must be int8, uint8, int16, or uint16; packed and float8 outputs fall back",
+            "output dtype {} must be int8, uint8, int16, uint16, or scalar saturated E4M3FN",
             crate::registry::ort_dtype_name(o.dtype)
         );
     }
