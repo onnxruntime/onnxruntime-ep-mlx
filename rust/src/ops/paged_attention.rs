@@ -43,7 +43,8 @@ const VECTOR_BODY: &str = r#"
         o[j] = 0.0f;
     }
     float maximum = -FLT_MAX, sum = 0.0f;
-    for (int i = partition; i < total; i += PARTITIONS) {
+    for (size_t logical = partition; logical < size_t(total); logical += PARTITIONS) {
+        int i = int(logical);
         size_t offset = 0;
         if (i < past) {
             int physical = table[B * MAX_BLOCKS + i / BLOCK];
@@ -306,7 +307,9 @@ pub(super) fn vector(
         &templates,
         &specs,
         [
-            heads * if two_pass { 32 } else { 1024 },
+            heads
+                .checked_mul(if two_pass { 32 } else { 1024 })
+                .ok_or("PagedAttention: vector launch grid exceeds int32")?,
             queries,
             if two_pass { partitions } else { 1 },
         ],
@@ -316,6 +319,7 @@ pub(super) fn vector(
             1,
         ],
     )?;
+    ctx.mark_fast("mlx_paged_vector");
     if !two_pass {
         return Ok(results[0]);
     }
@@ -327,7 +331,13 @@ pub(super) fn vector(
         &results,
         &templates,
         &[("output", shape, mlx::mlx_dtype__MLX_FLOAT16)],
-        [heads * 1024, queries, 1],
+        [
+            heads
+                .checked_mul(1024)
+                .ok_or("PagedAttention: reduction launch grid exceeds int32")?,
+            queries,
+            1,
+        ],
         [1024, 1, 1],
     )?;
     Ok(reduced[0])

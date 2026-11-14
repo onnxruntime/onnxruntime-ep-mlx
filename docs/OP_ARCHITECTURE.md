@@ -990,6 +990,12 @@ writes and multiple sequences retain functional updated-cache reads. Other
 geometries and an explicit `MLX_SDPA_BLOCKS` override retain dense attention
 lowering; all existing masks and cache writeback semantics are preserved.
 
+Long unquantized, non-latent FP16 windowed prefill gathers only physical pages
+intersecting the earliest query's attention window. Attention-mask coordinates
+are relative to that bounded view while RoPE keeps absolute sequence positions.
+This composes with native grouped-KV prefill; short queries and other cache or
+dtype forms retain their existing full-view routes.
+
 Standard causal `Attention` with one query and one current key can attend every
 past/current key. It omits the redundant causal array rather than capturing a
 first-call KV extent during shapeless decode. An external mask still applies,
