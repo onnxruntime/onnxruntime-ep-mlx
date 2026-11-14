@@ -20,6 +20,8 @@ const EAGER_REASON: &str =
 pub(crate) struct QuantizedMatMul {
     x: Option<NodeDesc>,
     w: NodeDesc,
+    weight_cast: Option<mlx::mlx_dtype>,
+    weight_transposed: bool,
 }
 
 fn dq_signature(
@@ -62,6 +64,10 @@ fn product_kind(domain: &str, op: &str, version: i32) -> Option<bool> {
     }
 }
 
+fn product_dtype(dtype: ort::ONNXTensorElementDataType) -> bool {
+    super::quant::mlx_float_dtype(dtype).is_some()
+}
+
 /// Above this many activation rows, decoding the FP8 weight once beats per-tile decode.
 const FLOAT8_TILED_ROWS: i32 = 8;
 
@@ -69,13 +75,18 @@ const FLOAT8_TILED_ROWS: i32 = 8;
 /// Returns whether the activation is batched (rank > 2), which only FP8 MatMul weights fuse.
 pub(crate) fn partition_product_candidate(node: &NodeView) -> Option<bool> {
     let grouped = product_kind(&node.domain(), &node.op_type(), node.since_version())?;
-    let rank = node.input_info(0).filter(|x| x.dtype == FLOAT)?.shape.len();
+    let dtype = node.input_info(0)?.dtype;
+    let rank = node
+        .input_info(0)
+        .filter(|x| product_dtype(x.dtype))?
+        .shape
+        .len();
     let batched = rank > 2 && node.op_type() == "MatMul";
     (node.num_outputs() == 1
-        && node.output_info(0).is_some_and(|out| out.dtype == FLOAT)
+        && node.output_info(0).is_some_and(|out| out.dtype == dtype)
         && (rank == 2 || batched)
         && node.input_info(1).is_some_and(|input| {
-            input.dtype == FLOAT && input.shape.len() == if grouped { 3 } else { 2 }
+            input.dtype == dtype && input.shape.len() == if grouped { 3 } else { 2 }
         }))
     .then_some(batched)
 }
@@ -116,24 +127,54 @@ pub(crate) fn recognize(nodes: &mut [NodeDesc]) {
     {
         return;
     }
-    let mut producers: HashMap<String, NodeDesc> = HashMap::new();
+    let mut producers: HashMap<String, QuantizedMatMul> = HashMap::new();
     for node in nodes {
         if product_kind(&node.domain, &node.op_type, node.since_version).is_some()
             && node.inputs.len() >= 2
             && node.outputs.len() == 1
-            && node.outputs[0].otype == FLOAT
+            && product_dtype(node.outputs[0].otype)
             && let Some(w) = producers.get(&node.inputs[1].name)
         {
-            node.qdq = Some(Box::new(QuantizedMatMul {
-                x: producers.get(&node.inputs[0].name).cloned(),
-                w: w.clone(),
-            }));
+            let mut pattern = w.clone();
+            pattern.x = producers.get(&node.inputs[0].name).and_then(|x| {
+                (x.weight_cast.is_none() && !x.weight_transposed).then(|| x.w.clone())
+            });
+            node.qdq = Some(Box::new(pattern));
             node.compile_shape_safety = CompileShapeSafety::EagerOnly {
                 reason: EAGER_REASON,
             };
         }
         if dq_candidate(node) {
-            producers.insert(node.outputs[0].name.clone(), node.clone());
+            producers.insert(
+                node.outputs[0].name.clone(),
+                QuantizedMatMul {
+                    x: None,
+                    w: node.clone(),
+                    weight_cast: None,
+                    weight_transposed: false,
+                },
+            );
+        } else if node.domain.is_empty()
+            && node.inputs.len() == 1
+            && node.outputs.len() == 1
+            && let Some(parent) = producers.get(&node.inputs[0].name)
+        {
+            let mut pattern = parent.clone();
+            match node.op_type.as_str() {
+                "Cast"
+                    if pattern.weight_cast.is_none()
+                        && matches!(node.outputs[0].otype,
+                        ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16 |
+                        ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16) =>
+                {
+                    pattern.weight_cast = super::quant::mlx_float_dtype(node.outputs[0].otype);
+                }
+                "Transpose" if node.int_arrays.get("perm").is_none_or(|p| p == &[1, 0]) => {
+                    pattern.weight_transposed = !pattern.weight_transposed;
+                }
+                _ => continue,
+            }
+            producers.insert(node.outputs[0].name.clone(), pattern);
         }
     }
 }
@@ -450,6 +491,16 @@ fn has_zero(dq: &NodeDesc) -> bool {
 }
 
 impl Product<'_> {
+    fn weight_rounding_header(&self) -> String {
+        let dtype = self.pattern.weight_cast.unwrap_or(F32);
+        let ty = match dtype {
+            mlx::mlx_dtype__MLX_FLOAT16 => "half",
+            mlx::mlx_dtype__MLX_BFLOAT16 => "bfloat",
+            _ => "float",
+        };
+        format!("inline float mlx_weight_round(float v) {{ return float({ty}(v)); }}\n")
+    }
+
     fn operands(&self) -> [mlx::mlx_array; 6] {
         [
             self.x.data,
@@ -471,7 +522,7 @@ impl Product<'_> {
         let wz = i32::from(has_zero(&self.pattern.w));
         let (decoder, value, zero) = match self.w.float8 {
             Some(format) => (
-                format.metal(),
+                format.metal() + &self.weight_rounding_header(),
                 "mlx_fp8(uint(w[i]))",
                 "mlx_fp8(uint(zero[p]))",
             ),
@@ -494,9 +545,15 @@ inline float mlx_weight_w(W w, S scale, Z zero, uint expert, uint k, uint col) {
              + size_t(wc / {wd2}) * {ws2};
     size_t i = {tb} ? (size_t(expert) * {n} + col) * {k} + k
                    : (size_t(expert) * {k} + k) * {n} + col;
-    return precise::fma(float({value} - ({wz} ? {zero} : {neutral})), scale[p], -0.0f);
+    return {round_open}precise::fma(float({value} - ({wz} ? {zero} : {neutral})), scale[p], -0.0f){round_close};
 }}
-"#
+"#,
+            round_open = if self.w.float8.is_some() {
+                "mlx_weight_round("
+            } else {
+                ""
+            },
+            round_close = if self.w.float8.is_some() { ")" } else { "" },
         )
     }
 
@@ -578,7 +635,7 @@ inline float mlx_weight_w(W w, S scale, Z zero, uint expert, uint k, uint col) {
             ("WD1", wd1),
             ("WD2", wd2),
         ];
-        let header = format.metal();
+        let header = format.metal() + &self.weight_rounding_header();
         let indices = self
             .routing
             .map_or_else(|| ctx.scalar_i32(0), |r| r.indices);
@@ -668,7 +725,7 @@ inline float mlx_weight_w(W w, S scale, Z zero, uint expert, uint k, uint col) {
                 ("WD2", wd2),
             ],
             shape: &self.w.shape,
-            dtype: F32,
+            dtype: self.pattern.weight_cast.unwrap_or(F32),
             grid: [cols / vec, rows, 1],
             group: [64.min(cols / vec), 1, 1],
         }
@@ -787,6 +844,88 @@ inline float mlx_weight_w(W w, S scale, Z zero, uint expert, uint k, uint col) {
     }
 }
 
+pub(super) fn block_fp8(
+    ctx: &mut TranslationContext,
+    node: &NodeDesc,
+    activation: mlx::mlx_array,
+) -> Result<bool, MlxError> {
+    if !metal::is_gpu(ctx)? {
+        return Ok(false);
+    }
+    let mut dq = NodeDesc::new(
+        "DequantizeLinear".into(),
+        String::new(),
+        21,
+        CompileShapeSafety::EagerOnly {
+            reason: EAGER_REASON,
+        },
+    );
+    dq.inputs = node.inputs[1..3].to_vec();
+    dq.ints.insert("axis".into(), 1);
+    dq.ints.insert(
+        "block_size".into(),
+        node.ints.get("block_size").copied().unwrap_or(128),
+    );
+    let w = operand(ctx, &dq, true)?.ok_or_else(||
+        "MatMulBlockQuantizedFp8Weight: invalid FP8 block layout; supply E4M3FN [N,K] weights and FP32 [N,ceil(K/block_size)] scales".to_string())?;
+    let dtype = ctx.dtype_of(activation);
+    let original = ctx.shape_of(activation);
+    let k = *original
+        .last()
+        .ok_or("MatMulBlockQuantizedFp8Weight: A requires rank >= 1")?;
+    let m = original[..original.len() - 1]
+        .iter()
+        .try_fold(1i32, |n, &d| n.checked_mul(d))
+        .ok_or("MatMulBlockQuantizedFp8Weight: flattened activation rows exceed i32")?;
+    let n = w.shape[0];
+    let x = Operand {
+        data: ctx.contiguous(activation)?,
+        shape: vec![m, k],
+        scale: ctx.scalar_f32(1.0),
+        zero: ctx.scalar_i32(0),
+        parameters: Parameters::scalar(),
+        packed: 0,
+        float8: None,
+    };
+    let pattern = QuantizedMatMul {
+        x: None,
+        w: dq,
+        weight_cast: Some(dtype),
+        weight_transposed: false,
+    };
+    let total = m
+        .checked_mul(n)
+        .ok_or("MatMulBlockQuantizedFp8Weight: output elements exceed i32")?;
+    let Some((y, path)) = (Product {
+        pattern: &pattern,
+        x: &x,
+        w: &w,
+        m,
+        k,
+        n,
+        trans_a: false,
+        trans_b: true,
+        routing: None,
+    })
+    .compute(ctx, &[m, n], total)?
+    else {
+        return Err("MatMulBlockQuantizedFp8Weight: GPU product geometry is unsupported; check weight dimensions".into());
+    };
+    let mut y = ctx.astype(y, dtype)?;
+    if node.inputs.get(4).is_some_and(|r| r.source != Src::Absent) {
+        let bias = ctx.resolve(&node.inputs[4])?;
+        y = ctx.binary(mlx::mlx_add, y, bias)?;
+    }
+    let mut output = original[..original.len() - 1].to_vec();
+    output.push(n);
+    y = ctx.reshape(y, &output)?;
+    if let Some(path) = path {
+        ctx.mark_fast(path);
+    }
+    ctx.bind(&node.outputs[0], y);
+    Ok(true)
+}
+
 pub(super) fn execute(ctx: &mut TranslationContext, node: &NodeDesc) -> Result<bool, MlxError> {
     let Some(pattern) = &node.qdq else {
         return Ok(false);
@@ -797,16 +936,29 @@ pub(super) fn execute(ctx: &mut TranslationContext, node: &NodeDesc) -> Result<b
     let Some(w) = operand(ctx, &pattern.w, true)? else {
         return Ok(false);
     };
+    if pattern.weight_transposed && w.shape.len() != 2
+        || node.op_type == "GroupedMatMul" && node.outputs[0].otype != FLOAT
+    {
+        return Ok(false);
+    }
     let mut leading = None;
-    let x = if let Some(dq) = &pattern.x {
-        let Some(x) = operand(ctx, dq, false)? else {
-            return Ok(false);
-        };
+    let quantized_x = if let Some(dq) = &pattern.x {
+        operand(ctx, dq, false)?
+    } else {
+        None
+    };
+    if pattern.x.is_some() && quantized_x.is_none() && w.float8.is_none() {
+        return Ok(false);
+    }
+    // Resolve ordinary DQ output for FP8 activations, rather than reading codes as integers.
+    let x = if let Some(x) = quantized_x {
         x
     } else {
         let mut data = ctx.resolve(&node.inputs[0])?;
         let mut shape = ctx.shape_of(data);
-        if ctx.dtype_of(data) != F32 {
+        if ctx.dtype_of(data) != F32
+            && (w.float8.is_none() || pattern.weight_cast != Some(ctx.dtype_of(data)))
+        {
             return Ok(false);
         }
         if shape.len() > 2 && node.op_type == "MatMul" && w.float8.is_some() {
@@ -840,7 +992,8 @@ pub(super) fn execute(ctx: &mut TranslationContext, node: &NodeDesc) -> Result<b
     }
     let gemm = node.op_type == "Gemm";
     let trans_a = gemm && node.ints.get("transA").copied().unwrap_or(0) != 0;
-    let trans_b = (grouped || gemm) && node.ints.get("transB").copied().unwrap_or(0) != 0;
+    let trans_b = ((grouped || gemm) && node.ints.get("transB").copied().unwrap_or(0) != 0)
+        ^ pattern.weight_transposed;
     let (m, k) = (
         x.shape[usize::from(trans_a)],
         x.shape[usize::from(!trans_a)],
@@ -892,8 +1045,12 @@ pub(super) fn execute(ctx: &mut TranslationContext, node: &NodeDesc) -> Result<b
     let Some(total) = m.checked_mul(selections).and_then(|v| v.checked_mul(n)) else {
         return Ok(false);
     };
+    let mut effective_pattern = pattern.as_ref().clone();
+    if x.float8.is_none() && !integer8(ctx.dtype_of(x.data)) {
+        effective_pattern.x = None;
+    }
     let Some((mut y, path)) = (Product {
-        pattern,
+        pattern: &effective_pattern,
         x: &x,
         w: &w,
         m,
@@ -913,8 +1070,14 @@ pub(super) fn execute(ctx: &mut TranslationContext, node: &NodeDesc) -> Result<b
         y = ctx.binary(mlx::mlx_add, y, selected)?;
     }
     if gemm {
+        let dtype = super::quant::mlx_float_dtype(node.outputs[0].otype).unwrap_or(F32);
+        y = ctx.astype(y, dtype)?;
         y = super::matmul::gemm_epilogue(ctx, node, y)?;
     }
+    y = ctx.astype(
+        y,
+        super::quant::mlx_float_dtype(node.outputs[0].otype).unwrap_or(F32),
+    )?;
     if let Some(mut leading) = leading {
         leading.push(n);
         y = ctx.reshape(y, &leading)?;
@@ -1117,7 +1280,12 @@ mod tests {
                         node.inputs = vec![reference("af"), reference("wf")];
                         node.outputs = vec![output("y")];
                         node.ints.insert("transB".into(), i64::from(transposed));
-                        node.qdq = Some(Box::new(QuantizedMatMul { x: Some(a), w }));
+                        node.qdq = Some(Box::new(QuantizedMatMul {
+                            x: Some(a),
+                            w,
+                            weight_cast: None,
+                            weight_transposed: false,
+                        }));
                         let routes = [2i32, 0, 1];
                         if grouped {
                             let indices = ctx.keep(Array::from_data(
@@ -1223,7 +1391,12 @@ mod tests {
             reference("bias"),
         ];
         node.outputs = vec![output("y")];
-        node.qdq = Some(Box::new(QuantizedMatMul { x: None, w }));
+        node.qdq = Some(Box::new(QuantizedMatMul {
+            x: None,
+            w,
+            weight_cast: None,
+            weight_transposed: false,
+        }));
         assert!(execute(&mut ctx, &node).unwrap());
         let y = ctx.resolve(&reference("y")).unwrap();
         let y = ctx.contiguous_eval(y).unwrap();
@@ -1388,7 +1561,12 @@ mod tests {
                         node.inputs = vec![reference("af"), reference("wf")];
                         node.outputs = vec![output("y")];
                         node.ints.insert("transB".into(), i64::from(transposed));
-                        node.qdq = Some(Box::new(QuantizedMatMul { x: Some(a), w }));
+                        node.qdq = Some(Box::new(QuantizedMatMul {
+                            x: Some(a),
+                            w,
+                            weight_cast: None,
+                            weight_transposed: false,
+                        }));
                         let byte = |q: i32, signed: bool| {
                             if signed {
                                 (q - 128) as i8 as u8
@@ -1532,7 +1710,12 @@ mod tests {
                     reason: EAGER_REASON,
                 },
             );
-            node.qdq = Some(Box::new(QuantizedMatMul { x: Some(a), w }));
+            node.qdq = Some(Box::new(QuantizedMatMul {
+                x: Some(a),
+                w,
+                weight_cast: None,
+                weight_transposed: false,
+            }));
             node.inputs = ["af", "wf", "indices"].map(reference).to_vec();
             node.outputs = vec![output("y")];
             let (m, k, n, groups, selections, blocks) = (2, 65, 5, 3, 2, 3);
@@ -1658,7 +1841,12 @@ mod tests {
                 );
                 node.inputs = vec![reference("af"), reference("wf")];
                 node.outputs = vec![output("y")];
-                node.qdq = Some(Box::new(QuantizedMatMul { x: Some(a), w }));
+                node.qdq = Some(Box::new(QuantizedMatMul {
+                    x: Some(a),
+                    w,
+                    weight_cast: None,
+                    weight_transposed: false,
+                }));
                 let ones = vec![1u8; k as usize];
                 for (name, shape, values) in [
                     ("a", vec![1, k], ones.as_slice()),

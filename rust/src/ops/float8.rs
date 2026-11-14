@@ -1,17 +1,95 @@
 //! ONNX 8-bit float formats. MLX has no FP8 dtype, so payloads travel as uint8 bit patterns and
-//! are decoded exactly to FLOAT on the device: by table lookup for standalone DequantizeLinear and
-//! inline in fused weight readers.
+//! are decoded exactly to FLOAT on the device and inline in fused weight readers.
 
 use crate::engine::{MlxError, TranslationContext};
 use crate::mlx::Array;
+use crate::mlx::metal::Kernel;
 use crate::sys::{mlx, ort};
 
-/// Exact FLOAT values of FP8 bit patterns via a device-side 256-entry table lookup.
+const ENCODE_E4M3: &str = r#"
+inline uint mlx_e4m3_encode(float x) {
+    uint sign = (as_type<uint>(x) >> 24) & 0x80u;
+    if (isnan(x)) { return sign | 0x7fu; }
+    float a = min(abs(x), 448.0f);
+    uint code;
+    if (a < 0.015625f) {
+        code = uint(rint(a * 512.0f));
+    } else {
+        int e = int((as_type<uint>(a) >> 23) & 255u) - 127;
+        uint mantissa = uint(rint(ldexp(a, 3 - e)));
+        code = uint((e + 7) * 8) + mantissa - 8u;
+    }
+    return sign | min(code, 126u);
+}
+"#;
+
+pub(super) fn quantize_e4m3(
+    ctx: &mut TranslationContext,
+    value: mlx::mlx_array,
+) -> Result<mlx::mlx_array, MlxError> {
+    let shape = ctx.shape_of(value);
+    let count = i32::try_from(ctx.size_of(value))
+        .map_err(|_| "QuantizeLinear FP8: element count exceeds i32; split the tensor")?;
+    if count == 0 {
+        return ctx.zeros(&shape, mlx::mlx_dtype__MLX_UINT8);
+    }
+    if !crate::mlx::metal::is_gpu(ctx)? {
+        let value = ctx.astype(value, mlx::mlx_dtype__MLX_FLOAT32)?;
+        let value = ctx.contiguous_eval(value)?;
+        let values = unsafe {
+            std::slice::from_raw_parts(ctx.host_ptr(value).cast::<f32>(), count as usize)
+        };
+        let table = Format::E4M3Fn.table();
+        let bits: Vec<u8> = values
+            .iter()
+            .map(|&v| {
+                let sign = ((v.to_bits() >> 24) & 0x80) as u8;
+                if v.is_nan() {
+                    return sign | 0x7f;
+                }
+                let a = v.abs().min(448.0);
+                let hi = table[..127].partition_point(|&d| d < a).min(126);
+                let lo = hi.saturating_sub(1);
+                let dl = a - table[lo];
+                let dh = table[hi] - a;
+                let code = if dl < dh || dl == dh && lo % 2 == 0 {
+                    lo
+                } else {
+                    hi
+                };
+                sign | code as u8
+            })
+            .collect();
+        return Ok(ctx.from_host(bits.as_ptr().cast(), &shape, mlx::mlx_dtype__MLX_UINT8));
+    }
+    Kernel {
+        name: c"mlx_fp8_quantize",
+        source: "uint i = thread_position_in_grid.x; if (i < COUNT) { y[i] = mlx_e4m3_encode(float(x[i])); }",
+        header: ENCODE_E4M3, templates: &[("COUNT", count)], shape: &shape,
+        dtype: mlx::mlx_dtype__MLX_UINT8, grid: [count, 1, 1], group: [256.min(count), 1, 1],
+    }.run(ctx, &[("x", value)])
+}
+
+/// Exact FLOAT values through a direct GPU decoder (table lookup on CPU).
 pub(crate) fn decode(
     ctx: &mut TranslationContext,
     bits: mlx::mlx_array,
     format: Format,
 ) -> Result<mlx::mlx_array, MlxError> {
+    if crate::mlx::metal::is_gpu(ctx)? {
+        let shape = ctx.shape_of(bits);
+        let count = i32::try_from(ctx.size_of(bits))
+            .map_err(|_| "DequantizeLinear FP8: element count exceeds i32; split the tensor")?;
+        if count == 0 {
+            return ctx.zeros(&shape, mlx::mlx_dtype__MLX_FLOAT32);
+        }
+        return Kernel {
+            name: c"mlx_fp8_decode",
+            source: "uint i = thread_position_in_grid.x; if (i < COUNT) { y[i] = mlx_fp8(uint(bits[i])); }",
+            header: &format.metal(), templates: &[("COUNT", count)], shape: &shape,
+            dtype: mlx::mlx_dtype__MLX_FLOAT32, grid: [count, 1, 1], group: [256.min(count), 1, 1],
+        }.run(ctx, &[("bits", bits)]);
+    }
     let table = format.table();
     let table = ctx.keep(Array::from_data(
         table.as_ptr().cast(),

@@ -782,6 +782,7 @@ pub struct TranslationContext<'a> {
     stream: mlxsys::mlx_stream,
     /// name -> raw handle (borrowed; owned by `arena` or the plan cache).
     env: HashMap<String, mlxsys::mlx_array>,
+    float8_formats: HashMap<String, crate::ops::float8::Format>,
     /// Arrays produced during translation. Boundary roots retain their own references before
     /// these handles are released, allowing MLX to recycle intermediates during eager eval.
     arena: Vec<Array>,
@@ -866,6 +867,7 @@ impl<'a> TranslationContext<'a> {
             kctx,
             stream,
             env: HashMap::new(),
+            float8_formats: HashMap::new(),
             arena: Vec::new(),
             input_arena: Vec::new(),
             astype_cache: HashMap::new(),
@@ -1126,7 +1128,32 @@ impl<'a> TranslationContext<'a> {
     /// Bind a node output name to a produced MLX array (visible to downstream nodes and CopyOut).
     pub fn bind(&mut self, o: &OutRef, a: mlxsys::mlx_array) {
         self.env.insert(o.name.clone(), a);
+        if let Some(format) = crate::ops::float8::Format::from_onnx(o.otype) {
+            self.float8_formats.insert(o.name.clone(), format);
+        } else {
+            self.float8_formats.remove(&o.name);
+        }
         self.frozen_views.remove(&o.name);
+    }
+
+    fn boundary_array(
+        &mut self,
+        o: &OutRef,
+        a: mlxsys::mlx_array,
+    ) -> Result<mlxsys::mlx_array, MlxError> {
+        if let Some(format) = crate::ops::float8::Format::from_onnx(o.otype) {
+            if self.float8_formats.get(&o.name) != Some(&format)
+                || self.dtype_of(a) != mlxsys::mlx_dtype__MLX_UINT8
+            {
+                return Err(format!(
+                    "MLX: FP8 output {} is not a matching byte payload; route encoded outputs through the FP8 quantizer",
+                    o.name
+                ));
+            }
+            Ok(a)
+        } else {
+            self.astype(a, mlx_dtype_from_onnx(o.otype))
+        }
     }
 
     /// Prove that a value comes from immutable initializer data, excluding shape-derived data.
@@ -1591,6 +1618,11 @@ impl<'a> TranslationContext<'a> {
         &mut self,
         r: &TensorRef,
     ) -> Result<Option<(mlxsys::mlx_array, crate::ops::float8::Format)>, MlxError> {
+        if let Some(&format) = self.float8_formats.get(&r.name)
+            && let Some(&array) = self.env.get(&r.name)
+        {
+            return Ok(Some((array, format)));
+        }
         if !matches!(r.source, Src::Initializer | Src::CtxInput) {
             return Ok(None);
         }
@@ -2742,7 +2774,7 @@ impl<'a> TranslationContext<'a> {
             let a = self
                 .env_get(&o.name)
                 .ok_or_else(|| format!("MLX: compiled trace missing output {}", o.name))?;
-            let casted = self.astype(a, mlx_dtype_from_onnx(o.otype))?;
+            let casted = self.boundary_array(o, a)?;
             let casted = if contiguous {
                 self.contiguous(casted)?
             } else {
@@ -2831,7 +2863,7 @@ impl<'a> TranslationContext<'a> {
                     && !self.patched_alias_outputs.contains(&o.name)
                     && let Some(&a) = self.env.get(&o.name)
                 {
-                    let casted = self.astype(a, mlx_dtype_from_onnx(o.otype))?;
+                    let casted = self.boundary_array(o, a)?;
                     // Materialise to row-major contiguous HERE (once, at the boundary) so the
                     // flat copy_out memcpy is valid. Intermediate view ops (transpose/slice/
                     // expand/split) therefore stay zero-copy strided views that MLX folds into

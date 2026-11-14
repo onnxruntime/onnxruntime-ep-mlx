@@ -9,5 +9,5 @@ for (uint j = 0; j < VEC; ++j) {
     size_t p = pr + size_t((c + j) / WD2) * WS2;
     float d = dv[j];
     if (W_ZERO) { d -= mlx_fp8(uint(wzero[p])); }
-    y[base + j] = precise::fma(d, float(wscale[p]), -0.0f);
+    y[base + j] = WT(precise::fma(d, float(wscale[p]), -0.0f));
 }

@@ -424,9 +424,30 @@ fn qdq_eager_nodes(
                 .flatten()
                 .and_then(|value| producers.get(&value).copied())
         };
-        let Some(weight) = producer(1).filter(|node| supported.contains(node)) else {
+        let Some(mut weight) = producer(1).filter(|node| supported.contains(node)) else {
             continue;
         };
+        let mut weight_views = Vec::new();
+        loop {
+            let metadata = &snapshot.nodes[&weight];
+            if !metadata.domain.is_empty()
+                || !matches!(metadata.op_type.as_str(), "Cast" | "Transpose")
+            {
+                break;
+            }
+            weight_views.push(weight);
+            let Some(parent) = metadata
+                .input_slots
+                .first()
+                .copied()
+                .flatten()
+                .and_then(|value| producers.get(&value).copied())
+                .filter(|node| supported.contains(node))
+            else {
+                break;
+            };
+            weight = parent;
+        }
         let weight_view = NodeView::new(api, raw_nodes[&weight]);
         let Some(packed_weight) = crate::ops::qdq::partition_dq_candidate(&weight_view, true)
         else {
@@ -458,6 +479,7 @@ fn qdq_eager_nodes(
             continue;
         }
         result.extend([product, weight]);
+        result.extend(weight_views);
         result.extend(activation);
     }
     result
