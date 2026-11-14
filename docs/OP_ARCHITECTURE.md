@@ -316,6 +316,69 @@ ORT-main/ONNX-main build described above, with CPU fallback and AOT function
 inlining disabled, provider profiles checked, and private dispatch asserted.
 Released-runtime schema skips and native direct-handler tests are distinct evidence.
 
+### FP8 DequantizeLinear and fused products
+
+`float8.rs` defines FLOAT8E4M3FN, E4M3FNUZ, E5M2 and E5M2FNUZ decoding. MLX
+has no float8 dtype, so `engine::resolve_float8` transports initializer and
+boundary payloads as uint8 bits (copying unaligned initializer bytes); generic
+dtype mapping and Cast remain unchanged. Standalone DQ decodes bits through an
+exact 256-entry table, applies `(d - zero) * scale` in fp32 (zero point must
+share the data format and scale shape), then rounds once to the output dtype.
+FP8 DQ is eager-only, like packed transport.
+
+FP32-output FP8 weight DQ feeding MatMul / Gemm / GroupedMatMul-29 fuses
+without materializing a floating weight on the decode path. Kernels decode
+inline with exact fp16 bit construction (four bytes per `uint`; E5M2FNUZ uses
+the generic decoder since exponent 31 is finite) and round each element to fp32
+before an fp32 dot:
+
+| Shape | Kernel (`op.fast`) |
+| --- | --- |
+| M≤8, K-contiguous weight (Gemm transB=1, transB GroupedMatMul), K%8==0 | `mlx_fp8_gemv_k`: SIMD-group per 4 output rows, M tiled by 4 |
+| M≤8, N-contiguous weight (MatMul, Gemm transB=0), N%4==0 | `mlx_fp8_gemv_n`: K split across threadgroups, then sum |
+| M>8, not grouped | `mlx_fp8_dequant_matmul`: one GPU decode to fp32, then MLX GEMM |
+| other (odd N/K, transA, grouped M>16) | `mlx_fp8_matvec` / `mlx_fp8_tiled_matmul` reader |
+
+MatMul with rank≥3 X is flattened when the weight is FP8. Shared DQ outputs keep
+their ordinary DQ value. FP8 activations, fp16/bf16-output DQ, device-tensor
+FP8 inputs and other unsupported forms use ordinary DQ plus the unfused product.
+`ONNXRUNTIME_EP_MLX_NO_QDQ_FUSION=1` disables fusion. The contrib
+`MatMulBlockQuantizedFp8Weight` op still decodes on host.
+
+`test_fp8_fusion.py` checks all 256 codes of each format through every kernel
+above, including transA, odd-N/K and grouped routes, and asserts the kernel
+via trace. GroupedMatMul-29 cases skip on released ORT 1.31; they pass on the
+schema-enabled runtime described in "Reproducing schema-enabled runtime
+validation".
+
+Synchronized session runs on M1 Max (E4M3FN, block 128 along K, median µs, 400
+runs; footprint MB; unfused is the same binary with fusion disabled):
+
+| Case | Fused | Unfused | Dense fp16 | Dense fp32 |
+| --- | --- | --- | --- | --- |
+| Gemm transB 4096², M=1 | 394 (145) | 1443 (399) | 314 | 411 |
+| Gemm transB 4096², M=8 | 515 | 1468 | 374 | 460 |
+| Gemm transB 4096², M=128 | 1429 (277) | 2145 (416) | 905 | 1161 |
+| MatMul 4096², M=1 | 377 | 1543 | 379 | 522 |
+| MatMul 4096², M=8 | 451 | 1469 | 370 | 434 |
+| MatMul 4096², M=128 | 1308 | 2003 | 917 | 1010 |
+| Gemm transB 8192², M=1 | 540 (323) | 5074 (1089) | 657 (566) | — |
+| MatMul 8192², M=1 | 605 | 5383 | 911 | — |
+
+Times include roughly 0.2–0.25 ms of session overhead. The prefill route
+allocates a transient fp32 weight per run.
+
+GroupedMatMul-29 on the schema-enabled runtime (8 experts of 2048², two
+selections; E4M3FN, block 128 along K, median µs over 300 runs; footprint MB):
+
+| Case | Fused | Unfused |
+| --- | --- | --- |
+| transB=1, M=1 | 349 (227) | 2447 (609) |
+| transB=1, M=8 | 468 | 3043 |
+| transB=1, M=64 | 1989 | 7005 |
+| transB=0, M=1 | 334 | 2485 |
+| transB=0, M=64 | 2002 | 6546 |
+
 ### Packed static-weight consumers
 
 `packed/fusion.rs` recognizes DequantizePacked feeding MatMul, Gemm,
@@ -354,7 +417,7 @@ is not selected by default. Dense M>4 profiles outside the native-QMM subset
 and unsupported views/widths) retain ordinary GPU decode plus matmul. Small
 dense products and routed experts retain direct kernels. Thus fallback profiles
 may materialize floating weights; the no-full-weight claim applies only to
-eligible fused routes. FP8 DQ transport/fusion, arbitrary QDQ view chains,
+eligible fused routes. Arbitrary QDQ view chains,
 general spatial/grouped Conv, and the other 16 packed formats' GPU fusion
 remain unimplemented, not hardware-impossibility claims.
 
@@ -750,7 +813,8 @@ The **core Rust modules** register:
 | `norm.rs` | RMS/Layer/Group/Instance/Batch/Lp normalization, MeanVarianceNormalization, LRN, Microsoft skip-norm variants |
 | `attention.rs` | GroupQueryAttention, Attention (opset 23 & 24), MultiHeadAttention, RotaryEmbedding |
 | `matmul.rs` | MatMul, GroupedMatMul, Gemm, com.microsoft::FusedMatMul |
-| `qdq.rs` | Private QDQ matrix-product recognition and direct packed int4/uint4 and int8/uint8 Metal kernels |
+| `qdq.rs` | Private QDQ matrix-product recognition and direct packed int4/uint4, int8/uint8 and FP8 Metal kernels |
+| `float8.rs` | FP8 formats, exact host/Metal decoders for DequantizeLinear transport and fusion |
 | `packed/` | Pack/Unpack/DequantizePacked; private family decoders/codebooks, Metal decoding, constant views and consumer fusion |
 | `conv.rs` | Conv/ConvTranspose/DeformConv and local/global pooling |
 | `quant.rs` | MatMulNBits, GatherBlockQuantized, Quantize/Dequantize/DynamicQuantize, MatMulInteger, ConvInteger, QLinearMatMul, QLinearConv |

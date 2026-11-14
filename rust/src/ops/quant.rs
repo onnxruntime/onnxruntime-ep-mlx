@@ -1469,6 +1469,9 @@ fn dequant_input(
     input: &crate::engine::TensorRef,
 ) -> Result<mlx::mlx_array, MlxError> {
     let Some(packed) = ctx.resolve_packed4(input)? else {
+        if let Some((bits, format)) = ctx.resolve_float8(input)? {
+            return super::float8::decode(ctx, bits, format);
+        }
         return ctx.resolve(input);
     };
     let count = if packed.shape.contains(&0) {
@@ -1866,6 +1869,7 @@ fn is_quant_output(t: ort::ONNXTensorElementDataType) -> bool {
 fn is_dequant_input(t: ort::ONNXTensorElementDataType) -> bool {
     is_quant_output(t)
         || packed4_signed(t).is_some()
+        || super::float8::Format::from_onnx(t).is_some()
         || t == ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32
 }
 
@@ -1941,6 +1945,13 @@ fn dequantize_linear_compile_shape_safety(node: &NodeView) -> crate::registry::C
     {
         CompileShapeSafety::EagerOnly {
             reason: "packed Q/DQ keeps logical ONNX metadata separate from byte storage",
+        }
+    } else if node
+        .input_info(0)
+        .is_some_and(|info| super::float8::Format::from_onnx(info.dtype).is_some())
+    {
+        CompileShapeSafety::EagerOnly {
+            reason: "FP8 DQ transports bit patterns that MLX cannot represent as a tensor dtype",
         }
     } else {
         quantize_linear_compile_shape_safety(node)
@@ -2336,10 +2347,20 @@ fn dequantize_linear_claim(node: &NodeView) -> ClaimResult {
     };
     if !is_dequant_input(x.dtype) || !is_float(s.dtype) || !is_float(o.dtype) {
         deny!(
-            "input dtype {} must be int4, uint4, int8, uint8, int16, uint16, or int32; scale/output must be float32, float16, or bfloat16 (got {} -> {})",
+            "input dtype {} must be int4, uint4, int8, uint8, int16, uint16, int32, or float8; scale/output must be float32, float16, or bfloat16 (got {} -> {})",
             crate::registry::ort_dtype_name(x.dtype),
             crate::registry::ort_dtype_name(s.dtype),
             crate::registry::ort_dtype_name(o.dtype)
+        );
+    }
+    if super::float8::Format::from_onnx(x.dtype).is_some() {
+        require!(
+            node.since_version() >= 19,
+            "float8 DQ requires opset 19 or later"
+        );
+        require!(
+            x.shape.iter().all(|&d| d <= i32::MAX as i64),
+            "float8 DQ dimensions must fit int32"
         );
     }
     if packed4_signed(x.dtype).is_some() {

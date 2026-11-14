@@ -6,6 +6,7 @@ pub mod broadcast_adjoint;
 pub mod conv;
 pub mod elementary_contrib;
 pub mod elementwise;
+pub(crate) mod float8;
 mod host_scan;
 pub mod image;
 mod kv_cache;

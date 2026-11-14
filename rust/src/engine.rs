@@ -1586,6 +1586,81 @@ impl<'a> TranslationContext<'a> {
         }))
     }
 
+    /// FP8 payloads as uint8 bit patterns of the logical shape. Only decoders may consume them.
+    pub(crate) fn resolve_float8(
+        &mut self,
+        r: &TensorRef,
+    ) -> Result<Option<(mlxsys::mlx_array, crate::ops::float8::Format)>, MlxError> {
+        if !matches!(r.source, Src::Initializer | Src::CtxInput) {
+            return Ok(None);
+        }
+        if self.in_general_trace || self.in_compiled_trace {
+            if r.init
+                .as_ref()
+                .is_some_and(|init| crate::ops::float8::Format::from_onnx(init.dtype).is_some())
+            {
+                return Err("MLX: FP8 tensor transport cannot be captured".into());
+            }
+            return Ok(None);
+        }
+        let host = self.raw_host(r)?;
+        let Some(format) = crate::ops::float8::Format::from_onnx(host.dtype) else {
+            return Ok(None);
+        };
+        let shape = host
+            .shape
+            .iter()
+            .map(|&d| dim_i32(d))
+            .collect::<Result<Vec<_>, _>>()?;
+        let count = shape
+            .iter()
+            .try_fold(1usize, |n, &d| n.checked_mul(d as usize))
+            .ok_or("MLX: FP8 tensor element count overflows")?;
+        if count != host.count
+            || r.init
+                .as_ref()
+                .and_then(|init| init.owned.as_ref())
+                .is_some_and(|owned| owned.len() != count)
+        {
+            return Err(format!(
+                "MLX: FP8 tensor {} has {} payload bytes for shape {:?}; supply one byte per element",
+                r.name, host.count, host.shape
+            ));
+        }
+        if count != 0 && host.data.is_null() {
+            return Err(format!(
+                "MLX: nonempty FP8 tensor {} has a null data pointer; supply its FP8 bytes in the initializer or input buffer",
+                r.name
+            ));
+        }
+        let uint8 = ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8;
+        // Fused FP8 kernels use vector loads; copy rare unaligned payloads into MLX storage.
+        let misaligned = !(host.data as usize).is_multiple_of(16);
+        let cache_key = format!("{}\0float8", r.cache_key());
+        let data = if let Some(array) = self.plan.cache.get(&cache_key) {
+            array.as_raw()
+        } else if count == 0 {
+            self.zeros(&shape, mlxsys::mlx_dtype__MLX_UINT8)?
+        } else if r.source == Src::Initializer || r.constant || misaligned {
+            let array = if r.source == Src::Initializer && !misaligned {
+                initializer_array(r, host.data, &shape, mlxsys::mlx_dtype__MLX_UINT8)
+            } else {
+                Array::from_data(host.data, &shape, mlxsys::mlx_dtype__MLX_UINT8)
+            };
+            let raw = array.as_raw();
+            if r.source == Src::Initializer || r.constant {
+                self.plan.cache.insert(cache_key, array);
+                raw
+            } else {
+                self.keep_input(array)
+            }
+        } else {
+            let array = self.runtime_input_array(host.data, &shape, uint8);
+            self.keep_input(array)
+        };
+        Ok(Some((data, format)))
+    }
+
     /// Read a constant/parameter input's HOST bytes at translate time (shape/axes/indices operands).
     /// Handles both a compile-time `Initializer` and a constant/dynamic `CtxInput` (read live from
     /// the kernel context each run). Faithful port of `TranslationContext::RawHost`.
