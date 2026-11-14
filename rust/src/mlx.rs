@@ -7,6 +7,8 @@
 
 use crate::sys::mlx;
 
+pub(crate) mod metal;
+
 /// Owning wrapper over an `mlx_stream` (freed once on drop).
 pub struct Stream {
     raw: mlx::mlx_stream,

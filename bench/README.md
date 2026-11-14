@@ -44,6 +44,132 @@ Shared-runner timings are too noisy for reliable regression detection, even when
 both builds use the same runner. Reproduce timing changes locally on an idle machine
 before drawing conclusions. Correctness tests remain automatic and separate.
 
+## Static-weight decode consumers
+
+`static_weight_decode.py` measures real MLX-only ORT MatMul, Gemm and
+GroupedMatMul calls with float, byte-QDQ or common GGUF weights. Opset-29
+models need a runtime containing the new schemas; see the
+[isolated development-runtime build](../docs/OP_ARCHITECTURE.md#reproducing-schema-enabled-runtime-validation).
+Released ORT 1.31 is not a substitute.
+
+```sh
+python bench/static_weight_decode.py --library rust/target/release/libonnxruntime_mlx_ep.dylib \
+  --output fused.json --op grouped --format gguf:q4_0 --trans-b 1 \
+  --rows 64 --inner 4096 --outer 4096 --experts 8 --active-experts 2 \
+  --selections 2 --unique-routes --warmup 10 --samples 30
+# Repeat in a separate process with the same library and --disable-fusion.
+```
+
+Run serially on an idle Apple-silicon GPU. Unset MLX trace, fine-trace and verbose
+variables; the harness rejects them. Reports include raw warm samples, binary
+SHA256, dtype, actual selected experts, encoded/full-weight bytes and MLX peak
+active allocation. CPU input/output boundaries and explicit GPU synchronization
+are timed; session setup is excluded. Peak allocation includes warmup/repacking,
+not process RSS or GPU residency. Compare the saved `.npy` results before using
+timings. `--dtype float16` creates a real HALF graph; it is not a hidden casting
+shortcut for a FLOAT graph.
+
+`ggml_static_weight_decode.cpp` is an optional direct GGML Metal
+`MUL_MAT_ID` comparator, not a full llama.cpp model benchmark. Build it against
+an installed Metal-enabled GGML:
+
+```sh
+c++ -O3 -std=c++17 -Wall -Wextra -Werror bench/ggml_static_weight_decode.cpp \
+  $(pkg-config --cflags --libs ggml) -lggml-base -o ggml-static-weight-decode
+./ggml-static-weight-decode --format gguf:q4_0 --rows 64 --inner 4096 --outer 4096 \
+  --experts 8 --selections 2 --weights weights.bin --x x.f32 --ids ids.i64 \
+  --ids-type i64 --time-io 1 --warmup 10 --repeats 30 \
+  --output-json ggml.json --output-raw ggml.f32 --metal-plugin /path/to/libggml-metal.so
+```
+
+Use the same raw [E,N,K] GGUF bytes, [M,K] Float32 activations and [M,S] IDs
+as the ONNX transB=1 fixture. The helper uses only the requested Metal backend,
+checks support and synchronizes upload/compute/download; no scheduler or CPU
+fallback is loaded. It rejects duplicate experts within a token because GGML's
+public contract leaves them undefined, while the MLX/ONNX path supports them.
+
+The measured GGML 0.29 Metal implementation's M>=32 expert kernel converts
+weights **and Float32 activations to FP16 tiles** before Float32 accumulation:
+[pinned kernel source](https://github.com/ggml-org/ggml/blob/57e2c2ca2a7cae756b1c4dfafa0cdfef9051d234/src/ggml-metal/kernels/mul_mm.metal).
+Its Float32 API is therefore not equivalent to an ONNX FLOAT contraction.
+Report its lower latency together with the precision difference and output
+errors, rather than weakening the MLX FLOAT contract to match it.
+
+### Measured Apple M1 Max, 32 GiB
+
+The final MLX 0.32.4 / schema-enabled ORT 1.33 development build measured 64
+same-binary A/B pairs (SHA256
+`26439d9c43dc4f3f529298a1ee143585e90502422ec5c4ddac06dbf9d1f601ce`).
+Each used 10 warmups, 30 synchronized samples, separate serial processes and
+CPU input/output boundaries. All paired outputs passed `rtol=2e-4, atol=2e-4`.
+These are operator measurements, not full-model token throughput.
+
+Grouped FLOAT results use E=8, K=N=4096, S=2 and unique routes [0,1].
+Latency cells are **fusion enabled / disabled**, in milliseconds; peak cells
+are MLX active allocation in decimal MB, including warmup/repacking.
+
+| Format / transB | M=1 ms | M=64 ms | M=64 peak MB |
+|---|---:|---:|---:|
+| int8 / 0 | 0.948 / 8.558 | 4.205 / 31.205 | 137.39 / 674.27 |
+| int8 / 1 | 0.664 / 8.763 | 4.130 / 32.473 | 137.39 / 674.27 |
+| Q4_0 / 0 | 1.043 / 2.609 | 4.304 / 25.333 | 78.64 / 615.52 |
+| Q4_0 / 1 | 0.940 / 2.648 | 4.104 / 26.379 | 78.64 / 615.52 |
+| Q4_1 / 1 | 0.846 / 2.675 | 4.239 / 26.403 | 87.03 / 623.90 |
+| Q8_0 / 1 | 0.715 / 2.785 | 4.166 / 26.457 | 145.75 / 682.62 |
+| Q4_K / 1 | 0.941 / 3.318 | 4.866 / 26.974 | 78.64 / 615.52 |
+| Q5_K / 1 | 0.960 / 3.495 | 4.934 / 27.157 | 95.42 / 632.29 |
+| Q6_K / 1 | 0.762 / 2.918 | 4.218 / 26.606 | 113.25 / 650.12 |
+
+Eligible calls avoid the 536.87 MB full FLOAT bank and decode only selected
+experts into bounded tiles. They do not create [M,S,K,N] weights. The unfused
+baseline already uses indexed MLX matmul, so an expanded tensor is not counted
+as a measured baseline allocation.
+
+Dense FLOAT Gemm transB=1, K=4096, N=14336:
+
+| Format | M=1 ms | M=64 ms | M=64 peak MB |
+|---|---:|---:|---:|
+| Q4_0 | 0.733 / 1.826 | 1.533 / 2.708 | 92.80 / 272.63 |
+| Q4_1 | 0.768 / 1.859 | 1.534 / 2.726 | 96.47 / 276.30 |
+| Q8_0 | 0.663 / 1.878 | 1.548 / 2.817 | 151.52 / 301.99 |
+| Q4_K | 1.213 / 2.176 | 1.526 / 3.066 | 92.80 / 272.63 |
+| Q5_K | 1.226 / 2.244 | 1.695 / 3.128 | 111.15 / 279.97 |
+| Q6_K (prefill fallback) | 0.894 / 2.056 | 2.891 / 2.867 | 287.77 / 287.77 |
+
+Native affine QMM handles eligible FLOAT prefill without a floating bank;
+Q6_K's group-16 parameters do not fit native group-32 QMM. Its slower custom
+dense prefill experiment was rejected, so M=64 retains ordinary GPU
+decode/matmul rather than claiming a speedup. MatMul through a constant
+Transpose was also paired for all six formats. Square dense Q4_0 transB=0
+M=1 was 0.822 / 0.842 ms: effectively parity, not a reliable speedup.
+
+Wide Q4_0 grouped transB=1 with N=14336 measured 1.410 / 8.006 ms at M=1 and
+12.244 / 91.141 ms at M=64; peaks were 264 / 2143 MB and 273 / 2152 MB.
+True HALF Q4_0 at N=4096 measured 0.671 / 2.026 ms and 3.190 / 11.617 ms.
+E=32 wide-bank fused-only measurements were 2.430 / 12.085 ms for M=1 / 64,
+with 1057 / 1065 MB peaks; no unsafe full-bank baseline was run, so these
+are not speedup pairs. The live E=128, N=4097, K=4096 test selected IDs [0,127],
+matched independent decoded-row references exactly, and peaked at 1208 MB
+instead of materializing an 8.59 GB FLOAT bank. It validates size_t offsets
+beyond signed int32, not steady-state latency.
+
+Identical raw inputs were verified for the separate GGML 0.29 Metal samples:
+
+| Format | MLX / GGML M=1 ms | MLX / GGML M=64 ms | M=64 max abs difference |
+|---|---:|---:|---:|
+| Q4_0 | 0.940 / 0.270 | 4.104 / 1.099 | 8.33e-5 |
+| Q4_1 | 0.846 / 0.305 | 4.239 / 1.110 | 1.59e-4 |
+| Q8_0 | 0.715 / 0.386 | 4.166 / 1.133 | 1.40e-3 |
+| Q4_K | 0.941 / 0.353 | 4.866 / 1.207 | 5.68e-3 |
+| Q5_K | 0.960 / 0.420 | 4.934 / 1.300 | 1.25e-2 |
+| Q6_K | 0.762 / 0.398 | 4.218 / 1.269 | 2.84e-2 |
+
+GGML remains faster, including its FLOAT matvec. Its prefill FP16 operand
+staging explains a different precision contract, not equivalent FLOAT
+throughput. The installed GGML binary reports commit `unknown`; the source
+link above identifies the inspected 0.29 implementation, not an embedded
+binary revision.
+
 ## onnax decoder workloads
 
 `onnax_decoder.py` loads an exported onnax decoder task and reuses its sessions

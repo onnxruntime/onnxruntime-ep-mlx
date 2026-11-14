@@ -15,6 +15,7 @@ use crate::registry::{
 use crate::sys::{mlx, ort};
 use crate::{deny, require};
 
+pub(crate) mod fused;
 mod integer_gemm;
 use integer_gemm::{integer_gemm_dtype, integer_gemm_op, integer_gemm_scale};
 
@@ -315,6 +316,9 @@ fn matmul_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError>
     if super::lut4::execute(ctx, n)? {
         return Ok(());
     }
+    if super::packed::execute(ctx, n)? {
+        return Ok(());
+    }
     if super::qdq::execute(ctx, n)? {
         return Ok(());
     }
@@ -422,7 +426,10 @@ pub(super) fn grouped_matmul_op(
     n: &NodeDesc,
 ) -> Result<(), MlxError> {
     let trans_b = n.ints.get("transB").copied().unwrap_or(0) != 0;
-    if !trans_b && super::qdq::execute(ctx, n)? {
+    if super::packed::execute(ctx, n)? {
+        return Ok(());
+    }
+    if super::qdq::execute(ctx, n)? {
         return Ok(());
     }
     let x = ctx.resolve(&n.inputs[0])?;
@@ -598,9 +605,14 @@ fn gemm_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
     if integer_gemm_dtype(n.outputs[0].otype) {
         return integer_gemm_op(ctx, n);
     }
+    if super::packed::execute(ctx, n)? {
+        return Ok(());
+    }
+    if super::qdq::execute(ctx, n)? {
+        return Ok(());
+    }
     let mut a = ctx.resolve(&n.inputs[0])?;
     let mut b = ctx.resolve(&n.inputs[1])?;
-    let dt = ctx.dtype_of(a);
 
     let trans_a = n.ints.get("transA").copied().unwrap_or(0) != 0;
     let trans_b = n.ints.get("transB").copied().unwrap_or(0) != 0;
@@ -611,10 +623,21 @@ fn gemm_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
         b = ctx.transpose(b, &[1, 0])?;
     }
 
+    let mm = ctx.binary(mlx::mlx_matmul, a, b)?;
+    let y = gemm_epilogue(ctx, n, mm)?;
+    ctx.mark_fast("mlx_matmul");
+    ctx.bind(&n.outputs[0], y);
+    Ok(())
+}
+
+pub(super) fn gemm_epilogue(
+    ctx: &mut TranslationContext,
+    n: &NodeDesc,
+    mm: mlx::mlx_array,
+) -> Result<mlx::mlx_array, MlxError> {
+    let dt = ctx.dtype_of(mm);
     let alpha = n.floats.get("alpha").copied().unwrap_or(1.0);
     let beta = n.floats.get("beta").copied().unwrap_or(1.0);
-
-    let mm = ctx.binary(mlx::mlx_matmul, a, b)?;
     let mut y = if alpha != 1.0 {
         let s = scalar_like(ctx, alpha, dt)?;
         ctx.binary(mlx::mlx_multiply, mm, s)?
@@ -647,9 +670,7 @@ fn gemm_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
     if n.since_version >= 29 && ctx.size_of(y) == 0 {
         y = ctx.zeros(&ctx.shape_of(y), dt)?;
     }
-    ctx.mark_fast("mlx_matmul");
-    ctx.bind(&n.outputs[0], y);
-    Ok(())
+    Ok(y)
 }
 
 // ---- claim predicates --------------------------------------------------------------------------

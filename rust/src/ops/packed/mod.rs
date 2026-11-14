@@ -1,9 +1,8 @@
 //! ONNX opset-29 Pack, Unpack, and DequantizePacked.
 //!
-//! These byte-exact operators run eagerly on the host. This preserves the full signed-INT64
-//! grouped-radix contract and the normative little-endian GGUF layouts instead of narrowing
-//! intermediates to Metal's 32-bit integer arithmetic. All 27 fixed opset-29 GGUF profiles,
-//! including the pinned normative IQ codebooks, are supported.
+//! Vectorized MLX and tiled Metal paths preserve the normative little-endian block layouts.
+//! Exact host paths retain the full signed-INT64 grouped-radix contract and all 27 fixed
+//! GGUF profiles, including the pinned normative IQ codebooks.
 
 use std::ffi::c_void;
 
@@ -16,7 +15,13 @@ use crate::sys::{mlx, ort};
 use crate::{deny, require};
 
 mod decode;
+mod fusion;
+mod gpu;
 mod iq_tables;
+mod qmm;
+
+pub(super) use fusion::execute;
+pub(crate) use fusion::{FusedWeight, partition_regions, recognize};
 
 const UINT8: ort::ONNXTensorElementDataType =
     ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8;
@@ -101,7 +106,7 @@ fn normalize_axis(axis: i64, rank: usize, op: &str) -> Result<usize, MlxError> {
     Ok(axis as usize)
 }
 
-fn checked_count(shape: &[i64], op: &str) -> Result<usize, MlxError> {
+fn element_count(shape: &[i64], op: &str) -> Result<usize, MlxError> {
     if shape.iter().any(|&dim| dim < 0) {
         return Err(format!(
             "MLX {op}: runtime shape contains a negative dimension"
@@ -111,11 +116,20 @@ fn checked_count(shape: &[i64], op: &str) -> Result<usize, MlxError> {
         return Ok(0);
     }
     shape.iter().try_fold(1usize, |count, &dim| {
-        count
-            .checked_mul(dim as usize)
-            .filter(|&value| value <= i32::MAX as usize)
-            .ok_or_else(|| format!("MLX {op}: tensor element count exceeds int32 indexing"))
+        count.checked_mul(dim as usize).ok_or_else(|| {
+            format!("MLX {op}: tensor element count overflows; reduce the logical shape")
+        })
     })
+}
+
+fn checked_count(shape: &[i64], op: &str) -> Result<usize, MlxError> {
+    let count = element_count(shape, op)?;
+    if count > i32::MAX as usize {
+        return Err(format!(
+            "MLX {op}: tensor element count exceeds int32 indexing"
+        ));
+    }
+    Ok(count)
 }
 
 fn packed_axis_count(count: usize, spec: PackSpec, word_bits: usize) -> Result<usize, MlxError> {
@@ -437,7 +451,7 @@ fn decode_packed(input: &[u8], format: PackedFormat, shape: &[i64]) -> Result<Ve
             shape.last().unwrap()
         ));
     }
-    let count = checked_count(shape, "DequantizePacked")?;
+    let count = element_count(shape, "DequantizePacked")?;
     let expected = count
         .checked_div(block_elements)
         .and_then(|blocks| blocks.checked_mul(block_bytes))
@@ -751,31 +765,49 @@ fn view_dtype(
     ctx.emit(|out, stream| unsafe { mlx::mlx_view(out, value, dtype, stream) })
 }
 
-fn dequantize_common_mlx(
+fn dequantize_input(
     ctx: &mut TranslationContext,
     node: &NodeDesc,
     format: PackedFormat,
     shape: &[i64],
-) -> Result<mlx::mlx_array, MlxError> {
+) -> Result<(mlx::mlx_array, Vec<i32>, usize), MlxError> {
     let input = ctx.resolve(&node.inputs[0])?;
     if ctx.dtype_of(input) != mlx::mlx_dtype__MLX_UINT8 || ctx.ndim(input) != 1 {
         return Err("MLX DequantizePacked: input must be rank-1 UINT8".into());
     }
     let (block_elements, block_bytes) = format.geometry();
-    let count = checked_count(shape, "DequantizePacked")?;
+    let count = element_count(shape, "DequantizePacked")?;
     if shape.is_empty() || shape.last().unwrap() % block_elements as i64 != 0 {
         return Err(format!(
             "MLX DequantizePacked: last dimension must be a multiple of {block_elements}"
         ));
     }
-    let expected_bytes = count / block_elements * block_bytes;
+    let expected_bytes = (count / block_elements)
+        .checked_mul(block_bytes)
+        .ok_or("MLX DequantizePacked: packed byte count overflow; reduce the logical shape")?;
     if ctx.size_of(input) != expected_bytes {
         return Err(format!(
             "MLX DequantizePacked: input has {} bytes; format and shape require {expected_bytes}",
             ctx.size_of(input)
         ));
     }
-    let blocks = expected_bytes / block_bytes;
+    let shape = shape
+        .iter()
+        .copied()
+        .map(dim_i32)
+        .collect::<Result<_, _>>()?;
+    Ok((input, shape, count))
+}
+
+fn dequantize_common_mlx(
+    ctx: &mut TranslationContext,
+    node: &NodeDesc,
+    format: PackedFormat,
+    shape: &[i64],
+) -> Result<mlx::mlx_array, MlxError> {
+    let (input, output_shape, count) = dequantize_input(ctx, node, format, shape)?;
+    let (block_elements, block_bytes) = format.geometry();
+    let blocks = count / block_elements;
     let blocks = dim_i32(blocks as i64)?;
     let matrix = ctx.reshape(input, &[blocks, block_bytes as i32])?;
     let scale = slice_matrix(ctx, matrix, blocks, 0, 2)?;
@@ -812,11 +844,6 @@ fn dequantize_common_mlx(
         }
         _ => return Err("MLX DequantizePacked: format has no common MLX fast path".into()),
     };
-    let output_shape: Vec<_> = shape
-        .iter()
-        .copied()
-        .map(dim_i32)
-        .collect::<Result<_, _>>()?;
     let values = ctx.reshape(values, &output_shape)?;
     let values = ctx.astype(values, mlx_dtype_from_onnx(node.outputs[0].otype))?;
     ctx.mark_fast(match format {
@@ -939,6 +966,10 @@ fn dequantize_packed_op(ctx: &mut TranslationContext, node: &NodeDesc) -> Result
         .int_arrays
         .get("shape")
         .ok_or("MLX DequantizePacked: required shape attribute is missing")?;
+    if let Some(output) = gpu::dequantize(ctx, node, format, shape)? {
+        ctx.bind(&node.outputs[0], output);
+        return Ok(());
+    }
     if matches!(
         format,
         PackedFormat::Q4_0 | PackedFormat::Q4_1 | PackedFormat::Q8_0
@@ -1083,6 +1114,10 @@ fn dequantize_packed_claim(node: &NodeView) -> ClaimResult {
         "DequantizePacked input must be rank-1 UINT8"
     );
     require!(
+        input.shape[0] <= i64::from(i32::MAX),
+        "DequantizePacked encoded payload exceeds MLX's int32 dimension limit; split the expert bank or reduce its channel dimensions"
+    );
+    require!(
         matches!(output.dtype, FLOAT | FLOAT16 | BFLOAT16 | DOUBLE),
         "DequantizePacked output must be float, float16, bfloat16, or double"
     );
@@ -1091,8 +1126,12 @@ fn dequantize_packed_claim(node: &NodeView) -> ClaimResult {
     let format = PackedFormat::parse(&format_name)?;
     let (present, shape) = node.ints_attr("shape");
     require!(
-        present && !shape.is_empty() && shape.iter().all(|&dim| dim >= 0),
-        "DequantizePacked shape must be a nonempty list of nonnegative dimensions"
+        present
+            && !shape.is_empty()
+            && shape
+                .iter()
+                .all(|&dim| (0..=i64::from(i32::MAX)).contains(&dim)),
+        "DequantizePacked shape must be nonempty and contain nonnegative MLX int32 dimensions; split dimensions larger than 2147483647"
     );
     let output_dtype = node.int_attr("output_dtype", FLOAT as i64);
     require!(
@@ -1116,8 +1155,10 @@ fn dequantize_packed_claim(node: &NodeView) -> ClaimResult {
         "DequantizePacked last dimension must be a multiple of {block_elements}"
     );
     if shape.iter().all(|&dim| dim >= 0) {
-        let count = checked_count(&shape, "DequantizePacked")?;
-        let expected = count / block_elements * block_bytes;
+        let count = element_count(&shape, "DequantizePacked")?;
+        let expected = (count / block_elements)
+            .checked_mul(block_bytes)
+            .ok_or("DequantizePacked byte count overflows; reduce the logical shape")?;
         require!(
             input.shape[0] < 0 || input.shape[0] == expected as i64,
             "DequantizePacked input has {} bytes, expected {expected}",
@@ -1141,18 +1182,9 @@ fn packed_compile_shape_safety(node: &NodeView) -> CompileShapeSafety {
                 reason: FAST_REASON,
             }
         }
-        "DequantizePacked"
-            if matches!(
-                node.string_attr("format", "").as_str(),
-                "gguf:q4_0" | "gguf:q4_1" | "gguf:q8_0"
-            ) && node
-                .output_info(0)
-                .is_some_and(|output| output.dtype != DOUBLE) =>
-        {
-            CompileShapeSafety::ShapeKeyedOnly {
-                reason: FAST_REASON,
-            }
-        }
+        "DequantizePacked" if gpu::has_decoder(node) => CompileShapeSafety::ShapeKeyedOnly {
+            reason: FAST_REASON,
+        },
         _ => CompileShapeSafety::EagerOnly {
             reason: HOST_REASON,
         },
@@ -1933,11 +1965,19 @@ mod tests {
     }
 
     #[test]
-    fn mlx_common_dequantize_matches_onnx_reference_vectors() {
+    fn metal_dequantize_matches_onnx_reference_vectors() {
         for (name, format) in [
             ("gguf:q4_0", PackedFormat::Q4_0),
             ("gguf:q4_1", PackedFormat::Q4_1),
+            ("gguf:q5_0", PackedFormat::Q5_0),
+            ("gguf:q5_1", PackedFormat::Q5_1),
             ("gguf:q8_0", PackedFormat::Q8_0),
+            ("gguf:q8_1", PackedFormat::Q8_1),
+            ("gguf:q2_k", PackedFormat::Q2K),
+            ("gguf:q3_k", PackedFormat::Q3K),
+            ("gguf:q4_k", PackedFormat::Q4K),
+            ("gguf:q5_k", PackedFormat::Q5K),
+            ("gguf:q6_k", PackedFormat::Q6K),
         ] {
             let (elements, bytes) = format.geometry();
             let block = reference_payload(name, bytes);
@@ -1967,8 +2007,9 @@ mod tests {
             );
             node.inputs = vec![reference("x")];
             node.outputs = vec![output("y", FLOAT)];
-            let actual =
-                dequantize_common_mlx(&mut ctx, &node, format, &[2, elements as i64]).unwrap();
+            let actual = gpu::dequantize(&mut ctx, &node, format, &[2, elements as i64])
+                .unwrap()
+                .unwrap();
             let actual = ctx.contiguous(actual).unwrap();
             evaluate(actual);
             let actual = unsafe {

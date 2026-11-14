@@ -2,10 +2,10 @@
 //! dequantized tensors remain available to other consumers and graph outputs.
 
 use std::collections::HashMap;
-use std::ffi::CString;
 
+use super::matmul::fused::{self, KernelKind, Routing};
 use crate::engine::{MlxError, NodeDesc, Src, TranslationContext};
-use crate::mlx::VectorArray;
+use crate::mlx::metal::{self, Kernel};
 use crate::registry::{CompileShapeSafety, NodeView};
 use crate::sys::{mlx, ort};
 
@@ -55,7 +55,7 @@ fn product_kind(domain: &str, op: &str, version: i32) -> Option<bool> {
         return None;
     }
     match op {
-        "MatMul" => Some(false),
+        "MatMul" | "Gemm" => Some(false),
         "GroupedMatMul" if version == 29 => Some(true),
         _ => None,
     }
@@ -66,8 +66,7 @@ pub(crate) fn partition_product_candidate(node: &NodeView) -> bool {
     let Some(grouped) = product_kind(&node.domain(), &node.op_type(), node.since_version()) else {
         return false;
     };
-    (!grouped || node.int_attr("transB", 0) == 0)
-        && node.num_outputs() == 1
+    node.num_outputs() == 1
         && node.output_info(0).is_some_and(|out| out.dtype == FLOAT)
         && node
             .input_info(0)
@@ -109,8 +108,6 @@ pub(crate) fn recognize(nodes: &mut [NodeDesc]) {
     let mut producers: HashMap<String, NodeDesc> = HashMap::new();
     for node in nodes {
         if product_kind(&node.domain, &node.op_type, node.since_version).is_some()
-            && (node.op_type != "GroupedMatMul"
-                || node.ints.get("transB").copied().unwrap_or(0) == 0)
             && node.inputs.len() >= 2
             && node.outputs.len() == 1
             && node.outputs[0].otype == FLOAT
@@ -281,13 +278,19 @@ fn binary_scales(dq: &NodeDesc) -> bool {
     })
 }
 
-fn integer_exact(pattern: &QuantizedMatMul, x: &Operand, w: &Operand) -> bool {
+fn integer_exact(
+    pattern: &QuantizedMatMul,
+    x: &Operand,
+    w: &Operand,
+    trans_a: bool,
+    trans_b: bool,
+) -> bool {
     // Each centered int8/uint8 value is in [-255,255]. For K<=256 every partial sum's
     // absolute value is <=16,646,400<2^24, hence exact in int32 AND float32. Binary
     // scales in [2^-40,2^40] keep every scaled product/partial normal and finite.
-    (0..=256).contains(&x.shape[1])
-        && x.parameters.strides[1] == 0
-        && w.parameters.strides[1] == 0
+    (0..=256).contains(&x.shape[usize::from(!trans_a)])
+        && x.parameters.strides[usize::from(!trans_a)] == 0
+        && w.parameters.strides[1 + usize::from(trans_b)] == 0
         && pattern.x.as_ref().is_some_and(binary_scales)
         && binary_scales(&pattern.w)
 }
@@ -317,11 +320,16 @@ const SOURCE: &str = r#"
     bool compensated = true;
     int isum = 0;
     for (uint k = lane; k < K; k += 32) {
-        size_t xp = size_t(row / XD0) * XS0 + size_t(k / XD1) * XS1;
-        size_t wp = size_t(expert / WD0) * WS0 + size_t(k / WD1) * WS1
-                  + size_t(col / WD2) * WS2;
-        size_t xi = size_t(row) * K + k;
-        size_t wi = (size_t(expert) * K + k) * N + col;
+        uint xr = TRANS_A ? k : row;
+        uint xc = TRANS_A ? row : k;
+        uint wr = TRANS_B ? col : k;
+        uint wc = TRANS_B ? k : col;
+        size_t xp = size_t(xr / XD0) * XS0 + size_t(xc / XD1) * XS1;
+        size_t wp = size_t(expert / WD0) * WS0 + size_t(wr / WD1) * WS1
+                  + size_t(wc / WD2) * WS2;
+        size_t xi = TRANS_A ? size_t(k) * M + row : size_t(row) * K + k;
+        size_t wi = TRANS_B ? (size_t(expert) * N + col) * K + k
+                           : (size_t(expert) * K + k) * N + col;
         int aq = 0;
         int az = 0;
         if (X_QUANT) {
@@ -346,7 +354,7 @@ const SOURCE: &str = r#"
         } else {
             // Separate, precise FP32 DQ rounding occurs before the dot, never outside it.
             float ax = X_QUANT ? precise::fma(float(a), xscale[xp], 0.0f)
-                               : float(x[size_t(row) * K + k]);
+                               : float(x[xi]);
             float bw = precise::fma(float(b), wscale[wp], 0.0f);
             sum = precise::fma(ax, bw, sum);
             if ((X_PACKED || W_PACKED) && compensated) {
@@ -385,28 +393,181 @@ const SOURCE: &str = r#"
         if (valid) { sum = result; }
     }
     if (INTEGER) {
-        size_t xp = size_t(row / XD0) * XS0;
-        size_t wp = size_t(expert / WD0) * WS0 + size_t(col / WD2) * WS2;
+        size_t xp = TRANS_A ? size_t(row / XD1) * XS1 : size_t(row / XD0) * XS0;
+        size_t wp = size_t(expert / WD0) * WS0
+                  + (TRANS_B ? size_t(col / WD1) * WS1 : size_t(col / WD2) * WS2);
         sum = (float(isum) * xscale[xp]) * wscale[wp];
     }
     if (lane == 0) { y[out] = sum; }
 "#;
 
+struct Product<'a> {
+    pattern: &'a QuantizedMatMul,
+    x: &'a Operand,
+    w: &'a Operand,
+    m: i32,
+    k: i32,
+    n: i32,
+    trans_a: bool,
+    trans_b: bool,
+    routing: Option<&'a Routing>,
+}
+
+fn has_zero(dq: &NodeDesc) -> bool {
+    dq.inputs.get(2).is_some_and(|r| r.source != Src::Absent)
+}
+
+impl Product<'_> {
+    fn operands(&self) -> [mlx::mlx_array; 6] {
+        [
+            self.x.data,
+            self.w.data,
+            self.x.scale,
+            self.w.scale,
+            self.x.zero,
+            self.w.zero,
+        ]
+    }
+
+    fn weight_only_header(&self) -> String {
+        let Parameters {
+            strides: [ws0, ws1, ws2],
+            divisors: [wd0, wd1, wd2],
+        } = self.w.parameters;
+        let (m, k, n) = (self.m, self.k, self.n);
+        let (ta, tb) = (i32::from(self.trans_a), i32::from(self.trans_b));
+        let wz = i32::from(has_zero(&self.pattern.w));
+        format!(
+            r#"
+#include <metal_simdgroup_matrix>
+template <typename X, typename S, typename Z>
+inline float mlx_weight_x(X x, S, Z, uint row, uint k) {{
+    size_t i = {ta} ? size_t(k) * {m} + row : size_t(row) * {k} + k;
+    return float(x[i]);
+}}
+template <typename W, typename S, typename Z>
+inline float mlx_weight_w(W w, S scale, Z zero, uint expert, uint k, uint col) {{
+    uint wr = {tb} ? col : k, wc = {tb} ? k : col;
+    size_t p = size_t(expert / {wd0}) * {ws0} + size_t(wr / {wd1}) * {ws1}
+             + size_t(wc / {wd2}) * {ws2};
+    size_t i = {tb} ? (size_t(expert) * {n} + col) * {k} + k
+                   : (size_t(expert) * {k} + k) * {n} + col;
+    return precise::fma(float(int(w[i]) - ({wz} ? int(zero[p]) : 0)), scale[p], -0.0f);
+}}
+"#
+        )
+    }
+
+    fn simd_templates(&self, exact: bool) -> Vec<(&'static str, i32)> {
+        vec![
+            ("M", self.m),
+            ("K", self.k),
+            ("N", self.n),
+            ("S", self.routing.map_or(1, |r| r.selections)),
+            ("GROUPED", i32::from(self.routing.is_some())),
+            ("TRANS_A", i32::from(self.trans_a)),
+            ("TRANS_B", i32::from(self.trans_b)),
+            ("X_QUANT", i32::from(self.pattern.x.is_some())),
+            ("X_PACKED", self.x.packed),
+            ("W_PACKED", self.w.packed),
+            ("INTEGER", i32::from(exact)),
+            (
+                "X_ZERO",
+                i32::from(self.pattern.x.as_ref().is_some_and(has_zero)),
+            ),
+            ("W_ZERO", i32::from(has_zero(&self.pattern.w))),
+            ("XS0", self.x.parameters.strides[0]),
+            ("XS1", self.x.parameters.strides[1]),
+            ("XD0", self.x.parameters.divisors[0]),
+            ("XD1", self.x.parameters.divisors[1]),
+            ("WS0", self.w.parameters.strides[0]),
+            ("WS1", self.w.parameters.strides[1]),
+            ("WS2", self.w.parameters.strides[2]),
+            ("WD0", self.w.parameters.divisors[0]),
+            ("WD1", self.w.parameters.divisors[1]),
+            ("WD2", self.w.parameters.divisors[2]),
+        ]
+    }
+
+    fn compute(
+        &self,
+        ctx: &mut TranslationContext,
+        shape: &[i32],
+        total: i32,
+    ) -> Result<Option<(mlx::mlx_array, Option<&'static str>)>, MlxError> {
+        if total == 0 || self.k == 0 {
+            return Ok(Some((ctx.zeros(shape, F32)?, None)));
+        }
+        let exact = integer_exact(self.pattern, self.x, self.w, self.trans_a, self.trans_b);
+        // Retain the proven-integer/compensated paths for doubly quantized and packed4 inputs.
+        if self.pattern.x.is_none() && self.w.packed == 0 {
+            let header = self.weight_only_header();
+            if let Some((y, kind)) = (fused::Matmul {
+                operands: self.operands(),
+                m: self.m,
+                k: self.k,
+                n: self.n,
+                routing: self.routing,
+                k_contiguous: self.trans_b,
+                header: &header,
+                shape,
+                dtype: F32,
+            })
+            .run(ctx)?
+            {
+                return Ok(Some((
+                    y,
+                    Some(match kind {
+                        KernelKind::Matvec => "mlx_qdq_matvec",
+                        KernelKind::Tiled => "mlx_qdq_tiled_matmul",
+                    }),
+                )));
+            }
+        }
+        let Some(threads) = total.checked_mul(32) else {
+            return Ok(None);
+        };
+        let indices = self
+            .routing
+            .map_or_else(|| ctx.scalar_i32(0), |r| r.indices);
+        let y = Kernel {
+            name: c"mlx_qdq_matmul",
+            source: SOURCE,
+            header: HEADER,
+            templates: &self.simd_templates(exact),
+            shape,
+            dtype: F32,
+            grid: [threads, 1, 1],
+            group: [threads.min(256), 1, 1],
+        }
+        .run(
+            ctx,
+            &[
+                ("x", self.x.data),
+                ("w", self.w.data),
+                ("xscale", self.x.scale),
+                ("wscale", self.w.scale),
+                ("xzero", self.x.zero),
+                ("wzero", self.w.zero),
+                ("indices", indices),
+            ],
+        )?;
+        let packed = self.x.packed != 0 || self.w.packed != 0;
+        let path = match (packed, exact) {
+            (true, true) => "mlx_qdq_packed4_integer_matmul",
+            (true, false) => "mlx_qdq_packed4_matmul",
+            (false, true) => "mlx_qdq_integer_matmul",
+            (false, false) => "mlx_qdq_matmul",
+        };
+        Ok(Some((y, Some(path))))
+    }
+}
+
 pub(super) fn execute(ctx: &mut TranslationContext, node: &NodeDesc) -> Result<bool, MlxError> {
     let Some(pattern) = &node.qdq else {
         return Ok(false);
     };
-    let mut device = unsafe { mlx::mlx_device_new() };
-    let mut kind = mlx::mlx_device_type__MLX_CPU;
-    let mut rc = unsafe { mlx::mlx_stream_get_device(&mut device, ctx.stream()) };
-    if rc == 0 {
-        rc = unsafe { mlx::mlx_device_get_type(&mut kind, device) };
-    }
-    unsafe { mlx::mlx_device_free(device) };
-    if rc != 0 {
-        return Err("QDQ MatMul: cannot inspect MLX stream device".into());
-    }
-    if kind != mlx::mlx_device_type__MLX_GPU {
+    if !metal::is_gpu(ctx)? {
         return Ok(false);
     }
     let Some(w) = operand(ctx, &pattern.w, true)? else {
@@ -436,10 +597,16 @@ pub(super) fn execute(ctx: &mut TranslationContext, node: &NodeDesc) -> Result<b
     if w.shape.len() != if grouped { 3 } else { 2 } {
         return Ok(false);
     }
-    let (m, k) = (x.shape[0], x.shape[1]);
-    let n = *w.shape.last().expect("rank checked");
-    let mut indices = ctx.scalar_i32(0);
-    let mut selections = 1;
+    let gemm = node.op_type == "Gemm";
+    let trans_a = gemm && node.ints.get("transA").copied().unwrap_or(0) != 0;
+    let trans_b = (grouped || gemm) && node.ints.get("transB").copied().unwrap_or(0) != 0;
+    let (m, k) = (
+        x.shape[usize::from(trans_a)],
+        x.shape[usize::from(!trans_a)],
+    );
+    let rank = w.shape.len();
+    let n = w.shape[rank - 1 - usize::from(trans_b)];
+    let wk = w.shape[rank - 2 + usize::from(trans_b)];
     let bias = if grouped && node.inputs.get(3).is_some_and(|r| r.source != Src::Absent) {
         let b = ctx.resolve(&node.inputs[3])?;
         if ctx.dtype_of(b) != F32 {
@@ -449,178 +616,66 @@ pub(super) fn execute(ctx: &mut TranslationContext, node: &NodeDesc) -> Result<b
     } else {
         None
     };
-    if grouped {
-        indices = ctx.resolve(&node.inputs[2])?;
+    let routing = if grouped {
+        let indices = ctx.resolve(&node.inputs[2])?;
         let shape = ctx.shape_of(indices);
         let wide = |s: &[i32]| s.iter().copied().map(i64::from).collect::<Vec<_>>();
+        let canonical_w = if trans_b {
+            vec![w.shape[0], w.shape[2], w.shape[1]]
+        } else {
+            w.shape.clone()
+        };
         super::matmul::grouped_geometry(
             &wide(&x.shape),
-            &wide(&w.shape),
+            &wide(&canonical_w),
             &wide(&shape),
             bias.map(|b| wide(&ctx.shape_of(b))).as_deref(),
             None,
         )?;
-        if !matches!(
-            ctx.dtype_of(indices),
-            mlx::mlx_dtype__MLX_INT32 | mlx::mlx_dtype__MLX_INT64
-        ) {
-            return Err("QDQ GroupedMatMul: indices must be int32 or int64".into());
+        Some(fused::read_routing(ctx, &node.inputs[2], w.shape[0])?)
+    } else {
+        if k != wk {
+            return Err(format!(
+                "QDQ {}: activation reduction dimension {k} differs from weight dimension {wk}; check transA/transB and the original DequantizeLinear layout",
+                node.op_type
+            ));
         }
-        let values = ctx.read_ints_eval(&node.inputs[2])?;
-        if values.len() != (i64::from(shape[0]) * i64::from(shape[1])) as usize
-            || values.iter().any(|&i| i < 0 || i >= i64::from(w.shape[0]))
-        {
-            return Err("QDQ GroupedMatMul: group_indices values must be in [0,G)".into());
-        }
-        indices = ctx.contiguous(indices)?;
-        selections = shape[1];
-    } else if k != w.shape[0] {
-        return Err("QDQ MatMul: reduction dimensions differ".into());
-    }
+        None
+    };
+    let selections = routing.as_ref().map_or(1, |r| r.selections);
     let shape = if grouped {
         vec![m, selections, n]
     } else {
         vec![m, n]
     };
-    let total = m
-        .checked_mul(selections)
-        .and_then(|v| v.checked_mul(n))
-        .ok_or("QDQ MatMul: output exceeds int32 indexing")?;
-    let Some(threads) = total.checked_mul(32) else {
+    let Some(total) = m.checked_mul(selections).and_then(|v| v.checked_mul(n)) else {
         return Ok(false);
     };
-    let exact = integer_exact(pattern, &x, &w);
-    let mut y = if total == 0 || k == 0 {
-        ctx.zeros(&shape, F32)?
-    } else {
-        let mut inputs = VectorArray::new();
-        for a in [x.data, w.data, x.scale, w.scale, x.zero, w.zero, indices] {
-            // MLX emits scalar references for rank-0 arguments; this shader uses pointers.
-            let a = if ctx.ndim(a) == 0 {
-                ctx.reshape(a, &[1])?
-            } else {
-                a
-            };
-            inputs.append(a);
-        }
-        let names = super::selective_scan::VecString::new(&[
-            "x", "w", "xscale", "wscale", "xzero", "wzero", "indices",
-        ])?;
-        let outputs = super::selective_scan::VecString::new(&["y"])?;
-        let source = CString::new(SOURCE).expect("static shader has no NUL");
-        let header = CString::new(HEADER).expect("static shader header has no NUL");
-        let kernel = unsafe {
-            mlx::mlx_fast_metal_kernel_new(
-                c"mlx_qdq_matmul".as_ptr(),
-                names.as_raw(),
-                outputs.as_raw(),
-                source.as_ptr(),
-                header.as_ptr(),
-                true,
-                false,
-            )
-        };
-        if kernel.ctx.is_null() {
-            return Err("QDQ MatMul: cannot create Metal kernel".into());
-        }
-        let config = unsafe { mlx::mlx_fast_metal_kernel_config_new() };
-        if config.ctx.is_null() {
-            unsafe { mlx::mlx_fast_metal_kernel_free(kernel) };
-            return Err("QDQ MatMul: cannot create Metal kernel configuration".into());
-        }
-        let mut rc = 0;
-        for (name, value) in [
-            ("M", m),
-            ("K", k),
-            ("N", n),
-            ("S", selections),
-            ("GROUPED", i32::from(grouped)),
-            ("X_QUANT", i32::from(pattern.x.is_some())),
-            ("X_PACKED", x.packed),
-            ("W_PACKED", w.packed),
-            ("INTEGER", i32::from(exact)),
-            (
-                "X_ZERO",
-                i32::from(
-                    pattern
-                        .x
-                        .as_ref()
-                        .is_some_and(|d| d.inputs.get(2).is_some_and(|r| r.source != Src::Absent)),
-                ),
-            ),
-            (
-                "W_ZERO",
-                i32::from(
-                    pattern
-                        .w
-                        .inputs
-                        .get(2)
-                        .is_some_and(|r| r.source != Src::Absent),
-                ),
-            ),
-            ("XS0", x.parameters.strides[0]),
-            ("XS1", x.parameters.strides[1]),
-            ("XD0", x.parameters.divisors[0]),
-            ("XD1", x.parameters.divisors[1]),
-            ("WS0", w.parameters.strides[0]),
-            ("WS1", w.parameters.strides[1]),
-            ("WS2", w.parameters.strides[2]),
-            ("WD0", w.parameters.divisors[0]),
-            ("WD1", w.parameters.divisors[1]),
-            ("WD2", w.parameters.divisors[2]),
-        ] {
-            let name = CString::new(name).expect("template name has no NUL");
-            rc |= unsafe {
-                mlx::mlx_fast_metal_kernel_config_add_template_arg_int(config, name.as_ptr(), value)
-            };
-        }
-        rc |= unsafe {
-            mlx::mlx_fast_metal_kernel_config_add_output_arg(
-                config,
-                shape.as_ptr(),
-                shape.len(),
-                F32,
-            )
-        };
-        rc |= unsafe { mlx::mlx_fast_metal_kernel_config_set_grid(config, threads, 1, 1) };
-        rc |= unsafe {
-            mlx::mlx_fast_metal_kernel_config_set_thread_group(config, threads.min(256), 1, 1)
-        };
-        let mut result = VectorArray::new();
-        if rc == 0 {
-            rc = unsafe {
-                mlx::mlx_fast_metal_kernel_apply(
-                    result.as_mut_ptr(),
-                    kernel,
-                    inputs.as_raw(),
-                    config,
-                    ctx.stream(),
-                )
-            };
-        }
-        unsafe {
-            mlx::mlx_fast_metal_kernel_config_free(config);
-            mlx::mlx_fast_metal_kernel_free(kernel);
-        }
-        if rc != 0 || result.size() != 1 {
-            return Err("QDQ MatMul: Metal kernel dispatch failed".into());
-        }
-        ctx.keep(result.get(0))
+    let Some((mut y, path)) = (Product {
+        pattern,
+        x: &x,
+        w: &w,
+        m,
+        k,
+        n,
+        trans_a,
+        trans_b,
+        routing: routing.as_ref(),
+    })
+    .compute(ctx, &shape, total)?
+    else {
+        return Ok(false);
     };
     if let Some(b) = bias {
+        let indices = routing.as_ref().expect("grouped routing").indices;
         let selected = ctx.emit(|res, s| unsafe { mlx::mlx_take_axis(res, b, indices, 0, s) })?;
         y = ctx.binary(mlx::mlx_add, y, selected)?;
     }
-    if total != 0 && k != 0 {
-        ctx.mark_fast(if (x.packed != 0 || w.packed != 0) && exact {
-            "mlx_qdq_packed4_integer_matmul"
-        } else if x.packed != 0 || w.packed != 0 {
-            "mlx_qdq_packed4_matmul"
-        } else if exact {
-            "mlx_qdq_integer_matmul"
-        } else {
-            "mlx_qdq_matmul"
-        });
+    if gemm {
+        y = super::matmul::gemm_epilogue(ctx, node, y)?;
+    }
+    if let Some(path) = path {
+        ctx.mark_fast(path);
     }
     ctx.bind(&node.outputs[0], y);
     Ok(true)
@@ -751,7 +806,7 @@ mod tests {
             ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8,
             ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8,
         ];
-        for grouped in [false, true] {
+        for (grouped, transposed) in [(false, false), (false, true), (true, false), (true, true)] {
             for &at in &types {
                 for &wt in &types {
                     if crate::engine::packed4_signed(at).is_none()
@@ -784,8 +839,12 @@ mod tests {
                         w.inputs[0] = quantized_reference(
                             "w",
                             &wv,
-                            &if grouped {
+                            &if grouped && transposed {
+                                vec![groups.into(), n.into(), k.into()]
+                            } else if grouped {
                                 vec![groups.into(), k.into(), n.into()]
+                            } else if transposed {
+                                vec![n.into(), k.into()]
                             } else {
                                 vec![k.into(), n.into()]
                             },
@@ -796,7 +855,14 @@ mod tests {
                         scalar_scale(&mut a, 0.25);
                         scalar_scale(&mut w, 0.125);
                         let mut node = NodeDesc::new(
-                            if grouped { "GroupedMatMul" } else { "MatMul" }.into(),
+                            if grouped {
+                                "GroupedMatMul"
+                            } else if transposed {
+                                "Gemm"
+                            } else {
+                                "MatMul"
+                            }
+                            .into(),
                             String::new(),
                             if grouped { 29 } else { 13 },
                             CompileShapeSafety::EagerOnly {
@@ -805,6 +871,7 @@ mod tests {
                         );
                         node.inputs = vec![reference("af"), reference("wf")];
                         node.outputs = vec![output("y")];
+                        node.ints.insert("transB".into(), i64::from(transposed));
                         node.qdq = Some(Box::new(QuantizedMatMul { x: Some(a), w }));
                         let routes = [2i32, 0, 1];
                         if grouped {
@@ -839,8 +906,13 @@ mod tests {
                                 for col in 0..n {
                                     let expected: i32 = (0..k)
                                         .map(|kk| {
+                                            let wi = if transposed {
+                                                (group * n + col) * k + kk
+                                            } else {
+                                                (group * k + kk) * n + col
+                                            };
                                             (av[(row * k + kk) as usize] - az)
-                                                * (wv[((group * k + kk) * n + col) as usize] - wz)
+                                                * (wv[wi as usize] - wz)
                                         })
                                         .sum();
                                     assert_eq!(
@@ -1031,7 +1103,7 @@ mod tests {
     #[test]
     fn qdq_direct_gpu_products() {
         // Direct handler tests do not assert ORT can load GroupedMatMul-29.
-        for grouped in [false, true] {
+        for (grouped, transposed) in [(false, false), (false, true), (true, false), (true, true)] {
             for signed_a in [false, true] {
                 for signed_w in [false, true] {
                     for k in [0, 33, 256, 4096] {
@@ -1054,7 +1126,14 @@ mod tests {
                         scalar_scale(&mut a, 0.25);
                         scalar_scale(&mut w, 0.125);
                         let mut node = NodeDesc::new(
-                            if grouped { "GroupedMatMul" } else { "MatMul" }.into(),
+                            if grouped {
+                                "GroupedMatMul"
+                            } else if transposed {
+                                "Gemm"
+                            } else {
+                                "MatMul"
+                            }
+                            .into(),
                             String::new(),
                             if grouped { 29 } else { 13 },
                             CompileShapeSafety::EagerOnly {
@@ -1063,6 +1142,7 @@ mod tests {
                         );
                         node.inputs = vec![reference("af"), reference("wf")];
                         node.outputs = vec![output("y")];
+                        node.ints.insert("transB".into(), i64::from(transposed));
                         node.qdq = Some(Box::new(QuantizedMatMul { x: Some(a), w }));
                         let byte = |q: i32, signed: bool| {
                             if signed {
@@ -1079,8 +1159,12 @@ mod tests {
                             ("a", vec![m, k], av, signed_a),
                             (
                                 "w",
-                                if grouped {
+                                if grouped && transposed {
+                                    vec![groups, n, k]
+                                } else if grouped {
                                     vec![groups, k, n]
+                                } else if transposed {
+                                    vec![n, k]
                                 } else {
                                     vec![k, n]
                                 },
@@ -1141,7 +1225,13 @@ mod tests {
                                     let expected: i64 = (0..k)
                                         .map(|kk| {
                                             i64::from((row * k + kk) % 7)
-                                                * i64::from(((g * k + kk) * n + col) % 11)
+                                                * i64::from(
+                                                    (if transposed {
+                                                        (g * n + col) * k + kk
+                                                    } else {
+                                                        (g * k + kk) * n + col
+                                                    }) % 11,
+                                                )
                                         })
                                         .sum();
                                     assert_eq!(
@@ -1349,7 +1439,10 @@ mod tests {
                     .unwrap()
                     .unwrap();
                 let w = operand(&mut ctx, &pattern.w, true).unwrap().unwrap();
-                assert_eq!(integer_exact(pattern, &x, &w), static_scales && k <= 256);
+                assert_eq!(
+                    integer_exact(pattern, &x, &w, false, false),
+                    static_scales && k <= 256
+                );
                 assert!(execute(&mut ctx, &node).unwrap());
                 let y = ctx.resolve(&reference("y")).unwrap();
                 let y = ctx.contiguous_eval(y).unwrap();

@@ -1,17 +1,203 @@
-"""Real current-runtime QDQ sessions; GroupedMatMul-29 handler tests live in Rust."""
+"""Strict QDQ product sessions, original layouts, and independently checked GPU fusion."""
 
 import json
 import math
 import os
-from pathlib import Path
 import subprocess
 import sys
+from pathlib import Path
 
 import numpy as np
 import onnxruntime as ort
 import pytest
-from onnx import TensorProto, helper, numpy_helper
+from _schema_runtime import session as schema_session
+from onnx import TensorProto, defs, helper, numpy_helper
+from onnx.reference import ReferenceEvaluator
 from onnxruntime.capi.onnxruntime_pybind11_state import Fail
+
+
+def _transposed_model(case, layout, dtype):
+    rng = np.random.default_rng(42)
+    m, k, n, experts, selections = 3, 67, 7, 4, 3
+    grouped, trans_a = case == "Grouped", case == "GemmTransA"
+    weight_shape = (experts, n, k) if grouped else (n, k)
+    a_shape = (k, m) if trans_a else (m, k)
+    low, high, zero = (-70, 70, -3) if dtype == np.int8 else (0, 180, 71)
+    feeds = {
+        "a": rng.integers(low, high, a_shape).astype(dtype),
+        "w": rng.integers(low, high, weight_shape).astype(dtype),
+    }
+    block = 16 if layout == "blocked" else 0
+    scale_shape = (*weight_shape[:-1], (k + block - 1) // block) if block else (n,)
+    a_scale = np.array([0.125, 0.25, 0.5], np.float32)
+    w_scale = np.resize(
+        np.array([0.0625, 0.125, 0.25] if layout == "integer" else [0.03, 0.07, 0.011],
+                 np.float32),
+        scale_shape,
+    )
+    a_zero = np.full(a_scale.shape, zero, dtype)
+    w_zero = rng.integers(low, high, scale_shape).astype(dtype)
+    parameters = {"as": a_scale, "ws": w_scale, "az": a_zero, "wz": w_zero}
+    initializers = []
+    if layout == "integer":
+        initializers = [numpy_helper.from_array(parameters.pop(name), name)
+                        for name in ("as", "ws")]
+    feeds.update(parameters)
+    nodes = [
+        helper.make_node("DequantizeLinear", ["a", "as", "az"], ["af"],
+                         axis=1 if trans_a else 0),
+        helper.make_node("DequantizeLinear", ["w", "ws", "wz"], ["wf"],
+                         axis=len(weight_shape) - (1 if block else 2),
+                         **({"block_size": block} if block else {})),
+    ]
+    activation = (
+        (feeds["a"].astype(np.float32)
+         - _expanded(a_zero, a_shape, 1 if trans_a else 0, 0))
+        * _expanded(a_scale, a_shape, 1 if trans_a else 0, 0)
+    )
+    if trans_a:
+        activation = activation.T
+    weight = (
+        (feeds["w"].astype(np.float32)
+         - _expanded(w_zero, weight_shape, len(weight_shape) - (1 if block else 2), block))
+        * _expanded(w_scale, weight_shape, len(weight_shape) - (1 if block else 2), block)
+    )
+    if grouped:
+        feeds["ids"] = np.array([[3, 0, 3], [1, 1, 0], [0, 3, 1]], np.int64)
+        feeds["bias"] = rng.normal(0, 0.2, (experts, n)).astype(np.float32)
+        nodes.append(helper.make_node("GroupedMatMul", ["af", "wf", "ids", "bias"],
+                                      ["y"], transB=1))
+        expected = np.stack([
+            activation[row].astype(np.float64) @ weight[ids].astype(np.float64).T
+            for row, choices in enumerate(feeds["ids"]) for ids in choices
+        ]).reshape(m, selections, n).astype(np.float32) + feeds["bias"][feeds["ids"]]
+        shape = [m, selections, n]
+    else:
+        feeds["c"] = rng.normal(0, 0.2, (1, n)).astype(np.float32)
+        nodes.append(helper.make_node("Gemm", ["af", "wf", "c"], ["y"],
+                                      transA=int(trans_a), transB=1, alpha=0.75, beta=-0.25))
+        # Preserve the MatMul output rounding before the ordered Gemm epilogue.
+        product = (activation.astype(np.float64) @ weight.astype(np.float64).T).astype(np.float32)
+        expected = product * np.float32(0.75) + feeds["c"] * np.float32(-0.25)
+        shape = [m, n]
+    nodes.append(helper.make_node("Add", ["wf", "wf"], ["shared"]))
+    info = helper.make_tensor_value_info
+    model = helper.make_model(helper.make_graph(
+        nodes, "original_transposed_qdq_layout",
+        [info(name, helper.np_dtype_to_tensor_dtype(value.dtype), list(value.shape))
+         for name, value in feeds.items()],
+        [info("y", TensorProto.FLOAT, shape),
+         info("wf", TensorProto.FLOAT, list(weight_shape)),
+         info("shared", TensorProto.FLOAT, list(weight_shape))],
+        initializers,
+    ), opset_imports=[helper.make_opsetid("", 29 if grouped else 24)], ir_version=11)
+    return model.SerializeToString(), feeds, expected, weight
+
+
+@pytest.mark.parametrize("case", ["Gemm", "GemmTransA", "Grouped"])
+@pytest.mark.parametrize("layout", ["integer", "axis", "blocked"])
+@pytest.mark.parametrize("dtype", [np.int8, np.uint8], ids=["int8", "uint8"])
+def test_transposed_qdq(case, layout, dtype, monkeypatch):
+    model, feeds, expected, weight = _transposed_model(case, layout, dtype)
+    for disabled in ["0", "1"]:
+        monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_QDQ_FUSION", disabled)
+        result = schema_session(model).run(None, feeds)
+        np.testing.assert_allclose(result[0], expected, rtol=2e-5, atol=8e-4)
+        np.testing.assert_array_equal(result[1], weight)
+        np.testing.assert_array_equal(result[2], weight + weight)
+
+
+def test_transposed_qdq_actual_dispatch(tmp_path):
+    trace = tmp_path / "transposed-gemm.json"
+    subprocess.run(
+        [sys.executable, "-m", "pytest",
+         f"{Path(__file__)}::test_transposed_qdq[int8-blocked-Gemm]",
+         "-q", "-p", "no:cacheprovider"],
+        env={**os.environ, "ONNXRUNTIME_EP_MLX_TRACE": str(trace)},
+        check=True, timeout=180,
+    )
+    kernels = {event.get("args", {}).get("kernel")
+               for event in json.loads(trace.read_text()) if event.get("cat") == "op.fast"}
+    assert "mlx_qdq_matmul" in kernels, kernels
+
+
+def _require_grouped_reference():
+    if defs.onnx_opset_version() < 29:
+        pytest.skip("ONNX lacks the GroupedMatMul-29 reference schema; install ONNX from main")
+
+
+@pytest.mark.parametrize("case", ["Gemm", "GemmTransA", "Grouped"])
+@pytest.mark.parametrize("transpose", [0, 1])
+@pytest.mark.parametrize("dtype", [np.int8, np.uint8], ids=["int8", "uint8"])
+def test_weight_only_prefill(case, transpose, dtype, monkeypatch):
+    if case == "Grouped":
+        _require_grouped_reference()
+    rng = np.random.default_rng(815)
+    m, k, n, experts, selections = 17, 257, 69, 5, 3
+    grouped, trans_a = case == "Grouped", case == "GemmTransA"
+    weight_shape = ((experts,) if grouped else ()) + ((n, k) if transpose else (k, n))
+    low, high, zero = (-70, 70, -3) if dtype == np.int8 else (0, 180, 71)
+    feeds = {
+        "x": rng.normal(0, 0.2, (k, m) if trans_a else (m, k)).astype(np.float32),
+        "w": rng.integers(low, high, weight_shape).astype(dtype),
+        "scale": np.resize(np.array([0.03, 0.07, 0.011], np.float32), (n,)),
+        "zero": np.full((n,), zero, dtype),
+    }
+    axis = len(weight_shape) - (2 if transpose else 1)
+    weight = ((feeds["w"].astype(np.float32) - _expanded(feeds["zero"], weight_shape, axis, 0))
+              * _expanded(feeds["scale"], weight_shape, axis, 0))
+    activation = feeds["x"].T if trans_a else feeds["x"]
+    nodes = [helper.make_node("DequantizeLinear", ["w", "scale", "zero"], ["wf"], axis=axis)]
+    if grouped:
+        feeds["ids"] = np.resize(np.array([4, 1, 1, 4, 4, 1], np.int64), (m, selections))
+        feeds["bias"] = rng.normal(0, 0.2, (experts, n)).astype(np.float32)
+        nodes.append(helper.make_node("GroupedMatMul", ["x", "wf", "ids", "bias"], ["y"],
+                                      transB=transpose))
+        canonical = weight.transpose(0, 2, 1) if transpose else weight
+        expected = np.stack([
+            activation[row].astype(np.float64) @ canonical[expert].astype(np.float64)
+            for row, choices in enumerate(feeds["ids"]) for expert in choices
+        ]).reshape(m, selections, n).astype(np.float32) + feeds["bias"][feeds["ids"]]
+        shape = [m, selections, n]
+    else:
+        feeds["c"] = rng.normal(0, 0.2, (n,)).astype(np.float32)
+        nodes.append(helper.make_node("Gemm", ["x", "wf", "c"], ["y"],
+                                      transA=int(trans_a), transB=transpose,
+                                      alpha=0.75, beta=-0.25))
+        canonical = weight.T if transpose else weight
+        product = (activation.astype(np.float64) @ canonical.astype(np.float64)).astype(np.float32)
+        expected = product * np.float32(0.75) + feeds["c"] * np.float32(-0.25)
+        shape = [m, n]
+    info = helper.make_tensor_value_info
+    model = helper.make_model(helper.make_graph(
+        nodes, "weight_only_prefill",
+        [info(name, helper.np_dtype_to_tensor_dtype(value.dtype), list(value.shape))
+         for name, value in feeds.items()],
+        [info("y", TensorProto.FLOAT, shape)],
+    ), opset_imports=[helper.make_opsetid("", 29 if grouped else 24)], ir_version=11)
+    reference = ReferenceEvaluator(model).run(None, feeds)[0]
+    np.testing.assert_allclose(reference, expected, rtol=2e-5, atol=8e-6)
+    for disabled in ["0", "1"]:
+        monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_QDQ_FUSION", disabled)
+        actual = schema_session(model.SerializeToString()).run(None, feeds)[0]
+        np.testing.assert_allclose(actual, expected, rtol=2e-5, atol=8e-6)
+
+
+def test_weight_only_prefill_actual_dispatch(tmp_path):
+    _require_grouped_reference()
+    probe, _, _, _ = _transposed_model("Grouped", "axis", np.int8)
+    schema_session(probe)
+    trace = tmp_path / "weight-only-prefill.json"
+    subprocess.run(
+        [sys.executable, "-m", "pytest",
+         f"{Path(__file__)}::test_weight_only_prefill", "-k", "Grouped and int8",
+         "-q", "-p", "no:cacheprovider"],
+        env={**os.environ, "ONNXRUNTIME_EP_MLX_TRACE": str(trace)},
+        check=True, timeout=180,
+    )
+    kernels = {event.get("args", {}).get("kernel")
+               for event in json.loads(trace.read_text()) if event.get("cat") == "op.fast"}
+    assert "mlx_qdq_tiled_matmul" in kernels, kernels
 
 
 def _expanded(value, shape, axis, block):
@@ -290,7 +476,9 @@ def test_qdq_nonfusion_dispatch(tmp_path, unsupported):
     events = json.loads(trace.read_text())
     kernels = {e.get("args", {}).get("kernel")
                for e in events if e.get("cat") == "op.fast"}
-    assert not {"mlx_qdq_matmul", "mlx_qdq_integer_matmul"} & kernels
+    assert not {
+        "mlx_qdq_matmul", "mlx_qdq_matvec", "mlx_qdq_tiled_matmul", "mlx_qdq_integer_matmul",
+    } & kernels
 
 
 @pytest.mark.skipif(not ort.__version__.startswith("1.31."),

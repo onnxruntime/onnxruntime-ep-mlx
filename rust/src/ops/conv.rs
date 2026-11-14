@@ -20,6 +20,9 @@ use crate::registry::{
 use crate::sys::mlx;
 use crate::{deny, require};
 
+mod packed;
+pub(crate) use packed::profile as packed_pointwise_profile;
+
 // ---- small arithmetic/movement helpers ----------------------------------------------------------
 
 fn add(
@@ -191,6 +194,10 @@ fn conv_general(
 // ---- Conv ---------------------------------------------------------------------------------------
 
 fn conv_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
+    if let Some(y) = packed::execute(ctx, n)? {
+        ctx.bind(&n.outputs[0], y);
+        return Ok(());
+    }
     let x0 = ctx.resolve(&n.inputs[0])?;
     let spatial_rank = ctx.ndim(x0) as i32 - 2;
     // The claim permits dynamic (symbolic) spatial dims; the general compiled path is shape-keyed so

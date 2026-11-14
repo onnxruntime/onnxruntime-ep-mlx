@@ -118,6 +118,9 @@ fn normalize_indices(
 // ---- handlers ----------------------------------------------------------------------------------
 
 fn gather_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
+    if super::packed::execute(ctx, n)? {
+        return Ok(());
+    }
     let data = ctx.resolve(&n.inputs[0])?;
     let indices = ctx.resolve(&n.inputs[1])?;
     let rank = ctx.ndim(data) as i32;

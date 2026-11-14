@@ -71,6 +71,34 @@ arbitrary-precision oracle; fractional scaling and arithmetic overflow retain
 explicit guards.
 See the [opset-29 support and remaining gaps](../docs/OP_ARCHITECTURE.md#opset-29-onnx-main-unreleased).
 
+`test_packed_fusion.py` checks all 11 GPU GGUF formats against ONNX-main
+decoding/contractions: both expert layouts, Gemm transpositions, constant views,
+live/repeated/unused routes, selected embedding rows, pointwise Conv and ordinary
+Conv fallback profiles. It also checks native-QMM changed-value/shape replay,
+two-dimensional decode tails, shared signed zeros/nonfinite fields and FP32
+accumulation/BF16 exponent range. Trace subprocesses assert actual private
+dispatch, not merely graph claims, and probe schema availability before spawning.
+Native prefill covers M=32/33 boundaries, large FLOAT activations/weights and
+NaN/Inf classes, without narrowing FLOAT operands.
+`test_qdq_fusion.py` retains the exact/compensated packed regressions and adds
+original-layout Gemm/GroupedMatMul transpositions and byte-weight tiled prefill.
+Use the synchronized [static-weight consumer harness](../bench/README.md#static-weight-decode-consumers)
+for latency and memory; trace/verbose measurements are not timing evidence.
+
+For a full Python run, isolate the operator and remaining suites in separate
+processes: the backend's lazy registration can precede the operator fixture's
+independent registration in an aggregate `pytest tests` run.
+
+```sh
+python -m pytest -q tests/ops
+python -m pytest -q tests --ignore=tests/ops
+```
+
+If an inherited environment has `pytest-randomly` installed, set
+`PYTEST_ADDOPTS="-p no:randomly"` for these commands and their subprocesses.
+Existing trace-order assertions require their selected cases in collection
+order; this does not alter provider execution or numerical checks.
+
 `test_attention_semantics.py` uses small, locally built models and an independent float64 SDPA
 oracle rather than version-specific ONNX backend fixture names. It covers fully masked rows
 (including the combined causal/explicit mask), broadcast mask ranks, FP16/FP32, GQA and cached
