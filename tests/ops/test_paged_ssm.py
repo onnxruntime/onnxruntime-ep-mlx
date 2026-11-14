@@ -204,7 +204,7 @@ def test_mrotary_column_gather_reference(dtype, rank, layout, interleaved, rot, 
     model = runtime_model(model, dtype)
     session = strict_session(model)
     rng = np.random.default_rng(413)
-    for batch, tokens in [(2, 3), (1, 1), (3, 5), (2, 3)]:
+    for batch, tokens in [(2, 3), (1, 1), (1, 0), (3, 5), (2, 3)]:
         cos = rng.standard_normal((17, half)).astype(dtype)
         sin = rng.standard_normal((17, half)).astype(dtype)
         x4 = rng.standard_normal((batch, 2, tokens, 12)).astype(dtype)
