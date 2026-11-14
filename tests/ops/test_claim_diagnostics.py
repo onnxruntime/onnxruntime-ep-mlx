@@ -52,8 +52,8 @@ def _declined_float8_quant_model() -> bytes:
     return m.make_model(
         "QuantizeLinear",
         [m.tensor("x", DataType.FLOAT, [2]), m.tensor("scale", DataType.FLOAT, [])],
-        [m.tensor("out", DataType.FLOAT8E4M3FN, [2])],
-        attributes={"output_dtype": int(DataType.FLOAT8E4M3FN)},
+        [m.tensor("out", DataType.FLOAT8E5M2, [2])],
+        attributes={"output_dtype": int(DataType.FLOAT8E5M2)},
         opset=24,
     )
 
