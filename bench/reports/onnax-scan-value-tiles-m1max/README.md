@@ -33,6 +33,36 @@ whole-process memory observations. `environment.json` identifies the source
 and input-manifest digests; copied drivers record the exact commands and
 captured-array paths used on this machine.
 
+## Full decoder measurement
+
+The complete Qwen3.5-0.8B comparison uses a 4032-token input with 4031 shifted
+prediction targets. Both independent processes load the same 25 symbolically
+simplified backward graphs, frozen forward/head graphs, inputs and adapters.
+The [symbolic-adjoint change](https://github.com/justinchuby/onnax/pull/200)
+identifies the graph-generation work. Each library runs ten warmups and
+100 measured forward/loss/VJP calls with fixed parameters. Both body and head
+sessions are eager; ORT optimization is disabled.
+
+| Reverse value columns | Step median | Step P95 | Prediction targets/s | Process peak physical footprint |
+| --- | ---: | ---: | ---: | ---: |
+| Four | 10.501 s | 10.650 s | 383.9 | 8.572 GB |
+| Eight | 10.675 s | 11.832 s | 377.6 | 7.819 GB |
+
+The candidate's whole-process peak is 8.8% lower, including setup and runtime.
+Its full-step median is 1.7% higher in this pair, with a broader tail. Forward
+and output-head work has medians of 3.359 / 3.564 seconds; body backward has
+medians of 7.120 / 7.098 seconds. The raw samples retain this phase variation.
+
+All 100 token losses are equal. All 60 final adapter gradients match at
+`rtol=1e-4, atol=1e-6`, with maximum absolute difference 1.54e-8. Input/adapter
+digests and loaded graph identities agree, and both runs leave parameters unchanged.
+Both process guards complete with zero observation errors and maximum gaps
+below 1.05 seconds; `caffeinate -i` covers the measurement.
+
+`full4032-formal/` contains raw samples, phase timings, process observations,
+all gradient checks, session overrides and copied drivers. The earlier
+single-call whole-model qualification remains in `full4032/`.
+
 ## Numerical coverage
 
 The native Scan suite passes 56 tests with ORT graph optimization and CPU
@@ -40,13 +70,3 @@ fallback disabled for MLX execution. Coverage includes both scan directions,
 key widths 16–128, value widths around the eight-column boundary, a partial
 17-column tile, zero cotangents, decay extremes, changing inputs, compilation
 and structurally different Scan bodies.
-
-## Whole-model gradient check
-
-The 4032-token decoder also runs in separate original/candidate processes,
-with the same 25 simplified backward graphs, frozen forward/head graphs,
-inputs and adapter parameters. All 60 adapter gradients and the token loss
-match at `rtol=1e-4, atol=1e-6`. `full4032/` records the per-gradient errors,
-input/adapter digests, graph overrides and process guards. Each process runs
-one warmup and one checked call; the 100-sample timing table above measures
-the single backward block.
