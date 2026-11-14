@@ -52,19 +52,59 @@ ONNXRUNTIME_MLX_EP_LIB=rust/target/release/libonnxruntime_mlx_ep.dylib \
 ```
 
 Use `--mode accuracy` or `--mode benchmark` to run only one part. The ONNX
-baseline and paper-style candidate run through the EP with CPU fallback and ORT
-graph optimizations disabled. Separate compiled-MLX timings compare an
-inference-only `log1p` formulation and distinguish loss of fused SDPA from
-normalization overhead. Each latency sample synchronizes output evaluation;
-warmup/compilation is excluded. JSON includes raw samples and device/version
-metadata. Repeat in separate processes on an idle machine before interpreting
-small differences.
+baseline, an FP32-upcast-only control, and the paper-style candidate run through
+the EP with CPU fallback and ORT graph optimizations disabled. The upcast-only
+control runs the same operator in FP32 before casting back; for LogSoftmax and
+loss, it retains `x - logsumexp(x)`. Separate compiled-MLX timings compare the
+same control, the paper normalizer, and an inference-only `log1p` formulation.
+Composed attention uses the same softmax operation for the current and upcast
+controls, and also measures the cost of losing fused SDPA. Each latency sample
+synchronizes output evaluation; warmup/compilation is excluded.
+
+Variant order rotates across shapes separately for each operator and dtype. To
+balance each individual comparison, repeat the benchmark in a fresh process with
+`--reverse-order` and the same warmup/sample settings. JSON includes order,
+raw samples, and device/version metadata. Measure on an idle machine and repeat
+before interpreting small differences.
 
 The candidates are benchmark graphs, not production replacements. The existing
-`x - logsumexp(x)` loss/log-softmax path can lose representable values, including
-BF16 uniform logits with a large common offset. Rewriting the normalizer
-improves those outputs but can add significant dispatch/memory overhead; the
-paper's training-gradient benefits do not establish an inference speedup.
+`x - logsumexp(x)` loss/log-softmax path can lose representable values. The
+following max-class LogSoftmax outputs agree between the EP and compiled MLX;
+the reference is independently computed in FP64 and rounded to the output dtype.
+FP32 upcasting fixes the tested narrow-dtype cliff, tie, and 1000-offset cases,
+but cancellation remains at larger offsets and for small max-class corrections.
+The paper normalizer preserves those values by excluding the maximum.
+
+| Dtype and logits | Rounded reference | Current | Upcast | Paper |
+| --- | ---: | ---: | ---: | ---: |
+| BF16 `[3, -3, -3]` | -0.00494385 | 0 | -0.00494385 | -0.00494385 |
+| FP16 `[4, -4, -4]` | -0.00067091 | 0 | -0.00067091 | -0.00067091 |
+| BF16 `[9, 9, -9]` | -0.69140625 | -0.6875 | -0.69140625 | -0.69140625 |
+| BF16 `[1000, 1000, 1000]` | -1.1015625 | 0 | -1.1015625 | -1.1015625 |
+| FP16 `[1000, 1000, 1000]` | -1.09863281 | -1 | -1.09863281 | -1.09863281 |
+| BF16 `[32768, 32768, 32768]` | -1.1015625 | 0 | -1.09375 | -1.1015625 |
+| FP16 `[32768, 32768, 32768]` | -1.09863281 | 0 | -1.09765625 | -1.09863281 |
+| FP16 `[9, -9, -9]` | -5.96046e-8 | 0 | 0 | -5.96046e-8 |
+| BF16 `[0, -64, -64]` | -3.20278e-28 | 0 | 0 | -3.20278e-28 |
+
+Two mirrored-order 20-warmup/100-sample sweeps on an M1 Max with Python 3.13.5,
+MLX 0.32.4, and ORT 1.31.0 separated the two costs below. Ratios are geometric
+means of the per-case ratio of the two-run median latencies for FP16 and BF16
+inputs.
+
+| Comparison | Upcast / current | Paper / upcast | Paper / current |
+| --- | ---: | ---: | ---: |
+| EP Softmax | 1.06x | 1.32x | 1.40x |
+| EP LogSoftmax | 1.04x | 1.37x | 1.43x |
+| EP SoftmaxCrossEntropyLoss | 1.01x | 1.04x | 1.04x |
+| Compiled MLX LogSoftmax | 1.05x | 1.56x | 1.64x |
+| Composed attention | 1.12x | 1.39x | 1.56x |
+
+The composed-current attention baseline was 1.21x the fused-current baseline,
+so decomposition is a distinct cost. The paper candidate's extra normalization
+work, rather than FP32 upcasting alone, accounts for most of the standalone
+Softmax/LogSoftmax and attention overhead. The paper's training-gradient benefits
+do not establish an inference speedup.
 
 ## CI
 

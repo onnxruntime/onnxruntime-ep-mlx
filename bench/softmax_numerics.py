@@ -1,8 +1,9 @@
 """Reproduce arXiv:2610.31642 forward collapse and measure proposed fixes on Metal.
 
 The ONNX candidates run through the real EP with CPU fallback disabled. The MLX
-microbenchmarks additionally measure an inference-only log1p formulation and
-separate attention normalization overhead from the cost of losing fused SDPA.
+microbenchmarks isolate FP32 upcasting from the paper's normalizer rewrite,
+measure an inference-only log1p formulation, and separate attention
+normalization overhead from the cost of losing fused SDPA.
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ import platform
 import statistics
 import time
 from pathlib import Path
+from typing import TypeVar
 
 import mlx.core as mx
 import numpy as np
@@ -28,6 +30,36 @@ DTYPES = {
     "fp16": (DT.FLOAT16, mx.float16),
     "bf16": (DT.BFLOAT16, mx.bfloat16),
 }
+T = TypeVar("T")
+
+
+def counterbalanced_order(
+    variants: tuple[T, ...], case_index: int, *, reverse: bool = False
+) -> tuple[T, ...]:
+    """Rotate variants and reverse every rotation cycle to balance run order."""
+    if not variants:
+        raise ValueError(
+            "Cannot counterbalance an empty variant list; provide at least one variant."
+        )
+    if case_index < 0:
+        raise ValueError(
+            f"Cannot counterbalance case index {case_index}; use a non-negative index."
+        )
+    size = len(variants)
+    if size == 1:
+        return variants
+
+    # All rotations in both directions balance first and pairwise ordering for
+    # two and three variants. Larger groups receive the same treatment without
+    # coupling ordering to the growing benchmark record count.
+    cycle_size = size if size == 2 else 2 * size
+    phase = case_index % cycle_size
+    ordered = variants
+    if phase >= size:
+        ordered = tuple(reversed(variants))
+        phase -= size
+    ordered = ordered[phase:] + ordered[:phase]
+    return tuple(reversed(ordered)) if reverse else ordered
 
 
 def reference(x: np.ndarray) -> np.ndarray:
@@ -52,6 +84,16 @@ def paper_logsoftmax(x: mx.array) -> mx.array:
     return (shifted - normalizer).astype(x.dtype)
 
 
+def current_logsoftmax(x: mx.array) -> mx.array:
+    return x - mx.logsumexp(x, axis=-1, keepdims=True)
+
+
+def upcast_logsoftmax(x: mx.array) -> mx.array:
+    """Use the existing forward formula, but accumulate and normalize in FP32."""
+    work = x.astype(mx.float32)
+    return (work - mx.logsumexp(work, axis=-1, keepdims=True)).astype(x.dtype)
+
+
 def forward_logsoftmax(x: mx.array) -> mx.array:
     """Equivalent finite-input forward formula, not the paper's autodiff rule."""
     work = x.astype(mx.float32)
@@ -67,10 +109,14 @@ def model(
     shape: tuple[int, ...],
     dtype: DT,
     *,
-    fixed: bool = False,
+    variant: str = "current",
     log_prob: bool = False,
 ) -> bytes:
     """FP32 boundaries permit BF16 testing without NumPy/ORT BF16 feeds."""
+    if variant not in ("current", "upcast", "paper"):
+        raise ValueError(
+            f"Unknown softmax benchmark variant {variant!r}; use current, upcast, or paper."
+        )
     nodes: list[ir.Node] = []
     initializers: list[ir.Value] = []
 
@@ -102,22 +148,34 @@ def model(
         target = value("target", DT.INT64, loss_shape)
         inputs.append(target)
     outputs = []
-    if not fixed:
+    if variant in ("current", "upcast"):
+        compute_dtype = DT.FLOAT if variant == "upcast" else dtype
+        work = stored
+        if compute_dtype != dtype:
+            work = emit("Cast", [stored], compute_dtype, shape, to=int(compute_dtype))
         result_shape = loss_shape if loss_op else shape
-        out = value("result", dtype, result_shape)
+        out = value("result", compute_dtype, result_shape)
         op_outputs = [out]
         attrs = {"reduction": "none"} if loss_op else {"axis": -1}
         if log_prob:
-            op_outputs.append(value("log_prob", dtype, shape))
+            op_outputs.append(value("log_prob", compute_dtype, shape))
         nodes.append(
             ir.node(
                 op,
-                [stored, target] if loss_op else [stored],
+                [work, target] if loss_op else [work],
                 attributes=attrs,
                 outputs=op_outputs,
             )
         )
         for result in op_outputs:
+            if compute_dtype != dtype:
+                result = emit(
+                    "Cast",
+                    [result],
+                    dtype,
+                    list(result.shape),
+                    to=int(dtype),
+                )
             outputs.append(
                 emit("Cast", [result], DT.FLOAT, list(result.shape), to=int(DT.FLOAT))
             )
@@ -176,7 +234,7 @@ def model(
         outputs,
         nodes=nodes,
         initializers=initializers,
-        name=f"{op}_{'paper' if fixed else 'current'}",
+        name=f"{op}_{variant}",
         opset_imports={"": 24},
     )
     return ir.to_proto(ir.Model(graph, ir_version=11)).SerializeToString()
@@ -284,6 +342,13 @@ def attention_accuracy() -> list[dict]:
 
 def accuracy() -> list[dict]:
     records = []
+    mlx_variants = {
+        "current": current_logsoftmax,
+        "upcast": upcast_logsoftmax,
+        "paper": paper_logsoftmax,
+        "forward_log1p": forward_logsoftmax,
+    }
+    compiled_variants = {name: mx.compile(fn) for name, fn in mlx_variants.items()}
     cases = {
         "bf16_cliff": [3.0, -3.0, -3.0],
         "fp16_cliff": [4.0, -4.0, -4.0],
@@ -294,6 +359,7 @@ def accuracy() -> list[dict]:
         "singleton": [9.0],
         "uniform": [0.0, 0.0, 0.0],
         "uniform_offset": [1000.0, 1000.0, 1000.0],
+        "wide_uniform_offset": [32768.0, 32768.0, 32768.0],
     }
     for name, (onnx_dt, mlx_dt) in DTYPES.items():
         for case, logits in cases.items():
@@ -308,7 +374,16 @@ def accuracy() -> list[dict]:
                 current = session(model(op, x.shape, onnx_dt, log_prob=is_loss)).run(
                     None, feed
                 )
-                fixed = session(model(op, x.shape, onnx_dt, fixed=True)).run(
+                upcast = session(
+                    model(
+                        op,
+                        x.shape,
+                        onnx_dt,
+                        variant="upcast",
+                        log_prob=is_loss,
+                    )
+                ).run(None, feed)
+                paper = session(model(op, x.shape, onnx_dt, variant="paper")).run(
                     None, feed
                 )[0]
                 expected = (
@@ -317,38 +392,71 @@ def accuracy() -> list[dict]:
                 quantized = rounded(expected, mlx_dt)
                 # Compiled Metal log1p is less accurate than the standalone primitive.
                 tolerance = {"fp32": 1e-4, "fp16": 2e-3, "bf16": 1e-2}[name]
+                # The control rounds logsumexp before subtracting the logits.
+                upcast_atol = max(5e-7, float(np.spacing(np.abs(stored)).max()))
                 np.testing.assert_allclose(
-                    fixed,
+                    upcast[0],
+                    quantized,
+                    rtol=tolerance,
+                    atol=upcast_atol,
+                    err_msg=f"upcast candidate: {name}/{case}/{op}",
+                )
+                if is_loss:
+                    np.testing.assert_allclose(
+                        upcast[1],
+                        rounded(ref, mlx_dt),
+                        rtol=tolerance,
+                        atol=upcast_atol,
+                        err_msg=f"upcast log_prob: {name}/{case}",
+                    )
+                np.testing.assert_allclose(
+                    paper,
                     quantized,
                     rtol=tolerance,
                     atol=0,
                     err_msg=f"paper candidate: {name}/{case}/{op}",
                 )
+                mlx_results = {}
                 if op == "LogSoftmax":
-                    quick = np.array(
-                        forward_logsoftmax(mx.array(x, dtype=mlx_dt)).astype(mx.float32)
+                    mlx_input = mx.array(x, dtype=mlx_dt)
+                    for mode, functions in (
+                        ("mlx", mlx_variants),
+                        ("mlx_compiled", compiled_variants),
+                    ):
+                        for variant, function in functions.items():
+                            actual = np.array(function(mlx_input).astype(mx.float32))
+                            mlx_results[f"{mode}_{variant}"] = actual
+                            if variant == "current":
+                                continue
+                            np.testing.assert_allclose(
+                                actual,
+                                quantized,
+                                rtol=tolerance,
+                                atol=upcast_atol if variant == "upcast" else 0,
+                                err_msg=f"{mode} {variant} candidate: {name}/{case}",
+                            )
+                record = {
+                    "dtype": name,
+                    "case": case,
+                    "op": op,
+                    "reference": float(expected.flat[0]),
+                    "rounded_reference": float(quantized.flat[0]),
+                    "current": float(current[0].flat[0]),
+                    "upcast": float(upcast[0].flat[0]),
+                    "paper": float(paper.flat[0]),
+                    "optional_log_prob": float(current[1].flat[0]) if is_loss else None,
+                    "upcast_optional_log_prob": float(upcast[1].flat[0])
+                    if is_loss
+                    else None,
+                }
+                if mlx_results:
+                    record.update(
+                        {
+                            key: float(actual.flat[0])
+                            for key, actual in mlx_results.items()
+                        }
                     )
-                    np.testing.assert_allclose(
-                        quick,
-                        quantized,
-                        rtol=tolerance,
-                        atol=0,
-                        err_msg=f"forward candidate: {name}/{case}",
-                    )
-                records.append(
-                    {
-                        "dtype": name,
-                        "case": case,
-                        "op": op,
-                        "reference": float(expected.flat[0]),
-                        "rounded_reference": float(quantized.flat[0]),
-                        "current": float(current[0].flat[0]),
-                        "paper": float(fixed.flat[0]),
-                        "optional_log_prob": float(current[1].flat[0])
-                        if is_loss
-                        else None,
-                    }
-                )
+                records.append(record)
             # NLL consumes log probabilities; it does not normalize or create the collapse.
             nll_feed = {
                 "x": rounded(ref, mlx_dt),
@@ -394,39 +502,53 @@ def evaluate(function, *arrays) -> None:
     mx.eval(function(*arrays))
 
 
-def composed_attention(q, k, v, *, fixed=False):
+def composed_attention(q, k, v, *, variant="current"):
     scores = (q * q.shape[-1] ** -0.5) @ mx.swapaxes(k, -1, -2)
-    probs = (
-        mx.exp(paper_logsoftmax(scores))
-        if fixed
-        else mx.softmax(scores, axis=-1, precise=True)
-    )
+    if variant == "current":
+        probs = mx.softmax(scores, axis=-1, precise=True)
+    elif variant == "upcast":
+        probs = mx.softmax(scores.astype(mx.float32), axis=-1, precise=True).astype(
+            scores.dtype
+        )
+    elif variant == "paper":
+        probs = mx.exp(paper_logsoftmax(scores.astype(mx.float32))).astype(scores.dtype)
+    else:
+        raise ValueError(
+            f"Unknown attention benchmark variant {variant!r}; "
+            "use current, upcast, or paper."
+        )
     return probs @ v
 
 
-def benchmark(warmup: int, samples: int) -> list[dict]:
+def benchmark(warmup: int, samples: int, *, reverse_order: bool = False) -> list[dict]:
     rng = np.random.default_rng(42)
     records = []
-    for shape in (
-        (1, 32768),
-        (1, 131072),
-        (1, 262144),
-        (8, 131072),
-        (1, 8, 128, 128),
-        (1, 8, 512, 512),
+    for shape_index, shape in enumerate(
+        (
+            (1, 32768),
+            (1, 131072),
+            (1, 262144),
+            (8, 131072),
+            (1, 8, 128, 128),
+            (1, 8, 512, 512),
+        )
     ):
         x_np = rng.standard_normal(shape).astype(np.float32)
-        for name, (onnx_dt, mlx_dt) in DTYPES.items():
-            for op in ("Softmax", "LogSoftmax", "SoftmaxCrossEntropyLoss"):
+        for dtype_index, (name, (onnx_dt, mlx_dt)) in enumerate(DTYPES.items()):
+            for op_index, op in enumerate(
+                ("Softmax", "LogSoftmax", "SoftmaxCrossEntropyLoss")
+            ):
                 if op == "SoftmaxCrossEntropyLoss" and len(shape) != 2:
                     continue
                 feeds = {"x": x_np}
                 if op == "SoftmaxCrossEntropyLoss":
                     feeds["target"] = x_np.argmax(axis=-1).astype(np.int64)
-                # Alternate ordering between shapes/dtypes to reduce systematic order bias.
-                variants = (False, True) if len(records) % 4 == 0 else (True, False)
-                for fixed in variants:
-                    run = session(model(op, shape, onnx_dt, fixed=fixed))
+                for variant in counterbalanced_order(
+                    ("current", "upcast", "paper"),
+                    shape_index + dtype_index + op_index,
+                    reverse=reverse_order,
+                ):
+                    run = session(model(op, shape, onnx_dt, variant=variant))
                     output = run.run(None, feeds)[0]
                     ref = reference(rounded(x_np, mlx_dt))
                     expected = (
@@ -441,14 +563,14 @@ def benchmark(warmup: int, samples: int) -> list[dict]:
                         rounded(expected, mlx_dt),
                         rtol={"fp32": 1e-5, "fp16": 2e-2, "bf16": 8e-2}[name],
                         atol=1e-6,
-                        err_msg=f"{op}/{name}/{shape}/{fixed}",
+                        err_msg=f"{op}/{name}/{shape}/{variant}",
                     )
                     record = {
                         "backend": "EP",
                         "shape": shape,
                         "dtype": name,
                         "op": op,
-                        "variant": "paper" if fixed else "current",
+                        "variant": variant,
                         **measure(
                             functools.partial(run.run, None, feeds), warmup, samples
                         ),
@@ -462,10 +584,14 @@ def benchmark(warmup: int, samples: int) -> list[dict]:
                     )
             x = mx.array(x_np, dtype=mlx_dt)
             mx.eval(x)
-            for variant, function in (
-                ("current", lambda z: z - mx.logsumexp(z, axis=-1, keepdims=True)),
+            variants = (
+                ("current", current_logsoftmax),
+                ("upcast", upcast_logsoftmax),
                 ("paper", paper_logsoftmax),
                 ("forward_log1p", forward_logsoftmax),
+            )
+            for variant, function in counterbalanced_order(
+                variants, shape_index + dtype_index, reverse=reverse_order
             ):
                 compiled = mx.compile(function)
                 record = {
@@ -483,15 +609,17 @@ def benchmark(warmup: int, samples: int) -> list[dict]:
                     json.dumps({k: v for k, v in record.items() if k != "samples_us"}),
                     flush=True,
                 )
-    for shape in ((1, 8, 1, 4096, 64), (1, 8, 128, 128, 64), (1, 8, 512, 512, 64)):
+    for shape_index, shape in enumerate(
+        ((1, 8, 1, 4096, 64), (1, 8, 128, 128, 64), (1, 8, 512, 512, 64))
+    ):
         b, h, qlen, klen, dim = shape
-        for name, (_, mlx_dt) in DTYPES.items():
+        for dtype_index, (name, (_, mlx_dt)) in enumerate(DTYPES.items()):
             q, k, v = [
                 mx.array(rng.standard_normal(dims).astype(np.float32), dtype=mlx_dt)
                 for dims in ((b, h, qlen, dim), (b, h, klen, dim), (b, h, klen, dim))
             ]
             mx.eval(q, k, v)
-            for variant, function in (
+            variants = (
                 (
                     "fused_current",
                     lambda q, k, v: mx.fast.scaled_dot_product_attention(
@@ -499,7 +627,17 @@ def benchmark(warmup: int, samples: int) -> list[dict]:
                     ),
                 ),
                 ("composed_current", composed_attention),
-                ("composed_paper", functools.partial(composed_attention, fixed=True)),
+                (
+                    "composed_upcast",
+                    functools.partial(composed_attention, variant="upcast"),
+                ),
+                (
+                    "composed_paper",
+                    functools.partial(composed_attention, variant="paper"),
+                ),
+            )
+            for variant, function in counterbalanced_order(
+                variants, shape_index + dtype_index, reverse=reverse_order
             ):
                 compiled = mx.compile(function)
                 output = np.array(compiled(q, k, v).astype(mx.float32))
@@ -542,6 +680,11 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--samples", type=int, default=100)
+    parser.add_argument(
+        "--reverse-order",
+        action="store_true",
+        help="reverse every case's variant order for a counterbalanced second sweep",
+    )
     args = parser.parse_args()
     if args.warmup < 1 or args.samples < 1:
         parser.error(
@@ -564,9 +707,16 @@ def main() -> None:
             "library": str(Path(lib).resolve()),
             "no_compile": os.environ.get("ONNXRUNTIME_EP_MLX_NO_COMPILE", "0"),
         },
+        "benchmark_config": {
+            "warmup": args.warmup,
+            "samples": args.samples,
+            "reverse_order": args.reverse_order,
+        },
         "accuracy": accuracy() if args.mode != "benchmark" else [],
         "attention_accuracy": attention_accuracy() if args.mode != "benchmark" else [],
-        "benchmarks": benchmark(args.warmup, args.samples)
+        "benchmarks": benchmark(
+            args.warmup, args.samples, reverse_order=args.reverse_order
+        )
         if args.mode != "accuracy"
         else [],
     }
