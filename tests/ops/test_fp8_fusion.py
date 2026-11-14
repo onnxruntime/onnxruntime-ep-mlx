@@ -4,6 +4,7 @@ References decode with ml_dtypes, apply the ONNX per-element ``(x - zero) * scal
 float32, and accumulate in float64.
 """
 
+import ctypes
 import json
 import os
 import subprocess
@@ -11,6 +12,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import onnxruntime as ort
 import pytest
 from _schema_runtime import session
 from onnx import TensorProto, helper, numpy_helper
@@ -215,6 +217,81 @@ def test_fused_replay(case, layout, m, k, n, batch):
     _check(session(model).run(None, feeds)[0], expected, float(np.abs(weight).sum()))
 
 
+ACTIVATION_CASES = ["MatMul", "Gemm", "GroupedMatMul"]
+ACTIVATION_WEIGHTS = {"int8": (np.int8, TensorProto.INT8), "uint8": (np.uint8, TensorProto.UINT8),
+                      "e4m3fn": FORMATS["e4m3fn"]}
+
+
+def _activation_model(fmt, case, weight_type):
+    """FP8 activation DQ feeding a product whose weight is also DequantizeLinear."""
+    rng = np.random.default_rng(3)
+    m, k, n = 3, 32, 8
+    x_bits = _weights(rng, (m, k), fmt)
+    one = FORMATS[fmt][0]
+    # +-1 codes (E4M3FN 0x38/0xB8) are +56/+184 if read as integers.
+    x_bits[:, :2] = np.array([1, -1], np.float32).astype(one).view(np.uint8)
+    x_scale, x_zero = np.float32(0.5), np.array(-2, np.float32).astype(one).view(np.uint8)
+    x = (_decode(x_bits, fmt) - _decode(x_zero, fmt)) * x_scale
+    w_np, w_onnx = ACTIVATION_WEIGHTS[weight_type]
+    grouped = case == "GroupedMatMul"
+    trans_b = case != "MatMul"
+    shape = (2, n, k) if grouped else (n, k) if trans_b else (k, n)
+    if weight_type in FORMATS:
+        w_q = _weights(rng, shape, weight_type)
+        w_real = _decode(w_q, weight_type)
+    else:
+        info = np.iinfo(w_np)
+        w_q = rng.integers(info.min, info.max + 1, shape).astype(w_np)
+        w_real = w_q.astype(np.float32)
+    w_scale, w_zero = np.float32(0.03), np.zeros((), np.uint8).astype(w_q.dtype)
+    weight = (w_real - (0 if weight_type in FORMATS else w_zero.astype(np.float32))) * w_scale
+    nodes = [
+        helper.make_node("DequantizeLinear", ["xq", "xs", "xz"], ["xf"]),
+        helper.make_node("DequantizeLinear", ["w", "ws", "wz"], ["wf"]),
+    ]
+    feeds_info = [helper.make_tensor_value_info("xq", FORMATS[fmt][1], [m, k])]
+    feeds = {}
+    if grouped:
+        ids = rng.integers(0, 2, (m, 2)).astype(np.int64)
+        feeds["ids"] = ids
+        feeds_info.append(helper.make_tensor_value_info("ids", TensorProto.INT64, [m, 2]))
+        nodes.append(helper.make_node("GroupedMatMul", ["xf", "wf", "ids"], ["y"], transB=1))
+        expected = np.einsum("mk,msnk->msn", x.astype(np.float64), weight[ids].astype(np.float64))
+        opset, ir = 29, 11
+    else:
+        dense = weight.T if trans_b else weight
+        nodes.append(helper.make_node(case, ["xf", "wf"], ["y"],
+                                      **({"transB": 1} if trans_b else {})))
+        expected = x.astype(np.float64) @ dense.astype(np.float64)
+        opset, ir = 21, 10
+    graph = helper.make_graph(
+        nodes, "fp8_activation", feeds_info,
+        [helper.make_tensor_value_info("y", TensorProto.FLOAT, None)],
+        [_initializer("xs", np.array(x_scale)),
+         _initializer("xz", x_zero.reshape(()), FORMATS[fmt][1]),
+         _initializer("w", w_q, w_onnx if weight_type in FORMATS else None),
+         _initializer("ws", np.array(w_scale)),
+         _initializer("wz", w_zero.reshape(()), w_onnx if weight_type in FORMATS else None)],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", opset)],
+                              ir_version=ir)
+    xq = ort.OrtValue.ortvalue_from_shape_and_type([m, k], FORMATS[fmt][1])
+    ctypes.memmove(xq.data_ptr(), x_bits.ctypes.data, x_bits.nbytes)
+    feeds["xq"] = xq
+    return model.SerializeToString(), feeds, expected.astype(np.float32)
+
+
+@pytest.mark.parametrize("weight_type", list(ACTIVATION_WEIGHTS))
+@pytest.mark.parametrize("case", ACTIVATION_CASES)
+@pytest.mark.parametrize("fmt", ["e4m3fn", "e5m2"])
+def test_fp8_activation_not_fused(fmt, case, weight_type, monkeypatch):
+    model, feeds, expected = _activation_model(fmt, case, weight_type)
+    for disabled in ["0", "1"]:
+        monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_QDQ_FUSION", disabled)
+        y = session(model).run(None, feeds)[0]  # GroupedMatMul skips without opset 29.
+        np.testing.assert_allclose(y, expected, rtol=2e-5, atol=1e-4)
+
+
 PATTERN_CASES = {
     # id: (case, m, k, trans_a, n_pad, kernel)
     "gemv_k": ("Gemm", 1, 8, False, 0, "mlx_fp8_gemv_k"),
@@ -363,12 +440,15 @@ DISPATCH_CASES = [
     *[(f"test_fused_grouped_decodes_all_bit_patterns[e4m3fn-{name}]", kernel)
       for name, kernel in [("gemv_k", "mlx_fp8_gemv_k"), ("tiled_trans_b", "mlx_fp8_tiled_matmul"),
                            ("gemv_n", "mlx_fp8_gemv_n"), ("tiled", "mlx_fp8_tiled_matmul")]],
+    # FP8 activations are never fused; None asserts that no QDQ/FP8 product kernel ran.
+    *[(f"test_fp8_activation_not_fused[e4m3fn-{case}-{w}]", None)
+      for case in ACTIVATION_CASES for w in ACTIVATION_WEIGHTS],
 ]
 
 
 @pytest.mark.parametrize("test,kernel", DISPATCH_CASES, ids=[t for t, _ in DISPATCH_CASES])
 def test_fused_dispatch(tmp_path, test, kernel):
-    if "grouped" in test:
+    if "grouped" in test.lower():
         session(_grouped_model("e4m3fn", True, 1, 8, 4, "tensor")[0])  # Skips without opset 29.
     for disabled in [False, True]:
         trace = tmp_path / f"{disabled}.json"
@@ -382,6 +462,9 @@ def test_fused_dispatch(tmp_path, test, kernel):
         )
         kernels = {e.get("args", {}).get("kernel") for e in json.loads(trace.read_text())
                    if e.get("cat") == "op.fast"}
+        if kernel is None:
+            assert not {k for k in kernels if k and k.startswith(("mlx_qdq", "mlx_fp8"))}, kernels
+            break
         assert (kernel in kernels) is not disabled, kernels
 
 

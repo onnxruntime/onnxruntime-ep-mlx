@@ -237,7 +237,9 @@ fn operand(
     };
     let scale = ctx.resolve(&dq.inputs[1])?;
     let float8 = float8.map(|(_, format)| format);
-    if (packing == 0 && float8.is_none() && !integer8(ctx.dtype_of(data)))
+    // Fused kernels decode FP8 only for weights; FP8 activations use their ordinary DQ output.
+    if (float8.is_some() && !weight)
+        || (packing == 0 && float8.is_none() && !integer8(ctx.dtype_of(data)))
         || ctx.dtype_of(scale) != F32
         || !(shape.len() == 2 || (weight && shape.len() == 3))
     {
