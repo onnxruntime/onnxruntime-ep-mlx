@@ -413,9 +413,9 @@ fn qdq_eager_nodes(
             continue;
         }
         let view = NodeView::new(api, raw_nodes[&product]);
-        if !crate::ops::qdq::partition_product_candidate(&view) {
+        let Some(batched) = crate::ops::qdq::partition_product_candidate(&view) else {
             continue;
-        }
+        };
         let inputs = &snapshot.nodes[&product].input_slots;
         let producer = |slot: usize| {
             inputs
@@ -427,11 +427,14 @@ fn qdq_eager_nodes(
         let Some(weight) = producer(1).filter(|node| supported.contains(node)) else {
             continue;
         };
-        let Some(packed_weight) =
-            crate::ops::qdq::partition_dq_candidate(&NodeView::new(api, raw_nodes[&weight]), true)
+        let weight_view = NodeView::new(api, raw_nodes[&weight]);
+        let Some(packed_weight) = crate::ops::qdq::partition_dq_candidate(&weight_view, true)
         else {
             continue;
         };
+        if batched && !crate::ops::qdq::partition_float8(&weight_view) {
+            continue;
+        }
         let mut activation = None;
         let mut packed_activation = false;
         if let Some(input) = producer(0) {

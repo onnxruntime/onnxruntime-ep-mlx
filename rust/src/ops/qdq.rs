@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 
+use super::float8::Format;
 use super::matmul::fused::{self, KernelKind, Routing};
 use crate::engine::{MlxError, NodeDesc, Src, TranslationContext};
 use crate::mlx::metal::{self, Kernel};
@@ -61,19 +62,27 @@ fn product_kind(domain: &str, op: &str, version: i32) -> Option<bool> {
     }
 }
 
+/// Above this many activation rows, decoding the FP8 weight once beats per-tile decode.
+const FLOAT8_TILED_ROWS: i32 = 8;
+
 /// A conservative typed subset of the runtime recognizer, after ordinary claim validation.
-pub(crate) fn partition_product_candidate(node: &NodeView) -> bool {
-    let Some(grouped) = product_kind(&node.domain(), &node.op_type(), node.since_version()) else {
-        return false;
-    };
-    node.num_outputs() == 1
+/// Returns whether the activation is batched (rank > 2), which only FP8 MatMul weights fuse.
+pub(crate) fn partition_product_candidate(node: &NodeView) -> Option<bool> {
+    let grouped = product_kind(&node.domain(), &node.op_type(), node.since_version())?;
+    let rank = node.input_info(0).filter(|x| x.dtype == FLOAT)?.shape.len();
+    let batched = rank > 2 && node.op_type() == "MatMul";
+    (node.num_outputs() == 1
         && node.output_info(0).is_some_and(|out| out.dtype == FLOAT)
-        && node
-            .input_info(0)
-            .is_some_and(|input| input.dtype == FLOAT && input.shape.len() == 2)
+        && (rank == 2 || batched)
         && node.input_info(1).is_some_and(|input| {
             input.dtype == FLOAT && input.shape.len() == if grouped { 3 } else { 2 }
-        })
+        }))
+    .then_some(batched)
+}
+
+pub(crate) fn partition_float8(node: &NodeView) -> bool {
+    node.input_info(0)
+        .is_some_and(|data| Format::from_onnx(data.dtype).is_some())
 }
 
 pub(crate) fn partition_dq_candidate(node: &NodeView, weight: bool) -> Option<bool> {
@@ -92,7 +101,9 @@ pub(crate) fn partition_dq_candidate(node: &NodeView, weight: bool) -> Option<bo
     {
         return None;
     }
-    let packed = crate::engine::packed4_signed(data.dtype).is_some();
+    // Packed and FP8 payloads have no MLX tensor dtype, so their transport requires eager regions.
+    let packed = crate::engine::packed4_signed(data.dtype).is_some()
+        || Format::from_onnx(data.dtype).is_some();
     (packed
         || data.dtype == ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8
         || data.dtype == ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8)
@@ -197,6 +208,7 @@ struct Operand {
     shape: Vec<i32>,
     parameters: Parameters,
     packed: i32,
+    float8: Option<Format>,
 }
 
 fn integer8(dtype: mlx::mlx_dtype) -> bool {
@@ -210,14 +222,22 @@ fn operand(
 ) -> Result<Option<Operand>, MlxError> {
     super::quant::validate_packed_dq(ctx, dq)?;
     let packed = ctx.resolve_packed4(&dq.inputs[0])?;
+    let float8 = if packed.is_none() {
+        ctx.resolve_float8(&dq.inputs[0])?
+    } else {
+        None
+    };
     let (data, shape, packing) = if let Some(packed) = packed {
         (packed.data, packed.shape, if packed.signed { 2 } else { 1 })
+    } else if let Some((bits, _)) = float8 {
+        (bits, ctx.shape_of(bits), 0)
     } else {
         let data = ctx.resolve(&dq.inputs[0])?;
         (data, ctx.shape_of(data), 0)
     };
     let scale = ctx.resolve(&dq.inputs[1])?;
-    if (packing == 0 && !integer8(ctx.dtype_of(data)))
+    let float8 = float8.map(|(_, format)| format);
+    if (packing == 0 && float8.is_none() && !integer8(ctx.dtype_of(data)))
         || ctx.dtype_of(scale) != F32
         || !(shape.len() == 2 || (weight && shape.len() == 3))
     {
@@ -238,6 +258,15 @@ fn operand(
                 );
             }
             zero.data
+        } else if let Some(format) = float8 {
+            match ctx.resolve_float8(&dq.inputs[2])? {
+                Some((zero, zero_format))
+                    if zero_format == format && ctx.shape_of(zero) == scale_shape =>
+                {
+                    zero
+                }
+                _ => return Ok(None),
+            }
         } else {
             let zero = ctx.resolve(&dq.inputs[2])?;
             if ctx.dtype_of(zero) != ctx.dtype_of(data) || ctx.shape_of(zero) != scale_shape {
@@ -255,6 +284,7 @@ fn operand(
         shape,
         parameters,
         packed: packing,
+        float8,
     }))
 }
 
@@ -437,9 +467,19 @@ impl Product<'_> {
         let (m, k, n) = (self.m, self.k, self.n);
         let (ta, tb) = (i32::from(self.trans_a), i32::from(self.trans_b));
         let wz = i32::from(has_zero(&self.pattern.w));
+        let (decoder, value, zero) = match self.w.float8 {
+            Some(format) => (
+                format.metal(),
+                "mlx_fp8(uint(w[i]))",
+                "mlx_fp8(uint(zero[p]))",
+            ),
+            None => (String::new(), "int(w[i])", "int(zero[p])"),
+        };
+        let neutral = if self.w.float8.is_some() { "0.0f" } else { "0" };
         format!(
             r#"
 #include <metal_simdgroup_matrix>
+{decoder}
 template <typename X, typename S, typename Z>
 inline float mlx_weight_x(X x, S, Z, uint row, uint k) {{
     size_t i = {ta} ? size_t(k) * {m} + row : size_t(row) * {k} + k;
@@ -452,7 +492,7 @@ inline float mlx_weight_w(W w, S scale, Z zero, uint expert, uint k, uint col) {
              + size_t(wc / {wd2}) * {ws2};
     size_t i = {tb} ? (size_t(expert) * {n} + col) * {k} + k
                    : (size_t(expert) * {k} + k) * {n} + col;
-    return precise::fma(float(int(w[i]) - ({wz} ? int(zero[p]) : 0)), scale[p], -0.0f);
+    return precise::fma(float({value} - ({wz} ? {zero} : {neutral})), scale[p], -0.0f);
 }}
 "#
         )
@@ -489,6 +529,170 @@ inline float mlx_weight_w(W w, S scale, Z zero, uint expert, uint k, uint col) {
         ]
     }
 
+    /// Vectorized FP8 decode GEMV for few activation rows; `None` defers to the tiled reader.
+    fn float8_gemv(
+        &self,
+        ctx: &mut TranslationContext,
+        shape: &[i32],
+    ) -> Result<Option<(mlx::mlx_array, &'static str)>, MlxError> {
+        let Some(format) = self.w.float8 else {
+            return Ok(None);
+        };
+        let grouped = self.routing.is_some();
+        let selections = self.routing.map_or(1, |r| r.selections);
+        let routes = self.m * selections;
+        let aligned = if self.trans_b {
+            self.k % 8 == 0
+        } else {
+            self.n % 4 == 0
+        };
+        if self.trans_a || !aligned || routes > if grouped { 16 } else { 8 } {
+            return Ok(None);
+        }
+        let Parameters {
+            strides: [ws0, ws1, ws2],
+            divisors: [wd0, wd1, wd2],
+        } = self.w.parameters;
+        // Four rows per threadgroup keeps the K-contiguous accumulators in registers.
+        let (z, tile_m) = match (grouped, self.trans_b) {
+            (true, _) => (routes, 1),
+            (false, true) => ((self.m - 1) / 4 + 1, self.m.min(4)),
+            (false, false) => (1, self.m),
+        };
+        let lanes = if self.trans_b { 8 } else { 4 };
+        let mut templates = vec![
+            ("M", self.m),
+            ("K", self.k),
+            ("N", self.n),
+            ("S", selections),
+            ("GROUPED", i32::from(grouped)),
+            ("TILE_M", tile_m),
+            ("W_ZERO", i32::from(has_zero(&self.pattern.w))),
+            ("CHUNK_SCALE", i32::from(ws2 == 0 || wd2 % lanes == 0)),
+            ("WS0", ws0),
+            ("WS1", ws1),
+            ("WS2", ws2),
+            ("WD0", wd0),
+            ("WD1", wd1),
+            ("WD2", wd2),
+        ];
+        let header = format.metal();
+        let indices = self
+            .routing
+            .map_or_else(|| ctx.scalar_i32(0), |r| r.indices);
+        let inputs = [
+            ("x", self.x.data),
+            ("w", self.w.data),
+            ("wscale", self.w.scale),
+            ("wzero", self.w.zero),
+            ("indices", indices),
+        ];
+        if self.trans_b {
+            const ROWS: i32 = 4;
+            const SIMDGROUPS: i32 = 2;
+            templates.extend([("ROWS", ROWS), ("SIMDGROUPS", SIMDGROUPS)]);
+            let groups = (self.n - 1) / (ROWS * SIMDGROUPS) + 1;
+            let y = Kernel {
+                name: c"mlx_fp8_gemv_k",
+                source: include_str!("matmul/fp8_gemv_k.metal"),
+                header: &header,
+                templates: &templates,
+                shape,
+                dtype: F32,
+                grid: [groups * 32 * SIMDGROUPS, 1, z],
+                group: [32 * SIMDGROUPS, 1, 1],
+            }
+            .run(ctx, &inputs)?;
+            return Ok(Some((y, "mlx_fp8_gemv_k")));
+        }
+        const SIMDGROUPS: i32 = 8;
+        let groups = (self.n - 1) / 128 + 1;
+        // Split K across threadgroups until the GPU has enough independent row streams.
+        let split = (256 / (groups * z)).clamp(1, (self.k / (SIMDGROUPS * 16)).max(1));
+        templates.extend([("SIMDGROUPS", SIMDGROUPS), ("SPLIT", split)]);
+        let partial_shape = [split, routes, self.n];
+        let y = Kernel {
+            name: c"mlx_fp8_gemv_n",
+            source: include_str!("matmul/fp8_gemv_n.metal"),
+            header: &header,
+            templates: &templates,
+            shape: if split == 1 { shape } else { &partial_shape },
+            dtype: F32,
+            grid: [groups * 32, split * SIMDGROUPS, z],
+            group: [32, SIMDGROUPS, 1],
+        }
+        .run(ctx, &inputs)?;
+        let y = if split == 1 {
+            y
+        } else {
+            let sum = ctx.emit(|res, s| unsafe { mlx::mlx_sum_axis(res, y, 0, false, s) })?;
+            ctx.reshape(sum, shape)?
+        };
+        Ok(Some((y, "mlx_fp8_gemv_n")))
+    }
+
+    /// Prefill: decode the FP8 weight once per run on GPU, then use MLX's dense GEMM.
+    fn float8_decoded_matmul(
+        &self,
+        ctx: &mut TranslationContext,
+    ) -> Result<Option<mlx::mlx_array>, MlxError> {
+        let Some(format) = self.w.float8 else {
+            return Ok(None);
+        };
+        if self.routing.is_some() {
+            return Ok(None);
+        }
+        let Parameters {
+            strides: [ws0, ws1, ws2],
+            divisors: [wd0, wd1, wd2],
+        } = self.w.parameters;
+        let (rows, cols) = (self.w.shape[0], self.w.shape[1]);
+        let vec = if cols % 4 == 0 { 4 } else { 1 };
+        let header = format.metal();
+        let weight = Kernel {
+            name: c"mlx_fp8_dequant",
+            source: include_str!("matmul/fp8_dequant.metal"),
+            header: &header,
+            templates: &[
+                ("R1", rows),
+                ("C", cols),
+                ("VEC", vec),
+                ("W_ZERO", i32::from(has_zero(&self.pattern.w))),
+                ("WS0", ws0),
+                ("WS1", ws1),
+                ("WS2", ws2),
+                ("WD0", wd0),
+                ("WD1", wd1),
+                ("WD2", wd2),
+            ],
+            shape: &self.w.shape,
+            dtype: F32,
+            grid: [cols / vec, rows, 1],
+            group: [64.min(cols / vec), 1, 1],
+        }
+        .run(
+            ctx,
+            &[
+                ("w", self.w.data),
+                ("wscale", self.w.scale),
+                ("wzero", self.w.zero),
+            ],
+        )?;
+        let weight = if self.trans_b {
+            ctx.transpose(weight, &[1, 0])?
+        } else {
+            weight
+        };
+        let x = if self.trans_a {
+            ctx.transpose(self.x.data, &[1, 0])?
+        } else {
+            self.x.data
+        };
+        Ok(Some(ctx.emit(|res, s| unsafe {
+            mlx::mlx_matmul(res, x, weight, s)
+        })?))
+    }
+
     fn compute(
         &self,
         ctx: &mut TranslationContext,
@@ -497,6 +701,19 @@ inline float mlx_weight_w(W w, S scale, Z zero, uint expert, uint k, uint col) {
     ) -> Result<Option<(mlx::mlx_array, Option<&'static str>)>, MlxError> {
         if total == 0 || self.k == 0 {
             return Ok(Some((ctx.zeros(shape, F32)?, None)));
+        }
+        if self.w.float8.is_some() {
+            if self.pattern.x.is_some() {
+                return Ok(None);
+            }
+            if let Some((y, path)) = self.float8_gemv(ctx, shape)? {
+                return Ok(Some((y, Some(path))));
+            }
+            if self.m > FLOAT8_TILED_ROWS
+                && let Some(y) = self.float8_decoded_matmul(ctx)?
+            {
+                return Ok(Some((y, Some("mlx_fp8_dequant_matmul"))));
+            }
         }
         let exact = integer_exact(self.pattern, self.x, self.w, self.trans_a, self.trans_b);
         // Retain the proven-integer/compensated paths for doubly quantized and packed4 inputs.
@@ -517,12 +734,17 @@ inline float mlx_weight_w(W w, S scale, Z zero, uint expert, uint k, uint col) {
             {
                 return Ok(Some((
                     y,
-                    Some(match kind {
-                        KernelKind::Matvec => "mlx_qdq_matvec",
-                        KernelKind::Tiled => "mlx_qdq_tiled_matmul",
+                    Some(match (kind, self.w.float8.is_some()) {
+                        (KernelKind::Matvec, false) => "mlx_qdq_matvec",
+                        (KernelKind::Tiled, false) => "mlx_qdq_tiled_matmul",
+                        (KernelKind::Matvec, true) => "mlx_fp8_matvec",
+                        (KernelKind::Tiled, true) => "mlx_fp8_tiled_matmul",
                     }),
                 )));
             }
+        }
+        if self.w.float8.is_some() {
+            return Ok(None);
         }
         let Some(threads) = total.checked_mul(32) else {
             return Ok(None);
@@ -573,15 +795,31 @@ pub(super) fn execute(ctx: &mut TranslationContext, node: &NodeDesc) -> Result<b
     let Some(w) = operand(ctx, &pattern.w, true)? else {
         return Ok(false);
     };
+    let mut leading = None;
     let x = if let Some(dq) = &pattern.x {
         let Some(x) = operand(ctx, dq, false)? else {
             return Ok(false);
         };
         x
     } else {
-        let data = ctx.resolve(&node.inputs[0])?;
-        let shape = ctx.shape_of(data);
-        if shape.len() != 2 || ctx.dtype_of(data) != F32 {
+        let mut data = ctx.resolve(&node.inputs[0])?;
+        let mut shape = ctx.shape_of(data);
+        if ctx.dtype_of(data) != F32 {
+            return Ok(false);
+        }
+        if shape.len() > 2 && node.op_type == "MatMul" && w.float8.is_some() {
+            let k = shape[shape.len() - 1];
+            let Some(m) = shape[..shape.len() - 1]
+                .iter()
+                .try_fold(1i32, |acc, &d| acc.checked_mul(d))
+            else {
+                return Ok(false);
+            };
+            leading = Some(shape[..shape.len() - 1].to_vec());
+            shape = vec![m, k];
+            data = ctx.reshape(data, &shape)?;
+        }
+        if shape.len() != 2 {
             return Ok(false);
         }
         Operand {
@@ -591,6 +829,7 @@ pub(super) fn execute(ctx: &mut TranslationContext, node: &NodeDesc) -> Result<b
             shape,
             parameters: Parameters::scalar(),
             packed: 0,
+            float8: None,
         }
     };
     let grouped = node.op_type == "GroupedMatMul";
@@ -673,6 +912,10 @@ pub(super) fn execute(ctx: &mut TranslationContext, node: &NodeDesc) -> Result<b
     }
     if gemm {
         y = super::matmul::gemm_epilogue(ctx, node, y)?;
+    }
+    if let Some(mut leading) = leading {
+        leading.push(n);
+        y = ctx.reshape(y, &leading)?;
     }
     if let Some(path) = path {
         ctx.mark_fast(path);
