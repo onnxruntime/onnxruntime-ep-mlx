@@ -68,6 +68,18 @@ fn product_dtype(dtype: ort::ONNXTensorElementDataType) -> bool {
     super::quant::mlx_float_dtype(dtype).is_some()
 }
 
+pub(crate) fn weight_product_supported(
+    float8: bool,
+    cast: Option<mlx::mlx_dtype>,
+    dtype: ort::ONNXTensorElementDataType,
+) -> bool {
+    if dtype == FLOAT {
+        cast.is_none()
+    } else {
+        float8 && cast.is_some() && cast == super::quant::mlx_float_dtype(dtype)
+    }
+}
+
 /// Above this many activation rows, decoding the FP8 weight once beats per-tile decode.
 const FLOAT8_TILED_ROWS: i32 = 8;
 
@@ -83,6 +95,7 @@ pub(crate) fn partition_product_candidate(node: &NodeView) -> Option<bool> {
         .len();
     let batched = rank > 2 && node.op_type() == "MatMul";
     (node.num_outputs() == 1
+        && (!grouped || dtype == FLOAT)
         && node.output_info(0).is_some_and(|out| out.dtype == dtype)
         && (rank == 2 || batched)
         && node.input_info(1).is_some_and(|input| {
@@ -94,6 +107,18 @@ pub(crate) fn partition_product_candidate(node: &NodeView) -> Option<bool> {
 pub(crate) fn partition_float8(node: &NodeView) -> bool {
     node.input_info(0)
         .is_some_and(|data| Format::from_onnx(data.dtype).is_some())
+}
+
+pub(crate) fn partition_weight_cast(node: &NodeView) -> Option<mlx::mlx_dtype> {
+    if node.input_info(0)?.dtype != FLOAT {
+        return None;
+    }
+    super::quant::mlx_float_dtype(node.output_info(0)?.dtype).filter(|dtype| {
+        matches!(
+            *dtype,
+            mlx::mlx_dtype__MLX_FLOAT16 | mlx::mlx_dtype__MLX_BFLOAT16
+        )
+    })
 }
 
 pub(crate) fn partition_dq_candidate(node: &NodeView, weight: bool) -> Option<bool> {
@@ -121,7 +146,10 @@ pub(crate) fn partition_dq_candidate(node: &NodeView, weight: bool) -> Option<bo
         .then_some(packed)
 }
 
-pub(crate) fn recognize(nodes: &mut [NodeDesc]) {
+pub(crate) fn recognize(
+    nodes: &mut [NodeDesc],
+    dtypes: &HashMap<String, ort::ONNXTensorElementDataType>,
+) {
     if std::env::var_os("ONNXRUNTIME_EP_MLX_NO_QDQ_FUSION")
         .is_some_and(|v| v != "0" && !v.is_empty())
     {
@@ -133,7 +161,17 @@ pub(crate) fn recognize(nodes: &mut [NodeDesc]) {
             && node.inputs.len() >= 2
             && node.outputs.len() == 1
             && product_dtype(node.outputs[0].otype)
+            && (node.op_type != "GroupedMatMul" || node.outputs[0].otype == FLOAT)
             && let Some(w) = producers.get(&node.inputs[1].name)
+            && weight_product_supported(
+                dtypes
+                    .get(&w.w.inputs[0].name)
+                    .copied()
+                    .or_else(|| w.w.inputs[0].init.as_ref().map(|init| init.dtype))
+                    .is_some_and(|dtype| Format::from_onnx(dtype).is_some()),
+                w.weight_cast,
+                node.outputs[0].otype,
+            )
         {
             let mut pattern = w.clone();
             pattern.x = producers.get(&node.inputs[0].name).and_then(|x| {
@@ -1455,21 +1493,86 @@ mod tests {
         mm.outputs = vec![output("y")];
         let mut nodes = vec![a, w, mm];
         nodes[1].outputs[0].external = true;
-        recognize(&mut nodes);
+        recognize(&mut nodes, &HashMap::new());
         assert!(nodes[2].qdq.as_ref().unwrap().x.is_some());
         assert_eq!(nodes[1].op_type, "DequantizeLinear");
         assert!(nodes[1].outputs[0].external);
         assert_eq!(nodes[2].inputs[1].name, "wf");
         nodes[2].qdq = None;
         nodes[1].domain = "com.microsoft".into();
-        recognize(&mut nodes);
+        recognize(&mut nodes, &HashMap::new());
         assert!(nodes[2].qdq.is_none());
         nodes[1].domain.clear();
         nodes[2].op_type = "GroupedMatMul".into();
         for version in [28, 30] {
             nodes[2].since_version = version;
-            recognize(&mut nodes);
+            recognize(&mut nodes, &HashMap::new());
             assert!(nodes[2].qdq.is_none());
+        }
+    }
+
+    #[test]
+    fn qdq_recognition_requires_fp8_for_low_precision_weight_casts() {
+        use ort::*;
+        for weight_type in [
+            ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8,
+            ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8,
+            ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT4,
+            ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E4M3FN,
+        ] {
+            for dtype in [
+                FLOAT,
+                ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16,
+                ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16,
+            ] {
+                for op in ["MatMul", "Gemm"] {
+                    let mut nodes = vec![dq("w")];
+                    let mut weight = "wf";
+                    if dtype != FLOAT {
+                        let mut cast = NodeDesc::new(
+                            "Cast".into(),
+                            String::new(),
+                            21,
+                            CompileShapeSafety::Shapeless,
+                        );
+                        cast.inputs = vec![reference(weight)];
+                        cast.outputs = vec![output("wl")];
+                        cast.outputs[0].otype = dtype;
+                        nodes.push(cast);
+                        weight = "wl";
+                    }
+                    let mut transpose = NodeDesc::new(
+                        "Transpose".into(),
+                        String::new(),
+                        13,
+                        CompileShapeSafety::Shapeless,
+                    );
+                    transpose.inputs = vec![reference(weight)];
+                    transpose.outputs = vec![output("wt")];
+                    transpose.outputs[0].otype = dtype;
+                    transpose.int_arrays.insert("perm".into(), vec![1, 0]);
+                    nodes.push(transpose);
+                    let mut product =
+                        NodeDesc::new(op.into(), String::new(), 13, CompileShapeSafety::Shapeless);
+                    product.inputs = vec![reference("x"), reference("wt")];
+                    product.outputs = vec![output("y")];
+                    product.outputs[0].otype = dtype;
+                    nodes.push(product);
+                    recognize(&mut nodes, &HashMap::from([("w".into(), weight_type)]));
+                    let product = nodes.last().unwrap();
+                    let supported = dtype == FLOAT
+                        || weight_type
+                            == ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT8E4M3FN;
+                    assert_eq!(product.qdq.is_some(), supported);
+                    assert_eq!(
+                        matches!(
+                            product.compile_shape_safety,
+                            CompileShapeSafety::EagerOnly { .. }
+                        ),
+                        supported,
+                    );
+                }
+            }
         }
     }
 

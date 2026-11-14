@@ -428,12 +428,30 @@ fn qdq_eager_nodes(
             continue;
         };
         let mut weight_views = Vec::new();
+        let mut weight_cast = None;
         loop {
             let metadata = &snapshot.nodes[&weight];
             if !metadata.domain.is_empty()
                 || !matches!(metadata.op_type.as_str(), "Cast" | "Transpose")
             {
                 break;
+            }
+            let view = NodeView::new(api, raw_nodes[&weight]);
+            if metadata.op_type == "Cast" {
+                let cast = crate::ops::qdq::partition_weight_cast(&view);
+                if weight_cast.is_some() || cast.is_none() {
+                    break;
+                }
+                weight_cast = cast;
+            } else {
+                let (present, perm) = view.ints_attr("perm");
+                if view
+                    .input_info(0)
+                    .is_none_or(|input| input.shape.len() != 2)
+                    || present && perm != [1, 0]
+                {
+                    break;
+                }
             }
             weight_views.push(weight);
             let Some(parent) = metadata
@@ -453,7 +471,14 @@ fn qdq_eager_nodes(
         else {
             continue;
         };
-        if batched && !crate::ops::qdq::partition_float8(&weight_view) {
+        let float8_weight = crate::ops::qdq::partition_float8(&weight_view);
+        if batched && !float8_weight
+            || !crate::ops::qdq::weight_product_supported(
+                float8_weight,
+                weight_cast,
+                view.output_info(0).expect("typed product output").dtype,
+            )
+        {
             continue;
         }
         let mut activation = None;

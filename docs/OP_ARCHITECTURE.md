@@ -344,7 +344,11 @@ an optional FP16/BF16 Cast and rank-two Transpose after FP32 weight DQ. Decode
 rounds each scaled weight through that Cast before FP32 accumulation; prefill
 decodes directly into the consumer dtype. Product output rounding precedes the
 ordinary Gemm epilogue or Add bias. Shared DQ/Cast outputs retain their ordinary
-values. FP8 activation DQ stays in the graph and supplies floating activations
+values. Cast fusion is FP8-only: INT8/UINT8 DQ followed by FP16/BF16 Cast retains
+ordinary compiled matrix products, while direct FP32 integer DQ through a rank-two
+Transpose still fuses. Packed INT4/UINT4 transport remains eager independently
+of fusion. Partition discovery checks these same dtype and view constraints.
+FP8 activation DQ stays in the graph and supplies floating activations
 to the weight-only kernels; its byte codes never enter integer QDQ readers.
 Scalar FP32, saturated E4M3FN QuantizeLinear uses device round-to-nearest-even
 encoding (including subnormals and signed zero), enabling activation Q/DQ patterns.

@@ -121,6 +121,134 @@ def test_transposed_qdq_actual_dispatch(tmp_path):
     assert "mlx_qdq_matmul" in kernels, kernels
 
 
+def _integer_cast_product_model(weight_type, output_type, product, decoder=False):
+    from test_packed_qdq import _initializer
+    import ml_dtypes
+
+    rng = np.random.default_rng(713)
+    m, k, n = 4, 64, 32
+    transposed = product in ("TransposeMatMul", "Gemm")
+    shape = (n, k) if transposed else (k, n)
+    w = rng.integers(0 if weight_type == TensorProto.UINT8 else -8, 8, shape).astype(
+        np.uint8 if weight_type == TensorProto.UINT8 else np.int8)
+    x = rng.normal(0, 0.25, (m, k)).astype(np.float32)
+    dtype = {TensorProto.FLOAT: np.float32, TensorProto.FLOAT16: np.float16,
+             TensorProto.BFLOAT16: ml_dtypes.bfloat16}[output_type]
+    nodes = [helper.make_node("DequantizeLinear", ["w", "scale"], ["wf"])]
+    a, weight = "x", "wf"
+    if output_type != TensorProto.FLOAT:
+        nodes += [helper.make_node("Cast", ["x"], ["a"], to=output_type),
+                  helper.make_node("Cast", ["wf"], ["wl"], to=output_type)]
+        a, weight = "a", "wl"
+    if product == "CastMatMul":
+        if output_type == TensorProto.FLOAT:
+            nodes.append(helper.make_node("Cast", [weight], ["wh"], to=TensorProto.FLOAT16))
+            weight = "wh"
+        nodes.append(helper.make_node("Cast", [weight], ["wc"], to=output_type))
+        weight = "wc"
+    if product == "TransposeMatMul":
+        nodes.append(helper.make_node("Transpose", [weight], ["wt"], perm=[1, 0]))
+        weight = "wt"
+    nodes += [helper.make_node("Gemm" if product == "Gemm" else "MatMul",
+                              [a, weight], ["p"],
+                              **({"transB": 1} if product == "Gemm" else {})),
+              helper.make_node("Relu", ["p"], ["r"]),
+              helper.make_node("Cast", ["r"], ["y"], to=TensorProto.FLOAT)]
+    inputs = [helper.make_tensor_value_info("x", TensorProto.FLOAT, [m, k])]
+    feeds = {"x": x}
+    initializers = [numpy_helper.from_array(np.array(0.03, np.float32), "scale")]
+    if weight_type == TensorProto.INT4:
+        initializers.append(_initializer("w", w, weight_type))
+    else:
+        inputs.append(helper.make_tensor_value_info("w", weight_type, list(shape)))
+        feeds["w"] = w
+    outputs = [helper.make_tensor_value_info("y", TensorProto.FLOAT, [m, n])]
+    if decoder:
+        # Short-head Attention has a distinct capture class, exposing QDQ co-location decisions.
+        initializers += [numpy_helper.from_array(np.ones((1, 1, 1, 32), np.float32), name)
+                         for name in ("q", "key", "value")]
+        nodes.append(helper.make_node("Attention", ["q", "key", "value"],
+                                      ["attention", "present_key", "present_value"]))
+        outputs += [helper.make_tensor_value_info(name, TensorProto.FLOAT, [1, 1, 1, 32])
+                    for name in ("attention", "present_key", "present_value")]
+    model = helper.make_model(helper.make_graph(
+        nodes, "integer_dq_cast_product",
+        inputs, outputs, initializers,
+    ), opset_imports=[helper.make_opsetid("", 23 if decoder else 21)], ir_version=10)
+    decoded = (w.astype(np.float32) * np.float32(0.03)).astype(dtype).astype(np.float64)
+    if product == "CastMatMul" and output_type == TensorProto.FLOAT:
+        decoded = decoded.astype(np.float16).astype(np.float64)
+    expected = (x.astype(dtype).astype(np.float64)
+                @ (decoded.T if transposed else decoded)).astype(dtype).astype(np.float32)
+    return model.SerializeToString(), feeds, np.maximum(expected, 0)
+
+
+@pytest.mark.parametrize("weight_type", [TensorProto.INT8, TensorProto.UINT8, TensorProto.INT4],
+                         ids=["int8", "uint8", "int4"])
+@pytest.mark.parametrize("output_type", [TensorProto.FLOAT, TensorProto.FLOAT16,
+                                       TensorProto.BFLOAT16], ids=["fp32", "fp16", "bf16"])
+@pytest.mark.parametrize("product", ["MatMul", "TransposeMatMul", "Gemm", "CastMatMul"])
+def test_integer_dq_cast_product_routing(tmp_path, weight_type, output_type, product):
+    _check_integer_dq_cast_product_routing(tmp_path, weight_type, output_type, product)
+
+
+@pytest.mark.parametrize("weight_type", [TensorProto.INT8, TensorProto.UINT8],
+                         ids=["int8", "uint8"])
+@pytest.mark.parametrize("output_type,product", [
+    (TensorProto.FLOAT16, "MatMul"),
+    (TensorProto.BFLOAT16, "TransposeMatMul"),
+    (TensorProto.FLOAT, "CastMatMul"),
+    (TensorProto.FLOAT, "TransposeMatMul"),
+])
+def test_integer_dq_cast_decoder_routing(tmp_path, weight_type, output_type, product):
+    _check_integer_dq_cast_product_routing(tmp_path, weight_type, output_type, product,
+                                          decoder=True)
+
+
+def _check_integer_dq_cast_product_routing(tmp_path, weight_type, output_type, product,
+                                          decoder=False):
+    code = """
+import os
+import numpy as np
+import onnxruntime as ort
+from _schema_runtime import session
+from test_qdq_fusion import _integer_cast_product_model
+ort.register_execution_provider_library("MLXExecutionProvider", os.environ["ONNXRUNTIME_MLX_EP_LIB"])
+model, feeds, expected = _integer_cast_product_model(WEIGHT, OUTPUT, PRODUCT, DECODER)
+result = session(model)
+np.testing.assert_allclose(result.run(None, feeds)[0], expected, rtol=0.01, atol=0.003)
+zero_feeds = {**feeds, "w": np.zeros_like(feeds["w"])} if "w" in feeds else {
+    "x": np.zeros_like(feeds["x"])}
+np.testing.assert_array_equal(result.run(None, zero_feeds)[0], np.zeros_like(expected))
+np.testing.assert_allclose(result.run(None, feeds)[0], expected, rtol=0.01, atol=0.003)
+""".replace("WEIGHT", str(weight_type)).replace("OUTPUT", str(output_type)).replace(
+        "PRODUCT", repr(product)).replace("DECODER", repr(decoder))
+    for disabled in [False, True]:
+        trace = tmp_path / f"integer-cast-{disabled}.json"
+        subprocess.run([sys.executable, "-c", code], cwd=Path(__file__).parent,
+                       env={**os.environ, "ONNXRUNTIME_EP_MLX_TRACE": str(trace),
+                            "ONNXRUNTIME_EP_MLX_NO_QDQ_FUSION": str(int(disabled)),
+                            "ONNXRUNTIME_EP_MLX_NO_COMPILE": "0",
+                            "ONNXRUNTIME_EP_MLX_NO_GENERAL_COMPILE": "0"},
+                       check=True, timeout=120)
+        events = json.loads(trace.read_text())
+        paths = [e["args"] for e in events if e.get("cat") == "ep.path"
+                 and ("MatMul" in e["args"]["ops"] or "Gemm" in e["args"]["ops"])]
+        assert len(paths) == 3, paths
+        kernels = {e.get("args", {}).get("kernel") for e in events
+                   if e.get("cat") == "op.fast"}
+        if output_type != TensorProto.FLOAT or product == "CastMatMul" or disabled:
+            # Packed payload transport still requires eager execution, independently of fusion.
+            expected_path = "eager" if weight_type == TensorProto.INT4 else "general"
+            assert {path["path"] for path in paths} == {expected_path}, paths
+            assert not any(k and k.startswith("mlx_qdq") for k in kernels), kernels
+            if decoder:
+                assert all("DequantizeLinear" in path["ops"] and "Relu" in path["ops"]
+                           for path in paths), paths
+        elif not disabled:
+            assert any(k and k.startswith("mlx_qdq") for k in kernels), kernels
+
+
 def _require_grouped_reference():
     if defs.onnx_opset_version() < 29:
         pytest.skip("ONNX lacks the GroupedMatMul-29 reference schema; install ONNX from main")
