@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import struct
+import subprocess
+import sys
 from pathlib import Path
 
 import _models as m
@@ -416,6 +419,246 @@ def test_pack_unpack_bits_arbitrary_axis(runtime_opset29, tmp_path: Path) -> Non
     session = _mlx_session(unpack, tmp_path / "unpack-bits")
     np.testing.assert_array_equal(session.run(None, feeds)[0], x)
     _assert_mlx_profile(session)
+
+
+@pytest.mark.parametrize("bits", range(1, 8))
+@pytest.mark.parametrize("storage", [TensorProto.UINT8, TensorProto.UINT32], ids=["u8", "u32"])
+@pytest.mark.parametrize("intermediate", [False, True], ids=["input", "intermediate"])
+@pytest.mark.parametrize("disable_compile", ["0", "1"], ids=["compile-enabled", "eager"])
+def test_pack_bits_checks_live_codes(
+    runtime_opset29, bits, storage, intermediate, disable_compile, monkeypatch
+) -> None:
+    monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_COMPILE", disable_compile)
+    word_bits = 8 if storage == TensorProto.UINT8 else 32
+    shape = [2, 3]
+    packed_shape = [2, (shape[1] * bits + word_bits - 1) // word_bits]
+    model = _reference_model(
+        "Pack",
+        [helper.make_tensor_value_info("x", TensorProto.UINT8, shape)],
+        helper.make_tensor_value_info("y", storage, packed_shape),
+        bits=bits,
+        output_type=storage,
+    )
+    if intermediate:
+        model.graph.node[0].input[0] = "live"
+        model.graph.node.insert(0, helper.make_node("Identity", ["x"], ["live"]))
+    session = _mlx_session(model)
+    reference = ReferenceEvaluator(model)
+    limit = (1 << bits) - 1
+    valid = np.array([[0, limit, 0], [limit, 0, limit]], dtype=np.uint8)
+    other_valid = limit - valid
+    invalid = valid.copy()
+    invalid[1, 1] = limit + 1
+    for values in [valid, other_valid]:
+        np.testing.assert_array_equal(
+            session.run(None, {"x": values})[0], reference.run(None, {"x": values})[0]
+        )
+    with pytest.raises(ValueError, match="Input codes must be representable"):
+        reference.run(None, {"x": invalid})
+    message = (
+        rf"Pack: maximum input code {limit + 1} exceeds {limit} for bits={bits}; "
+        rf"provide UINT8 codes in \[0, {limit}\]"
+    )
+    with pytest.raises(ort.capi.onnxruntime_pybind11_state.EPFail, match=message):
+        session.run(None, {"x": invalid})
+    np.testing.assert_array_equal(
+        session.run(None, {"x": valid})[0], reference.run(None, {"x": valid})[0]
+    )
+
+
+@pytest.mark.parametrize("storage", [TensorProto.UINT8, TensorProto.UINT32], ids=["u8", "u32"])
+@pytest.mark.parametrize("disable_compile", ["0", "1"], ids=["compile-enabled", "eager"])
+def test_pack_full_byte_accepts_255_after_empty_replay(
+    runtime_opset29, storage, disable_compile, monkeypatch
+) -> None:
+    monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_COMPILE", disable_compile)
+    word_bits = 8 if storage == TensorProto.UINT8 else 32
+    model = _reference_model(
+        "Pack",
+        [helper.make_tensor_value_info("x", TensorProto.UINT8, [None, 5])],
+        helper.make_tensor_value_info("y", storage, [None, (40 + word_bits - 1) // word_bits]),
+        bits=8,
+        output_type=storage,
+    )
+    session = _mlx_session(model)
+    reference = ReferenceEvaluator(model)
+    nonempty = np.array([[0, 1, 127, 254, 255], [255, 254, 127, 1, 0]], dtype=np.uint8)
+    for values in [
+        np.empty((0, 5), np.uint8),
+        nonempty,
+        255 - nonempty,
+        np.empty((0, 5), np.uint8),
+    ]:
+        np.testing.assert_array_equal(
+            session.run(None, {"x": values})[0], reference.run(None, {"x": values})[0]
+        )
+
+
+def test_pack_unpack_large_empty_non_axis(runtime_opset29) -> None:
+    # Keep a regression in graph-construction complexity bounded to a subprocess.
+    worker = "_MLX_PACK_EMPTY_TEST_WORKER"
+    if os.environ.get(worker) != "1":
+        result = subprocess.run(
+            [sys.executable, "-m", "pytest", f"{Path(__file__)}::test_pack_unpack_large_empty_non_axis",
+             "-q", "-p", "no:cacheprovider"],
+            env={**os.environ, worker: "1"},
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=45,
+            check=False,
+        )
+        assert result.returncode == 0, result.stdout
+        return
+
+    cases = [
+        ([0, 1_000_000], 1, {"bits": 8}, TensorProto.UINT8),
+        ([1_000_000, 0], 0, {"bits": 3}, TensorProto.UINT32),
+        ([2, 0, 100_000], -1, {"bits": 5}, TensorProto.UINT8),
+        ([50_000, 50_000, 5, 0], 2, {"radix": 3, "group_size": 5}, TensorProto.UINT8),
+    ]
+    for shape, axis, attributes, storage in cases:
+        axis %= len(shape)
+        word_bits = 8 if storage == TensorProto.UINT8 else 32
+        packed_shape = shape.copy()
+        if "bits" in attributes:
+            total_bits = shape[axis] * attributes["bits"]
+        else:
+            radix, group_size = attributes["radix"], attributes["group_size"]
+            groups = (shape[axis] + group_size - 1) // group_size
+            total_bits = groups * (radix**group_size - 1).bit_length()
+        packed_shape[axis] = (total_bits + word_bits - 1) // word_bits
+        pack = _reference_model(
+            "Pack",
+            [helper.make_tensor_value_info("x", TensorProto.UINT8, shape)],
+            helper.make_tensor_value_info("y", storage, packed_shape),
+            axis=axis,
+            output_type=storage,
+            **attributes,
+        )
+        inputs = {"x": np.empty(shape, dtype=np.uint8)}
+        actual = _mlx_session(pack).run(None, inputs)[0]
+        expected = ReferenceEvaluator(pack).run(None, inputs)[0]
+        np.testing.assert_array_equal(actual, expected)
+        assert list(actual.shape) == packed_shape
+
+        unpack = _reference_model(
+            "Unpack",
+            [helper.make_tensor_value_info("x", storage, packed_shape),
+             helper.make_tensor_value_info("count", TensorProto.INT64, [])],
+            helper.make_tensor_value_info("y", TensorProto.UINT8, [None] * len(shape)),
+            axis=axis,
+            **attributes,
+        )
+        feeds = {"x": actual, "count": np.array(shape[axis], dtype=np.int64)}
+        session = _mlx_session(unpack)
+        actual = session.run(None, feeds)[0]
+        expected = ReferenceEvaluator(unpack).run(None, feeds)[0]
+        np.testing.assert_array_equal(actual, expected)
+        assert list(actual.shape) == shape
+        feeds["count"] = np.array(0, dtype=np.int64)
+        with pytest.raises(ort.capi.onnxruntime_pybind11_state.EPFail, match="packed axis"):
+            session.run(None, feeds)
+        with pytest.raises(ValueError, match="Packed axis dimension must equal"):
+            ReferenceEvaluator(unpack).run(None, feeds)
+
+
+@pytest.mark.parametrize("shape,axis", [([0], 0), ([0, 5], 0), ([2, 0, 3], 1), ([0, 0], -1)])
+@pytest.mark.parametrize("storage", [TensorProto.UINT8, TensorProto.UINT32], ids=["u8", "u32"])
+def test_pack_unpack_zero_selected_axis(runtime_opset29, shape, axis, storage) -> None:
+    pack = _reference_model(
+        "Pack",
+        [helper.make_tensor_value_info("x", TensorProto.UINT8, shape)],
+        helper.make_tensor_value_info("y", storage, shape),
+        bits=3,
+        axis=axis,
+        output_type=storage,
+    )
+    packed = _mlx_session(pack).run(None, {"x": np.empty(shape, np.uint8)})[0]
+    np.testing.assert_array_equal(
+        packed, ReferenceEvaluator(pack).run(None, {"x": np.empty(shape, np.uint8)})[0]
+    )
+    unpack = _reference_model(
+        "Unpack",
+        [helper.make_tensor_value_info("x", storage, shape),
+         helper.make_tensor_value_info("count", TensorProto.INT64, [])],
+        helper.make_tensor_value_info("y", TensorProto.UINT8, shape),
+        bits=3,
+        axis=axis,
+    )
+    feeds = {"x": packed, "count": np.array(0, np.int64)}
+    np.testing.assert_array_equal(
+        _mlx_session(unpack).run(None, feeds)[0], ReferenceEvaluator(unpack).run(None, feeds)[0]
+    )
+
+
+def test_unpack_empty_count_exceeding_mlx_dimension_limit(runtime_opset29) -> None:
+    count = 1 << 31
+    shape = [0, count // 8]
+    model = _reference_model(
+        "Unpack",
+        [helper.make_tensor_value_info("x", TensorProto.UINT8, shape),
+         helper.make_tensor_value_info("count", TensorProto.INT64, [])],
+        helper.make_tensor_value_info("y", TensorProto.UINT8, [0, None]),
+        bits=1,
+    )
+    feeds = {"x": np.empty(shape, np.uint8), "count": np.array(count, np.int64)}
+    assert ReferenceEvaluator(model).run(None, feeds)[0].shape == (0, count)
+    with pytest.raises(
+        ort.capi.onnxruntime_pybind11_state.EPFail,
+        match=r"Unpack: count 2147483648 exceeds the int32 dimension limit; reduce count",
+    ):
+        _mlx_session(model).run(None, feeds)
+
+
+@pytest.mark.parametrize("disable_compile", ["0", "1"], ids=["compile-enabled", "eager"])
+def test_unpack_empty_then_nonempty_replay(runtime_opset29, disable_compile, monkeypatch) -> None:
+    monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_COMPILE", disable_compile)
+    graph = helper.make_graph(
+        [helper.make_node("Unpack", ["x", "count"], ["y"], bits=5)],
+        "unpack-constant-count-replay",
+        [helper.make_tensor_value_info("x", TensorProto.UINT8, [None, 2])],
+        [helper.make_tensor_value_info("y", TensorProto.UINT8, [None, 3])],
+        [helper.make_tensor("count", TensorProto.INT64, [], [3])],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 29)], ir_version=11)
+    session = _mlx_session(model)
+    reference = ReferenceEvaluator(model)
+    for values in [
+        np.empty((0, 2), np.uint8),
+        np.array([[65, 12], [31, 64]], np.uint8),
+        np.array([[0, 0], [255, 127]], np.uint8),
+        np.empty((0, 2), np.uint8),
+    ]:
+        np.testing.assert_array_equal(
+            session.run(None, {"x": values})[0], reference.run(None, {"x": values})[0]
+        )
+
+
+def test_pack_bits_compile_policy(runtime_opset29, tmp_path: Path) -> None:
+    cases = [
+        ("test_pack_bits_checks_live_codes[compile-enabled-input-u8-3]", "Pack", False),
+        ("test_pack_full_byte_accepts_255_after_empty_replay[compile-enabled-u8]", "Pack", True),
+        ("test_unpack_empty_then_nonempty_replay[compile-enabled]", "Unpack", True),
+    ]
+    for index, (case, op, compiled) in enumerate(cases):
+        trace = tmp_path / f"packing-{index}.json"
+        subprocess.run(
+            [sys.executable, "-m", "pytest", f"{Path(__file__)}::{case}", "-q",
+             "-p", "no:cacheprovider"],
+            env={**os.environ, "ONNXRUNTIME_EP_MLX_TRACE": str(trace)},
+            check=True,
+            timeout=90,
+        )
+        events = [event["args"] for event in json.loads(trace.read_text())
+                  if event.get("cat") == "ep.path"
+                  and event.get("args", {}).get("ops") == op]
+        if compiled:
+            assert any(event["path"] == "general" for event in events), events
+            assert any(event["cache"] == "HIT" for event in events), events
+        else:
+            assert len(events) >= 3, events
+            assert all(event["path"] == "eager" for event in events), events
 
 
 def test_pack_grouped_radix_uint32(runtime_opset29, tmp_path: Path) -> None:

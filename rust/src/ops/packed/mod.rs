@@ -205,11 +205,14 @@ fn pack_codes(
     let axis = normalize_axis(axis, shape.len(), "Pack")?;
     let logical = shape[axis] as usize;
     let packed = packed_axis_count(logical, spec, word_bits)?;
-    let outer = checked_count(&shape[..axis], "Pack")?;
-    let inner = checked_count(&shape[axis + 1..], "Pack")?;
     let mut output_shape = shape.to_vec();
     output_shape[axis] = packed as i64;
     let output_count = checked_count(&output_shape, "Pack")?;
+    if output_count == 0 {
+        return Ok((Vec::new(), output_shape));
+    }
+    let outer = checked_count(&shape[..axis], "Pack")?;
+    let inner = checked_count(&shape[axis + 1..], "Pack")?;
     let mut output = vec![0u64; output_count];
     let groups = logical.div_ceil(spec.group_size);
 
@@ -293,11 +296,14 @@ fn unpack_codes(
             shape[axis]
         ));
     }
-    let outer = checked_count(&shape[..axis], "Unpack")?;
-    let inner = checked_count(&shape[axis + 1..], "Unpack")?;
     let mut output_shape = shape.to_vec();
     output_shape[axis] = count;
     let output_count = checked_count(&output_shape, "Unpack")?;
+    if output_count == 0 {
+        return Ok((Vec::new(), output_shape));
+    }
+    let outer = checked_count(&shape[..axis], "Unpack")?;
+    let inner = checked_count(&shape[axis + 1..], "Unpack")?;
     let mut output = vec![0u8; output_count];
     let groups = logical.div_ceil(spec.group_size);
     let range = (0..spec.group_size).try_fold(1u64, |value, _| {
@@ -626,13 +632,49 @@ fn pack_bits_mlx(
     }
     let rank = ctx.ndim(input);
     let axis = normalize_axis(axis, rank, "Pack")?;
-    let moved = move_axis_last(ctx, input, axis)?;
-    let logical = moved.shape[moved.shape.len() - 1] as usize;
+    let input_shape = ctx.shape_of(input);
+    let logical = input_shape[axis] as usize;
     let packed = logical
         .checked_mul(bits)
         .and_then(|value| value.checked_add(word_bits - 1))
         .map(|value| value / word_bits)
         .ok_or_else(|| "MLX Pack: packed axis size overflow".to_string())?;
+    let packed_dim = i32::try_from(packed)
+        .map_err(|_| "MLX Pack: packed axis exceeds int32; reduce the input axis length")?;
+    if input_shape.contains(&0) {
+        let mut output_shape = input_shape;
+        output_shape[axis] = packed_dim;
+        let dtype = if word_bits == 8 {
+            mlx::mlx_dtype__MLX_UINT8
+        } else {
+            mlx::mlx_dtype__MLX_UINT32
+        };
+        ctx.mark_fast("mlx_vectorized_pack_bits");
+        return ctx.zeros(&output_shape, dtype);
+    }
+    if bits < 8 {
+        if ctx.shapeless_compile() || ctx.shape_keyed_compile() {
+            return Err(
+                "MLX Pack: live code validation requires eager execution; disable compiled capture for this node"
+                    .into(),
+            );
+        }
+        let maximum = ctx
+            .emit(|out, stream| unsafe { mlx::mlx_max(out, input, false, stream) })
+            .and_then(|value| ctx.read_scalar_i64(value))
+            .map_err(|error| {
+                format!(
+                    "MLX Pack: unable to validate input codes for bits={bits}: {error}; check MLX backend logs and retry"
+                )
+            })?;
+        let limit = (1i64 << bits) - 1;
+        if maximum > limit {
+            return Err(format!(
+                "MLX Pack: maximum input code {maximum} exceeds {limit} for bits={bits}; provide UINT8 codes in [0, {limit}]"
+            ));
+        }
+    }
+    let moved = move_axis_last(ctx, input, axis)?;
     let rows = matrix_rows(&moved.shape, "Pack")?;
     let matrix = ctx.reshape(moved.value, &[rows, logical as i32])?;
     let matrix = ctx.astype(matrix, mlx::mlx_dtype__MLX_UINT32)?;
@@ -670,7 +712,7 @@ fn pack_bits_mlx(
         packed_matrix
     };
     let mut output_shape = moved.shape;
-    *output_shape.last_mut().unwrap() = packed as i32;
+    *output_shape.last_mut().unwrap() = packed_dim;
     ctx.mark_fast("mlx_vectorized_pack_bits");
     restore_axis(ctx, packed_matrix, &output_shape, &moved.inverse)
 }
@@ -696,8 +738,8 @@ fn unpack_bits_mlx(
     } else {
         32
     };
-    let moved = move_axis_last(ctx, input, axis)?;
-    let packed = moved.shape[moved.shape.len() - 1] as usize;
+    let input_shape = ctx.shape_of(input);
+    let packed = input_shape[axis] as usize;
     let expected = count
         .checked_mul(bits)
         .and_then(|value| value.checked_add(word_bits - 1))
@@ -708,6 +750,16 @@ fn unpack_bits_mlx(
             "MLX Unpack: packed axis has {packed} words; count {count} requires {expected}"
         ));
     }
+    let count_dim = i32::try_from(count).map_err(|_| {
+        format!("MLX Unpack: count {count} exceeds the int32 dimension limit; reduce count")
+    })?;
+    if input_shape.contains(&0) {
+        let mut output_shape = input_shape;
+        output_shape[axis] = count_dim;
+        ctx.mark_fast("mlx_vectorized_unpack_bits");
+        return ctx.zeros(&output_shape, mlx::mlx_dtype__MLX_UINT8);
+    }
+    let moved = move_axis_last(ctx, input, axis)?;
     let rows = matrix_rows(&moved.shape, "Unpack")?;
     let matrix = ctx.reshape(moved.value, &[rows, packed as i32])?;
     let matrix = ctx.astype(matrix, mlx::mlx_dtype__MLX_UINT32)?;
@@ -741,7 +793,7 @@ fn unpack_bits_mlx(
         ctx.astype(unpacked, mlx::mlx_dtype__MLX_UINT8)?
     };
     let mut output_shape = moved.shape;
-    *output_shape.last_mut().unwrap() = count as i32;
+    *output_shape.last_mut().unwrap() = count_dim;
     ctx.mark_fast("mlx_vectorized_unpack_bits");
     restore_axis(ctx, unpacked, &output_shape, &moved.inverse)
 }
@@ -1174,8 +1226,11 @@ fn packed_compile_shape_safety(node: &NodeView) -> CompileShapeSafety {
     const HOST_REASON: &str =
         "exact grouped-radix or complex GGUF decoding requires eager host payload access";
     match node.op_type().as_str() {
-        "Pack" if node.int_attr("bits", 0) != 0 => CompileShapeSafety::ShapeKeyedOnly {
+        "Pack" if node.int_attr("bits", 0) == 8 => CompileShapeSafety::ShapeKeyedOnly {
             reason: FAST_REASON,
+        },
+        "Pack" if (1..8).contains(&node.int_attr("bits", 0)) => CompileShapeSafety::EagerOnly {
+            reason: "Pack validates live codes against the bit width on every invocation",
         },
         "Unpack" if node.int_attr("bits", 0) != 0 && node.const_scalar_i64(1).is_some() => {
             CompileShapeSafety::ShapeKeyedOnly {
@@ -1397,6 +1452,19 @@ mod tests {
         assert_eq!(words, [102]);
         let (words, _) = pack_codes(&[1, 2], &[2], -1, spec, 8).unwrap();
         assert_eq!(words, [7]);
+    }
+
+    #[test]
+    fn grouped_empty_rows_do_not_overflow_independent_dimension_products() {
+        let spec = spec_group(3, 5);
+        let shape = [50_000, 50_000, 5, 0];
+        let (packed, packed_shape) = pack_codes(&[], &shape, 2, spec, 8).unwrap();
+        assert!(packed.is_empty());
+        assert_eq!(packed_shape, [50_000, 50_000, 1, 0]);
+        let (unpacked, unpacked_shape) = unpack_codes(&[], &packed_shape, 2, 5, spec, 8).unwrap();
+        assert!(unpacked.is_empty());
+        assert_eq!(unpacked_shape, shape);
+        assert!(unpack_codes(&[], &packed_shape, 2, 0, spec, 8).is_err());
     }
 
     #[test]

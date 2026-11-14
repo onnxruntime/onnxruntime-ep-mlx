@@ -137,8 +137,12 @@ DequantizePacked supports `gguf:q1_0`, `q2_0`, `q4_0`, `q4_1`, `q5_0`,
 IQ decoding uses the pinned normative codebooks and format-specific
 bit/sign/scale layouts, with independently generated ONNX-reference fixtures
 covering randomized nonzero single/multiblock data and scale/sign edge cases.
-Pack/Unpack's bits spelling has vectorized MLX fast paths. Custom Metal decoding
-supports Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q8_1 and Q2_K/Q3_K/Q4_K/Q5_K/Q6_K,
+Pack/Unpack's bits spelling has vectorized MLX fast paths. Pack with bits 1–7
+checks the live maximum via an MLX reduction and scalar read on every run, so
+those nodes are eager; bits=8 retains shape-keyed compilation because all UINT8
+codes are valid. Empty inputs return a correctly shaped empty tensor directly,
+after Unpack validates its packed-axis length. Custom Metal decoding supports
+Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q8_1 and Q2_K/Q3_K/Q4_K/Q5_K/Q6_K,
 including lazy standalone decoding and the fused consumers described below.
 Grouped radix and the other 16 quantization formats retain exact eager host
 fallbacks; their correctness coverage is not a GPU-speed claim.
