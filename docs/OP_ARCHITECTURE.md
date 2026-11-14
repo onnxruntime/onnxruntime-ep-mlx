@@ -343,8 +343,13 @@ MatMul with rank≥3 X is flattened when the weight is FP8. Shared DQ outputs ke
 their ordinary DQ value. FP8 activations, fp16/bf16-output DQ, device-tensor
 FP8 inputs and other unsupported forms use ordinary DQ plus the unfused product.
 `ONNXRUNTIME_EP_MLX_NO_QDQ_FUSION=1` disables fusion. The contrib
-`MatMulBlockQuantizedFp8Weight` op still decodes on host. GroupedMatMul FP8
-routes are implemented but not executed on released ORT 1.31.
+`MatMulBlockQuantizedFp8Weight` op still decodes on host.
+
+`test_fp8_fusion.py` checks all 256 codes of each format through every kernel
+above, including transA, odd-N/K and grouped routes, and asserts the kernel
+via trace. GroupedMatMul-29 cases skip on released ORT 1.31; they pass on the
+schema-enabled runtime described in "Reproducing schema-enabled runtime
+validation".
 
 Synchronized session runs on M1 Max (E4M3FN, block 128 along K, median µs, 400
 runs; footprint MB; unfused is the same binary with fusion disabled):
@@ -362,6 +367,17 @@ runs; footprint MB; unfused is the same binary with fusion disabled):
 
 Times include roughly 0.2–0.25 ms of session overhead. The prefill route
 allocates a transient fp32 weight per run.
+
+GroupedMatMul-29 on the schema-enabled runtime (8 experts of 2048², two
+selections; E4M3FN, block 128 along K, median µs over 300 runs; footprint MB):
+
+| Case | Fused | Unfused |
+| --- | --- | --- |
+| transB=1, M=1 | 349 (227) | 2447 (609) |
+| transB=1, M=8 | 468 | 3043 |
+| transB=1, M=64 | 1989 | 7005 |
+| transB=0, M=1 | 334 | 2485 |
+| transB=0, M=64 | 2002 | 6546 |
 
 ### Packed static-weight consumers
 

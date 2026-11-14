@@ -215,24 +215,169 @@ def test_fused_replay(case, layout, m, k, n, batch):
     _check(session(model).run(None, feeds)[0], expected, float(np.abs(weight).sum()))
 
 
-@pytest.mark.parametrize("case,layout,m,k,n,batch,kernel", [
-    ("Gemm", "axis", 1, 256, 96, None, "mlx_fp8_gemv_k"),
-    ("MatMul", "blocked", 3, 64, 64, (2,), "mlx_fp8_gemv_n"),
-    ("Gemm", "blocked", 20, 96, 48, None, "mlx_fp8_dequant_matmul"),
-    ("GemmTransA", "blocked", 3, 64, 40, None, "mlx_fp8_matvec"),
-    ("MatMul", "axis", 3, 33, 7, None, "mlx_fp8_tiled_matmul"),
-])
-def test_fused_dispatch(tmp_path, case, layout, m, k, n, batch, kernel):
+PATTERN_CASES = {
+    # id: (case, m, k, trans_a, n_pad, kernel)
+    "gemv_k": ("Gemm", 1, 8, False, 0, "mlx_fp8_gemv_k"),
+    "gemv_k_rows": ("Gemm", 3, 8, False, 0, "mlx_fp8_gemv_k"),
+    "gemv_n": ("MatMul", 1, 8, False, 0, "mlx_fp8_gemv_n"),
+    "dequant_matmul": ("MatMul", 9, 8, False, 0, "mlx_fp8_dequant_matmul"),
+    "matvec_odd_k": ("Gemm", 1, 7, False, 0, "mlx_fp8_matvec"),
+    "matvec_trans_a": ("Gemm", 3, 8, True, 0, "mlx_fp8_matvec"),
+    "tiled_odd_n": ("MatMul", 3, 8, False, 1, "mlx_fp8_tiled_matmul"),
+    "tiled_odd_k": ("Gemm", 6, 7, False, 0, "mlx_fp8_tiled_matmul"),
+}
+
+
+GROUPED_CASES = {
+    # id: (trans_b, m, k, n, layout, kernel); two selections per row.
+    "gemv_k": (True, 2, 64, 24, "blocked", "mlx_fp8_gemv_k"),
+    "gemv_k_routes12": (True, 6, 64, 24, "axis", "mlx_fp8_gemv_k"),
+    "matvec_odd_k": (True, 2, 67, 24, "blocked", "mlx_fp8_matvec"),
+    "tiled_trans_b": (True, 20, 64, 24, "blocked", "mlx_fp8_tiled_matmul"),
+    "tiled_odd_k": (True, 20, 67, 24, "tensor", "mlx_fp8_tiled_matmul"),
+    "gemv_n": (False, 2, 64, 24, "blocked", "mlx_fp8_gemv_n"),
+    "tiled_odd_n": (False, 3, 64, 7, "axis", "mlx_fp8_tiled_matmul"),
+    "tiled": (False, 20, 64, 24, "blocked", "mlx_fp8_tiled_matmul"),
+}
+
+
+def _grouped_model(fmt, trans_b, m, k, n, layout, *, bits=None, x=None, ids=None, scale=None,
+                   shared=False, bias=True):
+    rng = np.random.default_rng(7)
+    experts, selections = 4, 2
+    shape = (experts, n, k) if trans_b else (experts, k, n)
+    k_axis, n_axis = (2, 1) if trans_b else (1, 2)
+    if bits is None:
+        bits = _weights(rng, shape, fmt, special=True)
+    experts = bits.shape[0]
+    if scale is not None:
+        axis, block = 0, 0
+    elif layout == "tensor":
+        axis, block, scale = 0, 0, np.array(0.0371, np.float32)
+    elif layout == "axis":
+        axis, block = n_axis, 0
+        scale = rng.uniform(0.01, 0.2, n).astype(np.float32)
+    else:
+        axis, block = k_axis, 16
+        scale_shape = list(shape)
+        scale_shape[k_axis] = (k + block - 1) // block
+        scale = rng.uniform(0.01, 0.2, scale_shape).astype(np.float32)
+    zero_bits = np.zeros(scale.shape, np.uint8)
+    weight = (_decode(bits, fmt) - _expand(_decode(zero_bits, fmt), shape, axis, block)
+              ) * _expand(scale, shape, axis, block)
+    feeds = {
+        "x": rng.normal(0, 1, (m, k)).astype(np.float32) if x is None else x,
+        "ids": (rng.integers(0, experts, (m, selections)) if ids is None else ids
+                ).astype(np.int64),
+    }
+    b = rng.normal(0, 0.2, (experts, n)).astype(np.float32)
+    dense = np.swapaxes(weight, 1, 2) if trans_b else weight
+    with np.errstate(invalid="ignore"):
+        expected = np.einsum("mk,mskn->msn", feeds["x"].astype(np.float64),
+                             dense[feeds["ids"]].astype(np.float64)).astype(np.float32)
+    if bias:
+        expected = expected + b[feeds["ids"]]
+    attrs = {"axis": axis, **({"block_size": block} if block else {})}
+    nodes = [helper.make_node("DequantizeLinear", ["w", "ws", "wz"], ["wf"], **attrs),
+             helper.make_node("GroupedMatMul", ["x", "wf", "ids", *(["b"] if bias else [])],
+                              ["y"], transB=int(trans_b))]
+    outputs = [helper.make_tensor_value_info("y", TensorProto.FLOAT, None)]
+    if shared:
+        outputs.append(helper.make_tensor_value_info("wf", TensorProto.FLOAT, None))
+    initializers = [_initializer("w", bits, FORMATS[fmt][1]), _initializer("ws", scale),
+                    _initializer("wz", zero_bits, FORMATS[fmt][1])]
+    if bias:
+        initializers.append(_initializer("b", b))
+    graph = helper.make_graph(
+        nodes, "fp8_grouped",
+        [helper.make_tensor_value_info("x", TensorProto.FLOAT, list(feeds["x"].shape)),
+         helper.make_tensor_value_info("ids", TensorProto.INT64, list(feeds["ids"].shape))],
+        outputs, initializers,
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 29)], ir_version=11)
+    return model.SerializeToString(), feeds, expected, weight
+
+
+@pytest.mark.parametrize("shared", [False, True], ids=["fused", "shared"])
+@pytest.mark.parametrize("case", list(GROUPED_CASES))
+@pytest.mark.parametrize("fmt", list(FORMATS))
+def test_fused_grouped(fmt, case, shared, monkeypatch):
+    trans_b, m, k, n, layout, _ = GROUPED_CASES[case]
+    model, feeds, expected, weight = _grouped_model(fmt, trans_b, m, k, n, layout, shared=shared)
+    x_scale = float(np.abs(feeds["x"]).max() * np.abs(weight).sum(axis=2 if trans_b else 1).max())
+    for disabled in ["0", "1"]:
+        monkeypatch.setenv("ONNXRUNTIME_EP_MLX_NO_QDQ_FUSION", disabled)
+        # Skips where ORT cannot load opset 29.
+        outputs = session(model).run(None, feeds)
+        _check(outputs[0], expected, x_scale)
+        if shared:
+            np.testing.assert_array_equal(outputs[1], weight)
+
+
+@pytest.mark.parametrize("case", list(GROUPED_CASES))
+def test_fused_grouped_replay(case):
+    trans_b, m, k, n, layout, _ = GROUPED_CASES[case]
+    model, feeds, expected, weight = _grouped_model("e4m3fn", trans_b, m, k, n, layout)
+    _check(session(model).run(None, feeds)[0], expected, float(np.abs(weight).sum()))
+
+
+@pytest.mark.parametrize("trans_b,m", [(True, 1), (True, 9), (False, 1), (False, 9)],
+                         ids=["gemv_k", "tiled_trans_b", "gemv_n", "tiled"])
+@pytest.mark.parametrize("fmt", list(FORMATS))
+def test_fused_grouped_decodes_all_bit_patterns(fmt, trans_b, m):
+    """Each expert holds all 256 codes; one-hot rows select every decoded weight exactly."""
+    k = 8
+    patterns = np.arange(256, dtype=np.uint8)
+    codes = np.stack([patterns, patterns[::-1]])
+    bits = np.zeros((2, 256, k) if trans_b else (2, k, 256), np.uint8)
+    if trans_b:
+        bits[:, :, 0] = codes
+    else:
+        bits[:, 0, :] = codes
+    x = np.zeros((m, k), np.float32)
+    x[:, 0] = 1
+    ids = np.tile([[0, 1]], (m, 1))
+    model, feeds, expected, _ = _grouped_model(
+        fmt, trans_b, m, k, 256, None, bits=bits, x=x, ids=ids,
+        scale=np.array(0.125, np.float32), bias=False)
+    y = session(model).run(None, feeds)[0]
+    np.testing.assert_array_equal(expected, np.broadcast_to(
+        _decode(codes, fmt) * np.float32(0.125), expected.shape))
+    np.testing.assert_array_equal(np.isnan(y), np.isnan(expected))
+    finite = ~np.isnan(expected)
+    np.testing.assert_array_equal(y[finite], expected[finite])
+
+
+DISPATCH_CASES = [
+    *[(f"test_fused_replay[{_case_id(*c)}]", kernel) for *c, kernel in [
+        ("Gemm", "axis", 1, 256, 96, None, "mlx_fp8_gemv_k"),
+        ("MatMul", "blocked", 3, 64, 64, (2,), "mlx_fp8_gemv_n"),
+        ("Gemm", "blocked", 20, 96, 48, None, "mlx_fp8_dequant_matmul"),
+        ("GemmTransA", "blocked", 3, 64, 40, None, "mlx_fp8_matvec"),
+        ("MatMul", "axis", 3, 33, 7, None, "mlx_fp8_tiled_matmul"),
+    ]],
+    *[(f"test_fused_decodes_all_bit_patterns[e4m3fn-{name}]", case[-1])
+      for name, case in PATTERN_CASES.items()],
+    *[(f"test_fused_grouped_replay[{name}]", case[-1])
+      for name, case in GROUPED_CASES.items()],
+    *[(f"test_fused_grouped_decodes_all_bit_patterns[e4m3fn-{name}]", kernel)
+      for name, kernel in [("gemv_k", "mlx_fp8_gemv_k"), ("tiled_trans_b", "mlx_fp8_tiled_matmul"),
+                           ("gemv_n", "mlx_fp8_gemv_n"), ("tiled", "mlx_fp8_tiled_matmul")]],
+]
+
+
+@pytest.mark.parametrize("test,kernel", DISPATCH_CASES, ids=[t for t, _ in DISPATCH_CASES])
+def test_fused_dispatch(tmp_path, test, kernel):
+    if "grouped" in test:
+        session(_grouped_model("e4m3fn", True, 1, 8, 4, "tensor")[0])  # Skips without opset 29.
     for disabled in [False, True]:
         trace = tmp_path / f"{disabled}.json"
         env = {**os.environ, "ONNXRUNTIME_EP_MLX_TRACE": str(trace)}
         env.pop("ONNXRUNTIME_EP_MLX_NO_QDQ_FUSION", None)
         if disabled:
             env["ONNXRUNTIME_EP_MLX_NO_QDQ_FUSION"] = "1"
-        name = _case_id(case, layout, m, k, n, batch)
         subprocess.run(
-            [sys.executable, "-m", "pytest",
-             f"{Path(__file__)}::test_fused_replay[{name}]",
+            [sys.executable, "-m", "pytest", f"{Path(__file__)}::{test}",
              "-q", "-p", "no:cacheprovider"], env=env, check=True, timeout=180,
         )
         kernels = {e.get("args", {}).get("kernel") for e in json.loads(trace.read_text())
@@ -240,61 +385,36 @@ def test_fused_dispatch(tmp_path, case, layout, m, k, n, batch, kernel):
         assert (kernel in kernels) is not disabled, kernels
 
 
-@pytest.mark.parametrize("m,k", [(2, 64), (20, 67)])
-@pytest.mark.parametrize("fmt", ["e4m3fn", "e5m2"])
-def test_fused_grouped(fmt, m, k):
-    rng = np.random.default_rng(7)
-    experts, n, selections = 4, 24, 2
-    bits = _weights(rng, (experts, n, k), fmt, special=True)
-    scale = rng.uniform(0.01, 0.2, (experts, n, (k + 15) // 16)).astype(np.float32)
-    weight = _decode(bits, fmt) * _expand(scale, bits.shape, 2, 16)
-    feeds = {
-        "x": rng.normal(0, 1, (m, k)).astype(np.float32),
-        "ids": rng.integers(0, experts, (m, selections)).astype(np.int64),
-    }
-    graph = helper.make_graph(
-        [helper.make_node("DequantizeLinear", ["w", "ws"], ["wf"], axis=2, block_size=16),
-         helper.make_node("GroupedMatMul", ["x", "wf", "ids"], ["y"], transB=1)],
-        "fp8_grouped",
-        [helper.make_tensor_value_info("x", TensorProto.FLOAT, [m, k]),
-         helper.make_tensor_value_info("ids", TensorProto.INT64, [m, selections])],
-        [helper.make_tensor_value_info("y", TensorProto.FLOAT, None)],
-        [_initializer("w", bits, FORMATS[fmt][1]), _initializer("ws", scale)],
-    )
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 29)], ir_version=11)
-    result = session(model.SerializeToString())  # Skips where ORT cannot load opset 29.
-    expected = np.stack([
-        feeds["x"][row].astype(np.float64) @ weight[e].astype(np.float64).T
-        for row in range(m) for e in feeds["ids"][row]
-    ]).reshape(m, selections, n).astype(np.float32)
-    _check(result.run(None, feeds)[0], expected, float(np.abs(weight).sum(axis=-1).max() * 5))
 
 
-@pytest.mark.parametrize("case,m", [("Gemm", 1), ("MatMul", 1), ("MatMul", 9), ("Gemm", 3)],
-                         ids=["gemv_k", "gemv_n", "dequant_matmul", "gemv_k_rows"])
+@pytest.mark.parametrize("pattern", list(PATTERN_CASES))
 @pytest.mark.parametrize("fmt", list(FORMATS))
-def test_fused_decodes_all_bit_patterns(fmt, case, m):
+def test_fused_decodes_all_bit_patterns(fmt, pattern):
     """A one-hot activation selects each decoded weight exactly, including NaN and infinities."""
-    k = 8
+    case, m, k, trans_a, pad, _ = PATTERN_CASES[pattern]
+    n = 256 + pad
     patterns = np.arange(256, dtype=np.uint8)
-    bits = np.zeros((256, k) if case == "Gemm" else (k, 256), np.uint8)
+    bits = np.zeros((n, k) if case == "Gemm" else (k, n), np.uint8)
     if case == "Gemm":
-        bits[:, 0] = patterns
+        bits[:256, 0] = patterns
     else:
-        bits[0] = patterns
-    x = np.zeros((m, k), np.float32)
-    x[:, 0] = 1
+        bits[0, :256] = patterns
+    x = np.zeros((k, m) if trans_a else (m, k), np.float32)
+    x[(0, slice(None)) if trans_a else (slice(None), 0)] = 1
     scale = np.array(0.125, np.float32)
-    nodes = [helper.make_node("DequantizeLinear", ["w", "ws"], ["wf"]),
-             helper.make_node(case, ["x", "wf"], ["y"], **({"transB": 1} if case == "Gemm"
-                                                         else {}))]
+    attrs = {"transA": int(trans_a), "transB": 1} if case == "Gemm" else {}
     graph = helper.make_graph(
-        nodes, "fp8_patterns", [helper.make_tensor_value_info("x", TensorProto.FLOAT, [m, k])],
+        [helper.make_node("DequantizeLinear", ["w", "ws"], ["wf"]),
+         helper.make_node(case, ["x", "wf"], ["y"], **attrs)],
+        "fp8_patterns", [helper.make_tensor_value_info("x", TensorProto.FLOAT, list(x.shape))],
         [helper.make_tensor_value_info("y", TensorProto.FLOAT, None)],
         [_initializer("w", bits, FORMATS[fmt][1]), _initializer("ws", scale)],
     )
     model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 21)], ir_version=10)
     y = session(model.SerializeToString()).run(None, {"x": x})[0]
+    assert y.shape == (m, n)
+    np.testing.assert_array_equal(y[:, 256:], 0)
+    y = y[:, :256]
     expected = np.broadcast_to(_decode(patterns, fmt) * scale, y.shape)
     np.testing.assert_array_equal(np.isnan(y), np.isnan(expected))
     finite = ~np.isnan(expected)
