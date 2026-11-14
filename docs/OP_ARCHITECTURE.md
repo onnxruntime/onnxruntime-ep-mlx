@@ -78,7 +78,7 @@ The following table is the current support contract. Do not broaden claims witho
 | **NonZero** | `ai.onnx` | schema 9/13; bool, all 8/16/32/64-bit signed/unsigned integers, fp16/fp32/fp64 and (schema 13) bf16 | provider-owned exact eager host scan + int64 MLX output | Live payload determines row-major coordinates and `[rank, count]` shape on every call. Scalar output is `[0, count]` per ONNX, unlike ORT 1.31 CPU's `[1, count]`. |
 | **Unique** | `ai.onnx` | schema 11; bool, all 8/16/32/64-bit signed/unsigned integers, fp16/fp32/fp64; flat or axis slices, scalar/unknown rank/empty shapes, all optional outputs | provider-owned exact eager host sort/group + byte-preserving MLX outputs | [Contracts and authority limits](UNIQUE.md). Live cardinality and exact metadata; recursive eager parent boundaries. Legal NaNs use deterministic NaN-last sorting; NumPy half-axis ordering disagreement is explicit. Future28 dispatch is preserved; bf16 Unique28 remains unclaimed/unvalidated. Native validation pending. |
 | **MatMul** | `ai.onnx` | rank >=1 floating operands, including vector-vector, vector-matrix and batched vector forms | `mlx_matmul` | ONNX vector promotion/squeezing and batch broadcasting are native MLX semantics. Empty contraction dimensions, empty batches and symbolic extents are supported. Float64 uses the isolated MLX CPU stream; integer MatMul stays on ORT CPU. |
-| **GroupedMatMul** | `ai.onnx`, schema 29 (unreleased) | X[M,K], W[G,K,N], indices[M,S] int32/int64, optional bias[G,N]; matching fp16/bf16/fp32/fp64 data | GPU `mlx_gather_mm`; typed CPU gather + matmul | Output [M,S,N]. Eager live index validation rejects negative/out-of-range/full-width-overflow routes before dispatch. Empty M/S/K/N and unused/repeated experts retain ONNX semantics. Source implementation and direct handler tests; ORT 1.31 cannot load this schema. |
+| **GroupedMatMul** | `ai.onnx`, schema 29 (unreleased) | X[M,K], W[G,K,N] or transB W[G,N,K], indices[M,S] int32/int64, optional bias[G,N]; matching fp16/bf16/fp32/fp64 data | GPU gather-MM or direct QDQ/packed decode-compute; typed CPU gather + matmul | Output [M,S,N]. Live full-width route validation precedes dispatch. Both transB layouts avoid an expanded expert bank; fused kernels decode only selected experts. Empty/repeated/unused routes retain ONNX semantics. Native and isolated schema-enabled runtime qualification; released ORT 1.31 lacks the schema. |
 | **CDist** | `com.microsoft` | v1; homogeneous `fp32`/`fp64` rank-two A[M,N], B[K,N]; default/explicit `sqeuclidean` or `euclidean`; C[M,K] | provider-owned eager typed host distances | [Contracts, resource bounds and remaining metrics](CDIST.md). Direct differences; no [M,K,N] workspace. No ORT CPU fallback or GPU-acceleration claim; recursive eager boundary, unchanged DOUBLE-body restrictions. |
 | **Inverse** | `com.microsoft` | v1; homogeneous `fp32`/`fp64` rank >=2, square final axes, same-shape output, no attributes | eager `mlx_linalg_inv` on the run thread's reused default MLX CPU stream | [Contracts and limits](INVERSE.md). Typed LAPACK, explicit nonfinite-input errors, checked empty short-circuit and synchronous native errors; zero-trip Scan shape templates, recursive eager parent boundary, unchanged context stream and DOUBLE-body rejection. FLOAT16 promotion remains OPEN. |
 | **FusedMatMul** | `com.microsoft`, schema 1 | matching fp16/fp32/fp64/bf16 A/B/Y, alpha and all four transpose flags | transpose + `mlx_matmul` + scale | Batch transpose rotates axis 0 behind all batch axes, before last-two transpose; either batch flag requires equal ranks >=3, matching ORT's compute helper. Vector last-two transpose is a no-op. Narrow scaling uses a dtype-rounded alpha and FP32 product/scaling before the final output cast, avoiding an intermediate fp16/bf16 result. Empty-result materialization uses shape-keyed compilation. Float64 retains the existing isolated MLX CPU stream. Source implementation and fixtures only; runtime/compiled evidence pending. |
@@ -100,17 +100,117 @@ The following table is the current support contract. Do not broaden claims witho
 | **Dropout** | `ai.onnx` | Versioned floating data, optional ratio/training controls and mask; legacy `is_test` | identity/ones for inference, uniform sampling and scaled masking for training | Opsets 1/6 honor `is_test`; 7/10 retain inference behavior because they provide no per-node training selector. Mask dtype follows the schema (data dtype before opset 10, bool thereafter). Modern controls are live scalar tensors, including intermediate producers; inference ignores the ratio value. BF16 data requires opset 13 and BF16 ratio requires opset 22. Training is an eager partition boundary, preserving compiled neighbors and fresh default keys; explicit INT64 seed bits are preserved. Float64 data uses the MLX CPU stream. |
 | **RandomNormal / RandomNormalLike / RandomUniform / RandomUniformLike / Bernoulli / Multinomial** | `ai.onnx` | Existing versioned dtype/attribute restrictions; Like reads tensor geometry only; Normal supports bfloat16 output since schema 22; Bernoulli accepts float32/float16/float64 probabilities since schema 15 and bfloat16 since schema 22, with default or explicit native numeric/Boolean outputs | MLX random primitives | Unseeded forms are eager partition boundaries: each call consumes the live default key, including empty draws. Explicit float-seed forms retain the finite/non-negative/<2^64 claim guard and literal integer truncation; they remain fixed-key and shape-keyed when eligible. Normal's bfloat16 path keeps one existing F32 standard-normal draw/key on the context stream, then uses the current thread's existing default MLX CPU stream for F32 multiplication by the original FLOAT scale, F32 addition of the original FLOAT mean, and the final bfloat16 cast. This is provider-owned CPU affine execution, not an all-GPU path or ORT CPU fallback. It completes evaluation and checks CPU synchronization before exposing the result to consumers, also checking synchronization after construction/evaluation errors. This default stream can share other same-thread work; no exclusive ownership, new per-plan stream/worker/pool, or exhaustive native-error isolation is claimed. BF16 Normal/NormalLike and their recursive parents are eager even when seeded; old float32/float16 compilation behavior is unchanged. Parameters and intermediate samples are not pre-rounded to bfloat16; no new sampler, F64 Normal route or exact-real/higher-precision guarantee is introduced. Ordinary F32 arithmetic and final bfloat16 rounding can overflow or underflow; finite attributes do not guarantee finite outputs, and actual subnormal, signed-zero and cross-stream fidelity require runtime qualification. NormalLike defaults to the input dtype, including bfloat16 since schema 22; RandomNormal still defaults to float32. Bernoulli preserves its native bool draw and casts 0/1 exactly to the requested output type, including uint64 and DOUBLE. DOUBLE input or output selects the existing provider-owned MLX CPU-stream eager path, not ORT CPU fallback. Original DOUBLE probabilities are not downcast: native uint32 bits are compared in F64 against the F64 product of p and the native F32 upper constant (2^32+512). This preserves the native finite 32-bit draw/threshold policy, not a new sampler, 53-bit uniform resolution, exact-real probability guarantee, or cross-provider seeded sequence contract. The default output dtype remains the input dtype. Like's metadata claim accepts every legal input type in schema 1/22, including string/complex/double with explicit float32/float16 output dtype (also bfloat16 for NormalLike since schema 22), without converting its payload; non-MLX input types remain eager even with a seed. [ORT 1.31 initializer sizing](https://github.com/microsoft/onnxruntime/blob/v1.31.0/onnxruntime/core/framework/tensorprotoutils.cc#L1402-L1437) rejects complex initializers, as seen in [hosted run 39913638545](https://github.com/onnxruntime/onnxruntime-ep-mlx/actions/runs/39913638545/job/120282096717): these cases assert the exact session-initialization error against an independent CPU Shape control, not RNG execution. Scalar, empty and unknown-rank Like geometry is checked without narrowing wide dimensions. Recursive eager boundaries preserve neighboring deterministic compilation; control-flow bodies performing DOUBLE payload computation remain declined. Uniform bfloat16 output, Normal/Uniform DOUBLE outputs, full-precision DOUBLE uniform sampling and extreme uniform endpoints remain separate coverage gaps. |
 
+### Opset 29 (ONNX main, unreleased)
+
+The schema inventory is pinned to ONNX main
+[`3c41120`](https://github.com/onnx/onnx/blob/3c41120b9c69657a1dd13407b080bd451ed06c9c/onnx/defs/operator_sets.h):
+seven new operators and six schema updates. Source support does not upgrade the
+host runtime's schema registry. ORT 1.31 rejects opset 29 by default; even with
+`ALLOW_RELEASED_ONNX_OPSET_ONLY=0`, it lacks the new operator schemas. ORT main
+[`6080d7c`](https://github.com/microsoft/onnxruntime/tree/6080d7c7cc598db70335be28c7946c429dfb2671)
+also pins released ONNX 1.23.2 by default. An isolated build of that ORT main with
+the pinned ONNX-main source substituted successfully executes the version-29
+models through MLX, with CPU fallback and ahead-of-time function inlining
+disabled and MLX provider execution verified in profiles. This is a custom
+development runtime, not official ORT 1.31 support. Native handler tests and
+ONNX-main reference fixtures remain separate evidence; unavailable released
+runtime loading is explicitly skipped.
+
+| Operator | Change and implementation |
+|---|---|
+| Expm1, Log1p (new) | Native MLX stable unary primitives, preserving tiny representable results and signed zero. fp16/bf16/fp32 on Metal; fp64 on MLX CPU. |
+| LogCumSumExp (new) | Native inclusive forward MLX log-add-exp scan, arbitrary axis, fp32 accumulation for narrow inputs and fp64 for double. NaN and signed infinities propagate prefix-wise; empty tensors retain shape. Shape-keyed compilation. |
+| GroupedMatMul (new) | Native gather-MM and selected-expert QDQ/packed kernels support both transB layouts without a materialized weight transpose. |
+| Pack, Unpack (new) | UINT8 logical codes, UINT8/UINT32 words, arbitrary axis, bits 1-8 or grouped radix with the signed-INT64 power bound. See packed-format limits below. |
+| DequantizePacked (new) | Exact little-endian GGUF block decoding in fp32, one final output conversion; all 27 normative formats implemented, including the seven IQ codebook formats below. |
+| Gemm (updated) | Rank >=1 A, rank-2 B, last-two-axis transA (no-op for vectors), unidirectional C broadcasting, beta=0 ignores C. Floating dtypes retain native matmul and shape-keyed empty-result replay. Version 29 adds an exact eager host path for int32/uint32/int64/uint64 with checked i128 accumulation and integral scaling. |
+| MeanVarianceNormalization (updated) | Version 29 uses centered variance and configurable epsilon after sqrt; earlier schemas retain their second-moment expression and fixed epsilon. |
+| CausalConvWithState (updated) | Standard-domain dilation from version 29 uses native depthwise MLX conv1d and raw chronological carry of `(K-1)*dilation`. |
+| GatherND (updated) | Existing int32/int64 path plus full-width live bounds validation for version 29, before any unchecked gather. Version 29 is eager. |
+| ScatterElements, ScatterND (updated) | Version-29 mean includes original data once and all duplicate updates. Floating means use MLX scatter sums/counts, fp32 narrow accumulation, and a scaled retry for finite-sum overflow; double uses MLX CPU. Integer means use exact eager i128 host sums and floor division, avoiding 64-bit Metal scatter limitations. ScatterND accepts int32 indices and version-29 zero-width tuples. Other previously unclaimed reductions remain unclaimed. |
+
+DequantizePacked supports `gguf:q1_0`, `q2_0`, `q4_0`, `q4_1`, `q5_0`,
+`q5_1`, `q8_0`, `q8_1`, `q2_k`, `q3_k`, `q4_k`, `q5_k`, `q6_k`,
+`q8_k`, `iq4_nl`, `iq4_xs`, `tq1_0`, `tq2_0`, `mxfp4`, `nvfp4`,
+`iq2_xxs`, `iq2_xs`, `iq2_s`, `iq3_xxs`, `iq3_s`, `iq1_s`, and `iq1_m`
+(each identifier has the `gguf:` prefix).
+IQ decoding uses the pinned normative codebooks and format-specific
+bit/sign/scale layouts, with independently generated ONNX-reference fixtures
+covering randomized nonzero single/multiblock data and scale/sign edge cases.
+Pack/Unpack's bits spelling has vectorized MLX fast paths. Pack with bits 1–7
+checks the live maximum via an MLX reduction and scalar read on every run, so
+those nodes are eager; bits=8 retains shape-keyed compilation because all UINT8
+codes are valid. Empty inputs return a correctly shaped empty tensor directly,
+after Unpack validates its packed-axis length. Custom Metal decoding supports
+Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q8_1 and Q2_K/Q3_K/Q4_K/Q5_K/Q6_K,
+including lazy standalone decoding and the fused consumers described below.
+Grouped radix and the other 16 quantization formats retain exact eager host
+fallbacks; their correctness coverage is not a GPU-speed claim.
+String/complex forms unsupported by the array boundary remain unclaimed.
+
+Gemm-13 and Gemm-29 have the same integer dtype set: version 29 adds generalized
+geometry, not new integer dtypes. The new integer path preserves full-width
+values without floating-point narrowing, including values above 2^53.
+Fractional/nonfinite or out-of-i128-range coefficients remain unclaimed; checked
+accumulator overflow and results outside the output dtype produce actionable
+errors rather than assuming unspecified wraparound or silently rounding.
+MLX has no native integer GEMM primitive, so this is a correctness fallback, not
+an accelerated integer matrix product. Older-version integer Gemm remains
+unclaimed. Full-width fixtures use Python arbitrary-precision arithmetic because
+ONNX's NumPy reference applies floating scalar multiplication and can itself
+round large integers; smaller integral cases also match ReferenceEvaluator.
+
+#### Reproducing schema-enabled runtime validation
+
+Use fresh, ignored directories inside this worktree, not another checkout.
+With the normal test dependencies installed and the pinned MLX plugin built,
+download ORT `6080d7c` to `.deps/ort-opset29` and ONNX `3c41120` to
+`.deps/onnx-opset29`. The validated Apple-arm64 build route is:
+
+```bash
+python -m venv --system-site-packages .venv-opset29
+.venv-opset29/bin/python .deps/ort-opset29/tools/ci_build/build.py \
+  --config Release --build_dir "$PWD/.deps/ort-opset29-build" \
+  --parallel 6 --skip_tests --skip_submodule_sync --cmake_generator Ninja \
+  --build_shared_lib --build_wheel --compile_no_warning_as_error --update --build \
+  --cmake_extra_defines \
+    "FETCHCONTENT_SOURCE_DIR_ONNX=$PWD/.deps/onnx-opset29" \
+    FETCHCONTENT_TRY_FIND_PACKAGE_MODE=NEVER CMAKE_OSX_ARCHITECTURES=arm64 \
+    onnxruntime_ENABLE_TELEMETRY=OFF onnxruntime_BUILD_UNIT_TESTS=OFF
+.venv-opset29/bin/python -m pip install \
+  .deps/ort-opset29-build/Release/dist/onnxruntime-*.whl \
+  "onnx @ git+https://github.com/onnx/onnx.git@3c41120b9c69657a1dd13407b080bd451ed06c9c" \
+  "protobuf>=7.36.2"
+ALLOW_RELEASED_ONNX_OPSET_ONLY=0 \
+ONNXRUNTIME_MLX_EP_LIB="$PWD/rust/target/release/libonnxruntime_mlx_ep.dylib" \
+  .venv-opset29/bin/python -m pytest -q \
+    tests/ops/test_math.py tests/ops/test_reduction.py \
+    tests/ops/test_gemm.py tests/ops/test_grouped_matmul.py \
+    tests/ops/test_mean_variance_normalization_forms.py tests/ops/test_ssm_contracts.py \
+    tests/ops/test_gathernd.py tests/ops/test_scatter_symbolic.py tests/ops/test_packed_ops.py
+```
+
+Changing the model's opset stamp, merely registering schemas, or allowing CPU
+fallback does not validate these handlers. These tests run version-29 models,
+disable function inlining, and require MLX provider profiles.
+Validation passed 156 focused opset-29 tests without skips, 219 native Rust
+tests, and 2,299 selected Python operator/regression tests. The only regression
+skip was an unrelated negative loader contract specific to ORT 1.31, not missing
+opset-29 execution.
+
 ### GroupedMatMul and direct QDQ products
 
-The GroupedMatMul contract is the merged ONNX
-[`0834d5e`](https://github.com/onnx/onnx/blob/0834d5e3a5c41e6e3c36a6853e7540e81c704d07/onnx/defs/math/defs.cc),
+The GroupedMatMul contract is ONNX main
+[`3c41120`](https://github.com/onnx/onnx/blob/3c41120b9c69657a1dd13407b080bd451ed06c9c/onnx/defs/math/defs.cc),
 including its standard-operator function decomposition and float64 support. The pinned
 MLX GatherMM CPU kernel accepts only float32; the typed CPU fallback uses ordinary
 Matmul (double GEMM for float64), not a narrowing cast. GPU routing does not construct
 a gathered [M,S,K,N] expert-weight tensor.
 
-`qdq.rs` recognizes default-domain DequantizeLinear weights feeding MatMul or
-GroupedMatMul, optionally recognizing activation DQ too. On Metal, rank-two activations
+`qdq.rs` recognizes default-domain DequantizeLinear weights feeding MatMul,
+Gemm, or GroupedMatMul, optionally recognizing activation DQ too. Gemm and
+GroupedMatMul support both transB layouts; Gemm also honors transA and its ordered
+alpha/beta/bias epilogue. On Metal, rank-two activations
 and rank-two dense/rank-three expert int4/uint4/int8/uint8 weights with float32 scale/output use a
 private direct kernel. Per-tensor, per-axis (including negative axes), and blocked
 parameters are indexed in their original ONNX layouts; live weights, scales and zero
@@ -135,7 +235,7 @@ nonfinite, or if the original reduction is nonfinite. Thus it preserves the
 original exceptional arithmetic rather than promising exact-real recovery after
 intermediate overflow. Underflow can lose product residuals; Metal subnormal fidelity
 and blanket correctly-rounded dots are not claimed. Ordinary INT8/UINT8 general
-arithmetic and the proven integer subset are unchanged.
+arithmetic and the proven integer subset retain their existing numerical contracts.
 It supports realistic K and blocked scales, but is **not integer-only ALU or broadly
 bit-exact**. Finite packed regression references independently accumulate exact
 products of the already-float32-rounded DQ operands using binary integer
@@ -143,12 +243,12 @@ coefficients, then round the sum to float32 with ties to even. Existing
 `rtol=1e-5, atol=1e-6` thresholds are unchanged. Original NumPy float32 reductions
 remain named disagreement diagnostics: neither their reduction order nor a fitted
 output is the oracle. Exceptional regressions separately check the retained
-float32 overflow/NaN/Inf behavior. This source change still requires hosted
-qualification; earlier failing CI and numerical evidence are retained.
 No expanded floating activation or
-weight matrix is produced by this kernel. This is not MLX's affine QMM rewrite:
-that kernel's scale-after-dot/bias correction can change ONNX DQ overflow/cancellation
-semantics. Non-float32 DQ, vector/batched MatMul, and CPU streams use ordinary DQ
+weight matrix is produced by this kernel. Weight-only byte DQ additionally uses
+bounded SIMDgroup matrix tiles for prefill and a SIMD matvec for contiguous K
+decode; each weight is rounded to float32 before multiplication. Arbitrary
+float32 QDQ is not rewritten to affine QMM: scale-after-dot/bias correction can
+change ONNX DQ overflow/cancellation semantics. Non-float32 DQ, vector/batched MatMul, and CPU streams use ordinary DQ
 and the existing unfused matrix-product path. `ONNXRUNTIME_EP_MLX_NO_QDQ_FUSION=1` disables
 recognition for same-binary comparisons. Nonempty dispatched products expose
 `mlx_qdq_integer_matmul` or `mlx_qdq_matmul` in `op.fast` trace events; products
@@ -186,11 +286,13 @@ classes when it sees any `com.microsoft::PagedAttention`, or default-domain
 `Attention` / contrib `GroupQueryAttention` / `MultiHeadAttention` with both
 present-cache output slots 1 and 2 populated. Without pattern integration, packed
 DQ's Eager class and FP32 MatMul's Shapeless class would prevent their union.
-The packed pattern now places only already-claimable, direct FP32 DQ producers
-and their eligible default MatMul / GroupedMatMul-29 consumer in the existing
+The QDQ pattern places only already-claimable, direct FP32 DQ producers
+and their eligible default MatMul / Gemm / GroupedMatMul-29 consumer in the existing
 Eager class. It requires rank-two activations, rank-two/rank-three weights as
-appropriate, FP32 scales/output, INT4/UINT4/INT8/UINT8 quantized operands, and at
-least one packed operand. The signature predicates are shared with runtime
+appropriate, FP32 scales/output, and INT4/UINT4/INT8/UINT8 quantized operands.
+Packed transport retains eager co-location even
+when compute fusion is disabled; byte-only promotion honors that switch.
+The signature predicates are shared with runtime
 recognition; ordinary claims validate types/parameters first, and execution
 independently revalidates live geometry and the GPU device.
 
@@ -206,15 +308,63 @@ to cached Attention-24 with both present outputs, checks repeated live packed da
 and shared results against independent references, and asserts actual eager
 DQ/product co-location plus private dispatch with fusion enabled, absence with
 fusion disabled, and no promotion for vector MatMul. This is bounded integration,
-not a claim of full quantized-MoE model coverage or a positive GroupedMatMul-29
-ORT session.
+not a claim of full quantized-MoE model coverage.
 
-**Runtime qualification:** ORT v1.31.0 pins ONNX v1.22.0 in `cmake/deps.txt`, predating
-GroupedMatMul-29. The Rust direct-handler tests exercise implementation code, not an
-ORT opset-29 session. The Python QDQ tests exercise ordinary MatMul at opset 24.
-Real GroupedMatMul model loading remains blocked until a runtime is independently
-verified to include the merged schema; no global unreleased-opset override, custom
-domain relabeling, or dependency substitution is introduced.
+**Runtime qualification:** ordinary QDQ regressions also run on released ORT.
+GroupedMatMul-29 and packed-consumer models run on the isolated schema-enabled
+ORT-main/ONNX-main build described above, with CPU fallback and AOT function
+inlining disabled, provider profiles checked, and private dispatch asserted.
+Released-runtime schema skips and native direct-handler tests are distinct evidence.
+
+### Packed static-weight consumers
+
+`packed/fusion.rs` recognizes DequantizePacked feeding MatMul, Gemm,
+GroupedMatMul and Gather through bounded constant Reshape/Transpose chains.
+`conv/packed.rs` recognizes unpadded, unit-stride, group-one pointwise Conv in
+one to three spatial dimensions. Decode/view/consumer atomic regions preserve
+these patterns in decoder partitions; explicit layer cuts remain respected.
+Shared decoded outputs keep their original nodes and dtype conversions.
+
+The 11 Metal formats listed above share one normative FLOAT decoder.
+`matmul/fused.rs` loads decoded weights into bounded tiles, converts to the
+graph dtype before multiplication, and accumulates in float32. FP16 tiles are
+used only for FP16 graphs; FP32/BF16 operands are not silently narrowed to FP16.
+Both expert layouts map source addresses directly, without a floating transpose
+or [M,S,K,N] expansion. Repeated experts are legal; routing buckets reuse tiles
+only for selected experts. Gather decodes only requested embedding rows.
+Bias follows the original rounded product; activation/residual epilogues are
+not additionally fused.
+
+For dense FP32 prefill with M>=33, immutable host-backed weights, an affine
+matrix layout and a physical row width divisible by 32, `packed/qmm.rs`
+repackages Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q8_1/Q4_K/Q5_K codes and compact
+scale/bias parameters once into native MLX QMM storage. A one-time host check
+rejects nonfinite scale/minimum fields from this optimization; it does not
+decode float weights. The GPU repacking and native FLOAT tile reader never
+write a full floating weight. Half scales, bounded K-subscales and small codes
+make the affine products exactly representable in FLOAT; this justification
+does not extend to arbitrary QDQ scales. Native QMM is not used for narrow
+output dtypes, where earlier rounding could change the decoded weights.
+The minimum M exceeds every vector cutoff in pinned MLX 0.32.4, ensuring
+matrix readers rather than scale-after-dot vector arithmetic.
+
+Dense custom tiled prefill regressed against native GEMM in measurements and
+is not selected by default. Dense M>4 profiles outside the native-QMM subset
+(including Q2_K/Q3_K/Q6_K, narrow dtypes, live weights, nonfinite parameters,
+and unsupported views/widths) retain ordinary GPU decode plus matmul. Small
+dense products and routed experts retain direct kernels. Thus fallback profiles
+may materialize floating weights; the no-full-weight claim applies only to
+eligible fused routes. FP8 DQ transport/fusion, arbitrary QDQ view chains,
+general spatial/grouped Conv, and the other 16 packed formats' GPU fusion
+remain unimplemented, not hardware-impossibility claims.
+
+DequantizePacked checks each logical dimension and its one-dimensional encoded
+byte count against the MLX int32 dimension limit, but uses checked size_t
+logical offsets and a two-dimensional standalone decode grid. A live Q4_0
+bank [128,4097,4096] executes selected experts across the signed-int32 logical
+offset boundary without an 8.59 GB floating bank. This is execution evidence,
+not a steady-state timing or process-RSS measurement.
+See [synchronized consumer benchmarks](../bench/README.md#static-weight-decode-consumers).
 
 The FusedMatMul source contract follows immutable ORT
 [`402979ac`](https://github.com/microsoft/onnxruntime/tree/402979ac1bef89dcd55add41eaa7277c407599eb):
@@ -400,7 +550,7 @@ place. Those unused arrays are not additional evaluation roots, but compiled
 and performance evidence must include that per-cached-trace ownership cost;
 results for the earlier typed wide scan do not validate this implementation.
 
-`MeanVarianceNormalization` follows the schema-9/13 second-moment expression:
+Before schema 29, `MeanVarianceNormalization` follows the schema-9/13 second-moment expression:
 the epsilon is added after the square root, not inside it. Default axes are
 exactly `[0, 2, 3]`; explicit empty axes reduce all dimensions, including scalar
 inputs. Axes are checked at full integer width before native reduction. Narrow
@@ -595,12 +745,13 @@ The **core Rust modules** register:
 | Module | Registered ops |
 |---|---|
 | `elementwise.rs` / `math.rs` | Arithmetic, comparison, logical/bitwise, casts/bitcasts, transcendental functions, and activations including Mish/PRelu/HardSwish |
-| `reduction.rs` | Reduce family, ArgMin/ArgMax, CumSum/CumProd, Hardmax, TopK |
+| `reduction.rs` | Reduce family, ArgMin/ArgMax, CumSum/CumProd/LogCumSumExp, Hardmax, TopK |
 | `shape.rs` | Gather/scatter, reshape/layout, crop/pad, depth/space transforms, Resize/Upsample, Compress, ReverseSequence, EyeLike |
-| `norm.rs` | RMS/Layer/Group/Instance/Batch/Lp normalization, LRN, Microsoft skip-norm variants |
+| `norm.rs` | RMS/Layer/Group/Instance/Batch/Lp normalization, MeanVarianceNormalization, LRN, Microsoft skip-norm variants |
 | `attention.rs` | GroupQueryAttention, Attention (opset 23 & 24), MultiHeadAttention, RotaryEmbedding |
 | `matmul.rs` | MatMul, GroupedMatMul, Gemm, com.microsoft::FusedMatMul |
 | `qdq.rs` | Private QDQ matrix-product recognition and direct packed int4/uint4 and int8/uint8 Metal kernels |
+| `packed/` | Pack/Unpack/DequantizePacked; private family decoders/codebooks, Metal decoding, constant views and consumer fusion |
 | `conv.rs` | Conv/ConvTranspose/DeformConv and local/global pooling |
 | `quant.rs` | MatMulNBits, GatherBlockQuantized, Quantize/Dequantize/DynamicQuantize, MatMulInteger, ConvInteger, QLinearMatMul, QLinearConv |
 | `ssm.rs` | TensorScatter (opset 24), CausalConvWithState, LinearAttention (linear/gated/delta/gated_delta, GQA) |

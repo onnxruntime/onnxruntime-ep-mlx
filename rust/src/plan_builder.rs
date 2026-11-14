@@ -462,6 +462,7 @@ fn build_graph(
         .map(|value| snapshot.values[value].name.clone())
         .collect();
     crate::ops::lut4::recognize(&mut nodes, &graph_outputs);
+    crate::ops::packed::recognize(&mut nodes);
     Ok(nodes)
 }
 

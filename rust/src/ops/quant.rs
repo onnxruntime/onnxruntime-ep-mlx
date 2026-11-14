@@ -666,15 +666,16 @@ fn explicit_fp16_qmm_eligible(
         && w_dtype == mlx::mlx_dtype__MLX_UINT32
 }
 
-fn quantized_matmul(
+pub(super) fn quantized_matmul(
     ctx: &mut TranslationContext,
     x: mlx::mlx_array,
     w: mlx::mlx_array,
     scales: mlx::mlx_array,
     biases: mlx::mlx_array,
-    block: i64,
-    bits: i64,
+    quantization: [i64; 2],
+    transpose: bool,
 ) -> Result<mlx::mlx_array, MlxError> {
+    let [block, bits] = quantization;
     let group_size = mlx::mlx_optional_int_ {
         value: block as i32,
         has_value: true,
@@ -690,7 +691,7 @@ fn quantized_matmul(
             w,
             scales,
             biases,
-            true,
+            transpose,
             group_size,
             bit_width,
             c"affine".as_ptr(),
@@ -1194,7 +1195,15 @@ fn matmulnbits_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxE
             } else {
                 ctx.astype_once(biases, mlx::mlx_dtype__MLX_FLOAT16)?
             };
-            let y_fp16 = quantized_matmul(ctx, a2_fp16, w, scales_fp16, biases_fp16, block, bits)?;
+            let y_fp16 = quantized_matmul(
+                ctx,
+                a2_fp16,
+                w,
+                scales_fp16,
+                biases_fp16,
+                [block, bits],
+                true,
+            )?;
             let y = ctx.astype(y_fp16, mlx::mlx_dtype__MLX_BFLOAT16)?;
             ctx.mark_fast("mlx_quantized_matmul_fp16");
             y
@@ -1202,7 +1211,7 @@ fn matmulnbits_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxE
             let a2 = ctx.reshape(a, &[m, k as i32])?;
             let a2 = pad_last_dim(ctx, a2, (padded_k - k) as i32, act_dt)?;
             ctx.mark_fast("mlx_quantized_matmul");
-            quantized_matmul(ctx, a2, w, scales2d, biases, block, bits)?
+            quantized_matmul(ctx, a2, w, scales2d, biases, [block, bits], true)?
         }
     } else {
         let a2 = ctx.reshape(a, &[m, k as i32])?;

@@ -2,18 +2,18 @@
 
 import json
 import os
-from pathlib import Path
 import subprocess
 import sys
+from pathlib import Path
 
+import _schema_runtime as schema_runtime
 import ml_dtypes
 import numpy as np
-from onnx import AttributeProto, TensorProto as T, helper
-from onnx.reference import ReferenceEvaluator
 import pytest
-
+from onnx import AttributeProto, helper
+from onnx import TensorProto as T
+from onnx.reference import ReferenceEvaluator
 from test_metadata_only_shape import _session
-
 
 TYPES = {T.FLOAT16: np.float16, T.FLOAT: np.float32, T.DOUBLE: np.float64,
          T.BFLOAT16: ml_dtypes.bfloat16}
@@ -194,3 +194,23 @@ def test_mean_variance_actual_routes(tmp_path):
     assert [event["cache"] for event in paths if event["path"] == "general"] == [
         "MISS", "HIT", "RETRACE", "HIT", "HIT"]
     assert sum(event["path"] == "eager" for event in paths) == 5
+
+
+def _centered_mvn_cases():
+    yield "MeanVarianceNormalization", {"x": np.array([10000, 10002], np.float32)}, {
+        "axes": [0], "epsilon": 0.5,
+    }, (np.array([-2 / 3, 2 / 3], np.float32),)
+
+
+CENTERED_MVN_CASES = list(_centered_mvn_cases())
+
+
+@pytest.mark.parametrize("op,feeds,attrs,expected", CENTERED_MVN_CASES, ids=[case[0] for case in CENTERED_MVN_CASES])
+def test_centered_mvn_goldens_match_onnx_reference(op, feeds, attrs, expected):
+    schema_runtime.check_reference(op, feeds, attrs, expected, opset=29)
+
+
+@pytest.mark.parametrize("eager", [False, True])
+@pytest.mark.parametrize("op,feeds,attrs,expected", CENTERED_MVN_CASES, ids=[case[0] for case in CENTERED_MVN_CASES])
+def test_centered_mvn_mlx_against_reference(op, feeds, attrs, expected, eager, monkeypatch, tmp_path):
+    schema_runtime.check_mlx(op, feeds, attrs, expected, eager, monkeypatch, tmp_path, opset=29)

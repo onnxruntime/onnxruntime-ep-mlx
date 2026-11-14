@@ -186,6 +186,7 @@ pub struct NodeDesc {
     /// Recognized DQ operands for a private quantized kernel, never a public ONNX op.
     pub(crate) qdq: Option<Box<crate::ops::qdq::QuantizedMatMul>>,
     pub(crate) lut4: Option<Box<crate::ops::lut4::LookupMatMul>>,
+    pub(crate) packed_weight: Option<Box<crate::ops::packed::FusedWeight>>,
 }
 
 impl NodeDesc {
@@ -214,6 +215,7 @@ impl NodeDesc {
             subgraphs: Vec::new(),
             qdq: None,
             lut4: None,
+            packed_weight: None,
         }
     }
 }

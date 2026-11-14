@@ -377,6 +377,7 @@ fn register_builtin_ops(registry: &mut OpRegistry) {
     crate::ops::conv::register_conv(registry);
     crate::ops::vision::register_vision(registry);
     crate::ops::quant::register(registry); // quant
+    crate::ops::packed::register(registry);
     crate::ops::stragglers::register(registry); // stragglers
 }
 

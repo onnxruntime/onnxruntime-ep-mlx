@@ -167,8 +167,8 @@ pub(crate) unsafe fn get_capability(
             .filter(|node| is_decoder_attention_anchor(&snapshot.nodes[node]))
             .collect::<Vec<_>>();
         let decoder_graph = !attention_anchors.is_empty();
-        let packed_qdq_nodes = if decoder_graph {
-            packed_qdq_eager_nodes(
+        let qdq_nodes = if decoder_graph {
+            qdq_eager_nodes(
                 &snapshot,
                 &node_order,
                 &supported,
@@ -185,6 +185,10 @@ pub(crate) unsafe fn get_capability(
         let lookup_regions: Vec<Vec<_>> =
             crate::ops::lut4::partition_regions(&lookup_views, &supported)
                 .into_iter()
+                .chain(crate::ops::packed::partition_regions(
+                    &lookup_views,
+                    &supported,
+                ))
                 .map(|members| members.into_iter().map(|i| node_order[i]).collect())
                 .collect();
         let lookup_nodes: HashSet<_> = lookup_regions.iter().flatten().copied().collect();
@@ -208,7 +212,7 @@ pub(crate) unsafe fn get_capability(
                     && view.op_type() == "Range"
                     && view.subgraphs().is_empty();
                 if lookup_nodes.contains(&node)
-                    || packed_qdq_nodes.contains(&node)
+                    || qdq_nodes.contains(&node)
                     || crate::registry::requires_random_eager_boundary(&view)
                     || crate::registry::requires_unique_eager_boundary(&view)
                     || (live_range_boundary && !native_live_range)
@@ -378,13 +382,15 @@ pub(crate) unsafe fn get_capability(
     }
 }
 
-fn packed_qdq_eager_nodes(
+fn qdq_eager_nodes(
     snapshot: &OrtGraphSnapshot,
     order: &[onnx_runtime_ir::NodeId],
     supported: &[bool],
     api: *const ort::OrtApi,
     raw_nodes: &HashMap<onnx_runtime_ir::NodeId, *const ort::OrtNode>,
 ) -> HashSet<onnx_runtime_ir::NodeId> {
+    let fusion_disabled = std::env::var_os("ONNXRUNTIME_EP_MLX_NO_QDQ_FUSION")
+        .is_some_and(|v| v != "0" && !v.is_empty());
     let supported: HashSet<_> = order
         .iter()
         .copied()
@@ -421,13 +427,13 @@ fn packed_qdq_eager_nodes(
         let Some(weight) = producer(1).filter(|node| supported.contains(node)) else {
             continue;
         };
-        let Some(weight_packed) =
+        let Some(packed_weight) =
             crate::ops::qdq::partition_dq_candidate(&NodeView::new(api, raw_nodes[&weight]), true)
         else {
             continue;
         };
         let mut activation = None;
-        let mut activation_packed = false;
+        let mut packed_activation = false;
         if let Some(input) = producer(0) {
             let metadata = &snapshot.nodes[&input];
             if metadata.domain.is_empty() && metadata.op_type == "DequantizeLinear" {
@@ -441,13 +447,15 @@ fn packed_qdq_eager_nodes(
                     continue;
                 };
                 activation = Some(input);
-                activation_packed = packed;
+                packed_activation = packed;
             }
         }
-        if weight_packed || activation_packed {
-            result.extend([product, weight]);
-            result.extend(activation);
+        // Packed transport requires an eager region even when compute fusion is disabled.
+        if fusion_disabled && !packed_weight && !packed_activation {
+            continue;
         }
+        result.extend([product, weight]);
+        result.extend(activation);
     }
     result
 }

@@ -367,28 +367,7 @@ const KERNEL_SRC: &str = r#"
     for (uint n = 0; n < (uint)NSTATE; ++n) { hout[hbase + n] = h[n]; }
 "#;
 
-pub(crate) struct VecString(mlx::mlx_vector_string);
-
-impl VecString {
-    pub(crate) fn new(items: &[&str]) -> Result<Self, MlxError> {
-        let raw = unsafe { mlx::mlx_vector_string_new() };
-        for it in items {
-            let s = CString::new(*it).map_err(|_| "MLX SelectiveScan: bad name".to_string())?;
-            unsafe { mlx::mlx_vector_string_append_value(raw, s.as_ptr()) };
-        }
-        Ok(VecString(raw))
-    }
-
-    pub(crate) fn as_raw(&self) -> mlx::mlx_vector_string {
-        self.0
-    }
-}
-
-impl Drop for VecString {
-    fn drop(&mut self) {
-        unsafe { mlx::mlx_vector_string_free(self.0) };
-    }
-}
+pub(crate) use crate::mlx::metal::VectorString as VecString;
 
 /// Emit the fused kernel. Returns `Ok(None)` when this particular instance is not covered (wrong
 /// rank, dtype or `d_state`), so the caller can fall back to the generic unroll.
@@ -447,8 +426,8 @@ pub fn emit(
     let kernel = unsafe {
         mlx::mlx_fast_metal_kernel_new(
             name.as_ptr(),
-            in_names.0,
-            out_names.0,
+            in_names.as_raw(),
+            out_names.as_raw(),
             src.as_ptr(),
             header.as_ptr(),
             /* ensure_row_contiguous */ true,

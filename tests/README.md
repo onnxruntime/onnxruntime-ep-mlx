@@ -55,6 +55,50 @@ python -m pytest tests/ops -q
 Running `pytest` without `ONNXRUNTIME_MLX_EP_LIB` set **skips** the suite (rather than failing), so
 it is safe to include in any pytest invocation.
 
+New-schema tests live with their math, reduction, matrix-product, indexing,
+normalization, SSM, and packed-operator families. They use ONNX-main reference
+schemas for unreleased opset-29 contracts. With released ONNX packages, unavailable references
+are explicitly skipped. ORT 1.31 cannot load the new schemas, even with its
+development-opset override; those end-to-end cases are separately skipped, not
+counted as EP execution. An isolated ORT-main build with pinned ONNX-main sources
+also runs genuine version-29 MLX-only models, with CPU fallback and ahead-of-time
+function inlining disabled and provider profiles checked. The corresponding Rust
+tests run native CPU/Metal handlers directly, including all 27 packed formats,
+without an ORT model loader. Randomized IQ fixtures cover 21 blocks with scale,
+sign, parity, and distributed-scale edge bits. Integer Gemm compares ordinary
+values to ONNX ReferenceEvaluator and full-width values to an independent Python
+arbitrary-precision oracle; fractional scaling and arithmetic overflow retain
+explicit guards.
+See the [opset-29 support and remaining gaps](../docs/OP_ARCHITECTURE.md#opset-29-onnx-main-unreleased).
+
+`test_packed_fusion.py` checks all 11 GPU GGUF formats against ONNX-main
+decoding/contractions: both expert layouts, Gemm transpositions, constant views,
+live/repeated/unused routes, selected embedding rows, pointwise Conv and ordinary
+Conv fallback profiles. It also checks native-QMM changed-value/shape replay,
+two-dimensional decode tails, shared signed zeros/nonfinite fields and FP32
+accumulation/BF16 exponent range. Trace subprocesses assert actual private
+dispatch, not merely graph claims, and probe schema availability before spawning.
+Native prefill covers M=32/33 boundaries, large FLOAT activations/weights and
+NaN/Inf classes, without narrowing FLOAT operands.
+`test_qdq_fusion.py` retains the exact/compensated packed regressions and adds
+original-layout Gemm/GroupedMatMul transpositions and byte-weight tiled prefill.
+Use the synchronized [static-weight consumer harness](../bench/README.md#static-weight-decode-consumers)
+for latency and memory; trace/verbose measurements are not timing evidence.
+
+For a full Python run, isolate the operator and remaining suites in separate
+processes: the backend's lazy registration can precede the operator fixture's
+independent registration in an aggregate `pytest tests` run.
+
+```sh
+python -m pytest -q tests/ops
+python -m pytest -q tests --ignore=tests/ops
+```
+
+If an inherited environment has `pytest-randomly` installed, set
+`PYTEST_ADDOPTS="-p no:randomly"` for these commands and their subprocesses.
+Existing trace-order assertions require their selected cases in collection
+order; this does not alter provider execution or numerical checks.
+
 `test_attention_semantics.py` uses small, locally built models and an independent float64 SDPA
 oracle rather than version-specific ONNX backend fixture names. It covers fully masked rows
 (including the combined causal/explicit mask), broadcast mask ranks, FP16/FP32, GQA and cached

@@ -1,11 +1,11 @@
 """ScatterElements symbolic metadata and partial non-axis geometry."""
 
+import _models as m
+import _schema_runtime as schema_runtime
 import numpy as np
 import onnx_ir as ir
 import onnxruntime as ort
 import pytest
-
-import _models as m
 
 
 def _native(model):
@@ -87,3 +87,30 @@ def test_scatter_symbolic_updates_metadata_and_runtime_checks():
                 },
             )
         np.testing.assert_array_equal(session.run(None, feeds)[0], expected)
+
+
+def _scatter_mean_cases():
+    yield "ScatterND", {
+        "x": np.array([[1, 2], [3, 4]], np.float32),
+        "indices": np.array([[0], [0]], np.int32),
+        "updates": np.array([[3, 4], [5, 6]], np.float32),
+    }, {"reduction": "mean"}, (np.array([[3, 4], [3, 4]], np.float32),)
+    yield "ScatterElements", {
+        "x": np.array([[1, 2, 3], [4, 5, 6]], np.float32),
+        "indices": np.array([[0, -1, 0, 1]], np.int32),
+        "updates": np.array([[3, 7, 5, 6]], np.float32),
+    }, {"axis": -1, "reduction": "mean"}, (np.array([[3, 4, 5], [4, 5, 6]], np.float32),)
+
+
+SCATTER_MEAN_CASES = list(_scatter_mean_cases())
+
+
+@pytest.mark.parametrize("op,feeds,attrs,expected", SCATTER_MEAN_CASES, ids=[case[0] for case in SCATTER_MEAN_CASES])
+def test_scatter_mean_goldens_match_onnx_reference(op, feeds, attrs, expected):
+    schema_runtime.check_reference(op, feeds, attrs, expected, opset=29)
+
+
+@pytest.mark.parametrize("eager", [False, True])
+@pytest.mark.parametrize("op,feeds,attrs,expected", SCATTER_MEAN_CASES, ids=[case[0] for case in SCATTER_MEAN_CASES])
+def test_scatter_mean_mlx_against_reference(op, feeds, attrs, expected, eager, monkeypatch, tmp_path):
+    schema_runtime.check_mlx(op, feeds, attrs, expected, eager, monkeypatch, tmp_path, opset=29)

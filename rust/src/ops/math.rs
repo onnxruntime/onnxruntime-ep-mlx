@@ -230,6 +230,34 @@ unary_handler!(sqrt_op, mlx::mlx_sqrt);
 unary_handler!(neg_op, mlx::mlx_negative);
 unary_handler!(abs_op, mlx::mlx_abs);
 
+fn expm1_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
+    let x = ctx.resolve(&n.inputs[0])?;
+    let y = ctx.unary(mlx::mlx_expm1, x)?;
+    let y = preserve_zero(ctx, x, y)?;
+    ctx.bind(&n.outputs[0], y);
+    Ok(())
+}
+
+fn log1p_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
+    let x = ctx.resolve(&n.inputs[0])?;
+    let y = ctx.unary(mlx::mlx_log1p, x)?;
+    let y = preserve_zero(ctx, x, y)?;
+    ctx.bind(&n.outputs[0], y);
+    Ok(())
+}
+
+fn preserve_zero(
+    ctx: &mut TranslationContext,
+    x: mlx::mlx_array,
+    y: mlx::mlx_array,
+) -> Result<mlx::mlx_array, MlxError> {
+    // The Accelerate Expm1 implementation canonicalizes negative zero.
+    let zero = ctx.scalar_f32(0.0);
+    let zero = ctx.astype(zero, ctx.dtype_of(x))?;
+    let is_zero = ctx.binary(mlx::mlx_equal, x, zero)?;
+    ctx.where_(is_zero, x, y)
+}
+
 // Unary math / rounding / trig — each is a direct mlx-c primitive (dtype-preserving).
 
 /// ONNX `Sign` propagates NaN (`Sign(NaN) == NaN`), while `mlx_sign` maps NaN to 0. Re-introduce the
@@ -1032,6 +1060,8 @@ pub fn register(registry: &mut OpRegistry) {
     shapeless(registry, "Tanh", tanh_op, tanh_claim);
     shapeless(registry, "Exp", exp_op, float_unary_claim);
     shapeless(registry, "Log", log_op, fp64_unary_claim);
+    shapeless_since(registry, "Expm1", 29, expm1_op, fp64_unary_claim);
+    shapeless_since(registry, "Log1p", 29, log1p_op, fp64_unary_claim);
     shapeless(registry, "Sqrt", sqrt_op, fp64_unary_claim);
     shapeless(registry, "Neg", neg_op, signed_numeric_unary_claim);
     shapeless(registry, "Abs", abs_op, signed_numeric_unary_claim);
@@ -1107,5 +1137,165 @@ mod tests {
         assert!(!celu_uses_v28_function_body(12));
         assert!(!celu_uses_v28_function_body(27));
         assert!(celu_uses_v28_function_body(28));
+    }
+}
+
+#[cfg(test)]
+mod schema_contract_tests {
+    use super::*;
+    use crate::ops::test_helpers::*;
+
+    #[test]
+    fn stable_unary_tiny_values_signed_zero_and_domains() {
+        for cpu in [false, true] {
+            let stream = if cpu {
+                Stream::new_default_cpu()
+            } else {
+                Stream::new_default_gpu()
+            };
+            let mut plan = Plan::new(vec![]);
+            let mut ctx = TranslationContext::new(
+                &mut plan,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                stream.as_raw(),
+            );
+            let values = [
+                0.0f32,
+                -0.0,
+                1e-8,
+                -1e-8,
+                -1.0,
+                -2.0,
+                f32::NEG_INFINITY,
+                f32::INFINITY,
+                f32::NAN,
+            ];
+            let x = ctx.keep(Array::from_data(
+                values.as_ptr().cast(),
+                &[values.len() as i32],
+                mlx::mlx_dtype__MLX_FLOAT32,
+            ));
+            ctx.bind(&output("x"), x);
+            for (op, handler, expected) in [
+                (
+                    "Expm1",
+                    expm1_op as crate::registry::OpHandler,
+                    values.map(f32::exp_m1),
+                ),
+                (
+                    "Log1p",
+                    log1p_op as crate::registry::OpHandler,
+                    values.map(f32::ln_1p),
+                ),
+            ] {
+                let mut n = NodeDesc::new(op.into(), "".into(), 29, CompileShapeSafety::Shapeless);
+                n.inputs = vec![reference("x")];
+                n.outputs = vec![output("y")];
+                handler(&mut ctx, &n).unwrap();
+                let y = ctx.resolve(&reference("y")).unwrap();
+                let y = ctx.contiguous_eval(y).unwrap();
+                let actual = unsafe {
+                    std::slice::from_raw_parts(mlx::mlx_array_data_float32(y), values.len())
+                };
+                for (&a, e) in actual.iter().zip(expected) {
+                    if e.is_nan() {
+                        assert!(a.is_nan(), "{op}, cpu={cpu}: {a} should be NaN");
+                    } else if e == 0.0 || e.is_infinite() {
+                        assert_eq!(a.to_bits(), e.to_bits(), "{op}, cpu={cpu}");
+                    } else {
+                        assert!(
+                            (a - e).abs() <= 2e-6 * e.abs(),
+                            "{op}, cpu={cpu}: {a} != {e}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn stable_unary_preserves_narrow_and_double_storage() {
+        for (cpu, dtype) in [
+            (false, mlx::mlx_dtype__MLX_FLOAT16),
+            (false, mlx::mlx_dtype__MLX_BFLOAT16),
+            (true, mlx::mlx_dtype__MLX_FLOAT16),
+            (true, mlx::mlx_dtype__MLX_BFLOAT16),
+            (true, mlx::mlx_dtype__MLX_FLOAT64),
+        ] {
+            let stream = if cpu {
+                Stream::new_default_cpu()
+            } else {
+                Stream::new_default_gpu()
+            };
+            let mut plan = Plan::new(vec![]);
+            let mut ctx = TranslationContext::new(
+                &mut plan,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                stream.as_raw(),
+            );
+            let values = [-0.0f64, 1e-4, -1e-4, 1e-20];
+            let x = if cpu {
+                ctx.keep(Array::from_data(
+                    values.as_ptr().cast(),
+                    &[4],
+                    mlx::mlx_dtype__MLX_FLOAT64,
+                ))
+            } else {
+                let values = values.map(|v| v as f32);
+                ctx.keep(Array::from_data(
+                    values.as_ptr().cast(),
+                    &[4],
+                    mlx::mlx_dtype__MLX_FLOAT32,
+                ))
+            };
+            let x = ctx.astype(x, dtype).unwrap();
+            ctx.bind(&output("x"), x);
+            for op in ["Expm1", "Log1p"] {
+                crate::registry::translate(&mut ctx, &node(op, &["x"], 29)).unwrap();
+                let y = ctx.resolve(&reference("y")).unwrap();
+                assert_eq!(ctx.dtype_of(y), dtype);
+                let read_dtype = if cpu {
+                    mlx::mlx_dtype__MLX_FLOAT64
+                } else {
+                    mlx::mlx_dtype__MLX_FLOAT32
+                };
+                let y = ctx.astype(y, read_dtype).unwrap();
+                let y = ctx.contiguous_eval(y).unwrap();
+                let actual: Vec<f64> = if cpu {
+                    unsafe { std::slice::from_raw_parts(mlx::mlx_array_data_float64(y), 4) }
+                        .to_vec()
+                } else {
+                    unsafe { std::slice::from_raw_parts(mlx::mlx_array_data_float32(y), 4) }
+                        .iter()
+                        .map(|&v| f64::from(v))
+                        .collect()
+                };
+                assert_eq!(actual[0].to_bits(), (-0.0f64).to_bits());
+                for (i, &raw) in values.iter().enumerate().skip(1) {
+                    let convert = |v| {
+                        if dtype == mlx::mlx_dtype__MLX_FLOAT16 {
+                            half::f16::from_f64(v).to_f64()
+                        } else if dtype == mlx::mlx_dtype__MLX_BFLOAT16 {
+                            half::bf16::from_f64(v).to_f64()
+                        } else {
+                            v
+                        }
+                    };
+                    let value = convert(raw);
+                    let expected = convert(if op == "Expm1" {
+                        value.exp_m1()
+                    } else {
+                        value.ln_1p()
+                    });
+                    assert!(
+                        (actual[i] - expected).abs() <= expected.abs() * 1e-12,
+                        "{op}, dtype={dtype}, cpu={cpu}: {} != {expected}",
+                        actual[i]
+                    );
+                }
+            }
+        }
     }
 }

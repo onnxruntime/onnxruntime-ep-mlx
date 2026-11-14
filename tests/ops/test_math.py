@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
+import _models as m
+import _schema_runtime as schema_runtime
 import numpy as np
 import pytest
 from onnx_ir import DataType as DT
-
-import _models as m
-
 
 FLOAT_CASES = [(DT.FLOAT, np.float32, 1e-5), (DT.FLOAT16, np.float16, 3e-3)]
 
@@ -286,3 +285,27 @@ def test_equal_bool() -> None:
         rtol=0,
         atol=0,
     )
+
+
+def _stable_transform_cases():
+    yield "Expm1", {"x": np.array([-0.0, 1e-8, -1e-8, -np.inf, np.inf, np.nan], np.float32)}, {}, (
+        np.array([-0.0, 1e-8, -1e-8, -1, np.inf, np.nan], np.float32),
+    )
+    yield "Log1p", {"x": np.array([-0.0, 1e-8, -1, -2, np.inf, np.nan], np.float32)}, {}, (
+        np.array([-0.0, 1e-8, -np.inf, np.nan, np.inf, np.nan], np.float32),
+    )
+
+
+STABLE_TRANSFORM_CASES = list(_stable_transform_cases())
+
+
+@pytest.mark.parametrize("op,feeds,attrs,expected", STABLE_TRANSFORM_CASES, ids=[case[0] for case in STABLE_TRANSFORM_CASES])
+def test_stable_transform_goldens_match_onnx_reference(op, feeds, attrs, expected):
+    actual = schema_runtime.check_reference(op, feeds, attrs, expected, opset=29)
+    assert np.signbit(actual[0][0])
+
+
+@pytest.mark.parametrize("eager", [False, True])
+@pytest.mark.parametrize("op,feeds,attrs,expected", STABLE_TRANSFORM_CASES, ids=[case[0] for case in STABLE_TRANSFORM_CASES])
+def test_stable_transform_mlx_against_reference(op, feeds, attrs, expected, eager, monkeypatch, tmp_path):
+    schema_runtime.check_mlx(op, feeds, attrs, expected, eager, monkeypatch, tmp_path, opset=29)

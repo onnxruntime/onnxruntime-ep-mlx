@@ -15,6 +15,10 @@ use crate::registry::{
 use crate::sys::{mlx, ort};
 use crate::{deny, require};
 
+pub(crate) mod fused;
+mod integer_gemm;
+use integer_gemm::{integer_gemm_dtype, integer_gemm_op, integer_gemm_scale};
+
 fn present(n: &NodeDesc, i: usize) -> bool {
     i < n.inputs.len() && n.inputs[i].source != Src::Absent
 }
@@ -312,6 +316,9 @@ fn matmul_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError>
     if super::lut4::execute(ctx, n)? {
         return Ok(());
     }
+    if super::packed::execute(ctx, n)? {
+        return Ok(());
+    }
     if super::qdq::execute(ctx, n)? {
         return Ok(());
     }
@@ -400,9 +407,13 @@ fn grouped_claim(node: &NodeView) -> ClaimResult {
     } else {
         None
     };
+    let mut weight_shape = w.shape.clone();
+    if node.int_attr("transB", 0) != 0 && weight_shape.len() == 3 {
+        weight_shape.swap(1, 2);
+    }
     grouped_geometry(
         &x.shape,
-        &w.shape,
+        &weight_shape,
         &indices.shape,
         bias.as_ref().map(|b| b.shape.as_slice()),
         Some(&y.shape),
@@ -414,12 +425,19 @@ pub(super) fn grouped_matmul_op(
     ctx: &mut TranslationContext,
     n: &NodeDesc,
 ) -> Result<(), MlxError> {
+    let trans_b = n.ints.get("transB").copied().unwrap_or(0) != 0;
+    if super::packed::execute(ctx, n)? {
+        return Ok(());
+    }
     if super::qdq::execute(ctx, n)? {
         return Ok(());
     }
     let x = ctx.resolve(&n.inputs[0])?;
     let xs = ctx.shape_of(x);
-    let w = ctx.resolve(&n.inputs[1])?;
+    let mut w = ctx.resolve(&n.inputs[1])?;
+    if trans_b {
+        w = ctx.transpose(w, &[0, 2, 1])?;
+    }
     let ws = ctx.shape_of(w);
     let indices = ctx.resolve(&n.inputs[2])?;
     let ish = ctx.shape_of(indices);
@@ -584,40 +602,75 @@ fn fused_matmul_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), Mlx
 }
 
 fn gemm_op(ctx: &mut TranslationContext, n: &NodeDesc) -> Result<(), MlxError> {
+    if integer_gemm_dtype(n.outputs[0].otype) {
+        return integer_gemm_op(ctx, n);
+    }
+    if super::packed::execute(ctx, n)? {
+        return Ok(());
+    }
+    if super::qdq::execute(ctx, n)? {
+        return Ok(());
+    }
     let mut a = ctx.resolve(&n.inputs[0])?;
     let mut b = ctx.resolve(&n.inputs[1])?;
-    let dt = ctx.dtype_of(a);
 
     let trans_a = n.ints.get("transA").copied().unwrap_or(0) != 0;
     let trans_b = n.ints.get("transB").copied().unwrap_or(0) != 0;
-    if trans_a {
-        a = ctx.transpose(a, &[1, 0])?;
+    if trans_a && ctx.ndim(a) >= 2 {
+        a = ctx.transpose(a, &fused_matmul_axes(ctx.ndim(a), true, false))?;
     }
     if trans_b {
         b = ctx.transpose(b, &[1, 0])?;
     }
 
+    let mm = ctx.binary(mlx::mlx_matmul, a, b)?;
+    let y = gemm_epilogue(ctx, n, mm)?;
+    ctx.mark_fast("mlx_matmul");
+    ctx.bind(&n.outputs[0], y);
+    Ok(())
+}
+
+pub(super) fn gemm_epilogue(
+    ctx: &mut TranslationContext,
+    n: &NodeDesc,
+    mm: mlx::mlx_array,
+) -> Result<mlx::mlx_array, MlxError> {
+    let dt = ctx.dtype_of(mm);
     let alpha = n.floats.get("alpha").copied().unwrap_or(1.0);
     let beta = n.floats.get("beta").copied().unwrap_or(1.0);
-
-    let mm = ctx.binary(mlx::mlx_matmul, a, b)?;
     let mut y = if alpha != 1.0 {
         let s = scalar_like(ctx, alpha, dt)?;
         ctx.binary(mlx::mlx_multiply, mm, s)?
     } else {
         mm
     };
-    if present(n, 2) {
+    if present(n, 2) && (n.since_version < 29 || beta != 0.0) {
         let mut c = ctx.resolve(&n.inputs[2])?;
+        if n.since_version >= 29 {
+            let shape = ctx.shape_of(y);
+            let cshape = ctx.shape_of(c);
+            if cshape.len() > shape.len()
+                || !cshape
+                    .iter()
+                    .rev()
+                    .zip(shape.iter().rev())
+                    .all(|(&c, &y)| c == 1 || c == y)
+            {
+                return Err(format!(
+                    "Gemm-29: C shape {cshape:?} cannot broadcast to output {shape:?}; reshape C to a suffix compatible with Y"
+                ));
+            }
+        }
         if beta != 1.0 {
             let s = scalar_like(ctx, beta, dt)?;
             c = ctx.binary(mlx::mlx_multiply, c, s)?;
         }
         y = ctx.binary(mlx::mlx_add, y, c)?;
     }
-    ctx.mark_fast("mlx_matmul");
-    ctx.bind(&n.outputs[0], y);
-    Ok(())
+    if n.since_version >= 29 && ctx.size_of(y) == 0 {
+        y = ctx.zeros(&ctx.shape_of(y), dt)?;
+    }
+    Ok(y)
 }
 
 // ---- claim predicates --------------------------------------------------------------------------
@@ -662,23 +715,57 @@ fn gemm_claim(node: &NodeView) -> ClaimResult {
         _ => deny!("missing tensor type/shape info on an input or the output"),
     };
     require!(
-        is_mlx_cpu_float(a.dtype) && b.dtype == a.dtype && out.dtype == a.dtype,
-        "A/B/output must share one float dtype (fp32/fp16/bf16/fp64), got {}, {} -> {}",
+        (is_mlx_cpu_float(a.dtype) || node.since_version() >= 29 && integer_gemm_dtype(a.dtype))
+            && b.dtype == a.dtype
+            && out.dtype == a.dtype,
+        "A/B/output must share one floating dtype, or opset-29 int32/uint32/int64/uint64; got {}, {} -> {}",
         crate::registry::ort_dtype_name(a.dtype),
         crate::registry::ort_dtype_name(b.dtype),
         crate::registry::ort_dtype_name(out.dtype)
     );
+    if integer_gemm_dtype(a.dtype) {
+        integer_gemm_scale(node.float_attr("alpha", 1.0), "alpha")?;
+        integer_gemm_scale(node.float_attr("beta", 1.0), "beta")?;
+    }
     require!(
-        a.shape.len() == 2 && b.shape.len() == 2,
-        "A and B must both have rank 2 (got ranks {} and {})",
+        (a.shape.len() == 2 || node.since_version() >= 29 && !a.shape.is_empty())
+            && b.shape.len() == 2,
+        "Gemm requires rank-2 B and rank-2 A before opset 29, rank >= 1 A from opset 29 (got {} and {})",
         a.shape.len(),
         b.shape.len()
     );
+    let mut product_shape = a.shape.clone();
+    if node.int_attr("transA", 0) != 0 && product_shape.len() >= 2 {
+        let rank = product_shape.len();
+        product_shape.swap(rank - 2, rank - 1);
+    }
+    let (k, width) = if node.int_attr("transB", 0) == 0 {
+        (b.shape[0], b.shape[1])
+    } else {
+        (b.shape[1], b.shape[0])
+    };
+    let reduction = product_shape.last_mut().expect("checked non-scalar A");
+    require!(
+        *reduction < 0 || k < 0 || *reduction == k,
+        "Gemm contraction dimensions must match after transposition"
+    );
+    *reduction = width;
     if nin == 3 && node.input_present(2) {
         match node.input_info(2) {
-            Some(c) if c.dtype == a.dtype && c.shape.len() <= 2 => {}
+            Some(c) if c.dtype == a.dtype && c.shape.len() <= product_shape.len() => {
+                require!(
+                    c.shape
+                        .iter()
+                        .rev()
+                        .zip(product_shape.iter().rev())
+                        .all(|(&c, &y)| c < 0 || y < 0 || c == 1 || c == y),
+                    "Gemm C shape {:?} must be unidirectionally broadcastable to {:?}",
+                    c.shape,
+                    product_shape
+                );
+            }
             Some(c) => deny!(
-                "C must match dtype {} and have rank <= 2 (got dtype {}, rank {})",
+                "C must match dtype {} and be unidirectionally broadcastable to Y (got dtype {}, rank {})",
                 crate::registry::ort_dtype_name(a.dtype),
                 crate::registry::ort_dtype_name(c.dtype),
                 c.shape.len()
@@ -761,14 +848,27 @@ pub fn register(registry: &mut OpRegistry) {
         handler: matmul_op,
         claim: matmul_claim,
     });
-    registry.register_shapeless(OpRegistration {
-        domain: "",
-        op_type: "Gemm",
-        min_opset: K_ANY_OPSET,
-        max_opset: K_ANY_OPSET,
-        handler: gemm_op,
-        claim: gemm_claim,
-    });
+    registry.register_shape_classified(
+        OpRegistration {
+            domain: "",
+            op_type: "Gemm",
+            min_opset: K_ANY_OPSET,
+            max_opset: K_ANY_OPSET,
+            handler: gemm_op,
+            claim: gemm_claim,
+        },
+        |node|         if node.input_info(0).is_some_and(|input| integer_gemm_dtype(input.dtype)) {
+            crate::registry::CompileShapeSafety::EagerOnly {
+                reason: "integer Gemm uses checked live host accumulation without narrowing integer operands",
+            }
+        } else if node.since_version() >= 29 {
+            crate::registry::CompileShapeSafety::ShapeKeyedOnly {
+                reason: "Gemm-29 specializes empty-result materialization on live output extents",
+            }
+        } else {
+            crate::registry::CompileShapeSafety::Shapeless
+        },
+    );
 }
 
 #[cfg(test)]
@@ -1154,5 +1254,228 @@ mod tests {
         assert_eq!(fused_matmul_axes(3, true, true), [1, 2, 0]);
         assert_eq!(fused_matmul_axes(5, false, true), [1, 2, 3, 0, 4]);
         assert_eq!(fused_matmul_axes(5, true, true), [1, 2, 3, 4, 0]);
+    }
+}
+
+#[cfg(test)]
+mod schema_contract_tests {
+    use super::*;
+    use crate::ops::test_helpers::*;
+
+    #[test]
+    fn integer_gemm29_exact_values_transposes_broadcast_and_empty_geometry() {
+        use crate::ops::host_scan::read_live;
+        use crate::sys::ort;
+        for (dtype, otype) in [
+            (
+                mlx::mlx_dtype__MLX_INT32,
+                ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32,
+            ),
+            (
+                mlx::mlx_dtype__MLX_UINT32,
+                ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT32,
+            ),
+            (
+                mlx::mlx_dtype__MLX_INT64,
+                ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64,
+            ),
+            (
+                mlx::mlx_dtype__MLX_UINT64,
+                ort::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT64,
+            ),
+        ] {
+            let stream = Stream::new_default_gpu();
+            let mut plan = Plan::new(vec![]);
+            let mut ctx = TranslationContext::new(
+                &mut plan,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                stream.as_raw(),
+            );
+            let encode = |values: &[i128]| -> Vec<u8> {
+                values
+                    .iter()
+                    .flat_map(|&value| match dtype {
+                        mlx::mlx_dtype__MLX_INT32 => (value as i32).to_ne_bytes().to_vec(),
+                        mlx::mlx_dtype__MLX_UINT32 => (value as u32).to_ne_bytes().to_vec(),
+                        mlx::mlx_dtype__MLX_INT64 => (value as i64).to_ne_bytes().to_vec(),
+                        _ => (value as u64).to_ne_bytes().to_vec(),
+                    })
+                    .collect()
+            };
+            let mut n = NodeDesc::new(
+                "Gemm".into(),
+                "".into(),
+                29,
+                CompileShapeSafety::EagerOnly {
+                    reason: "checked integer arithmetic",
+                },
+            );
+            n.inputs = vec![reference("a"), reference("b"), reference("c")];
+            n.outputs = vec![output("y")];
+            n.outputs[0].otype = otype;
+            let result_ref = reference("y");
+            n.ints.insert("transA".into(), 1);
+            n.floats.insert("alpha".into(), 2.0);
+            n.floats.insert("beta".into(), -1.0);
+            for trans_b in [0, 1] {
+                n.ints.insert("transB".into(), trans_b);
+                for (name, shape, values) in [
+                    ("a", vec![2, 2, 3], (1..=12).collect::<Vec<i128>>()),
+                    (
+                        "b",
+                        vec![2, 2],
+                        if trans_b == 0 {
+                            vec![1, 2, 3, 4]
+                        } else {
+                            vec![1, 3, 2, 4]
+                        },
+                    ),
+                    ("c", vec![2], vec![1, 2]),
+                ] {
+                    let bytes = encode(&values);
+                    let array = ctx.from_host(bytes.as_ptr().cast(), &shape, dtype);
+                    ctx.bind(&output(name), array);
+                }
+                crate::registry::translate(&mut ctx, &n).unwrap();
+                let result = read_live(&mut ctx, &result_ref, "test").unwrap();
+                assert_eq!(result.shape, [2, 3, 2]);
+                assert_eq!(
+                    result.data,
+                    encode(&[25, 34, 33, 46, 41, 58, 73, 106, 81, 118, 89, 130])
+                );
+            }
+            n.ints.insert("transB".into(), 0);
+            n.floats.insert("alpha".into(), 1.0);
+            n.floats.insert("beta".into(), 0.0);
+            let large = if matches!(
+                dtype,
+                mlx::mlx_dtype__MLX_INT64 | mlx::mlx_dtype__MLX_UINT64
+            ) {
+                (1i128 << 53) + 1
+            } else {
+                (1i128 << 25) + 1
+            };
+            for (name, shape, values) in [
+                ("a", vec![2], vec![large, 2]),
+                ("b", vec![2, 1], vec![1, 1]),
+                ("c", vec![1], vec![1]),
+            ] {
+                let bytes = encode(&values);
+                let array = ctx.from_host(bytes.as_ptr().cast(), &shape, dtype);
+                ctx.bind(&output(name), array);
+            }
+            crate::registry::translate(&mut ctx, &n).unwrap();
+            let result = read_live(&mut ctx, &result_ref, "test").unwrap();
+            assert_eq!(result.shape, [1]);
+            assert_eq!(result.data, encode(&[large + 2]));
+            n.floats.insert("alpha".into(), 0.5);
+            assert!(
+                crate::registry::translate(&mut ctx, &n)
+                    .unwrap_err()
+                    .contains("finite integral")
+            );
+            n.floats.insert("alpha".into(), 2f32.powi(100));
+            assert!(
+                crate::registry::translate(&mut ctx, &n)
+                    .unwrap_err()
+                    .contains("exceeds")
+            );
+            n.ints.insert("transA".into(), 0);
+            n.floats.insert("alpha".into(), 1.0);
+            n.inputs.truncate(2);
+            for (a_shape, b_shape, expected_shape) in [
+                (vec![0, 2], vec![2, 3], vec![0, 3]),
+                (vec![2, 0], vec![0, 3], vec![2, 3]),
+                (vec![4, 2], vec![2, 0], vec![4, 0]),
+            ] {
+                for (name, shape) in [("a", a_shape), ("b", b_shape)] {
+                    let array = ctx.zeros(&shape, dtype).unwrap();
+                    ctx.bind(&output(name), array);
+                }
+                crate::registry::translate(&mut ctx, &n).unwrap();
+                let result = read_live(&mut ctx, &result_ref, "test").unwrap();
+                assert_eq!(result.shape, expected_shape);
+                assert!(result.data.iter().all(|&value| value == 0));
+            }
+        }
+    }
+
+    #[test]
+    fn gemm29_rank_transpose_and_beta_zero() {
+        for cpu in [false, true] {
+            let stream = if cpu {
+                Stream::new_default_cpu()
+            } else {
+                Stream::new_default_gpu()
+            };
+            let mut plan = Plan::new(vec![]);
+            let mut ctx = TranslationContext::new(
+                &mut plan,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                stream.as_raw(),
+            );
+            bind_float(
+                &mut ctx,
+                "x",
+                &[2, 2, 3],
+                &[1., 2., 3., 4., 5., 6., 7., 8., 9., 10., 11., 12.],
+            );
+            bind_float(&mut ctx, "w", &[2, 2], &[1., 2., 3., 4.]);
+            bind_float(&mut ctx, "bias", &[2], &[0.5, -0.5]);
+            let mut gemm = node("Gemm", &["x", "w", "bias"], 29);
+            gemm.ints.insert("transA".into(), 1);
+            crate::registry::translate(&mut ctx, &gemm).unwrap();
+            assert_output(
+                &mut ctx,
+                "y",
+                &[2, 3, 2],
+                &[
+                    13.5, 17.5, 17.5, 23.5, 21.5, 29.5, 37.5, 53.5, 41.5, 59.5, 45.5, 65.5,
+                ],
+            );
+            bind_float(&mut ctx, "x", &[2], &[1., 2.]);
+            bind_float(&mut ctx, "bias", &[2], &[f32::NAN, f32::INFINITY]);
+            gemm.floats.insert("beta".into(), 0.0);
+            crate::registry::translate(&mut ctx, &gemm).unwrap();
+            assert_output(&mut ctx, "y", &[2], &[7., 10.]);
+        }
+    }
+
+    #[test]
+    fn grouped_matmul29_transposed_weights() {
+        for cpu in [false, true] {
+            let stream = if cpu {
+                Stream::new_default_cpu()
+            } else {
+                Stream::new_default_gpu()
+            };
+            let mut plan = Plan::new(vec![]);
+            let mut ctx = TranslationContext::new(
+                &mut plan,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                stream.as_raw(),
+            );
+            bind_float(&mut ctx, "x", &[2, 3], &[1., 2., 3., 4., 5., 6.]);
+            bind_float(
+                &mut ctx,
+                "w",
+                &[2, 2, 3],
+                &[1., 2., 3., 4., 5., 6., 7., 8., 9., 10., 11., 12.],
+            );
+            bind_float(&mut ctx, "bias", &[2, 2], &[0.5, -0.5, 1., -1.]);
+            bind_indices(&mut ctx, &[2, 2], &[1, 0, 0, 1], true);
+            let mut grouped = node("GroupedMatMul", &["x", "w", "indices", "bias"], 29);
+            grouped.ints.insert("transB".into(), -1);
+            crate::registry::translate(&mut ctx, &grouped).unwrap();
+            assert_output(
+                &mut ctx,
+                "y",
+                &[2, 2, 2],
+                &[51., 67., 14.5, 31.5, 32.5, 76.5, 123., 166.],
+            );
+        }
     }
 }
